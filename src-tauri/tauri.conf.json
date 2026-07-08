@@ -27,10 +27,18 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERFRkRBM0RFNjg1QzFDMUYKUldRZkhGeG8zcVA5M2dzelI5Q21qMGIwczVjUzFkaXBFYlFVUGo3OG5yRW1vTFg5SXV1WmhUeFoK",
+      "endpoints": [
+        "https://github.com/wanwan-doudou/DnsBlackhole/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

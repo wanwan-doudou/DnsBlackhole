@@ -675,6 +675,48 @@ button.refreshing:disabled {
   margin-top: 0;
 }
 
+.about-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.about-version {
+  color: #3b4e62;
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.update-actions {
+  flex-shrink: 0;
+}
+
+.update-status {
+  margin-top: 12px;
+  border: 1px solid #dbe4ee;
+  border-radius: 4px;
+  padding: 10px 12px;
+  color: #3f5368;
+  background: #f7f9fb;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.update-status.ok {
+  border-color: #92d885;
+  color: #267000;
+  background: #f0faeb;
+}
+
+.update-status.err {
+  border-color: #f2b5b5;
+  color: #b42323;
+  background: #fff3f3;
+}
+
 .dns-settings {
   display: grid;
   grid-template-columns: minmax(420px, 1fr) 260px;
@@ -931,6 +973,10 @@ select:focus {
   padding: 18px;
   color: #738294;
   font-size: 13px;
+}
+
+.hidden {
+  display: none !important;
 }
 
 .message {
