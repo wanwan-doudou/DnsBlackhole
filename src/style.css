@@ -341,24 +341,80 @@ button.refreshing:disabled {
   height: 70px;
 }
 
-.sparkline line {
+.spark-baseline {
   stroke: #d9dde2;
   stroke-width: 1;
 }
 
-.sparkline polyline {
+.spark-line {
   fill: none;
-  stroke: #8f949a;
+  stroke: #7f7f7f;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.5;
+  stroke-width: 1;
 }
 
-.blocked-spark .sparkline line {
+.spark-area {
+  stroke: none;
+}
+
+.sparkline .spark-guide {
+  stroke: #9aa2ad;
+  stroke-dasharray: 4 4;
+  stroke-width: 1;
+}
+
+.sparkline .spark-point {
+  fill: #ffffff;
+  stroke: #727a83;
+  stroke-width: 2;
+}
+
+.spark-tooltip {
+  position: absolute;
+  z-index: 3;
+  min-width: 92px;
+  border: 1px solid #d8e1eb;
+  border-radius: 6px;
+  padding: 8px 11px;
+  color: #4b5968;
+  background: #ffffff;
+  box-shadow: 0 6px 18px rgba(38, 50, 63, 0.18);
+  pointer-events: none;
+  transform: translate(-50%, -105%);
+}
+
+.spark-tooltip strong,
+.spark-tooltip span {
+  display: block;
+}
+
+.spark-tooltip strong {
+  color: #354150;
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.spark-tooltip span {
+  margin-top: 3px;
+  color: #657487;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.blocked-spark .spark-baseline {
   stroke: #ffd2c8;
 }
 
-.blocked-spark .sparkline polyline {
+.blocked-spark .spark-line {
+  stroke: #f67247;
+}
+
+.blocked-spark .sparkline .spark-guide {
+  stroke: #ff9b84;
+}
+
+.blocked-spark .sparkline .spark-point {
   stroke: #ff7659;
 }
 

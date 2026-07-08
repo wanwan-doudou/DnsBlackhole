@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import appIconUrl from "./app-icon.png";
 import "./style.css";
 
 type ViewName = "dashboard" | "dns" | "filters" | "custom" | "settings";
@@ -97,6 +98,17 @@ type RenderStatusOptions = {
   renderDashboard?: boolean;
 };
 
+type HistoryPoint = {
+  index: number;
+  value: number;
+  label: string;
+};
+
+type ChartPoint = HistoryPoint & {
+  x: number;
+  y: number;
+};
+
 let messageTimer = 0;
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -109,7 +121,7 @@ app.innerHTML = `
     <header class="app-header">
       <div class="header-inner">
         <div class="brand">
-          <img class="brand-mark" src="/src/app-icon.png" alt="DnsBlackhole" />
+          <img class="brand-mark" src="${appIconUrl}" alt="DnsBlackhole" />
           <div>
             <h1>DnsBlackhole</h1>
             <span>DNS sinkhole</span>
@@ -137,10 +149,22 @@ app.innerHTML = `
           <article class="spark-card">
             <div class="spark-box">
               <strong id="queries">0</strong>
-              <svg class="sparkline" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
-                <line x1="0" y1="72" x2="260" y2="72"></line>
-                <polyline id="query_sparkline" points=""></polyline>
+              <svg class="sparkline" data-tooltip="query_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
+                <defs>
+                  <linearGradient id="query_spark_gradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#7f7f7f" stop-opacity="0.82"></stop>
+                    <stop offset="64%" stop-color="#7f7f7f" stop-opacity="0.6"></stop>
+                    <stop offset="92%" stop-color="#7f7f7f" stop-opacity="0.16"></stop>
+                    <stop offset="100%" stop-color="#7f7f7f" stop-opacity="0"></stop>
+                  </linearGradient>
+                </defs>
+                <line class="spark-baseline" x1="0" y1="72" x2="260" y2="72"></line>
+                <path class="spark-area" fill="url(#query_spark_gradient)" d=""></path>
+                <path class="spark-line" id="query_sparkline" d=""></path>
+                <line class="spark-guide hidden" x1="0" y1="8" x2="0" y2="72"></line>
+                <circle class="spark-point hidden" cx="0" cy="72" r="3"></circle>
               </svg>
+              <div class="spark-tooltip hidden" id="query_spark_tooltip"></div>
             </div>
             <span>DNS 查询</span>
           </article>
@@ -149,10 +173,22 @@ app.innerHTML = `
             <div class="spark-box">
               <strong id="blocked">0</strong>
               <small id="block_rate">0%</small>
-              <svg class="sparkline" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
-                <line x1="0" y1="72" x2="260" y2="72"></line>
-                <polyline id="blocked_sparkline" points=""></polyline>
+              <svg class="sparkline" data-tooltip="blocked_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
+                <defs>
+                  <linearGradient id="blocked_spark_gradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#f67247" stop-opacity="0.82"></stop>
+                    <stop offset="64%" stop-color="#f67247" stop-opacity="0.6"></stop>
+                    <stop offset="92%" stop-color="#f67247" stop-opacity="0.16"></stop>
+                    <stop offset="100%" stop-color="#f67247" stop-opacity="0"></stop>
+                  </linearGradient>
+                </defs>
+                <line class="spark-baseline" x1="0" y1="72" x2="260" y2="72"></line>
+                <path class="spark-area" fill="url(#blocked_spark_gradient)" d=""></path>
+                <path class="spark-line" id="blocked_sparkline" d=""></path>
+                <line class="spark-guide hidden" x1="0" y1="8" x2="0" y2="72"></line>
+                <circle class="spark-point hidden" cx="0" cy="72" r="3"></circle>
               </svg>
+              <div class="spark-tooltip hidden" id="blocked_spark_tooltip"></div>
             </div>
             <span>已被过滤器拦截</span>
           </article>
@@ -870,8 +906,11 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#queries"), formatCount(status.stats.queries));
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
-  renderSparkline("#query_sparkline", buildTrafficSeries(status.stats.traffic, "queries"));
-  renderSparkline("#blocked_sparkline", buildTrafficSeries(status.stats.traffic, "blocked"));
+  const trafficWindowHours = currentQueryLogEnabled
+    ? currentQueryLogRetentionHours
+    : runtimeWindowHours(status.stats.started_at);
+  renderSparkline("#query_sparkline", buildTrafficSeries(status.stats.traffic, "queries", trafficWindowHours));
+  renderSparkline("#blocked_sparkline", buildTrafficSeries(status.stats.traffic, "blocked", trafficWindowHours));
   renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries, false);
   renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked, true);
   renderUpstreamRequestRank(
@@ -1132,39 +1171,201 @@ function updateFilterField(id: string, target: HTMLInputElement): void {
 function buildTrafficSeries(
   buckets: TrafficBucket[] | undefined,
   field: "queries" | "blocked",
-): number[] {
+  windowHours: number,
+): HistoryPoint[] {
   const pointCount = 48;
   const latestMinute = Math.floor(Date.now() / 60000);
-  const firstMinute = latestMinute - pointCount + 1;
-  const values = Array.from({ length: pointCount }, () => 0);
+  const windowMinutes = Math.max(pointCount, Math.ceil(windowHours * 60));
+  const bucketMinutes = Math.max(1, Math.ceil(windowMinutes / pointCount));
+  const firstMinute = latestMinute - bucketMinutes * pointCount + 1;
+  const values = Array.from({ length: pointCount }, (_, index) => {
+    const minute = firstMinute + index * bucketMinutes;
+    return {
+      index,
+      value: 0,
+      label: formatSparkBucketLabel(minute, bucketMinutes),
+    };
+  });
 
   for (const bucket of buckets ?? []) {
-    const index = bucket.minute - firstMinute;
+    const index = Math.floor((bucket.minute - firstMinute) / bucketMinutes);
     if (index >= 0 && index < pointCount) {
-      values[index] = bucket[field];
+      values[index].value += bucket[field];
     }
   }
 
   return values;
 }
 
-function renderSparkline(selector: string, values: number[]): void {
-  const polyline = query<SVGPolylineElement>(selector);
+function renderSparkline(selector: string, series: HistoryPoint[]): void {
+  const line = query<SVGPathElement>(selector);
+  const svg = line.ownerSVGElement;
+  if (!svg) {
+    return;
+  }
+
+  const area = svg.querySelector<SVGPathElement>(".spark-area");
+  if (!area) {
+    return;
+  }
+
   const width = 260;
   const baseline = 72;
   const top = 8;
-  const maxValue = Math.max(...values, 1);
-  const points = values
-    .map((value, index) => {
-      const x = values.length === 1 ? width : (index / (values.length - 1)) * width;
-      const y = baseline - (value / maxValue) * (baseline - top);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+  const maxValue = Math.max(...series.map((point) => point.value), 1);
+  const coords = series.map<ChartPoint>((point, index) => {
+    const x = series.length === 1 ? width : (index / (series.length - 1)) * width;
+    const y = baseline - (point.value / maxValue) * (baseline - top);
+    return { ...point, x, y };
+  });
+  const linePath = buildMonotonePath(coords);
+  const areaPath = buildAreaPath(coords, baseline);
 
-  if (polyline.getAttribute("points") !== points) {
-    polyline.setAttribute("points", points);
+  if (line.getAttribute("d") !== linePath) {
+    line.setAttribute("d", linePath);
   }
+  if (area.getAttribute("d") !== areaPath) {
+    area.setAttribute("d", areaPath);
+  }
+
+  bindSparklineHover(svg, coords, width);
+}
+
+function buildAreaPath(points: ChartPoint[], baseline: number): string {
+  const linePath = buildMonotonePath(points);
+  if (!linePath || points.length === 0) {
+    return "";
+  }
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  return `${linePath} L ${last.x.toFixed(1)} ${baseline.toFixed(1)} L ${first.x.toFixed(1)} ${baseline.toFixed(1)} Z`;
+}
+
+function buildMonotonePath(points: ChartPoint[]): string {
+  if (points.length === 0) {
+    return "";
+  }
+  if (points.length === 1) {
+    const point = points[0];
+    return `M ${point.x.toFixed(1)} ${point.y.toFixed(1)}`;
+  }
+
+  const slopes = points.slice(0, -1).map((point, index) => {
+    const next = points[index + 1];
+    return (next.y - point.y) / (next.x - point.x || 1);
+  });
+  const tangents = points.map((_, index) => {
+    if (index === 0) {
+      return slopes[0];
+    }
+    if (index === points.length - 1) {
+      return slopes[slopes.length - 1];
+    }
+
+    const prev = slopes[index - 1];
+    const next = slopes[index];
+    return prev * next <= 0 ? 0 : (prev + next) / 2;
+  });
+
+  let path = `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`;
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const current = points[index];
+    const next = points[index + 1];
+    const dx = next.x - current.x;
+    const cp1x = current.x + dx / 3;
+    const cp1y = current.y + (tangents[index] * dx) / 3;
+    const cp2x = next.x - dx / 3;
+    const cp2y = next.y - (tangents[index + 1] * dx) / 3;
+    path += ` C ${cp1x.toFixed(1)} ${cp1y.toFixed(1)}, ${cp2x.toFixed(1)} ${cp2y.toFixed(1)}, ${next.x.toFixed(1)} ${next.y.toFixed(1)}`;
+  }
+
+  return path;
+}
+
+function bindSparklineHover(svg: SVGSVGElement, coords: ChartPoint[], width: number): void {
+  const guide = svg.querySelector<SVGLineElement>(".spark-guide");
+  const point = svg.querySelector<SVGCircleElement>(".spark-point");
+  const tooltipId = svg.dataset.tooltip;
+  const tooltip = tooltipId ? query<HTMLDivElement>(`#${tooltipId}`) : null;
+  if (!guide || !point || !tooltip) {
+    return;
+  }
+
+  const hideTooltip = () => {
+    guide.classList.add("hidden");
+    point.classList.add("hidden");
+    tooltip.classList.add("hidden");
+  };
+
+  svg.onpointerleave = hideTooltip;
+  svg.onpointermove = (event) => {
+    if (coords.length === 0) {
+      hideTooltip();
+      return;
+    }
+
+    const rect = svg.getBoundingClientRect();
+    const relativeX = clamp(((event.clientX - rect.left) / rect.width) * width, 0, width);
+    const nearest = coords.reduce((best, current) =>
+      Math.abs(current.x - relativeX) < Math.abs(best.x - relativeX) ? current : best,
+    );
+
+    guide.setAttribute("x1", nearest.x.toFixed(1));
+    guide.setAttribute("x2", nearest.x.toFixed(1));
+    point.setAttribute("cx", nearest.x.toFixed(1));
+    point.setAttribute("cy", nearest.y.toFixed(1));
+    tooltip.innerHTML = `<strong>${formatCount(nearest.value)}</strong><span>${escapeHtml(nearest.label)}</span>`;
+
+    const host = svg.parentElement;
+    const hostRect = host?.getBoundingClientRect();
+    const svgRect = svg.getBoundingClientRect();
+    const left = hostRect ? svgRect.left - hostRect.left + (nearest.x / width) * svgRect.width : 0;
+    const topPosition = hostRect ? svgRect.top - hostRect.top + (nearest.y / 78) * svgRect.height : 0;
+    const maxLeft = Math.max(78, (hostRect?.width ?? 0) - 78);
+    tooltip.style.left = `${clamp(left, 78, maxLeft)}px`;
+    tooltip.style.top = `${clamp(topPosition, 34, 106)}px`;
+
+    guide.classList.remove("hidden");
+    point.classList.remove("hidden");
+    tooltip.classList.remove("hidden");
+  };
+}
+
+function runtimeWindowHours(startedAt: number | null): number {
+  if (!startedAt) {
+    return 1;
+  }
+  const elapsedSeconds = Math.max(60, Date.now() / 1000 - startedAt);
+  return Math.max(1, Math.ceil(elapsedSeconds / 3600));
+}
+
+function formatSparkBucketLabel(minute: number, bucketMinutes: number): string {
+  const start = new Date(minute * 60000);
+  const end = new Date((minute + bucketMinutes - 1) * 60000);
+  const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  if (bucketMinutes >= 24 * 60) {
+    const startLabel = dateFormatter.format(start);
+    const endLabel = dateFormatter.format(end);
+    return startLabel === endLabel ? startLabel : `${startLabel} - ${endLabel}`;
+  }
+
+  const timeFormatter = new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const startLabel = timeFormatter.format(start);
+  const endLabel = timeFormatter.format(end);
+  return startLabel === endLabel ? startLabel : `${startLabel} - ${endLabel}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
 }
 
 function renderRankTable(
