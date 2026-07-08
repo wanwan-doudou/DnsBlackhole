@@ -463,6 +463,22 @@ const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 2_500, 5_000];
 const CHECK_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
 
+// 缓存 Intl 格式化器：构造开销较大，仪表盘每 5 秒刷新会高频调用（sparkline 标签单轮达数十次），复用可避免重复创建
+const countFormatter = new Intl.NumberFormat("zh-CN");
+const percentFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
+const filterTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+});
+const sparkDateFormatter = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" });
+const sparkTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
 const contentElement = query<HTMLDivElement>(".content");
 const enabledInput = query<HTMLInputElement>("#enabled");
 const useFiltersInput = query<HTMLInputElement>("#use_filters");
@@ -725,8 +741,17 @@ await loadConfig();
 await refreshStatus();
 setActiveView(activeView);
 window.setInterval(() => {
+  // 窗口不可见（最小化 / 切到托盘）时跳过轮询，避免无谓的 IPC 与重渲染
+  if (document.hidden) {
+    return;
+  }
   void refreshStatus({ auto: true });
 }, 5000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    void refreshStatus({ auto: true });
+  }
+});
 
 async function loadConfig(): Promise<void> {
   try {
@@ -1326,18 +1351,31 @@ function bindSparklineHover(svg: SVGSVGElement, coords: ChartPoint[], width: num
     point.setAttribute("cy", nearest.y.toFixed(1));
     tooltip.innerHTML = `<strong>${formatCount(nearest.value)}</strong><span>${escapeHtml(nearest.label)}</span>`;
 
-    const host = svg.parentElement;
-    const hostRect = host?.getBoundingClientRect();
-    const svgRect = svg.getBoundingClientRect();
-    const left = hostRect ? svgRect.left - hostRect.left + (nearest.x / width) * svgRect.width : 0;
-    const topPosition = hostRect ? svgRect.top - hostRect.top + (nearest.y / 78) * svgRect.height : 0;
-    const maxLeft = Math.max(78, (hostRect?.width ?? 0) - 78);
-    tooltip.style.left = `${clamp(left, 78, maxLeft)}px`;
-    tooltip.style.top = `${clamp(topPosition, 34, 106)}px`;
-
+    // 先显示再测量：.hidden 为 display:none 时取不到 tooltip 的真实尺寸
     guide.classList.remove("hidden");
     point.classList.remove("hidden");
     tooltip.classList.remove("hidden");
+
+    const host = svg.parentElement;
+    const hostRect = host?.getBoundingClientRect();
+    if (!hostRect) {
+      return;
+    }
+    const svgRect = svg.getBoundingClientRect();
+    const pointLeft = svgRect.left - hostRect.left + (nearest.x / width) * svgRect.width;
+    const pointTop = svgRect.top - hostRect.top + (nearest.y / 78) * svgRect.height;
+
+    // tooltip 位于 overflow:hidden 的卡片内，按其真实尺寸把锚点收敛到卡片范围内，避免溢出被裁切。
+    // CSS transform 为 translate(-50%, -105%)：水平相对锚点居中，垂直向上偏移自身高度的 105%
+    const margin = 8;
+    const halfWidth = tooltip.offsetWidth / 2;
+    const tooltipHeight = tooltip.offsetHeight;
+    const minLeft = halfWidth + margin;
+    const maxLeft = Math.max(minLeft, hostRect.width - halfWidth - margin);
+    const minTop = tooltipHeight * 1.05 + margin;
+    const maxTop = Math.max(minTop, hostRect.height - tooltipHeight * 0.05 - margin);
+    tooltip.style.left = `${clamp(pointLeft, minLeft, maxLeft)}px`;
+    tooltip.style.top = `${clamp(pointTop, minTop, maxTop)}px`;
   };
 }
 
@@ -1352,24 +1390,15 @@ function runtimeWindowHours(startedAt: number | null): number {
 function formatSparkBucketLabel(minute: number, bucketMinutes: number): string {
   const start = new Date(minute * 60000);
   const end = new Date((minute + bucketMinutes - 1) * 60000);
-  const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-  });
 
   if (bucketMinutes >= 24 * 60) {
-    const startLabel = dateFormatter.format(start);
-    const endLabel = dateFormatter.format(end);
+    const startLabel = sparkDateFormatter.format(start);
+    const endLabel = sparkDateFormatter.format(end);
     return startLabel === endLabel ? startLabel : `${startLabel} - ${endLabel}`;
   }
 
-  const timeFormatter = new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  const startLabel = timeFormatter.format(start);
-  const endLabel = timeFormatter.format(end);
+  const startLabel = sparkTimeFormatter.format(start);
+  const endLabel = sparkTimeFormatter.format(end);
   return startLabel === endLabel ? startLabel : `${startLabel} - ${endLabel}`;
 }
 
@@ -1594,7 +1623,7 @@ function showMessage(value: string, isError: boolean): void {
 
 
 function formatCount(value: number): string {
-  return new Intl.NumberFormat("zh-CN").format(value);
+  return countFormatter.format(value);
 }
 
 function formatRate(blocked: number, queries: number): string {
@@ -1605,7 +1634,7 @@ function formatRate(blocked: number, queries: number): string {
 }
 
 function formatPercent(value: number): string {
-  return `${(value * 100).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}%`;
+  return `${percentFormatter.format(value * 100)}%`;
 }
 
 function formatDuration(hours: number): string {
@@ -1622,12 +1651,7 @@ function formatTime(value: number | null): string {
   if (!value) {
     return "-";
   }
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(new Date(value * 1000));
+  return filterTimeFormatter.format(new Date(value * 1000));
 }
 
 function escapeHtml(value: string): string {
