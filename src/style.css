@@ -93,7 +93,11 @@ button.refreshing:disabled {
 
 #refresh_btn.refreshing {
   position: relative;
-  padding-left: 34px;
+  padding-left: 31px;
+}
+
+#refresh_btn {
+  width: 88px;
 }
 
 #refresh_btn.refreshing::before,
@@ -373,10 +377,15 @@ button.refreshing:disabled {
 .spark-tooltip {
   position: absolute;
   z-index: 3;
-  min-width: 92px;
+  display: flex;
+  min-width: 118px;
+  width: max-content;
+  max-width: 180px;
+  flex-direction: column;
+  gap: 3px;
   border: 1px solid #d8e1eb;
   border-radius: 6px;
-  padding: 8px 11px;
+  padding: 7px 10px;
   color: #4b5968;
   background: #ffffff;
   box-shadow: 0 6px 18px rgba(38, 50, 63, 0.18);
@@ -392,13 +401,13 @@ button.refreshing:disabled {
 .spark-tooltip strong {
   color: #354150;
   font-size: 13px;
-  line-height: 1.25;
+  line-height: 16px;
 }
 
 .spark-tooltip span {
-  margin-top: 3px;
   color: #657487;
   font-size: 12px;
+  line-height: 15px;
   white-space: nowrap;
 }
 

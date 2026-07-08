@@ -110,6 +110,7 @@ type ChartPoint = HistoryPoint & {
 };
 
 let messageTimer = 0;
+let updateStatusTimer = 0;
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -616,7 +617,7 @@ checkUpdateButton.addEventListener("click", async () => {
       manualDownloadButton.classList.remove("hidden");
       manualDownloadButton.disabled = false;
     } else {
-      setUpdateStatus("ok", `已是最新版本 v${await getVersion()}`);
+      setUpdateStatus("ok", `已是最新版本 v${await getVersion()}`, 3500);
     }
   } catch (error) {
     console.error("检查更新失败", error);
@@ -1031,12 +1032,20 @@ async function retryWithBackoff<T>(
   throw lastError;
 }
 
-function setUpdateStatus(kind: "info" | "ok" | "err", message: string): void {
+function setUpdateStatus(kind: "info" | "ok" | "err", message: string, autoHideMs = 0): void {
+  window.clearTimeout(updateStatusTimer);
   updateStatusElement.classList.remove("hidden", "ok", "err");
   if (kind !== "info") {
     updateStatusElement.classList.add(kind);
   }
   updateStatusElement.textContent = message;
+
+  if (autoHideMs > 0) {
+    updateStatusTimer = window.setTimeout(() => {
+      updateStatusElement.classList.add("hidden");
+      updateStatusElement.textContent = "";
+    }, autoHideMs);
+  }
 }
 
 function extractUrl(value: unknown): string | null {
