@@ -22,6 +22,7 @@ const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 const TRAFFIC_BUCKET_WINDOW_MINUTES: u64 = 90 * 24 * 60;
 const FASTEST_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_millis(350);
+const DNS_CACHE_ENTRY_OVERHEAD_BYTES: usize = 96;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RuleSummary {
@@ -95,10 +96,47 @@ struct UpstreamForwardResponse {
     duration_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct DnsCacheConfig {
+    enabled: bool,
+    max_size_bytes: usize,
+    min_ttl: u32,
+    max_ttl: u32,
+    optimistic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QueryCacheKey {
+    domain: String,
+    qtype: u16,
+    qclass: u16,
+}
+
+struct CachedDnsResponse {
+    response: Vec<u8>,
+    expires_at: u64,
+    size: usize,
+    last_used: u64,
+    refreshing: bool,
+}
+
+struct CacheHit {
+    response: Vec<u8>,
+    refresh: bool,
+}
+
+struct DnsCache {
+    config: DnsCacheConfig,
+    entries: HashMap<QueryCacheKey, CachedDnsResponse>,
+    total_size: usize,
+    access_counter: u64,
+}
+
 pub struct DnsServer {
     listen_addr: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    cache: Option<Arc<Mutex<DnsCache>>>,
 }
 
 impl DnsServer {
@@ -115,6 +153,7 @@ impl DnsServer {
         let upstream_mode = config.upstream_mode.clone();
         let query_log_enabled = config.query_log_enabled;
         let anonymize_client_ip = config.anonymize_client_ip;
+        let dns_cache = DnsCache::from_config(&config).map(|cache| Arc::new(Mutex::new(cache)));
         let rules = compile_rules(&rules_text);
         let socket =
             UdpSocket::bind(listen_addr).map_err(|e| format!("监听 {listen_addr} 失败：{e}"))?;
@@ -127,6 +166,7 @@ impl DnsServer {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_stats = Arc::clone(&stats);
+        let worker_dns_cache = dns_cache.clone();
         let thread = thread::spawn(move || {
             serve_udp(
                 socket,
@@ -135,6 +175,7 @@ impl DnsServer {
                 rules,
                 worker_stats,
                 database,
+                worker_dns_cache,
                 query_log_enabled,
                 anonymize_client_ip,
                 worker_stop,
@@ -145,11 +186,20 @@ impl DnsServer {
             listen_addr,
             stop,
             thread: Some(thread),
+            cache: dns_cache,
         })
     }
 
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
+    }
+
+    pub fn clear_cache(&self) -> Result<(), String> {
+        if let Some(cache) = &self.cache {
+            let mut cache = cache.lock().map_err(|_| "清除 DNS 缓存失败".to_string())?;
+            cache.clear();
+        }
+        Ok(())
     }
 
     pub fn stop(mut self) {
@@ -212,6 +262,138 @@ fn configure_udp_listener_socket(socket: &UdpSocket) -> Result<(), String> {
 #[cfg(not(windows))]
 fn configure_udp_listener_socket(_socket: &UdpSocket) -> Result<(), String> {
     Ok(())
+}
+
+impl DnsCacheConfig {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            enabled: config.dns_cache_enabled,
+            max_size_bytes: config.dns_cache_size,
+            min_ttl: config.dns_cache_min_ttl,
+            max_ttl: config.dns_cache_max_ttl,
+            optimistic: config.dns_cache_optimistic,
+        }
+    }
+}
+
+impl QueryCacheKey {
+    fn from_question(question: &Question) -> Self {
+        Self {
+            domain: question.domain.clone(),
+            qtype: question.qtype,
+            qclass: question.qclass,
+        }
+    }
+}
+
+impl DnsCache {
+    fn from_config(config: &AppConfig) -> Option<Self> {
+        let config = DnsCacheConfig::from_config(config);
+        if !config.enabled || config.max_size_bytes == 0 {
+            return None;
+        }
+
+        Some(Self {
+            config,
+            entries: HashMap::new(),
+            total_size: 0,
+            access_counter: 0,
+        })
+    }
+
+    fn lookup(&mut self, key: &QueryCacheKey, query: &[u8], now: u64) -> Option<CacheHit> {
+        self.access_counter = self.access_counter.wrapping_add(1);
+        let access = self.access_counter;
+        let Some(entry) = self.entries.get_mut(key) else {
+            return None;
+        };
+
+        let fresh = entry.expires_at > now;
+        if !fresh && !self.config.optimistic {
+            let size = entry.size;
+            self.total_size = self.total_size.saturating_sub(size);
+            self.entries.remove(key);
+            return None;
+        }
+
+        entry.last_used = access;
+        let refresh = !fresh && !entry.refreshing;
+        if refresh {
+            entry.refreshing = true;
+        }
+        let ttl = if fresh {
+            u32::try_from(entry.expires_at.saturating_sub(now))
+                .unwrap_or(u32::MAX)
+                .max(1)
+        } else {
+            1
+        };
+        let response = prepare_cached_response(&entry.response, query, ttl)?;
+        Some(CacheHit { response, refresh })
+    }
+
+    fn insert(&mut self, key: QueryCacheKey, response: Vec<u8>, now: u64) {
+        let Some(ttl) = cache_ttl_seconds(&response, &self.config) else {
+            return;
+        };
+        if ttl == 0 {
+            return;
+        }
+
+        self.access_counter = self.access_counter.wrapping_add(1);
+        let size = response
+            .len()
+            .saturating_add(key.domain.len())
+            .saturating_add(DNS_CACHE_ENTRY_OVERHEAD_BYTES);
+        if size > self.config.max_size_bytes {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&key) {
+            self.total_size = self.total_size.saturating_sub(previous.size);
+        }
+
+        self.total_size = self.total_size.saturating_add(size);
+        self.entries.insert(
+            key,
+            CachedDnsResponse {
+                response,
+                expires_at: now.saturating_add(u64::from(ttl)),
+                size,
+                last_used: self.access_counter,
+                refreshing: false,
+            },
+        );
+        self.evict_over_limit();
+    }
+
+    fn finish_refresh(&mut self, key: &QueryCacheKey) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.refreshing = false;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_size = 0;
+    }
+
+    fn evict_over_limit(&mut self) {
+        while self.total_size > self.config.max_size_bytes {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                self.total_size = 0;
+                return;
+            };
+
+            if let Some(entry) = self.entries.remove(&key) {
+                self.total_size = self.total_size.saturating_sub(entry.size);
+            }
+        }
+    }
 }
 
 pub fn summarize_rules(raw: &str) -> RuleSummary {
@@ -285,6 +467,7 @@ fn serve_udp(
     rules: CompiledRules,
     stats: Arc<Mutex<DnsStats>>,
     database: Arc<Database>,
+    dns_cache: Option<Arc<Mutex<DnsCache>>>,
     query_log_enabled: bool,
     anonymize_client_ip: bool,
     stop: Arc<AtomicBool>,
@@ -359,8 +542,60 @@ fn serve_udp(
             continue;
         }
 
+        let cache_key = QueryCacheKey::from_question(&question);
+        if let Some(cache_hit) =
+            lookup_cached_response(&dns_cache, &cache_key, query, current_second())
+        {
+            if let Err(error) = socket.send_to(&cache_hit.response, client_addr) {
+                let message = format!("返回 DNS 缓存响应失败：{error}");
+                record_error(&stats, message.clone());
+                write_query_log(
+                    &database,
+                    query_log_enabled,
+                    anonymize_client_ip,
+                    &question.domain,
+                    client_addr,
+                    false,
+                    false,
+                    true,
+                    None,
+                    None,
+                    Some(message),
+                );
+            } else {
+                write_query_log(
+                    &database,
+                    query_log_enabled,
+                    anonymize_client_ip,
+                    &question.domain,
+                    client_addr,
+                    false,
+                    false,
+                    false,
+                    None,
+                    Some(0),
+                    None,
+                );
+                if cache_hit.refresh {
+                    refresh_expired_cache_async(
+                        query.to_vec(),
+                        cache_key,
+                        upstream_servers.clone(),
+                        upstream_mode.clone(),
+                        dns_cache.clone(),
+                    );
+                }
+            }
+            continue;
+        }
+
         match forward_query(query, &upstream_servers, &upstream_mode, &mut next_upstream) {
             Ok(forwarded) => {
+                if let Some(cache) = &dns_cache {
+                    if let Ok(mut cache) = cache.lock() {
+                        cache.insert(cache_key, forwarded.response.clone(), current_second());
+                    }
+                }
                 if let Err(error) = socket.send_to(&forwarded.response, client_addr) {
                     let message = format!("转发响应给客户端失败：{error}");
                     record_error(&stats, message.clone());
@@ -425,6 +660,49 @@ fn forward_query(
         UpstreamMode::ParallelRequests => forward_parallel(query, upstream_servers),
         UpstreamMode::FastestAddr => forward_fastest_addr(query, upstream_servers),
     }
+}
+
+fn lookup_cached_response(
+    dns_cache: &Option<Arc<Mutex<DnsCache>>>,
+    cache_key: &QueryCacheKey,
+    query: &[u8],
+    now: u64,
+) -> Option<CacheHit> {
+    let cache = dns_cache.as_ref()?;
+    cache.lock().ok()?.lookup(cache_key, query, now)
+}
+
+fn refresh_expired_cache_async(
+    query: Vec<u8>,
+    cache_key: QueryCacheKey,
+    upstream_servers: Vec<UpstreamServer>,
+    upstream_mode: UpstreamMode,
+    dns_cache: Option<Arc<Mutex<DnsCache>>>,
+) {
+    let Some(cache) = dns_cache else {
+        return;
+    };
+
+    thread::spawn(move || {
+        let mut next_upstream = 0_usize;
+        match forward_query(
+            &query,
+            &upstream_servers,
+            &upstream_mode,
+            &mut next_upstream,
+        ) {
+            Ok(forwarded) => {
+                if let Ok(mut cache) = cache.lock() {
+                    cache.insert(cache_key, forwarded.response, current_second());
+                }
+            }
+            Err(_) => {
+                if let Ok(mut cache) = cache.lock() {
+                    cache.finish_refresh(&cache_key);
+                }
+            }
+        }
+    });
 }
 
 fn forward_load_balanced(
@@ -771,6 +1049,7 @@ fn normalize_domain(value: &str) -> Option<String> {
 struct Question {
     domain: String,
     qtype: u16,
+    qclass: u16,
     question_end: usize,
 }
 
@@ -816,12 +1095,14 @@ fn parse_question(packet: &[u8]) -> Result<Question, String> {
     }
 
     let qtype = read_u16(packet, offset).ok_or("DNS qtype 读取失败")?;
+    let qclass = read_u16(packet, offset + 2).ok_or("DNS qclass 读取失败")?;
     let question_end = offset + 4;
     let domain = labels.join(".").to_ascii_lowercase();
 
     Ok(Question {
         domain,
         qtype,
+        qclass,
         question_end,
     })
 }
@@ -846,7 +1127,7 @@ fn build_block_response(query: &[u8], question: &Question) -> Vec<u8> {
     if answer_count == 1 {
         response.extend_from_slice(&[0xC0, 0x0C]);
         write_u16(&mut response, question.qtype);
-        write_u16(&mut response, 1);
+        write_u16(&mut response, question.qclass);
         response.extend_from_slice(&60_u32.to_be_bytes());
         if question.qtype == TYPE_A {
             write_u16(&mut response, 4);
@@ -919,6 +1200,105 @@ fn extract_response_ips(packet: &[u8]) -> Vec<IpAddr> {
     ips
 }
 
+fn cache_ttl_seconds(packet: &[u8], config: &DnsCacheConfig) -> Option<u32> {
+    let ttl = response_min_answer_ttl(packet)?;
+    let mut ttl = ttl;
+    if config.min_ttl > 0 {
+        ttl = ttl.max(config.min_ttl);
+    }
+    if config.max_ttl > 0 {
+        ttl = ttl.min(config.max_ttl);
+    }
+    Some(ttl)
+}
+
+fn response_min_answer_ttl(packet: &[u8]) -> Option<u32> {
+    if packet.len() < DNS_HEADER_LEN {
+        return None;
+    }
+
+    let question_count = read_u16(packet, 4).unwrap_or(0);
+    let answer_count = read_u16(packet, 6).unwrap_or(0);
+    if answer_count == 0 {
+        return None;
+    }
+
+    let mut offset = DNS_HEADER_LEN;
+    for _ in 0..question_count {
+        let next_offset = skip_dns_name(packet, offset)?;
+        offset = next_offset.checked_add(4)?;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+
+    let mut min_ttl = None;
+    for _ in 0..answer_count {
+        let next_offset = skip_dns_name(packet, offset)?;
+        offset = next_offset;
+        if offset + 10 > packet.len() {
+            return None;
+        }
+
+        let ttl = read_u32(packet, offset + 4)?;
+        let data_len = read_u16(packet, offset + 8)? as usize;
+        min_ttl = Some(min_ttl.map_or(ttl, |current: u32| current.min(ttl)));
+        offset = offset.checked_add(10)?.checked_add(data_len)?;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+
+    min_ttl
+}
+
+fn prepare_cached_response(cached_response: &[u8], query: &[u8], ttl: u32) -> Option<Vec<u8>> {
+    if cached_response.len() < 2 || query.len() < 2 {
+        return None;
+    }
+
+    let mut response = cached_response.to_vec();
+    response[0..2].copy_from_slice(&query[0..2]);
+    rewrite_response_ttls(&mut response, ttl)?;
+    Some(response)
+}
+
+fn rewrite_response_ttls(packet: &mut [u8], ttl: u32) -> Option<()> {
+    if packet.len() < DNS_HEADER_LEN {
+        return None;
+    }
+
+    let question_count = read_u16(packet, 4).unwrap_or(0);
+    let answer_count = read_u16(packet, 6).unwrap_or(0);
+    let authority_count = read_u16(packet, 8).unwrap_or(0);
+    let mut offset = DNS_HEADER_LEN;
+
+    for _ in 0..question_count {
+        let next_offset = skip_dns_name(packet, offset)?;
+        offset = next_offset.checked_add(4)?;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+
+    for _ in 0..answer_count.saturating_add(authority_count) {
+        let next_offset = skip_dns_name(packet, offset)?;
+        offset = next_offset;
+        if offset + 10 > packet.len() {
+            return None;
+        }
+
+        write_u32_at(packet, offset + 4, ttl)?;
+        let data_len = read_u16(packet, offset + 8)? as usize;
+        offset = offset.checked_add(10)?.checked_add(data_len)?;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+
+    Some(())
+}
+
 fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
     loop {
         let length = *packet.get(offset)? as usize;
@@ -952,6 +1332,20 @@ fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
 
 fn write_u16(target: &mut Vec<u8>, value: u16) {
     target.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let first = *bytes.get(offset)?;
+    let second = *bytes.get(offset + 1)?;
+    let third = *bytes.get(offset + 2)?;
+    let fourth = *bytes.get(offset + 3)?;
+    Some(u32::from_be_bytes([first, second, third, fourth]))
+}
+
+fn write_u32_at(target: &mut [u8], offset: usize, value: u32) -> Option<()> {
+    let bytes = value.to_be_bytes();
+    target.get_mut(offset..offset + 4)?.copy_from_slice(&bytes);
+    Some(())
 }
 
 fn record_query(stats: &Arc<Mutex<DnsStats>>, domain: &str) {
@@ -1053,9 +1447,13 @@ fn record_traffic(stats: &mut DnsStats, blocked: bool) {
 }
 
 fn current_minute() -> u64 {
+    current_second() / 60
+}
+
+fn current_second() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() / 60)
+        .map(|duration| duration.as_secs())
         .unwrap_or_default()
 }
 
@@ -1125,6 +1523,37 @@ mod tests {
             extract_response_ips(&response),
             vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]
         );
+    }
+
+    #[test]
+    fn dns_cache_rewrites_transaction_id_and_ttl() {
+        let query = a_query("example.org");
+        let question = parse_question(&query).expect("query should parse");
+        let key = QueryCacheKey::from_question(&question);
+        let mut cache = DnsCache {
+            config: DnsCacheConfig {
+                enabled: true,
+                max_size_bytes: 16 * 1024,
+                min_ttl: 0,
+                max_ttl: 60,
+                optimistic: true,
+            },
+            entries: HashMap::new(),
+            total_size: 0,
+            access_counter: 0,
+        };
+
+        cache.insert(key.clone(), a_response("example.org", [1, 2, 3, 4]), 100);
+        let mut next_query = query.clone();
+        next_query[0] = 0xab;
+        next_query[1] = 0xcd;
+        let hit = cache
+            .lookup(&key, &next_query, 130)
+            .expect("cache should hit");
+
+        assert!(!hit.refresh);
+        assert_eq!(&hit.response[0..2], &[0xab, 0xcd]);
+        assert_eq!(response_min_answer_ttl(&hit.response), Some(30));
     }
 
     fn a_query(domain: &str) -> Vec<u8> {

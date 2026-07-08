@@ -27,6 +27,16 @@ pub struct AppConfig {
     pub anonymize_client_ip: bool,
     #[serde(default = "default_query_log_retention_hours")]
     pub query_log_retention_hours: u32,
+    #[serde(default = "default_dns_cache_enabled")]
+    pub dns_cache_enabled: bool,
+    #[serde(default = "default_dns_cache_size")]
+    pub dns_cache_size: usize,
+    #[serde(default)]
+    pub dns_cache_min_ttl: u32,
+    #[serde(default = "default_dns_cache_max_ttl")]
+    pub dns_cache_max_ttl: u32,
+    #[serde(default = "default_dns_cache_optimistic")]
+    pub dns_cache_optimistic: bool,
     #[serde(default = "default_filters")]
     pub filters: Vec<FilterSubscription>,
     #[serde(default = "default_custom_rules")]
@@ -86,6 +96,11 @@ impl Default for AppConfig {
             query_log_enabled: default_query_log_enabled(),
             anonymize_client_ip: false,
             query_log_retention_hours: default_query_log_retention_hours(),
+            dns_cache_enabled: default_dns_cache_enabled(),
+            dns_cache_size: default_dns_cache_size(),
+            dns_cache_min_ttl: 0,
+            dns_cache_max_ttl: default_dns_cache_max_ttl(),
+            dns_cache_optimistic: default_dns_cache_optimistic(),
             filters: default_filters(),
             blacklist: default_custom_rules(),
         }
@@ -121,6 +136,18 @@ impl AppConfig {
         if self.query_log_retention_hours == 0 || self.query_log_retention_hours > 24 * 365 {
             return Err("查询日志保留时间必须在 1 小时到 365 天之间".into());
         }
+        if self.dns_cache_enabled && self.dns_cache_size == 0 {
+            return Err("DNS 缓存大小必须大于 0".into());
+        }
+        if self.dns_cache_size > 512 * 1024 * 1024 {
+            return Err("DNS 缓存大小不能超过 512 MB".into());
+        }
+        if self.dns_cache_min_ttl > 7 * 24 * 3600 || self.dns_cache_max_ttl > 7 * 24 * 3600 {
+            return Err("DNS 缓存 TTL 不能超过 7 天".into());
+        }
+        if self.dns_cache_max_ttl > 0 && self.dns_cache_min_ttl > self.dns_cache_max_ttl {
+            return Err("DNS 缓存最小 TTL 不能大于最大 TTL".into());
+        }
         validate_filters(&self.filters)?;
         Ok(())
     }
@@ -146,6 +173,22 @@ fn default_query_log_enabled() -> bool {
 
 fn default_query_log_retention_hours() -> u32 {
     90 * 24
+}
+
+fn default_dns_cache_enabled() -> bool {
+    true
+}
+
+fn default_dns_cache_size() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_dns_cache_max_ttl() -> u32 {
+    24 * 3600
+}
+
+fn default_dns_cache_optimistic() -> bool {
+    true
 }
 
 fn default_upstream_dns() -> String {

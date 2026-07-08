@@ -6,7 +6,8 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import appIconUrl from "./app-icon.png";
 import "./style.css";
 
-type ViewName = "dashboard" | "dns" | "filters" | "custom" | "settings";
+type ViewName = "dashboard" | "dns" | "filters" | "custom" | "logs" | "settings";
+type QueryLogFilter = "all" | "processed" | "blocked" | "failed";
 
 type FilterSubscription = {
   id: string;
@@ -31,6 +32,11 @@ type AppConfig = {
   query_log_enabled: boolean;
   anonymize_client_ip: boolean;
   query_log_retention_hours: number;
+  dns_cache_enabled: boolean;
+  dns_cache_size: number;
+  dns_cache_min_ttl: number;
+  dns_cache_max_ttl: number;
+  dns_cache_optimistic: boolean;
   filters: FilterSubscription[];
   blacklist: string;
 };
@@ -82,6 +88,26 @@ type RuntimeStatus = {
   error: string | null;
 };
 
+type QueryLogRecord = {
+  id: number;
+  timestamp: number;
+  domain: string;
+  client_ip: string | null;
+  blocked: boolean;
+  forwarded: boolean;
+  failed: boolean;
+  upstream_server: string | null;
+  upstream_duration_ms: number | null;
+  error: string | null;
+};
+
+type QueryLogPage = {
+  records: QueryLogRecord[];
+  total: number;
+  page: number;
+  page_size: number;
+};
+
 type FilterUpdateResult = {
   status: RuntimeStatus;
   updated: number;
@@ -131,10 +157,21 @@ app.innerHTML = `
 
         <nav class="module-nav" aria-label="模块">
           <button class="nav-item active" data-view="dashboard" type="button">仪表盘</button>
-          <button class="nav-item" data-view="dns" type="button">DNS 设置</button>
-          <button class="nav-item" data-view="filters" type="button">过滤器</button>
-          <button class="nav-item" data-view="custom" type="button">自定义规则</button>
-          <button class="nav-item" data-view="settings" type="button">设置</button>
+          <div class="nav-menu">
+            <button class="nav-item" data-view="settings" data-nav-group="settings" type="button">设置</button>
+            <div class="nav-dropdown" role="menu">
+              <button data-view="settings" type="button" role="menuitem">常规设置</button>
+              <button data-view="dns" type="button" role="menuitem">DNS 设置</button>
+            </div>
+          </div>
+          <div class="nav-menu">
+            <button class="nav-item" data-view="filters" data-nav-group="filters" type="button">过滤器</button>
+            <div class="nav-dropdown" role="menu">
+              <button data-view="filters" type="button" role="menuitem">DNS 黑名单</button>
+              <button data-view="custom" type="button" role="menuitem">自定义过滤规则</button>
+            </div>
+          </div>
+          <button class="nav-item" data-view="logs" type="button">查询日志</button>
         </nav>
 
         <div class="header-actions">
@@ -269,6 +306,54 @@ app.innerHTML = `
 
       </section>
 
+      <section class="view query-log-view" data-view-panel="logs">
+        <div class="query-log-toolbar">
+          <div class="query-log-title">
+            <h2>查询日志</h2>
+            <button class="ghost-icon-button" id="query_log_refresh_btn" type="button" title="刷新查询日志">↻</button>
+          </div>
+          <label class="query-log-search">
+            <span aria-hidden="true">⌕</span>
+            <input id="query_log_search" autocomplete="off" spellcheck="false" placeholder="域名或客户端" />
+          </label>
+          <div class="query-log-filter" id="query_log_filter_menu">
+            <button class="query-log-filter-trigger" id="query_log_filter_button" type="button" aria-haspopup="listbox" aria-expanded="false">
+              <span id="query_log_filter_label">所有查询记录</span>
+              <i aria-hidden="true"></i>
+            </button>
+            <div class="query-log-filter-options" role="listbox" aria-label="查询日志筛选">
+              <button class="active" data-filter="all" type="button" role="option" aria-selected="true">所有查询记录</button>
+              <button data-filter="processed" type="button" role="option" aria-selected="false">已处理</button>
+              <button data-filter="blocked" type="button" role="option" aria-selected="false">已过滤</button>
+              <button data-filter="failed" type="button" role="option" aria-selected="false">失败</button>
+            </div>
+            <select id="query_log_filter" aria-hidden="true" tabindex="-1">
+              <option value="all">所有查询记录</option>
+              <option value="processed">已处理</option>
+              <option value="blocked">已过滤</option>
+              <option value="failed">失败</option>
+            </select>
+          </div>
+        </div>
+
+        <section class="query-log-panel">
+          <div class="query-log-head">
+            <span>时间</span>
+            <span>请求</span>
+            <span>响应</span>
+            <span>客户端</span>
+          </div>
+          <div class="query-log-body" id="query_log_body"></div>
+          <div class="query-log-pagination">
+            <span id="query_log_page_info">0 条记录</span>
+            <div class="button-group">
+              <button id="query_log_prev_btn" type="button">上一页</button>
+              <button id="query_log_next_btn" type="button">下一页</button>
+            </div>
+          </div>
+        </section>
+      </section>
+
       <section class="view" data-view-panel="dns">
         <section class="panel module-panel">
           <div class="panel-title with-actions">
@@ -323,6 +408,45 @@ app.innerHTML = `
                 </label>
               </div>
             </section>
+
+            <section class="settings-section dns-cache-section">
+              <div class="section-heading">
+                <h3>DNS 缓存配置</h3>
+                <span>您可以在此处配置 DNS 缓存</span>
+              </div>
+              <label class="check-row">
+                <input id="dns_cache_enabled" type="checkbox" />
+                <span>
+                  <strong>启用缓存</strong>
+                  <small>在本地存储 DNS 响应，减少重复查询的上游请求延迟。</small>
+                </span>
+              </label>
+              <div class="dns-cache-grid">
+                <label class="field">
+                  <span>缓存大小</span>
+                  <small>DNS 缓存大小（单位：字节）</small>
+                  <input id="dns_cache_size" type="number" min="1024" max="536870912" step="1024" />
+                </label>
+                <label class="field">
+                  <span>覆盖最小 TTL 值</span>
+                  <small>缓存 DNS 响应时，延长从上游服务器接收到的 TTL 值（秒）。</small>
+                  <input id="dns_cache_min_ttl" type="number" min="0" max="604800" step="1" />
+                </label>
+                <label class="field">
+                  <span>覆盖最大 TTL 值</span>
+                  <small>设定 DNS 缓存条目的最大 TTL 值（秒）。</small>
+                  <input id="dns_cache_max_ttl" type="number" min="0" max="604800" step="1" />
+                </label>
+              </div>
+              <label class="check-row">
+                <input id="dns_cache_optimistic" type="checkbox" />
+                <span>
+                  <strong>乐观缓存</strong>
+                  <small>即使条目已过期，也先从缓存中响应，并在后台刷新它们。</small>
+                </span>
+              </label>
+              <button id="clear_dns_cache_btn" type="button">清除缓存</button>
+            </section>
           </div>
         </section>
       </section>
@@ -341,7 +465,7 @@ app.innerHTML = `
                 <input id="use_filters" type="checkbox" />
                 <span>
                   <strong>使用过滤器和 Hosts 文件以拦截指定域名</strong>
-                  <small>你可以在过滤器和自定义规则中添加过滤规则。</small>
+                  <small>你可以在 DNS 黑名单和自定义过滤规则中添加过滤规则。</small>
                 </span>
               </label>
               <label class="field compact-select">
@@ -411,9 +535,9 @@ app.innerHTML = `
       <section class="view" data-view-panel="filters">
         <section class="panel module-panel">
           <div class="panel-title with-actions">
-            <h2>过滤器</h2>
+            <h2>DNS 黑名单</h2>
             <div class="button-group">
-              <button id="add_filter_btn" type="button">添加清单</button>
+              <button id="add_filter_btn" type="button">添加黑名单</button>
               <button class="primary" id="update_filters_btn" type="button">检查更新</button>
             </div>
           </div>
@@ -434,7 +558,7 @@ app.innerHTML = `
       <section class="view" data-view-panel="custom">
         <section class="panel module-panel">
           <div class="panel-title with-actions">
-            <h2>自定义规则</h2>
+            <h2>自定义过滤规则</h2>
             <button class="primary" id="save_custom_btn" type="button">保存</button>
           </div>
           <textarea id="blacklist" spellcheck="false"></textarea>
@@ -456,8 +580,13 @@ let queuedAutoRefresh = false;
 let scrollIdleTimer: number | undefined;
 let pendingUpdate: Update | null = null;
 let manualDownloadUrl = "";
+let queryLogPage = 1;
+let queryLogTotal = 0;
+let queryLogRefreshInFlight = false;
+let queryLogSearchTimer: number | undefined;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
+const QUERY_LOG_PAGE_SIZE = 50;
 const CHECK_RETRY_DELAYS_MS = [800, 2_000, 5_000];
 const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 2_500, 5_000];
 const CHECK_TIMEOUT_MS = 20_000;
@@ -478,6 +607,17 @@ const sparkTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   minute: "2-digit",
   hour12: false,
 });
+const logTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+const logDateFormatter = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric",
+  month: "numeric",
+  day: "numeric",
+});
 
 const contentElement = query<HTMLDivElement>(".content");
 const enabledInput = query<HTMLInputElement>("#enabled");
@@ -496,6 +636,11 @@ const queryLogRetentionInputs = Array.from(
 );
 const customRetentionField = query<HTMLLabelElement>("#custom_retention_field");
 const queryLogRetentionCustomInput = query<HTMLInputElement>("#query_log_retention_custom");
+const dnsCacheEnabledInput = query<HTMLInputElement>("#dns_cache_enabled");
+const dnsCacheSizeInput = query<HTMLInputElement>("#dns_cache_size");
+const dnsCacheMinTtlInput = query<HTMLInputElement>("#dns_cache_min_ttl");
+const dnsCacheMaxTtlInput = query<HTMLInputElement>("#dns_cache_max_ttl");
+const dnsCacheOptimisticInput = query<HTMLInputElement>("#dns_cache_optimistic");
 const blacklistInput = query<HTMLTextAreaElement>("#blacklist");
 const filtersTable = query<HTMLDivElement>(".filters-table");
 const filtersBody = query<HTMLDivElement>("#filters_body");
@@ -507,19 +652,72 @@ const stopButton = query<HTMLButtonElement>("#stop_btn");
 const refreshButton = query<HTMLButtonElement>("#refresh_btn");
 const addFilterButton = query<HTMLButtonElement>("#add_filter_btn");
 const updateFiltersButton = query<HTMLButtonElement>("#update_filters_btn");
+const clearDnsCacheButton = query<HTMLButtonElement>("#clear_dns_cache_btn");
 const appVersionElement = query<HTMLElement>("#app_version");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
 const installUpdateButton = query<HTMLButtonElement>("#install_update_btn");
 const manualDownloadButton = query<HTMLButtonElement>("#manual_download_btn");
 const updateStatusElement = query<HTMLElement>("#update_status");
+const queryLogRefreshButton = query<HTMLButtonElement>("#query_log_refresh_btn");
+const queryLogSearchInput = query<HTMLInputElement>("#query_log_search");
+const queryLogFilterInput = query<HTMLSelectElement>("#query_log_filter");
+const queryLogFilterMenu = query<HTMLDivElement>("#query_log_filter_menu");
+const queryLogFilterButton = query<HTMLButtonElement>("#query_log_filter_button");
+const queryLogFilterLabel = query<HTMLElement>("#query_log_filter_label");
+const queryLogBody = query<HTMLDivElement>("#query_log_body");
+const queryLogPageInfo = query<HTMLElement>("#query_log_page_info");
+const queryLogPrevButton = query<HTMLButtonElement>("#query_log_prev_btn");
+const queryLogNextButton = query<HTMLButtonElement>("#query_log_next_btn");
 
 document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
   button.addEventListener("click", () => {
+    // 有 data-nav-group 的按钮只作为下拉触发器，不直接导航
+    if (button.dataset.navGroup) {
+      return;
+    }
     const view = button.dataset.view as ViewName | undefined;
     if (view) {
       setActiveView(view);
+      // 点击下拉菜单项后关闭所有下拉框
+      closeAllDropdowns();
     }
   });
+});
+
+// 下拉菜单控制：点击触发，同时只显示一个
+const navMenus = document.querySelectorAll<HTMLDivElement>(".nav-menu");
+
+function closeAllDropdowns(): void {
+  navMenus.forEach((m) => m.classList.remove("open"));
+}
+
+function closeQueryLogFilter(): void {
+  queryLogFilterMenu.classList.remove("open");
+  queryLogFilterButton.setAttribute("aria-expanded", "false");
+}
+
+navMenus.forEach((menu) => {
+  const trigger = menu.querySelector<HTMLButtonElement>(".nav-item");
+  if (!trigger) return;
+  trigger.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const isOpen = menu.classList.contains("open");
+    closeAllDropdowns();
+    if (!isOpen) {
+      menu.classList.add("open");
+    }
+  });
+});
+
+// 点击页面其他区域时关闭下拉框
+document.addEventListener("click", (e) => {
+  const target = e.target as HTMLElement;
+  if (!target.closest(".nav-dropdown")) {
+    closeAllDropdowns();
+  }
+  if (!target.closest(".query-log-filter")) {
+    closeQueryLogFilter();
+  }
 });
 
 document.querySelectorAll<HTMLButtonElement>("[data-refresh-dashboard]").forEach((button) => {
@@ -528,9 +726,89 @@ document.querySelectorAll<HTMLButtonElement>("[data-refresh-dashboard]").forEach
   });
 });
 
+queryLogRefreshButton.addEventListener("click", async () => {
+  await refreshQueryLogs({ button: queryLogRefreshButton });
+});
+
+queryLogSearchInput.addEventListener("input", () => {
+  window.clearTimeout(queryLogSearchTimer);
+  queryLogSearchTimer = window.setTimeout(() => {
+    queryLogPage = 1;
+    void refreshQueryLogs();
+  }, 260);
+});
+
+queryLogFilterInput.addEventListener("change", () => {
+  queryLogPage = 1;
+  void refreshQueryLogs();
+});
+
+queryLogFilterButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (queryLogFilterButton.disabled) {
+    return;
+  }
+  closeAllDropdowns();
+  const open = !queryLogFilterMenu.classList.contains("open");
+  queryLogFilterMenu.classList.toggle("open", open);
+  queryLogFilterButton.setAttribute("aria-expanded", String(open));
+});
+
+queryLogFilterMenu.querySelectorAll<HTMLButtonElement>("[data-filter]").forEach((option) => {
+  option.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const value = option.dataset.filter as QueryLogFilter | undefined;
+    if (!value || queryLogFilterInput.value === value) {
+      closeQueryLogFilter();
+      return;
+    }
+    setQueryLogFilterValue(value);
+    closeQueryLogFilter();
+    queryLogFilterInput.dispatchEvent(new Event("change"));
+  });
+});
+
+queryLogFilterButton.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeQueryLogFilter();
+    queryLogFilterButton.focus();
+  }
+});
+
+queryLogPrevButton.addEventListener("click", () => {
+  if (queryLogPage <= 1) {
+    return;
+  }
+  queryLogPage -= 1;
+  void refreshQueryLogs();
+});
+
+queryLogNextButton.addEventListener("click", () => {
+  if (queryLogPage >= totalQueryLogPages()) {
+    return;
+  }
+  queryLogPage += 1;
+  void refreshQueryLogs();
+});
+
+queryLogBody.addEventListener("pointerover", (event) => {
+  const anchor = (event.target as HTMLElement).closest<HTMLElement>(".log-detail-anchor");
+  if (anchor) {
+    placeLogDetailPopover(anchor);
+  }
+});
+
+queryLogBody.addEventListener("focusin", (event) => {
+  const anchor = (event.target as HTMLElement).closest<HTMLElement>(".log-detail-anchor");
+  if (anchor) {
+    placeLogDetailPopover(anchor);
+  }
+});
+
 contentElement.addEventListener("scroll", markContentScrolling, { passive: true });
 
 queryLogEnabledInput.addEventListener("change", updateLogControls);
+dnsCacheEnabledInput.addEventListener("change", updateDnsCacheControls);
 queryLogRetentionInputs.forEach((input) => {
   input.addEventListener("change", () => {
     updateLogControls();
@@ -573,6 +851,10 @@ stopButton.addEventListener("click", async () => {
 });
 
 refreshButton.addEventListener("click", async () => {
+  if (activeView === "logs") {
+    await refreshQueryLogs({ button: refreshButton });
+    return;
+  }
   await refreshStatus({ button: refreshButton });
 });
 
@@ -609,6 +891,20 @@ updateFiltersButton.addEventListener("click", async () => {
   } finally {
     setBusy(false);
     setFilterUpdating(false);
+  }
+});
+
+clearDnsCacheButton.addEventListener("click", async () => {
+  setBusy(true);
+  try {
+    const status = await invoke<RuntimeStatus>("clear_dns_cache");
+    renderStatus(status);
+    showMessage("DNS 缓存已清除", false);
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    setBusy(false);
+    updateDnsCacheControls();
   }
 });
 
@@ -745,11 +1041,19 @@ window.setInterval(() => {
   if (document.hidden) {
     return;
   }
+  if (activeView === "logs") {
+    void refreshQueryLogs({ auto: true });
+    return;
+  }
   void refreshStatus({ auto: true });
 }, 5000);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
-    void refreshStatus({ auto: true });
+    if (activeView === "logs") {
+      void refreshQueryLogs({ auto: true });
+    } else {
+      void refreshStatus({ auto: true });
+    }
   }
 });
 
@@ -766,10 +1070,16 @@ async function loadConfig(): Promise<void> {
     queryLogEnabledInput.checked = config.query_log_enabled;
     anonymizeClientIpInput.checked = config.anonymize_client_ip;
     setRetentionValue(config.query_log_retention_hours);
+    dnsCacheEnabledInput.checked = config.dns_cache_enabled;
+    dnsCacheSizeInput.value = String(config.dns_cache_size);
+    dnsCacheMinTtlInput.value = String(config.dns_cache_min_ttl);
+    dnsCacheMaxTtlInput.value = String(config.dns_cache_max_ttl);
+    dnsCacheOptimisticInput.checked = config.dns_cache_optimistic;
     currentQueryLogEnabled = config.query_log_enabled;
     currentQueryLogRetentionHours = config.query_log_retention_hours;
     renderRetentionWindow();
     updateLogControls();
+    updateDnsCacheControls();
     blacklistInput.value = config.blacklist;
     filtersState = config.filters;
     renderFilters();
@@ -796,6 +1106,11 @@ function collectConfig(): AppConfig {
     query_log_enabled: queryLogEnabledInput.checked,
     anonymize_client_ip: anonymizeClientIpInput.checked,
     query_log_retention_hours: selectedRetentionHours(),
+    dns_cache_enabled: dnsCacheEnabledInput.checked,
+    dns_cache_size: Number(dnsCacheSizeInput.value || 0),
+    dns_cache_min_ttl: Number(dnsCacheMinTtlInput.value || 0),
+    dns_cache_max_ttl: Number(dnsCacheMaxTtlInput.value || 0),
+    dns_cache_optimistic: dnsCacheOptimisticInput.checked,
     listen_host: listenHostInput.value.trim(),
     listen_port: Number(listenPortInput.value),
     filters: filtersState.map((filter) => ({
@@ -829,6 +1144,33 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
   }
 }
 
+async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
+  if (queryLogRefreshInFlight) {
+    return;
+  }
+
+  queryLogRefreshInFlight = true;
+  setRefreshButtonState(options.button, true);
+  setQueryLogLoading(true);
+  try {
+    const page = await invoke<QueryLogPage>("get_query_logs", {
+      filter: queryLogFilterInput.value as QueryLogFilter,
+      search: queryLogSearchInput.value.trim(),
+      page: queryLogPage,
+      pageSize: QUERY_LOG_PAGE_SIZE,
+    });
+    queryLogPage = page.page;
+    queryLogTotal = page.total;
+    renderQueryLogs(page);
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    queryLogRefreshInFlight = false;
+    setQueryLogLoading(false);
+    setRefreshButtonState(options.button, false);
+  }
+}
+
 async function runStatusAction(
   action: () => Promise<RuntimeStatus>,
   successMessage: string,
@@ -851,13 +1193,23 @@ function setActiveView(view: ViewName): void {
   activeView = view;
   showMessage("", false);
   document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.view === view);
+    const isFilterGroup =
+      button.dataset.navGroup === "filters" && (view === "filters" || view === "custom");
+    const isSettingsGroup =
+      button.dataset.navGroup === "settings" && (view === "settings" || view === "dns");
+    button.classList.toggle(
+      "active",
+      button.dataset.view === view || isFilterGroup || isSettingsGroup,
+    );
   });
   document.querySelectorAll<HTMLElement>("[data-view-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.viewPanel === view);
   });
   if (view === "dashboard" && lastStatus) {
     renderStatus(lastStatus, { renderDashboard: true });
+  }
+  if (view === "logs") {
+    void refreshQueryLogs();
   }
 }
 
@@ -937,8 +1289,8 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
     : runtimeWindowHours(status.stats.started_at);
   renderSparkline("#query_sparkline", buildTrafficSeries(status.stats.traffic, "queries", trafficWindowHours));
   renderSparkline("#blocked_sparkline", buildTrafficSeries(status.stats.traffic, "blocked", trafficWindowHours));
-  renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries, false);
-  renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked, true);
+  renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries);
+  renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked);
   renderUpstreamRequestRank(
     "#upstream_rank",
     status.stats.upstream_requests ?? [],
@@ -946,6 +1298,182 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   );
   renderUpstreamLatencyRank("#upstream_latency_rank", status.stats.upstream_avg_latency ?? []);
 
+}
+
+function renderQueryLogs(page: QueryLogPage): void {
+  renderQueryLogPagination(page);
+
+  if (!currentQueryLogEnabled) {
+    setHtmlIfChanged(queryLogBody, `<div class="query-log-empty">查询日志未启用，请在设置中开启日志配置。</div>`);
+    return;
+  }
+
+  if (page.records.length === 0) {
+    const hasSearch = queryLogSearchInput.value.trim().length > 0 || queryLogFilterInput.value !== "all";
+    setHtmlIfChanged(
+      queryLogBody,
+      `<div class="query-log-empty">${hasSearch ? "没有匹配的查询记录" : "暂无查询记录"}</div>`,
+    );
+    return;
+  }
+
+  const html = page.records.map(renderQueryLogRow).join("");
+  setHtmlIfChanged(queryLogBody, html);
+}
+
+function renderQueryLogRow(record: QueryLogRecord): string {
+  const status = queryLogStatus(record);
+  const rowClass = record.blocked ? " blocked" : record.failed ? " failed" : "";
+  const detailText = record.error
+    ? record.error
+    : record.upstream_server
+      ? `上游：${record.upstream_server}`
+      : "本地响应";
+  const detail = escapeHtml(detailText);
+  const duration = record.upstream_duration_ms !== null
+    ? `${formatCount(record.upstream_duration_ms)} 毫秒`
+    : "";
+  const detailPopover = renderQueryLogDetail(record, status.label, detailText, duration);
+
+  return `
+    <div class="query-log-row${rowClass}">
+      <div class="log-time">
+        <strong>${escapeHtml(formatLogTime(record.timestamp))}</strong>
+        <span>${escapeHtml(formatLogDate(record.timestamp))}</span>
+      </div>
+      <div class="log-request">
+        <div class="log-detail-anchor">
+          <button class="log-detail-trigger" type="button" aria-label="查看请求详情">
+            ${renderLogEyeIcon(record.blocked ? "blocked" : "processed")}
+          </button>
+          ${detailPopover}
+        </div>
+        <div>
+          <strong title="${escapeHtml(record.domain)}">${escapeHtml(record.domain)}</strong>
+          <span>类型：标准 DNS</span>
+        </div>
+      </div>
+      <div class="log-response">
+        <strong class="${status.className}">${status.label}</strong>
+        <span title="${detail}">${detail}</span>
+        ${duration ? `<small>${duration}</small>` : ""}
+      </div>
+      <div class="log-client">
+        <strong>${escapeHtml(record.client_ip || "-")}</strong>
+        <span>${escapeHtml(record.client_ip || "未知客户端")}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderLogEyeIcon(className: string): string {
+  return `
+    <svg class="log-eye-icon ${className}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M2.75 12c1.95-3.25 5.2-5.25 9.25-5.25s7.3 2 9.25 5.25c-1.95 3.25-5.2 5.25-9.25 5.25S4.7 15.25 2.75 12Z"></path>
+      <circle cx="12" cy="12" r="2.75"></circle>
+      <path d="M4.75 19.25 19.25 4.75"></path>
+    </svg>
+  `;
+}
+
+function renderQueryLogDetail(
+  record: QueryLogRecord,
+  statusLabel: string,
+  detail: string,
+  duration: string,
+): string {
+  const rows = [
+    ["时间", formatLogTime(record.timestamp)],
+    ["日期", formatLogDate(record.timestamp)],
+    ["域名", record.domain],
+    ["类型", "标准 DNS"],
+    ["响应", statusLabel],
+    ["客户端", record.client_ip || "未知客户端"],
+    ["详情", detail],
+  ];
+
+  if (duration) {
+    rows.push(["耗时", duration]);
+  }
+
+  return `
+    <div class="log-detail-popover" role="tooltip">
+      <strong>请求详情</strong>
+      <dl>
+        ${rows
+          .map(
+            ([label, value]) => `
+              <div>
+                <dt>${escapeHtml(label)}</dt>
+                <dd title="${escapeHtml(value)}">${escapeHtml(value)}</dd>
+              </div>
+            `,
+          )
+          .join("")}
+      </dl>
+    </div>
+  `;
+}
+
+function renderQueryLogPagination(page: QueryLogPage): void {
+  const totalPages = totalQueryLogPages(page.total);
+  const start = page.total === 0 ? 0 : (page.page - 1) * page.page_size + 1;
+  const end = Math.min(page.total, page.page * page.page_size);
+  queryLogPageInfo.textContent =
+    page.total === 0
+      ? "0 条记录"
+      : `${formatCount(start)}-${formatCount(end)} / ${formatCount(page.total)} 条`;
+  queryLogPrevButton.disabled = page.page <= 1 || queryLogRefreshInFlight;
+  queryLogNextButton.disabled = page.page >= totalPages || queryLogRefreshInFlight;
+}
+
+function totalQueryLogPages(total = queryLogTotal): number {
+  return Math.max(1, Math.ceil(total / QUERY_LOG_PAGE_SIZE));
+}
+
+function queryLogStatus(record: QueryLogRecord): { label: string; className: string } {
+  if (record.blocked) {
+    return { label: "已拦截", className: "blocked" };
+  }
+  if (record.failed) {
+    return { label: "失败", className: "failed" };
+  }
+  return { label: "已处理", className: "processed" };
+}
+
+function setQueryLogFilterValue(value: QueryLogFilter): void {
+  const options = queryLogFilterMenu.querySelectorAll<HTMLButtonElement>("[data-filter]");
+  let label = "所有查询记录";
+
+  options.forEach((option) => {
+    const selected = option.dataset.filter === value;
+    option.classList.toggle("active", selected);
+    option.setAttribute("aria-selected", String(selected));
+    if (selected) {
+      label = option.textContent?.trim() || label;
+    }
+  });
+
+  queryLogFilterInput.value = value;
+  queryLogFilterLabel.textContent = label;
+}
+
+function placeLogDetailPopover(anchor: HTMLElement): void {
+  const popover = anchor.querySelector<HTMLElement>(".log-detail-popover");
+  if (!popover) {
+    return;
+  }
+
+  anchor.classList.remove("show-above");
+  const contentRect = contentElement.getBoundingClientRect();
+  const anchorRect = anchor.getBoundingClientRect();
+  const bottomLimit = Math.min(window.innerHeight, contentRect.bottom) - 12;
+  const topLimit = Math.max(0, contentRect.top) + 12;
+  const spaceBelow = bottomLimit - anchorRect.bottom;
+  const spaceAbove = anchorRect.top - topLimit;
+  const shouldShowAbove = spaceBelow < popover.offsetHeight + 16 && spaceAbove > spaceBelow;
+
+  anchor.classList.toggle("show-above", shouldShowAbove);
 }
 
 function setRadioValue(inputs: HTMLInputElement[], value: string): void {
@@ -993,6 +1521,15 @@ function updateLogControls(): void {
     "visible",
     enabled && selectedRadioValue(queryLogRetentionInputs, "2160") === "custom",
   );
+}
+
+function updateDnsCacheControls(): void {
+  const enabled = dnsCacheEnabledInput.checked;
+  dnsCacheSizeInput.disabled = !enabled;
+  dnsCacheMinTtlInput.disabled = !enabled;
+  dnsCacheMaxTtlInput.disabled = !enabled;
+  dnsCacheOptimisticInput.disabled = !enabled;
+  clearDnsCacheButton.disabled = !enabled;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1410,7 +1947,6 @@ function renderRankTable(
   selector: string,
   counts: Record<string, number>,
   total: number,
-  showBlockedMark: boolean,
 ): void {
   const container = query<HTMLDivElement>(selector);
   const rows = Object.entries(counts)
@@ -1428,13 +1964,11 @@ function renderRankTable(
     .map(([domain, count]) => {
       const barWidth = maxCount > 0 ? Math.max((count / maxCount) * 100, 2) : 0;
       const percent = total > 0 ? count / total : 0;
-      const blockedMark = showBlockedMark ? `<i class="block-eye" aria-hidden="true"></i>` : "";
 
       return `
         <div class="rank-row">
           <div class="rank-domain" title="${escapeHtml(domain)}">
             <span>${escapeHtml(domain)}</span>
-            ${blockedMark}
           </div>
           <div class="rank-value">
             <span class="rank-count">${formatCount(count)}</span>
@@ -1588,6 +2122,20 @@ function setFilterUpdating(updating: boolean): void {
   filtersTable.classList.toggle("is-updating", updating);
 }
 
+function setQueryLogLoading(loading: boolean): void {
+  queryLogRefreshButton.classList.toggle("loading", loading);
+  queryLogRefreshButton.disabled = loading;
+  queryLogSearchInput.disabled = loading;
+  queryLogFilterInput.disabled = loading;
+  queryLogFilterButton.disabled = loading;
+  if (loading) {
+    closeQueryLogFilter();
+  }
+  queryLogPrevButton.disabled = loading || queryLogPage <= 1;
+  queryLogNextButton.disabled = loading || queryLogPage >= totalQueryLogPages();
+  queryLogBody.classList.toggle("is-loading", loading);
+}
+
 function waitForPaint(): Promise<void> {
   return new Promise((resolve) => {
     requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
@@ -1652,6 +2200,14 @@ function formatTime(value: number | null): string {
     return "-";
   }
   return filterTimeFormatter.format(new Date(value * 1000));
+}
+
+function formatLogTime(value: number): string {
+  return logTimeFormatter.format(new Date(value * 1000));
+}
+
+function formatLogDate(value: number): string {
+  return logDateFormatter.format(new Date(value * 1000));
 }
 
 function escapeHtml(value: string): string {

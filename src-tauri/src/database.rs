@@ -7,7 +7,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
+use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use crate::{
@@ -29,6 +30,28 @@ pub struct QueryLogEntry {
     pub upstream_server: Option<String>,
     pub upstream_duration_ms: Option<u64>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryLogRecord {
+    pub id: i64,
+    pub timestamp: u64,
+    pub domain: String,
+    pub client_ip: Option<String>,
+    pub blocked: bool,
+    pub forwarded: bool,
+    pub failed: bool,
+    pub upstream_server: Option<String>,
+    pub upstream_duration_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryLogPage {
+    pub records: Vec<QueryLogRecord>,
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -201,6 +224,105 @@ impl Database {
             traffic: traffic_buckets(&conn, since)?,
             upstream_requests: upstream_request_counts(&conn, since)?,
             upstream_avg_latency: upstream_avg_latency(&conn, since)?,
+        })
+    }
+
+    pub fn query_logs(
+        &self,
+        retention_hours: u32,
+        filter: &str,
+        search: &str,
+        page: u32,
+        page_size: u32,
+    ) -> Result<QueryLogPage, String> {
+        let since = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
+        let filter_sql = match filter {
+            "blocked" => " AND blocked = 1",
+            "processed" => " AND blocked = 0 AND failed = 0",
+            "failed" => " AND failed = 1",
+            _ => "",
+        };
+        let where_sql = format!(
+            "timestamp >= :since
+             AND (
+                domain LIKE :search
+                OR COALESCE(client_ip, '') LIKE :search
+                OR COALESCE(upstream_server, '') LIKE :search
+                OR COALESCE(error, '') LIKE :search
+             )
+             {filter_sql}"
+        );
+        let sql = format!(
+            "SELECT
+                id,
+                timestamp,
+                domain,
+                client_ip,
+                blocked,
+                forwarded,
+                failed,
+                upstream_server,
+                upstream_duration_ms,
+                error
+             FROM query_logs
+             WHERE {where_sql}
+             ORDER BY timestamp DESC, id DESC
+             LIMIT :limit OFFSET :offset"
+        );
+        let search_pattern = format!("%{}%", search.trim());
+        let page = page.max(1);
+        let page_size = page_size.clamp(20, 200);
+        let limit = i64::from(page_size);
+        let offset = i64::from(page.saturating_sub(1)) * i64::from(page_size);
+        let conn = self.lock()?;
+        let total_sql = format!("SELECT COUNT(*) FROM query_logs WHERE {where_sql}");
+        let total = conn
+            .query_row(
+                &total_sql,
+                named_params! {
+                    ":since": since,
+                    ":search": search_pattern,
+                },
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|e| format!("统计查询日志失败：{e}"))?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("准备查询日志失败：{e}"))?;
+        let rows = stmt
+            .query_map(
+                named_params! {
+                    ":since": since,
+                    ":search": search_pattern,
+                    ":limit": limit,
+                    ":offset": offset,
+                },
+                |row| {
+                    Ok(QueryLogRecord {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        domain: row.get(2)?,
+                        client_ip: row.get(3)?,
+                        blocked: row.get::<_, i64>(4)? != 0,
+                        forwarded: row.get::<_, i64>(5)? != 0,
+                        failed: row.get::<_, i64>(6)? != 0,
+                        upstream_server: row.get(7)?,
+                        upstream_duration_ms: row.get(8)?,
+                        error: row.get(9)?,
+                    })
+                },
+            )
+            .map_err(|e| format!("读取查询日志失败：{e}"))?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|e| format!("解析查询日志失败：{e}"))?);
+        }
+        Ok(QueryLogPage {
+            records,
+            total,
+            page,
+            page_size,
         })
     }
 
@@ -506,6 +628,21 @@ mod tests {
         assert_eq!(stats.upstream_requests[0].requests, 1);
         assert_eq!(stats.upstream_avg_latency[0].upstream, "223.5.5.5:53");
         assert_eq!(stats.upstream_avg_latency[0].avg_ms, 24);
+
+        let logs = db
+            .query_logs(6, "all", "", 1, 20)
+            .expect("logs should load");
+        assert_eq!(logs.total, 2);
+        assert_eq!(logs.records.len(), 2);
+        assert_eq!(logs.records[0].domain, "www.example.org");
+        assert_eq!(logs.records[0].client_ip.as_deref(), Some("192.168.1.0"));
+
+        let blocked_logs = db
+            .query_logs(6, "blocked", "ads", 1, 20)
+            .expect("blocked logs should load");
+        assert_eq!(blocked_logs.total, 1);
+        assert_eq!(blocked_logs.records.len(), 1);
+        assert!(blocked_logs.records[0].blocked);
     }
 
     #[test]

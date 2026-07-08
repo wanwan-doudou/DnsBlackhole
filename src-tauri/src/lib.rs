@@ -11,7 +11,7 @@ use std::{
 };
 
 use config::AppConfig;
-use database::{Database, LogStats};
+use database::{Database, LogStats, QueryLogPage};
 use dns::{DnsServer, DnsStats, RuleSummary, RuntimeStatus};
 use filters::FilterUpdateReport;
 use serde::Serialize;
@@ -267,6 +267,39 @@ async fn get_status(
 }
 
 #[tauri::command]
+async fn get_query_logs(
+    state: tauri::State<'_, Arc<AppState>>,
+    filter: Option<String>,
+    search: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<QueryLogPage, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = state.current_config()?;
+        if !config.query_log_enabled {
+            return Ok(QueryLogPage {
+                records: Vec::new(),
+                total: 0,
+                page: page.unwrap_or(1).max(1),
+                page_size: page_size.unwrap_or(50).clamp(20, 200),
+            });
+        }
+
+        state.prune_query_logs_if_due(config.query_log_retention_hours, unix_now())?;
+        state.database.query_logs(
+            config.query_log_retention_hours,
+            filter.as_deref().unwrap_or("all"),
+            search.as_deref().unwrap_or(""),
+            page.unwrap_or(1),
+            page_size.unwrap_or(50),
+        )
+    })
+    .await
+    .map_err(|error| format!("获取查询日志失败：{error}"))?
+}
+
+#[tauri::command]
 async fn update_filters(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
@@ -337,6 +370,19 @@ fn stop_dns(state: tauri::State<'_, Arc<AppState>>) -> Result<RuntimeStatus, Str
     Ok(state.status(true))
 }
 
+#[tauri::command]
+fn clear_dns_cache(state: tauri::State<'_, Arc<AppState>>) -> Result<RuntimeStatus, String> {
+    let server = state
+        .server
+        .lock()
+        .map_err(|_| "读取 DNS 服务状态失败".to_string())?;
+    if let Some(server) = server.as_ref() {
+        server.clear_cache()?;
+    }
+    drop(server);
+    Ok(state.status(true))
+}
+
 fn apply_update_report_error(state: &AppState, report: &FilterUpdateReport) {
     if report.failed > 0 {
         state.set_error(Some(report.message.clone()));
@@ -365,9 +411,11 @@ pub fn run() {
             get_config,
             save_config,
             get_status,
+            get_query_logs,
             update_filters,
             start_dns,
-            stop_dns
+            stop_dns,
+            clear_dns_cache
         ])
         .setup(|app| {
             tray::create(app.handle())?;
