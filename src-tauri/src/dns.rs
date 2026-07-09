@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket},
     sync::mpsc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,8 +21,19 @@ const DNS_HEADER_LEN: usize = 12;
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 const TRAFFIC_BUCKET_WINDOW_MINUTES: u64 = 90 * 24 * 60;
-const FASTEST_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_millis(350);
+const UDP_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
+const DOH_CLIENT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const FASTEST_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_millis(180);
+const FASTEST_ADDR_MAX_IPS_PER_RESPONSE: usize = 8;
+const FASTEST_ADDR_MAX_PROBES: usize = 32;
+const DNS_WORK_QUEUE_CAPACITY: usize = 8192;
+const QUERY_LOG_QUEUE_CAPACITY: usize = 16384;
+const DNS_MIN_WORKERS: usize = 4;
+const DNS_MAX_WORKERS: usize = 32;
 const DNS_CACHE_ENTRY_OVERHEAD_BYTES: usize = 96;
+const DNSBLACKHOLE_USER_AGENT: &str = "DnsBlackhole/0.1";
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RuleSummary {
@@ -79,8 +90,8 @@ pub struct RuntimeStatus {
 
 #[derive(Clone)]
 pub struct CompiledRules {
-    blocks: Vec<Rule>,
-    allows: Vec<Rule>,
+    blocks: RuleSet,
+    allows: RuleSet,
     summary: RuleSummary,
 }
 
@@ -90,10 +101,49 @@ struct Rule {
     include_subdomains: bool,
 }
 
+#[derive(Clone, Default)]
+struct RuleSet {
+    exact: HashSet<String>,
+    suffix: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct RuntimeUpstream {
+    server: UpstreamServer,
+    doh_client: Option<reqwest::blocking::Client>,
+}
+
+struct DnsWorkItem {
+    query: Vec<u8>,
+    client_addr: SocketAddr,
+}
+
+struct DnsWorkerContext {
+    socket: Arc<UdpSocket>,
+    upstream_servers: Arc<Vec<RuntimeUpstream>>,
+    upstream_mode: UpstreamMode,
+    next_upstream: AtomicUsize,
+    rules: Arc<CompiledRules>,
+    stats: Arc<Mutex<DnsStats>>,
+    dns_cache: Option<Arc<Mutex<DnsCache>>>,
+    query_log_sender: Option<mpsc::SyncSender<QueryLogMessage>>,
+    anonymize_client_ip: bool,
+}
+
+struct QueryLogMessage {
+    entry: QueryLogEntry,
+    anonymize_client_ip: bool,
+}
+
 struct UpstreamForwardResponse {
     response: Vec<u8>,
     upstream: String,
     duration_ms: u64,
+}
+
+struct IpLatencyProbe {
+    response_index: usize,
+    duration: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +185,7 @@ struct DnsCache {
 pub struct DnsServer {
     listen_addr: SocketAddr,
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
     cache: Option<Arc<Mutex<DnsCache>>>,
 }
 
@@ -149,43 +199,70 @@ impl DnsServer {
         config.validate()?;
 
         let listen_addr = config.listen_socket_addr()?;
-        let upstream_servers = config.upstream_servers()?;
+        let upstream_servers = Arc::new(build_runtime_upstreams(config.upstream_servers()?)?);
         let upstream_mode = config.upstream_mode.clone();
         let query_log_enabled = config.query_log_enabled;
         let anonymize_client_ip = config.anonymize_client_ip;
         let dns_cache = DnsCache::from_config(&config).map(|cache| Arc::new(Mutex::new(cache)));
-        let rules = compile_rules(&rules_text);
+        let rules = Arc::new(compile_rules(&rules_text));
         let socket =
             UdpSocket::bind(listen_addr).map_err(|e| format!("监听 {listen_addr} 失败：{e}"))?;
         configure_udp_listener_socket(&socket)?;
         socket
-            .set_read_timeout(Some(Duration::from_millis(500)))
+            .set_read_timeout(Some(UDP_READ_TIMEOUT))
             .map_err(|e| format!("设置 DNS 读取超时失败：{e}"))?;
+        let socket = Arc::new(socket);
 
         reset_stats(&stats);
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker_stats = Arc::clone(&stats);
-        let worker_dns_cache = dns_cache.clone();
-        let thread = thread::spawn(move || {
-            serve_udp(
-                socket,
-                upstream_servers,
-                upstream_mode,
-                rules,
-                worker_stats,
-                database,
-                worker_dns_cache,
-                query_log_enabled,
-                anonymize_client_ip,
-                worker_stop,
-            );
+        let (work_sender, work_receiver) = mpsc::sync_channel(DNS_WORK_QUEUE_CAPACITY);
+        let work_receiver = Arc::new(Mutex::new(work_receiver));
+        let mut threads = Vec::new();
+
+        let mut query_log_thread = None;
+        let query_log_sender = if query_log_enabled {
+            let (sender, receiver) = mpsc::sync_channel(QUERY_LOG_QUEUE_CAPACITY);
+            query_log_thread = Some(spawn_query_log_writer(Arc::clone(&database), receiver));
+            Some(sender)
+        } else {
+            None
+        };
+
+        let worker_context = Arc::new(DnsWorkerContext {
+            socket: Arc::clone(&socket),
+            upstream_servers,
+            upstream_mode,
+            next_upstream: AtomicUsize::new(0),
+            rules,
+            stats: Arc::clone(&stats),
+            dns_cache: dns_cache.clone(),
+            query_log_sender,
+            anonymize_client_ip,
         });
+
+        for _ in 0..dns_worker_count() {
+            let worker_receiver = Arc::clone(&work_receiver);
+            let worker_context = Arc::clone(&worker_context);
+            let worker_stop = Arc::clone(&stop);
+            threads.push(thread::spawn(move || {
+                dns_worker_loop(worker_receiver, worker_context, worker_stop);
+            }));
+        }
+
+        let listener_socket = Arc::clone(&socket);
+        let listener_stats = Arc::clone(&stats);
+        let listener_stop = Arc::clone(&stop);
+        threads.push(thread::spawn(move || {
+            serve_udp(listener_socket, work_sender, listener_stats, listener_stop);
+        }));
+        if let Some(thread) = query_log_thread {
+            threads.push(thread);
+        }
 
         Ok(Self {
             listen_addr,
             stop,
-            thread: Some(thread),
+            threads,
             cache: dns_cache,
         })
     }
@@ -204,7 +281,7 @@ impl DnsServer {
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
+        for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
     }
@@ -262,6 +339,59 @@ fn configure_udp_listener_socket(socket: &UdpSocket) -> Result<(), String> {
 #[cfg(not(windows))]
 fn configure_udp_listener_socket(_socket: &UdpSocket) -> Result<(), String> {
     Ok(())
+}
+
+fn build_runtime_upstreams(
+    upstream_servers: Vec<UpstreamServer>,
+) -> Result<Vec<RuntimeUpstream>, String> {
+    upstream_servers
+        .into_iter()
+        .map(RuntimeUpstream::new)
+        .collect()
+}
+
+impl RuntimeUpstream {
+    fn new(server: UpstreamServer) -> Result<Self, String> {
+        let doh_client = match &server {
+            UpstreamServer::Udp(_) => None,
+            UpstreamServer::Doh(_) => Some(build_doh_client()?),
+        };
+
+        Ok(Self { server, doh_client })
+    }
+}
+
+fn build_doh_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(UPSTREAM_TIMEOUT)
+        .connect_timeout(UPSTREAM_TIMEOUT)
+        .pool_idle_timeout(Some(DOH_CLIENT_POOL_IDLE_TIMEOUT))
+        .pool_max_idle_per_host(2)
+        .user_agent(DNSBLACKHOLE_USER_AGENT)
+        .build()
+        .map_err(|e| format!("创建 DoH 客户端失败：{e}"))
+}
+
+fn dns_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|count| count.get().saturating_mul(2))
+        .unwrap_or(DNS_MIN_WORKERS)
+        .clamp(DNS_MIN_WORKERS, DNS_MAX_WORKERS)
+}
+
+fn spawn_query_log_writer(
+    database: Arc<Database>,
+    receiver: mpsc::Receiver<QueryLogMessage>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        for message in receiver {
+            if let Err(error) =
+                database.insert_query_log(&message.entry, message.anonymize_client_ip)
+            {
+                eprintln!("{error}");
+            }
+        }
+    })
 }
 
 impl DnsCacheConfig {
@@ -401,23 +531,23 @@ pub fn summarize_rules(raw: &str) -> RuleSummary {
 }
 
 pub fn compile_rules(raw: &str) -> CompiledRules {
-    let mut blocks = Vec::new();
-    let mut allows = Vec::new();
-    let mut ignored_rules = 0;
+    let mut blocks = RuleSet::default();
+    let mut allows = RuleSet::default();
+    let mut summary = RuleSummary::default();
 
     for line in raw.lines() {
         match parse_rule(line) {
-            ParsedRule::Block(rule) => blocks.push(rule),
-            ParsedRule::Allow(rule) => allows.push(rule),
-            ParsedRule::Ignored => ignored_rules += 1,
+            ParsedRule::Block(rule) => {
+                summary.block_rules += 1;
+                blocks.insert(rule);
+            }
+            ParsedRule::Allow(rule) => {
+                summary.allow_rules += 1;
+                allows.insert(rule);
+            }
+            ParsedRule::Ignored => summary.ignored_rules += 1,
         }
     }
-
-    let summary = RuleSummary {
-        block_rules: blocks.len(),
-        allow_rules: allows.len(),
-        ignored_rules,
-    };
 
     CompiledRules {
         blocks,
@@ -461,19 +591,12 @@ fn reset_stats(stats: &Arc<Mutex<DnsStats>>) {
 }
 
 fn serve_udp(
-    socket: UdpSocket,
-    upstream_servers: Vec<UpstreamServer>,
-    upstream_mode: UpstreamMode,
-    rules: CompiledRules,
+    socket: Arc<UdpSocket>,
+    work_sender: mpsc::SyncSender<DnsWorkItem>,
     stats: Arc<Mutex<DnsStats>>,
-    database: Arc<Database>,
-    dns_cache: Option<Arc<Mutex<DnsCache>>>,
-    query_log_enabled: bool,
-    anonymize_client_ip: bool,
     stop: Arc<AtomicBool>,
 ) {
     let mut buffer = [0_u8; 4096];
-    let mut next_upstream = 0_usize;
 
     while !stop.load(Ordering::Relaxed) {
         let (len, client_addr) = match socket.recv_from(&mut buffer) {
@@ -494,166 +617,191 @@ fn serve_udp(
             continue;
         }
 
-        let query = &buffer[..len];
-        let question = match parse_question(query) {
-            Ok(question) => question,
-            Err(error) => {
-                record_error(&stats, error);
-                continue;
+        let work_item = DnsWorkItem {
+            query: buffer[..len].to_vec(),
+            client_addr,
+        };
+        match work_sender.try_send(work_item) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                record_error(&stats, "DNS 请求队列已满，已丢弃请求".to_string());
             }
+            Err(mpsc::TrySendError::Disconnected(_)) => break,
+        }
+    }
+}
+
+fn dns_worker_loop(
+    receiver: Arc<Mutex<mpsc::Receiver<DnsWorkItem>>>,
+    context: Arc<DnsWorkerContext>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let work_item = match receiver
+            .lock()
+            .ok()
+            .and_then(|receiver| receiver.recv_timeout(WORKER_RECV_TIMEOUT).ok())
+        {
+            Some(work_item) => work_item,
+            None => continue,
         };
 
-        record_query(&stats, &question.domain);
+        handle_dns_query(&context, work_item);
+    }
+}
 
-        if rules.is_blocked(&question.domain) {
-            let response = build_block_response(query, &question);
-            if let Err(error) = socket.send_to(&response, client_addr) {
-                let message = format!("返回黑名单响应失败：{error}");
-                record_error(&stats, message.clone());
-                write_query_log(
-                    &database,
-                    query_log_enabled,
-                    anonymize_client_ip,
-                    &question.domain,
-                    client_addr,
-                    true,
-                    false,
-                    true,
-                    None,
-                    None,
-                    Some(message),
-                );
-                continue;
-            }
-            record_blocked(&stats, &question.domain);
-            write_query_log(
-                &database,
-                query_log_enabled,
-                anonymize_client_ip,
+fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
+    let query = work_item.query.as_slice();
+    let client_addr = work_item.client_addr;
+    let question = match parse_question(query) {
+        Ok(question) => question,
+        Err(error) => {
+            record_error(&context.stats, error);
+            return;
+        }
+    };
+
+    record_query(&context.stats, &question.domain);
+
+    if context.rules.is_blocked(&question.domain) {
+        let response = build_block_response(query, &question);
+        if let Err(error) = context.socket.send_to(&response, client_addr) {
+            let message = format!("返回黑名单响应失败：{error}");
+            record_error(&context.stats, message.clone());
+            queue_query_log(
+                context,
                 &question.domain,
                 client_addr,
                 true,
                 false,
+                true,
+                None,
+                None,
+                Some(message),
+            );
+            return;
+        }
+        record_blocked(&context.stats, &question.domain);
+        queue_query_log(
+            context,
+            &question.domain,
+            client_addr,
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        return;
+    }
+
+    let cache_key = QueryCacheKey::from_question(&question);
+    if let Some(cache_hit) =
+        lookup_cached_response(&context.dns_cache, &cache_key, query, current_second())
+    {
+        if let Err(error) = context.socket.send_to(&cache_hit.response, client_addr) {
+            let message = format!("返回 DNS 缓存响应失败：{error}");
+            record_error(&context.stats, message.clone());
+            queue_query_log(
+                context,
+                &question.domain,
+                client_addr,
+                false,
+                false,
+                true,
+                None,
+                None,
+                Some(message),
+            );
+        } else {
+            queue_query_log(
+                context,
+                &question.domain,
+                client_addr,
+                false,
+                false,
                 false,
                 None,
-                None,
+                Some(0),
                 None,
             );
-            continue;
+            if cache_hit.refresh {
+                refresh_expired_cache_async(
+                    work_item.query,
+                    cache_key,
+                    Arc::clone(&context.upstream_servers),
+                    context.upstream_mode.clone(),
+                    context.dns_cache.clone(),
+                );
+            }
         }
+        return;
+    }
 
-        let cache_key = QueryCacheKey::from_question(&question);
-        if let Some(cache_hit) =
-            lookup_cached_response(&dns_cache, &cache_key, query, current_second())
-        {
-            if let Err(error) = socket.send_to(&cache_hit.response, client_addr) {
-                let message = format!("返回 DNS 缓存响应失败：{error}");
-                record_error(&stats, message.clone());
-                write_query_log(
-                    &database,
-                    query_log_enabled,
-                    anonymize_client_ip,
+    match forward_query(
+        query,
+        context.upstream_servers.as_ref(),
+        &context.upstream_mode,
+        &context.next_upstream,
+    ) {
+        Ok(forwarded) => {
+            if let Some(cache) = &context.dns_cache {
+                if let Ok(mut cache) = cache.lock() {
+                    cache.insert(cache_key, forwarded.response.clone(), current_second());
+                }
+            }
+            if let Err(error) = context.socket.send_to(&forwarded.response, client_addr) {
+                let message = format!("转发响应给客户端失败：{error}");
+                record_error(&context.stats, message.clone());
+                queue_query_log(
+                    context,
                     &question.domain,
                     client_addr,
                     false,
-                    false,
                     true,
-                    None,
-                    None,
+                    true,
+                    Some(&forwarded.upstream),
+                    Some(forwarded.duration_ms),
                     Some(message),
                 );
             } else {
-                write_query_log(
-                    &database,
-                    query_log_enabled,
-                    anonymize_client_ip,
+                record_forwarded(&context.stats);
+                queue_query_log(
+                    context,
                     &question.domain,
                     client_addr,
-                    false,
-                    false,
-                    false,
-                    None,
-                    Some(0),
-                    None,
-                );
-                if cache_hit.refresh {
-                    refresh_expired_cache_async(
-                        query.to_vec(),
-                        cache_key,
-                        upstream_servers.clone(),
-                        upstream_mode.clone(),
-                        dns_cache.clone(),
-                    );
-                }
-            }
-            continue;
-        }
-
-        match forward_query(query, &upstream_servers, &upstream_mode, &mut next_upstream) {
-            Ok(forwarded) => {
-                if let Some(cache) = &dns_cache {
-                    if let Ok(mut cache) = cache.lock() {
-                        cache.insert(cache_key, forwarded.response.clone(), current_second());
-                    }
-                }
-                if let Err(error) = socket.send_to(&forwarded.response, client_addr) {
-                    let message = format!("转发响应给客户端失败：{error}");
-                    record_error(&stats, message.clone());
-                    write_query_log(
-                        &database,
-                        query_log_enabled,
-                        anonymize_client_ip,
-                        &question.domain,
-                        client_addr,
-                        false,
-                        true,
-                        true,
-                        Some(&forwarded.upstream),
-                        Some(forwarded.duration_ms),
-                        Some(message),
-                    );
-                } else {
-                    record_forwarded(&stats);
-                    write_query_log(
-                        &database,
-                        query_log_enabled,
-                        anonymize_client_ip,
-                        &question.domain,
-                        client_addr,
-                        false,
-                        true,
-                        false,
-                        Some(&forwarded.upstream),
-                        Some(forwarded.duration_ms),
-                        None,
-                    );
-                }
-            }
-            Err(error) => {
-                record_error(&stats, error.clone());
-                write_query_log(
-                    &database,
-                    query_log_enabled,
-                    anonymize_client_ip,
-                    &question.domain,
-                    client_addr,
-                    false,
                     false,
                     true,
+                    false,
+                    Some(&forwarded.upstream),
+                    Some(forwarded.duration_ms),
                     None,
-                    None,
-                    Some(error),
                 );
             }
+        }
+        Err(error) => {
+            record_error(&context.stats, error.clone());
+            queue_query_log(
+                context,
+                &question.domain,
+                client_addr,
+                false,
+                false,
+                true,
+                None,
+                None,
+                Some(error),
+            );
         }
     }
 }
 
 fn forward_query(
     query: &[u8],
-    upstream_servers: &[UpstreamServer],
+    upstream_servers: &[RuntimeUpstream],
     mode: &UpstreamMode,
-    next_upstream: &mut usize,
+    next_upstream: &AtomicUsize,
 ) -> Result<UpstreamForwardResponse, String> {
     match mode {
         UpstreamMode::LoadBalance => forward_load_balanced(query, upstream_servers, next_upstream),
@@ -675,7 +823,7 @@ fn lookup_cached_response(
 fn refresh_expired_cache_async(
     query: Vec<u8>,
     cache_key: QueryCacheKey,
-    upstream_servers: Vec<UpstreamServer>,
+    upstream_servers: Arc<Vec<RuntimeUpstream>>,
     upstream_mode: UpstreamMode,
     dns_cache: Option<Arc<Mutex<DnsCache>>>,
 ) {
@@ -684,12 +832,12 @@ fn refresh_expired_cache_async(
     };
 
     thread::spawn(move || {
-        let mut next_upstream = 0_usize;
+        let next_upstream = AtomicUsize::new(0);
         match forward_query(
             &query,
-            &upstream_servers,
+            upstream_servers.as_ref(),
             &upstream_mode,
-            &mut next_upstream,
+            &next_upstream,
         ) {
             Ok(forwarded) => {
                 if let Ok(mut cache) = cache.lock() {
@@ -707,8 +855,8 @@ fn refresh_expired_cache_async(
 
 fn forward_load_balanced(
     query: &[u8],
-    upstream_servers: &[UpstreamServer],
-    next_upstream: &mut usize,
+    upstream_servers: &[RuntimeUpstream],
+    next_upstream: &AtomicUsize,
 ) -> Result<UpstreamForwardResponse, String> {
     let mut last_error = None;
     let server_count = upstream_servers.len();
@@ -717,8 +865,7 @@ fn forward_load_balanced(
         return Err("没有可用的上游 DNS".into());
     }
 
-    let start = *next_upstream % server_count;
-    *next_upstream = (*next_upstream).wrapping_add(1);
+    let start = next_upstream.fetch_add(1, Ordering::Relaxed) % server_count;
 
     for offset in 0..server_count {
         let upstream = &upstream_servers[(start + offset) % server_count];
@@ -735,7 +882,7 @@ fn forward_load_balanced(
 
 fn forward_parallel(
     query: &[u8],
-    upstream_servers: &[UpstreamServer],
+    upstream_servers: &[RuntimeUpstream],
 ) -> Result<UpstreamForwardResponse, String> {
     if upstream_servers.is_empty() {
         return Err("没有可用的上游 DNS".into());
@@ -764,7 +911,7 @@ fn forward_parallel(
 
 fn forward_fastest_addr(
     query: &[u8],
-    upstream_servers: &[UpstreamServer],
+    upstream_servers: &[RuntimeUpstream],
 ) -> Result<UpstreamForwardResponse, String> {
     if upstream_servers.is_empty() {
         return Err("没有可用的上游 DNS".into());
@@ -801,27 +948,40 @@ fn forward_fastest_addr(
 }
 
 fn fastest_response_index(responses: &[UpstreamForwardResponse]) -> Option<usize> {
-    let mut best = None;
+    let candidates = responses
+        .iter()
+        .enumerate()
+        .flat_map(|(index, response)| {
+            extract_response_ips(&response.response)
+                .into_iter()
+                .take(FASTEST_ADDR_MAX_IPS_PER_RESPONSE)
+                .map(move |ip| (index, ip))
+        })
+        .take(FASTEST_ADDR_MAX_PROBES)
+        .collect::<Vec<_>>();
 
-    for (index, response) in responses.iter().enumerate() {
-        for ip in extract_response_ips(&response.response)
-            .into_iter()
-            .take(16)
-        {
-            let Some(duration) = measure_ip_latency(ip) else {
-                continue;
-            };
-            let should_replace = match best {
-                Some((_, best_duration)) => duration < best_duration,
-                None => true,
-            };
-            if should_replace {
-                best = Some((index, duration));
-            }
-        }
+    if candidates.is_empty() {
+        return None;
     }
 
-    best.map(|(index, _)| index)
+    let (sender, receiver) = mpsc::channel();
+    for (response_index, ip) in candidates {
+        let sender = sender.clone();
+        thread::spawn(move || {
+            if let Some(duration) = measure_ip_latency(ip) {
+                let _ = sender.send(IpLatencyProbe {
+                    response_index,
+                    duration,
+                });
+            }
+        });
+    }
+    drop(sender);
+
+    receiver
+        .into_iter()
+        .min_by_key(|probe| probe.duration)
+        .map(|probe| probe.response_index)
 }
 
 fn measure_ip_latency(ip: IpAddr) -> Option<Duration> {
@@ -839,12 +999,18 @@ fn measure_ip_latency(ip: IpAddr) -> Option<Duration> {
 
 fn forward_to_upstream(
     query: &[u8],
-    upstream: &UpstreamServer,
+    upstream: &RuntimeUpstream,
 ) -> Result<UpstreamForwardResponse, String> {
     let started = Instant::now();
-    let response = match upstream {
+    let response = match &upstream.server {
         UpstreamServer::Udp(addr) => forward_udp(query, *addr),
-        UpstreamServer::Doh(url) => forward_doh(query, url),
+        UpstreamServer::Doh(url) => {
+            let client = upstream
+                .doh_client
+                .as_ref()
+                .ok_or_else(|| "DoH 客户端未初始化".to_string())?;
+            forward_doh(query, url, client)
+        }
     }?;
     Ok(UpstreamForwardResponse {
         response,
@@ -853,8 +1019,8 @@ fn forward_to_upstream(
     })
 }
 
-fn format_upstream(upstream: &UpstreamServer) -> String {
-    match upstream {
+fn format_upstream(upstream: &RuntimeUpstream) -> String {
+    match &upstream.server {
         UpstreamServer::Udp(addr) => addr.to_string(),
         UpstreamServer::Doh(url) => normalize_doh_upstream_label(url),
     }
@@ -893,7 +1059,7 @@ fn forward_udp(query: &[u8], upstream_addr: SocketAddr) -> Result<Vec<u8>, Strin
     let socket =
         UdpSocket::bind(bind_addr).map_err(|e| format!("创建上游 DNS UDP 连接失败：{e}"))?;
     socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(UPSTREAM_TIMEOUT))
         .map_err(|e| format!("设置上游 DNS 超时失败：{e}"))?;
     socket
         .send_to(query, upstream_addr)
@@ -907,18 +1073,22 @@ fn forward_udp(query: &[u8], upstream_addr: SocketAddr) -> Result<Vec<u8>, Strin
     Ok(response)
 }
 
-fn forward_doh(query: &[u8], url: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .user_agent("DnsBlackhole/0.1")
-        .build()
-        .map_err(|e| format!("创建 DoH 客户端失败：{e}"))?;
+fn forward_doh(
+    query: &[u8],
+    url: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<Vec<u8>, String> {
+    let mut request_body = query.to_vec();
+    if request_body.len() >= 2 {
+        request_body[0] = 0;
+        request_body[1] = 0;
+    }
 
     let response = client
         .post(url)
         .header("accept", "application/dns-message")
         .header("content-type", "application/dns-message")
-        .body(query.to_vec())
+        .body(request_body)
         .send()
         .map_err(|e| format!("请求 DoH 上游失败：{e}"))?
         .error_for_status()
@@ -926,25 +1096,48 @@ fn forward_doh(query: &[u8], url: &str) -> Result<Vec<u8>, String> {
 
     response
         .bytes()
-        .map(|bytes| bytes.to_vec())
+        .map(|bytes| {
+            let mut response = bytes.to_vec();
+            if response.len() >= 2 && query.len() >= 2 {
+                response[0..2].copy_from_slice(&query[0..2]);
+            }
+            response
+        })
         .map_err(|e| format!("读取 DoH 响应失败：{e}"))
 }
 
 impl CompiledRules {
     fn is_blocked(&self, domain: &str) -> bool {
-        if self.allows.iter().any(|rule| rule.matches(domain)) {
+        if self.allows.contains(domain) {
             return false;
         }
-        self.blocks.iter().any(|rule| rule.matches(domain))
+        self.blocks.contains(domain)
     }
 }
 
-impl Rule {
-    fn matches(&self, domain: &str) -> bool {
-        if domain == self.domain {
+impl RuleSet {
+    fn insert(&mut self, rule: Rule) {
+        if rule.include_subdomains {
+            self.suffix.insert(rule.domain);
+        } else {
+            self.exact.insert(rule.domain);
+        }
+    }
+
+    fn contains(&self, domain: &str) -> bool {
+        if self.exact.contains(domain) || self.suffix.contains(domain) {
             return true;
         }
-        self.include_subdomains && domain.ends_with(&format!(".{}", self.domain))
+
+        let mut offset = 0;
+        while let Some(dot_index) = domain[offset..].find('.') {
+            offset += dot_index + 1;
+            if self.suffix.contains(&domain[offset..]) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -1382,10 +1575,8 @@ fn record_error(stats: &Arc<Mutex<DnsStats>>, error: String) {
     }
 }
 
-fn write_query_log(
-    database: &Arc<Database>,
-    enabled: bool,
-    anonymize_client_ip: bool,
+fn queue_query_log(
+    context: &DnsWorkerContext,
     domain: &str,
     client_addr: SocketAddr,
     blocked: bool,
@@ -1395,9 +1586,9 @@ fn write_query_log(
     upstream_duration_ms: Option<u64>,
     error: Option<String>,
 ) {
-    if !enabled {
+    let Some(sender) = &context.query_log_sender else {
         return;
-    }
+    };
 
     let entry = QueryLogEntry {
         domain: domain.to_string(),
@@ -1410,8 +1601,18 @@ fn write_query_log(
         error,
     };
 
-    if let Err(error) = database.insert_query_log(&entry, anonymize_client_ip) {
-        eprintln!("{error}");
+    let message = QueryLogMessage {
+        entry,
+        anonymize_client_ip: context.anonymize_client_ip,
+    };
+    match sender.try_send(message) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            record_error(&context.stats, "查询日志队列已满，已丢弃日志".to_string());
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            record_error(&context.stats, "查询日志写入队列已关闭".to_string());
+        }
     }
 }
 

@@ -31,7 +31,7 @@ pub struct AppConfig {
     pub dns_cache_enabled: bool,
     #[serde(default = "default_dns_cache_size")]
     pub dns_cache_size: usize,
-    #[serde(default)]
+    #[serde(default = "default_dns_cache_min_ttl")]
     pub dns_cache_min_ttl: u32,
     #[serde(default = "default_dns_cache_max_ttl")]
     pub dns_cache_max_ttl: u32,
@@ -98,7 +98,7 @@ impl Default for AppConfig {
             query_log_retention_hours: default_query_log_retention_hours(),
             dns_cache_enabled: default_dns_cache_enabled(),
             dns_cache_size: default_dns_cache_size(),
-            dns_cache_min_ttl: 0,
+            dns_cache_min_ttl: default_dns_cache_min_ttl(),
             dns_cache_max_ttl: default_dns_cache_max_ttl(),
             dns_cache_optimistic: default_dns_cache_optimistic(),
             filters: default_filters(),
@@ -181,6 +181,10 @@ fn default_dns_cache_enabled() -> bool {
 
 fn default_dns_cache_size() -> usize {
     16 * 1024 * 1024
+}
+
+fn default_dns_cache_min_ttl() -> u32 {
+    60
 }
 
 fn default_dns_cache_max_ttl() -> u32 {
