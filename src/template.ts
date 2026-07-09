@@ -85,34 +85,6 @@ export function renderAppTemplate(appIconUrl: string): string {
           </article>
         </div>
 
-        <section class="panel protection-panel">
-          <div class="rank-title">
-            <div>
-              <h2>防护事件</h2>
-              <span>访问控制、限速和协议拒绝</span>
-            </div>
-            <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
-          </div>
-          <div class="protection-grid">
-            <div class="protection-stat">
-              <span>访问拒绝</span>
-              <strong id="access_denied_total">0</strong>
-            </div>
-            <div class="protection-stat">
-              <span>限速拦截</span>
-              <strong id="rate_limited_total">0</strong>
-            </div>
-            <div class="protection-stat">
-              <span>ANY 拒绝</span>
-              <strong id="refused_any_total">0</strong>
-            </div>
-            <div class="protection-stat">
-              <span>UDP 静默丢弃</span>
-              <strong id="dropped_udp_total">0</strong>
-            </div>
-          </div>
-        </section>
-
         <div class="dashboard-rank-grid">
           <section class="panel rank-panel">
             <div class="rank-title">

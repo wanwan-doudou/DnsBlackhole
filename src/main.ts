@@ -902,10 +902,6 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#queries"), formatCount(status.stats.queries));
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
-  setTextIfChanged(query("#access_denied_total"), formatCount(status.stats.access_denied_total));
-  setTextIfChanged(query("#rate_limited_total"), formatCount(status.stats.rate_limited_total));
-  setTextIfChanged(query("#refused_any_total"), formatCount(status.stats.refused_any_total));
-  setTextIfChanged(query("#dropped_udp_total"), formatCount(status.stats.dropped_udp_total));
   const trafficWindowHours = currentQueryLogEnabled
     ? currentQueryLogRetentionHours
     : runtimeWindowHours(status.stats.started_at);

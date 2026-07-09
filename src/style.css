@@ -353,54 +353,15 @@ button.refreshing:disabled {
 .dashboard-rank-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 24px;
+  gap: 16px;
 }
 
 .dashboard-summary {
-  margin-bottom: 24px;
-}
-
-.protection-panel {
-  margin-bottom: 24px;
-  padding: 18px;
-}
-
-.protection-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 14px;
-  margin-top: 16px;
-}
-
-.protection-stat {
-  min-width: 0;
-  border: 1px solid #e1e8f0;
-  border-radius: 5px;
-  padding: 12px 14px;
-  background: #fbfcfd;
-}
-
-.protection-stat span {
-  display: block;
-  color: #6b7886;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.protection-stat strong {
-  display: block;
-  margin-top: 8px;
-  color: #2b3a49;
-  font-size: 22px;
-  line-height: 1;
-  font-weight: 650;
+  margin-bottom: 18px;
 }
 
 .upstream-rank-grid {
-  margin-top: 24px;
+  margin-top: 18px;
 }
 
 .query-log-view {
@@ -1761,14 +1722,14 @@ select:focus {
 }
 
 @media (max-width: 900px) {
+  .dashboard-summary,
   .dns-settings,
   .upstream-extra-grid,
   .diagnostics-grid,
   .diagnostic-probes,
   .runtime-watchdog-grid,
   .dns-security-grid,
-  .dns-security-options,
-  .protection-grid {
+  .dns-security-options {
     grid-template-columns: 1fr;
   }
 
