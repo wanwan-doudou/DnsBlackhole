@@ -3,5 +3,18 @@
   "identifier": "default",
   "description": "主窗口所需权限",
   "windows": ["main"],
-  "permissions": ["core:default", "updater:default", "process:default", "opener:default"]
+  "permissions": [
+    "core:app:allow-version",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+    "process:allow-restart",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://github.com/wanwan-doudou/DnsBlackhole/releases*"
+        }
+      ]
+    }
+  ]
 }

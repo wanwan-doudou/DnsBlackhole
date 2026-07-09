@@ -85,6 +85,34 @@ export function renderAppTemplate(appIconUrl: string): string {
           </article>
         </div>
 
+        <section class="panel protection-panel">
+          <div class="rank-title">
+            <div>
+              <h2>防护事件</h2>
+              <span>访问控制、限速和协议拒绝</span>
+            </div>
+            <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+          </div>
+          <div class="protection-grid">
+            <div class="protection-stat">
+              <span>访问拒绝</span>
+              <strong id="access_denied_total">0</strong>
+            </div>
+            <div class="protection-stat">
+              <span>限速拦截</span>
+              <strong id="rate_limited_total">0</strong>
+            </div>
+            <div class="protection-stat">
+              <span>ANY 拒绝</span>
+              <strong id="refused_any_total">0</strong>
+            </div>
+            <div class="protection-stat">
+              <span>UDP 静默丢弃</span>
+              <strong id="dropped_udp_total">0</strong>
+            </div>
+          </div>
+        </section>
+
         <div class="dashboard-rank-grid">
           <section class="panel rank-panel">
             <div class="rank-title">
@@ -357,6 +385,27 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <span>
                     <strong>拒绝 ANY 查询</strong>
                     <small>减少 DNS 放大攻击面，家庭网关场景通常应开启。</small>
+                  </span>
+                </label>
+              </div>
+            </section>
+
+            <section class="settings-section dns-security-section">
+              <div class="section-heading">
+                <h3>过滤器下载安全</h3>
+                <span>限制远程黑名单下载行为，降低异常响应和中间人篡改风险。</span>
+              </div>
+              <div class="dns-security-options">
+                <label class="field">
+                  <span>单个过滤器最大大小（MB）</span>
+                  <small>按解压后的实际读取大小限制，超过后立即中断下载。</small>
+                  <input id="filter_max_size_mb" type="number" min="1" max="256" step="1" />
+                </label>
+                <label class="check-row warning-check-row">
+                  <input id="allow_insecure_http" type="checkbox" />
+                  <span>
+                    <strong>允许不安全 HTTP</strong>
+                    <small>允许 HTTP 黑名单订阅和 HTTP DoH。仅在可信内网或临时迁移时使用。</small>
                   </span>
                 </label>
               </div>

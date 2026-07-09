@@ -29,7 +29,7 @@ mod tests {
             build_error_response, extract_response_ips, parse_question, prepare_cached_response,
             read_u16, response_is_truncated, response_min_record_ttl, validate_response_for_query,
         },
-        rules::compile_rules,
+        rules::{compile_rules, summarize_rules},
         stats::{DnsStats, current_second, record_blocked, record_query},
         upstream::{
             RuntimeUpstream, is_upstream_temporarily_unhealthy, mark_upstream_available,
@@ -53,6 +53,20 @@ mod tests {
         assert!(rules.is_blocked("track.example.org"));
         assert!(!rules.is_blocked("safe.example.org"));
         assert!(!rules.is_blocked("cdn.safe.example.org"));
+    }
+
+    #[test]
+    fn summarizes_ignored_rule_reasons() {
+        let summary = summarize_rules(
+            "! comment\n/ads[0-9]+\\.example/\n||example.org^$dnstype=A\nbad domain\n||valid.example^",
+        );
+
+        assert_eq!(summary.block_rules, 1);
+        assert_eq!(summary.ignored_rules, 4);
+        assert_eq!(summary.ignored_comment_rules, 1);
+        assert_eq!(summary.ignored_regex_rules, 1);
+        assert_eq!(summary.ignored_unsupported_rules, 1);
+        assert_eq!(summary.ignored_invalid_rules, 1);
     }
 
     #[test]

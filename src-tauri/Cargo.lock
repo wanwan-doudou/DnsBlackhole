@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "dnsblackhole"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "reqwest",
  "rusqlite",
@@ -904,6 +904,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

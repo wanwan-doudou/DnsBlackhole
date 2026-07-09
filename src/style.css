@@ -360,6 +360,45 @@ button.refreshing:disabled {
   margin-bottom: 24px;
 }
 
+.protection-panel {
+  margin-bottom: 24px;
+  padding: 18px;
+}
+
+.protection-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.protection-stat {
+  min-width: 0;
+  border: 1px solid #e1e8f0;
+  border-radius: 5px;
+  padding: 12px 14px;
+  background: #fbfcfd;
+}
+
+.protection-stat span {
+  display: block;
+  color: #6b7886;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.protection-stat strong {
+  display: block;
+  margin-top: 8px;
+  color: #2b3a49;
+  font-size: 22px;
+  line-height: 1;
+  font-weight: 650;
+}
+
 .upstream-rank-grid {
   margin-top: 24px;
 }
@@ -1728,7 +1767,8 @@ select:focus {
   .diagnostic-probes,
   .runtime-watchdog-grid,
   .dns-security-grid,
-  .dns-security-options {
+  .dns-security-options,
+  .protection-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1774,6 +1814,14 @@ select:focus {
 .retention-settings input:disabled,
 .check-row input:disabled+span {
   opacity: 0.58;
+}
+
+.warning-check-row strong {
+  color: #9b4b00;
+}
+
+.warning-check-row small {
+  color: #9a6a37;
 }
 
 .toggle-row {
@@ -1888,6 +1936,11 @@ select:focus {
   background: #fff0f0;
 }
 
+.state-tag.warning {
+  color: #9b4b00;
+  background: #fff3df;
+}
+
 .row-actions {
   display: flex;
   gap: 8px;
@@ -1919,6 +1972,16 @@ select:focus {
   grid-template-columns: minmax(180px, 0.35fr) minmax(260px, 1fr);
   gap: 12px;
   padding: 0 12px 14px 78px;
+}
+
+.filter-rule-detail {
+  display: block;
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  color: #7a8999;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .empty-row {

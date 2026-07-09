@@ -24,8 +24,8 @@ use super::{
     },
     rules::CompiledRules,
     stats::{
-        DnsStats, current_second, record_blocked_query, record_error, record_forwarded,
-        record_query,
+        DnsStats, current_second, record_access_denied, record_blocked_query, record_error,
+        record_forwarded, record_query, record_rate_limited, record_refused_any,
     },
     upstream::{RuntimeUpstream, UpstreamForwardResponse, forward_query},
 };
@@ -171,7 +171,19 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
 
     match context.access.check(client_addr.ip(), current_second()) {
         ClientAccessDecision::Allow => {}
-        ClientAccessDecision::Deny(message) | ClientAccessDecision::RateLimited(message) => {
+        ClientAccessDecision::Deny(message) => {
+            record_access_denied(
+                &context.stats,
+                matches!(response_target, DnsResponseTarget::Udp(_)),
+            );
+            send_refused_or_drop(context, response_target, query, message);
+            return;
+        }
+        ClientAccessDecision::RateLimited(message) => {
+            record_rate_limited(
+                &context.stats,
+                matches!(response_target, DnsResponseTarget::Udp(_)),
+            );
             send_refused_or_drop(context, response_target, query, message);
             return;
         }
@@ -215,14 +227,14 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             }
             None => send_no_response(response_target),
         }
-        record_error(&context.stats, message.clone());
+        record_refused_any(&context.stats);
         queue_query_log(
             context,
             &question.domain,
             client_addr,
             false,
             false,
-            true,
+            false,
             None,
             None,
             Some(message),

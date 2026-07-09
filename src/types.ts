@@ -15,6 +15,13 @@ export type FilterSubscription = {
   url: string;
   enabled: boolean;
   rule_count: number;
+  block_rule_count: number;
+  allow_rule_count: number;
+  ignored_rule_count: number;
+  ignored_comment_count: number;
+  ignored_regex_count: number;
+  ignored_unsupported_count: number;
+  ignored_invalid_count: number;
   last_updated: number | null;
   last_error: string | null;
 };
@@ -36,6 +43,8 @@ export type AppConfig = {
   rate_limit_per_second: number;
   refuse_any: boolean;
   filter_update_interval_hours: number;
+  filter_max_size_mb: number;
+  allow_insecure_http: boolean;
   query_log_enabled: boolean;
   anonymize_client_ip: boolean;
   launch_at_startup: boolean;
@@ -56,6 +65,10 @@ export type RuleSummary = {
   block_rules: number;
   allow_rules: number;
   ignored_rules: number;
+  ignored_comment_rules: number;
+  ignored_regex_rules: number;
+  ignored_unsupported_rules: number;
+  ignored_invalid_rules: number;
 };
 
 export type TrafficBucket = {
@@ -80,6 +93,10 @@ export type DnsStats = {
   blocked: number;
   forwarded: number;
   failed: number;
+  access_denied_total: number;
+  rate_limited_total: number;
+  refused_any_total: number;
+  dropped_udp_total: number;
   last_query: string | null;
   last_blocked: string | null;
   last_error: string | null;

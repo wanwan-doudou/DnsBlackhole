@@ -1,6 +1,6 @@
 [package]
 name = "dnsblackhole"
-version = "0.1.11"
+version = "0.1.12"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"
@@ -25,3 +25,6 @@ tauri-plugin-opener = "2"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-autostart = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

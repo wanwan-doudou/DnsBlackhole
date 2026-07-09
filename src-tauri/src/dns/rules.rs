@@ -7,6 +7,10 @@ pub struct RuleSummary {
     pub block_rules: usize,
     pub allow_rules: usize,
     pub ignored_rules: usize,
+    pub ignored_comment_rules: usize,
+    pub ignored_regex_rules: usize,
+    pub ignored_unsupported_rules: usize,
+    pub ignored_invalid_rules: usize,
 }
 
 #[derive(Clone)]
@@ -47,7 +51,15 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
                 summary.allow_rules += 1;
                 allows.insert(rule);
             }
-            ParsedRule::Ignored => summary.ignored_rules += 1,
+            ParsedRule::Ignored(reason) => {
+                summary.ignored_rules += 1;
+                match reason {
+                    IgnoredRuleReason::Comment => summary.ignored_comment_rules += 1,
+                    IgnoredRuleReason::Regex => summary.ignored_regex_rules += 1,
+                    IgnoredRuleReason::Unsupported => summary.ignored_unsupported_rules += 1,
+                    IgnoredRuleReason::Invalid => summary.ignored_invalid_rules += 1,
+                }
+            }
         }
     }
 
@@ -96,13 +108,20 @@ impl RuleSet {
 enum ParsedRule {
     Block(Rule),
     Allow(Rule),
-    Ignored,
+    Ignored(IgnoredRuleReason),
+}
+
+enum IgnoredRuleReason {
+    Comment,
+    Regex,
+    Unsupported,
+    Invalid,
 }
 
 fn parse_rule(line: &str) -> ParsedRule {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
-        return ParsedRule::Ignored;
+        return ParsedRule::Ignored(IgnoredRuleReason::Comment);
     }
 
     if let Some(rule) = parse_hosts_rule(trimmed) {
@@ -134,9 +153,12 @@ fn parse_filter_rule(line: &str) -> ParsedRule {
         (false, line)
     };
 
-    let pattern = rest.split('$').next().unwrap_or(rest).trim();
-    let Some(rule) = parse_pattern(pattern) else {
-        return ParsedRule::Ignored;
+    if rest.contains('$') {
+        return ParsedRule::Ignored(IgnoredRuleReason::Unsupported);
+    }
+
+    let Some(rule) = parse_pattern(rest.trim()) else {
+        return ParsedRule::Ignored(ignored_pattern_reason(rest.trim()));
     };
 
     if is_allow {
@@ -170,6 +192,14 @@ fn parse_pattern(pattern: &str) -> Option<Rule> {
         domain,
         include_subdomains,
     })
+}
+
+fn ignored_pattern_reason(pattern: &str) -> IgnoredRuleReason {
+    if pattern.starts_with('/') && pattern.ends_with('/') {
+        IgnoredRuleReason::Regex
+    } else {
+        IgnoredRuleReason::Invalid
+    }
 }
 
 fn normalize_domain(value: &str) -> Option<String> {

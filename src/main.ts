@@ -98,6 +98,8 @@ const blockedClientsInput = query<HTMLTextAreaElement>("#blocked_clients");
 const rateLimitPerSecondInput = query<HTMLInputElement>("#rate_limit_per_second");
 const refuseAnyInput = query<HTMLInputElement>("#refuse_any");
 const filterUpdateIntervalInput = query<HTMLSelectElement>("#filter_update_interval");
+const filterMaxSizeInput = query<HTMLInputElement>("#filter_max_size_mb");
+const allowInsecureHttpInput = query<HTMLInputElement>("#allow_insecure_http");
 const upstreamModeInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="upstream_mode"]'),
 );
@@ -364,6 +366,13 @@ addFilterButton.addEventListener("click", () => {
       url: "",
       enabled: true,
       rule_count: 0,
+      block_rule_count: 0,
+      allow_rule_count: 0,
+      ignored_rule_count: 0,
+      ignored_comment_count: 0,
+      ignored_regex_count: 0,
+      ignored_unsupported_count: 0,
+      ignored_invalid_count: 0,
       last_updated: null,
       last_error: null,
     },
@@ -617,6 +626,8 @@ async function loadConfig(): Promise<void> {
     rateLimitPerSecondInput.value = String(config.rate_limit_per_second);
     refuseAnyInput.checked = config.refuse_any;
     filterUpdateIntervalInput.value = String(config.filter_update_interval_hours);
+    filterMaxSizeInput.value = String(config.filter_max_size_mb);
+    allowInsecureHttpInput.checked = config.allow_insecure_http;
     setRadioValue(upstreamModeInputs, config.upstream_mode);
     queryLogEnabledInput.checked = config.query_log_enabled;
     anonymizeClientIpInput.checked = config.anonymize_client_ip;
@@ -666,6 +677,8 @@ function collectConfig(): AppConfig {
     rate_limit_per_second: Number(rateLimitPerSecondInput.value || 0),
     refuse_any: refuseAnyInput.checked,
     filter_update_interval_hours: Number(filterUpdateIntervalInput.value),
+    filter_max_size_mb: Number(filterMaxSizeInput.value || 50),
+    allow_insecure_http: allowInsecureHttpInput.checked,
     query_log_enabled: queryLogEnabledInput.checked,
     anonymize_client_ip: anonymizeClientIpInput.checked,
     query_log_retention_hours: selectedRetentionHours(),
@@ -816,8 +829,23 @@ function renderFilters(): void {
 
 function renderFilter(filter: FilterSubscription): string {
   const isEditing = editingFilterIds.has(filter.id);
-  const statusText = filter.last_error ? "更新失败" : filter.last_updated ? "已更新" : "未更新";
-  const statusClass = filter.last_error ? "danger" : filter.last_updated ? "ok" : "muted";
+  const hasUnsupportedIgnoredRules =
+    filter.ignored_regex_count + filter.ignored_unsupported_count + filter.ignored_invalid_count > 0;
+  const statusText = filter.last_error
+    ? "更新失败"
+    : filter.last_updated
+      ? hasUnsupportedIgnoredRules
+        ? "部分忽略"
+        : "已更新"
+      : "未更新";
+  const statusClass = filter.last_error
+    ? "danger"
+    : filter.last_updated
+      ? hasUnsupportedIgnoredRules
+        ? "warning"
+        : "ok"
+      : "muted";
+  const ruleSummary = formatFilterRuleSummary(filter);
 
   return `
     <div class="filter-item" data-id="${escapeHtml(filter.id)}">
@@ -829,7 +857,7 @@ function renderFilter(filter: FilterSubscription): string {
           <strong>${escapeHtml(filter.name || "未命名清单")}</strong>
           <span class="url-line" title="${escapeHtml(filter.url)}">${escapeHtml(filter.url || "尚未填写清单网址")}</span>
         </div>
-        <span class="rule-count">${formatCount(filter.rule_count)}</span>
+        <span class="rule-count" title="${escapeHtml(ruleSummary)}">${formatCount(filter.rule_count)}</span>
         <span class="update-time">${formatTime(filter.last_updated)}</span>
         <span class="state-tag ${statusClass}" title="${escapeHtml(filter.last_error ?? "")}">${statusText}</span>
         <div class="row-actions">
@@ -849,6 +877,7 @@ function renderFilter(filter: FilterSubscription): string {
                 <span>清单网址</span>
                 <input data-field="url" value="${escapeHtml(filter.url)}" spellcheck="false" />
               </label>
+              <small class="filter-rule-detail">${escapeHtml(ruleSummary)}</small>
             </div>
           `
           : ""
@@ -873,6 +902,10 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#queries"), formatCount(status.stats.queries));
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
+  setTextIfChanged(query("#access_denied_total"), formatCount(status.stats.access_denied_total));
+  setTextIfChanged(query("#rate_limited_total"), formatCount(status.stats.rate_limited_total));
+  setTextIfChanged(query("#refused_any_total"), formatCount(status.stats.refused_any_total));
+  setTextIfChanged(query("#dropped_udp_total"), formatCount(status.stats.dropped_udp_total));
   const trafficWindowHours = currentQueryLogEnabled
     ? currentQueryLogRetentionHours
     : runtimeWindowHours(status.stats.started_at);
@@ -932,6 +965,24 @@ function renderDiagnosticProbe(label: string, probe: DnsProbeResult): string {
       ${probe.error ? `<p>${escapeHtml(probe.error)}</p>` : ""}
     </div>
   `;
+}
+
+function formatFilterRuleSummary(filter: FilterSubscription): string {
+  const ignoredParts = [
+    filter.ignored_comment_count > 0 ? `空行/注释 ${formatCount(filter.ignored_comment_count)}` : "",
+    filter.ignored_regex_count > 0 ? `正则 ${formatCount(filter.ignored_regex_count)}` : "",
+    filter.ignored_unsupported_count > 0
+      ? `高级修饰符 ${formatCount(filter.ignored_unsupported_count)}`
+      : "",
+    filter.ignored_invalid_count > 0 ? `非法域名 ${formatCount(filter.ignored_invalid_count)}` : "",
+  ].filter(Boolean);
+
+  const ignoredText =
+    filter.ignored_rule_count > 0
+      ? `，忽略 ${formatCount(filter.ignored_rule_count)}（${ignoredParts.join("，") || "未分类"}）`
+      : "";
+
+  return `有效 ${formatCount(filter.rule_count)}，黑名单 ${formatCount(filter.block_rule_count)}，白名单 ${formatCount(filter.allow_rule_count)}${ignoredText}`;
 }
 
 function renderQueryLogs(page: QueryLogPage): void {

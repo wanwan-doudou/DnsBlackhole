@@ -23,6 +23,7 @@ const DOH_CLIENT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FASTEST_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_millis(180);
 const FASTEST_ADDR_MAX_IPS_PER_RESPONSE: usize = 8;
 const FASTEST_ADDR_MAX_PROBES: usize = 32;
+const MAX_PARALLEL_UPSTREAMS_PER_QUERY: usize = 8;
 const DNSBLACKHOLE_USER_AGENT: &str = "DnsBlackhole/0.1";
 
 #[derive(Clone)]
@@ -141,13 +142,14 @@ fn forward_parallel(
     query: &[u8],
     upstream_servers: &[RuntimeUpstream],
 ) -> Result<UpstreamForwardResponse, String> {
-    if upstream_servers.is_empty() {
+    let selected_upstreams = select_parallel_upstreams(upstream_servers);
+    if selected_upstreams.is_empty() {
         return Err("没有可用的上游 DNS".into());
     }
 
     let (sender, receiver) = mpsc::channel();
     let query = Arc::new(query.to_vec());
-    for upstream in upstream_servers {
+    for upstream in &selected_upstreams {
         let upstream = upstream.clone();
         let sender = sender.clone();
         let query = Arc::clone(&query);
@@ -158,7 +160,7 @@ fn forward_parallel(
     drop(sender);
 
     let mut last_error = None;
-    for result in receiver.iter().take(upstream_servers.len()) {
+    for result in receiver.iter().take(selected_upstreams.len()) {
         match result {
             Ok(response) => return Ok(response),
             Err(error) => last_error = Some(error),
@@ -172,13 +174,14 @@ fn forward_fastest_addr(
     query: &[u8],
     upstream_servers: &[RuntimeUpstream],
 ) -> Result<UpstreamForwardResponse, String> {
-    if upstream_servers.is_empty() {
+    let selected_upstreams = select_parallel_upstreams(upstream_servers);
+    if selected_upstreams.is_empty() {
         return Err("没有可用的上游 DNS".into());
     }
 
     let (sender, receiver) = mpsc::channel();
     let query = Arc::new(query.to_vec());
-    for upstream in upstream_servers {
+    for upstream in &selected_upstreams {
         let upstream = upstream.clone();
         let sender = sender.clone();
         let query = Arc::clone(&query);
@@ -190,7 +193,7 @@ fn forward_fastest_addr(
 
     let mut responses = Vec::new();
     let mut last_error = None;
-    for result in receiver.iter().take(upstream_servers.len()) {
+    for result in receiver.iter().take(selected_upstreams.len()) {
         match result {
             Ok(response) => responses.push(response),
             Err(error) => last_error = Some(error),
@@ -206,6 +209,26 @@ fn forward_fastest_addr(
     }
 
     Ok(responses.remove(0))
+}
+
+fn select_parallel_upstreams(upstream_servers: &[RuntimeUpstream]) -> Vec<RuntimeUpstream> {
+    let now = current_second();
+    let mut selected = upstream_servers
+        .iter()
+        .filter(|upstream| !is_upstream_temporarily_unhealthy(upstream, now))
+        .take(MAX_PARALLEL_UPSTREAMS_PER_QUERY)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if selected.is_empty() {
+        selected = upstream_servers
+            .iter()
+            .take(MAX_PARALLEL_UPSTREAMS_PER_QUERY)
+            .cloned()
+            .collect();
+    }
+
+    selected
 }
 
 fn fastest_response_index(responses: &[UpstreamForwardResponse]) -> Option<usize> {

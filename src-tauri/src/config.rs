@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, File},
+    io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
     time::Duration,
@@ -9,8 +10,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 5;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_FILTER_SIZE_MB: u32 = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -39,6 +41,10 @@ pub struct AppConfig {
     pub refuse_any: bool,
     #[serde(default = "default_filter_update_interval_hours")]
     pub filter_update_interval_hours: u32,
+    #[serde(default = "default_filter_max_size_mb")]
+    pub filter_max_size_mb: u32,
+    #[serde(default)]
+    pub allow_insecure_http: bool,
     #[serde(default = "default_query_log_enabled")]
     pub query_log_enabled: bool,
     #[serde(default)]
@@ -92,6 +98,20 @@ pub struct FilterSubscription {
     pub url: String,
     pub enabled: bool,
     pub rule_count: usize,
+    #[serde(default)]
+    pub block_rule_count: usize,
+    #[serde(default)]
+    pub allow_rule_count: usize,
+    #[serde(default)]
+    pub ignored_rule_count: usize,
+    #[serde(default)]
+    pub ignored_comment_count: usize,
+    #[serde(default)]
+    pub ignored_regex_count: usize,
+    #[serde(default)]
+    pub ignored_unsupported_count: usize,
+    #[serde(default)]
+    pub ignored_invalid_count: usize,
     pub last_updated: Option<u64>,
     pub last_error: Option<String>,
 }
@@ -104,6 +124,13 @@ impl Default for FilterSubscription {
             url: String::new(),
             enabled: true,
             rule_count: 0,
+            block_rule_count: 0,
+            allow_rule_count: 0,
+            ignored_rule_count: 0,
+            ignored_comment_count: 0,
+            ignored_regex_count: 0,
+            ignored_unsupported_count: 0,
+            ignored_invalid_count: 0,
             last_updated: None,
             last_error: None,
         }
@@ -133,6 +160,8 @@ impl Default for AppConfig {
             rate_limit_per_second: default_rate_limit_per_second(),
             refuse_any: default_refuse_any(),
             filter_update_interval_hours: default_filter_update_interval_hours(),
+            filter_max_size_mb: default_filter_max_size_mb(),
+            allow_insecure_http: false,
             query_log_enabled: default_query_log_enabled(),
             anonymize_client_ip: false,
             launch_at_startup: default_launch_at_startup(),
@@ -168,11 +197,19 @@ impl AppConfig {
     }
 
     pub fn upstream_servers(&self) -> Result<Vec<UpstreamServer>, String> {
-        parse_upstream_servers(&self.upstream_dns, &self.bootstrap_dns)
+        parse_upstream_servers(
+            &self.upstream_dns,
+            &self.bootstrap_dns,
+            self.allow_insecure_http,
+        )
     }
 
     pub fn fallback_servers(&self) -> Result<Vec<UpstreamServer>, String> {
-        parse_optional_upstream_servers(&self.fallback_dns, &self.bootstrap_dns)
+        parse_optional_upstream_servers(
+            &self.fallback_dns,
+            &self.bootstrap_dns,
+            self.allow_insecure_http,
+        )
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -192,6 +229,11 @@ impl AppConfig {
         }
         if !matches!(self.filter_update_interval_hours, 6 | 12 | 24 | 72 | 168) {
             return Err("过滤器更新间隔只能是 6、12、24、72 或 168 小时".into());
+        }
+        if !(1..=MAX_FILTER_SIZE_MB).contains(&self.filter_max_size_mb) {
+            return Err(format!(
+                "单个过滤器最大下载大小必须在 1 到 {MAX_FILTER_SIZE_MB} MB 之间"
+            ));
         }
         validate_client_list(&self.allowed_clients, "允许客户端")?;
         validate_client_list(&self.blocked_clients, "拒绝客户端")?;
@@ -213,7 +255,7 @@ impl AppConfig {
         if self.dns_cache_max_ttl > 0 && self.dns_cache_min_ttl > self.dns_cache_max_ttl {
             return Err("DNS 缓存最小 TTL 不能大于最大 TTL".into());
         }
-        validate_filters(&self.filters)?;
+        validate_filters(&self.filters, self.allow_insecure_http)?;
         Ok(())
     }
 }
@@ -232,6 +274,10 @@ fn default_listen_port() -> u16 {
 
 fn default_filter_update_interval_hours() -> u32 {
     12
+}
+
+fn default_filter_max_size_mb() -> u32 {
+    50
 }
 
 fn default_query_log_enabled() -> bool {
@@ -386,7 +432,10 @@ fn default_custom_rules() -> String {
     "! 自定义规则会和启用的远程清单一起生效\n||example-blocked.local^".into()
 }
 
-fn validate_filters(filters: &[FilterSubscription]) -> Result<(), String> {
+fn validate_filters(
+    filters: &[FilterSubscription],
+    allow_insecure_http: bool,
+) -> Result<(), String> {
     let mut ids = HashSet::new();
     for filter in filters {
         let id = filter.id.trim();
@@ -411,22 +460,35 @@ fn validate_filters(filters: &[FilterSubscription]) -> Result<(), String> {
         if url.is_empty() {
             return Err(format!("{} 的清单地址不能为空", filter.name));
         }
-        if !url.starts_with("https://") && !url.starts_with("http://") {
+        if url.starts_with("https://") {
+            continue;
+        }
+        if url.starts_with("http://") {
+            if allow_insecure_http {
+                continue;
+            }
             return Err(format!(
-                "{} 的清单地址必须以 http:// 或 https:// 开头",
+                "{} 使用了不安全的 HTTP 清单地址。默认只允许 HTTPS；如确需使用，请在安全防护中启用“允许不安全 HTTP”。",
                 filter.name
             ));
+        }
+        if !url.starts_with("https://") {
+            return Err(format!("{} 的清单地址必须以 https:// 开头", filter.name));
         }
     }
     Ok(())
 }
 
-fn parse_upstream_servers(value: &str, bootstrap_dns: &str) -> Result<Vec<UpstreamServer>, String> {
+fn parse_upstream_servers(
+    value: &str,
+    bootstrap_dns: &str,
+    allow_insecure_http: bool,
+) -> Result<Vec<UpstreamServer>, String> {
     let servers = value
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
-        .map(|line| parse_upstream_server(line, bootstrap_dns))
+        .map(|line| parse_upstream_server(line, bootstrap_dns, allow_insecure_http))
         .collect::<Result<Vec<_>, _>>()?;
 
     if servers.is_empty() {
@@ -439,18 +501,32 @@ fn parse_upstream_servers(value: &str, bootstrap_dns: &str) -> Result<Vec<Upstre
 fn parse_optional_upstream_servers(
     value: &str,
     bootstrap_dns: &str,
+    allow_insecure_http: bool,
 ) -> Result<Vec<UpstreamServer>, String> {
     value
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
-        .map(|line| parse_upstream_server(line, bootstrap_dns))
+        .map(|line| parse_upstream_server(line, bootstrap_dns, allow_insecure_http))
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn parse_upstream_server(value: &str, bootstrap_dns: &str) -> Result<UpstreamServer, String> {
-    if value.starts_with("https://") || value.starts_with("http://") {
+fn parse_upstream_server(
+    value: &str,
+    bootstrap_dns: &str,
+    allow_insecure_http: bool,
+) -> Result<UpstreamServer, String> {
+    if value.starts_with("https://") {
         return Ok(UpstreamServer::Doh(value.to_string()));
+    }
+    if value.starts_with("http://") {
+        if allow_insecure_http {
+            return Ok(UpstreamServer::Doh(value.to_string()));
+        }
+        return Err(
+            "HTTP DoH 上游不安全。默认只允许 HTTPS DoH；如确需使用，请在安全防护中启用“允许不安全 HTTP”。"
+                .into(),
+        );
     }
 
     parse_dns_socket_addr(value, bootstrap_dns).map(UpstreamServer::Udp)
@@ -764,7 +840,27 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
     if config.schema_version < 3 && config.runtime_watchdog_interval_seconds == 0 {
         config.runtime_watchdog_interval_seconds = default_runtime_watchdog_interval_seconds();
     }
+    if config.schema_version < 5 {
+        if config.filter_max_size_mb == 0 {
+            config.filter_max_size_mb = default_filter_max_size_mb();
+        }
+        if uses_insecure_http_endpoint(config) {
+            config.allow_insecure_http = true;
+        }
+    }
     config.schema_version = CURRENT_CONFIG_SCHEMA_VERSION;
+}
+
+fn uses_insecure_http_endpoint(config: &AppConfig) -> bool {
+    config
+        .upstream_dns
+        .lines()
+        .chain(config.fallback_dns.lines())
+        .any(|line| line.trim().starts_with("http://"))
+        || config
+            .filters
+            .iter()
+            .any(|filter| filter.url.trim().starts_with("http://"))
 }
 
 pub fn load(app: &AppHandle) -> Result<AppConfig, String> {
@@ -805,7 +901,76 @@ pub fn write_filter_cache(app: &AppHandle, id: &str, content: &str) -> Result<()
     let dir = filters_dir(app)?;
     fs::create_dir_all(&dir).map_err(|e| format!("创建清单缓存目录失败：{e}"))?;
     let path = filter_cache_path(app, id)?;
-    fs::write(&path, content).map_err(|e| format!("写入清单缓存失败：{}：{e}", path.display()))
+    write_file_atomically(&dir, &path, content.as_bytes())
+        .map_err(|e| format!("写入清单缓存失败：{}：{e}", path.display()))
+}
+
+fn write_file_atomically(dir: &Path, path: &Path, content: &[u8]) -> Result<(), String> {
+    let tmp_path = path.with_file_name(format!(
+        "{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("filter"),
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = File::create(&tmp_path)
+            .map_err(|e| format!("创建临时文件失败：{}：{e}", tmp_path.display()))?;
+        file.write_all(content)
+            .map_err(|e| format!("写入临时文件失败：{}：{e}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("同步临时文件失败：{}：{e}", tmp_path.display()))?;
+        drop(file);
+
+        replace_file(&tmp_path, path)?;
+        sync_directory(dir);
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    result
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    fn wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let from = wide(from.as_os_str());
+    let to = wide(to.as_os_str());
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if result == 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
+    fs::rename(from, to).map_err(|e| e.to_string())
+}
+
+fn sync_directory(dir: &Path) {
+    if let Ok(file) = File::open(dir) {
+        let _ = file.sync_all();
+    }
 }
 
 pub fn clear_filter_cache(
@@ -817,6 +982,13 @@ pub fn clear_filter_cache(
 
     for filter in &mut config.filters {
         filter.rule_count = 0;
+        filter.block_rule_count = 0;
+        filter.allow_rule_count = 0;
+        filter.ignored_rule_count = 0;
+        filter.ignored_comment_count = 0;
+        filter.ignored_regex_count = 0;
+        filter.ignored_unsupported_count = 0;
+        filter.ignored_invalid_count = 0;
         filter.last_updated = None;
         filter.last_error = None;
     }
@@ -883,6 +1055,7 @@ mod tests {
         let servers = parse_upstream_servers(
             "https://dns.alidns.com/dns-query\n223.5.5.5\n119.29.29.29:53",
             &default_bootstrap_dns(),
+            false,
         )
         .expect("upstreams should parse");
 
@@ -898,6 +1071,8 @@ mod tests {
 
         assert_eq!(config.listen_host, "0.0.0.0");
         assert_eq!(config.listen_port, 53);
+        assert_eq!(config.filter_max_size_mb, 50);
+        assert!(!config.allow_insecure_http);
         assert_eq!(
             config.upstream_dns,
             [
@@ -986,6 +1161,38 @@ mod tests {
             config.runtime_watchdog_interval_seconds,
             default_runtime_watchdog_interval_seconds()
         );
+        assert_eq!(config.filter_max_size_mb, default_filter_max_size_mb());
+    }
+
+    #[test]
+    fn rejects_http_endpoints_by_default() {
+        let mut config = AppConfig {
+            upstream_dns: "http://dns.example.test/dns-query".into(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.allow_insecure_http = true;
+        config
+            .validate()
+            .expect("explicit HTTP opt-in should validate");
+    }
+
+    #[test]
+    fn migrates_legacy_http_configs_to_explicit_opt_in() {
+        let mut config = AppConfig {
+            schema_version: 4,
+            upstream_dns: "http://dns.example.test/dns-query".into(),
+            ..AppConfig::default()
+        };
+        config.allow_insecure_http = false;
+
+        migrate_legacy_defaults(&mut config);
+
+        assert!(config.allow_insecure_http);
+        config
+            .validate()
+            .expect("legacy HTTP config should remain valid");
     }
 
     #[test]

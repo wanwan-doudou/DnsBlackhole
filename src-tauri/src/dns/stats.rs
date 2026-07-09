@@ -19,6 +19,10 @@ pub struct DnsStats {
     pub blocked: u64,
     pub forwarded: u64,
     pub failed: u64,
+    pub access_denied_total: u64,
+    pub rate_limited_total: u64,
+    pub refused_any_total: u64,
+    pub dropped_udp_total: u64,
     pub last_query: Option<String>,
     pub last_blocked: Option<String>,
     pub last_error: Option<String>,
@@ -166,6 +170,30 @@ pub(crate) fn record_error(stats: &Arc<Mutex<DnsStats>>, error: String) {
     if let Ok(mut current) = stats.lock() {
         current.failed += 1;
         current.last_error = Some(error);
+    }
+}
+
+pub(crate) fn record_access_denied(stats: &Arc<Mutex<DnsStats>>, dropped_udp: bool) {
+    if let Ok(mut current) = stats.lock() {
+        current.access_denied_total += 1;
+        if dropped_udp {
+            current.dropped_udp_total += 1;
+        }
+    }
+}
+
+pub(crate) fn record_rate_limited(stats: &Arc<Mutex<DnsStats>>, dropped_udp: bool) {
+    if let Ok(mut current) = stats.lock() {
+        current.rate_limited_total += 1;
+        if dropped_udp {
+            current.dropped_udp_total += 1;
+        }
+    }
+}
+
+pub(crate) fn record_refused_any(stats: &Arc<Mutex<DnsStats>>) {
+    if let Ok(mut current) = stats.lock() {
+        current.refused_any_total += 1;
     }
 }
 
