@@ -144,6 +144,7 @@ export type DnsProbeResult = {
 export type DnsDiagnosticsResult = {
   domain: string;
   listen_addr: string;
+  probe_addr: string;
   udp: DnsProbeResult;
   tcp: DnsProbeResult;
 };

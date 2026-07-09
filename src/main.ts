@@ -899,6 +899,10 @@ function renderDiagnosticsResult(result: DnsDiagnosticsResult): void {
       <strong>${escapeHtml(result.listen_addr)}</strong>
     </div>
     <div class="diagnostic-meta">
+      <span>诊断目标</span>
+      <strong>${escapeHtml(result.probe_addr)}</strong>
+    </div>
+    <div class="diagnostic-meta">
       <span>诊断域名</span>
       <strong>${escapeHtml(result.domain)}</strong>
     </div>

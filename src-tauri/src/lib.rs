@@ -6,7 +6,7 @@ mod tray;
 
 use std::{
     io::{self, Read, Write},
-    net::{SocketAddr, TcpStream, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -64,6 +64,7 @@ struct FilterCacheClearResult {
 struct DnsDiagnosticsResult {
     domain: String,
     listen_addr: String,
+    probe_addr: String,
     udp: DnsProbeResult,
     tcp: DnsProbeResult,
 }
@@ -530,15 +531,30 @@ fn spawn_runtime_watchdog(state: Arc<AppState>) {
 
 fn run_dns_diagnostics_blocking(config: &AppConfig) -> Result<DnsDiagnosticsResult, String> {
     let listen_addr = config.listen_socket_addr()?;
+    let probe_addr = diagnostic_probe_addr(listen_addr);
     let domain = normalize_diagnostics_domain(&config.diagnostics_domain)?;
     let query = build_diagnostic_dns_query(&domain, 1)?;
 
     Ok(DnsDiagnosticsResult {
         domain,
         listen_addr: listen_addr.to_string(),
-        udp: run_udp_dns_probe(listen_addr, &query),
-        tcp: run_tcp_dns_probe(listen_addr, &query),
+        probe_addr: probe_addr.to_string(),
+        udp: run_udp_dns_probe(probe_addr, &query),
+        tcp: run_tcp_dns_probe(probe_addr, &query),
     })
+}
+
+fn diagnostic_probe_addr(listen_addr: SocketAddr) -> SocketAddr {
+    if !listen_addr.ip().is_unspecified() {
+        return listen_addr;
+    }
+
+    let ip = if listen_addr.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    };
+    SocketAddr::new(ip, listen_addr.port())
 }
 
 fn run_udp_dns_probe(listen_addr: SocketAddr, query: &[u8]) -> DnsProbeResult {
@@ -727,6 +743,27 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_probe_addr_uses_loopback_for_wildcard_listener() {
+        assert_eq!(
+            diagnostic_probe_addr("0.0.0.0:53".parse().unwrap()).to_string(),
+            "127.0.0.1:53"
+        );
+        assert_eq!(
+            diagnostic_probe_addr("[::]:53".parse().unwrap()).to_string(),
+            "[::1]:53"
+        );
+        assert_eq!(
+            diagnostic_probe_addr("192.168.1.2:53".parse().unwrap()).to_string(),
+            "192.168.1.2:53"
+        );
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
