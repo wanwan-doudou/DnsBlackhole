@@ -1,147 +1,50 @@
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import {
+  clearDnsCache as clearDnsCacheCommand,
+  clearFilterCache as clearFilterCacheCommand,
+  getConfig,
+  getQueryLogs,
+  getStatus,
+  runDnsDiagnostics as runDnsDiagnosticsCommand,
+  saveConfig as saveConfigCommand,
+  startDns,
+  stopDns,
+  updateFilters as updateFiltersCommand,
+} from "./api";
 import appIconUrl from "./app-icon.png";
+import { buildTrafficSeries, renderSparkline, runtimeWindowHours } from "./charts";
+import { query } from "./dom";
+import {
+  escapeHtml,
+  formatCount,
+  formatDuration,
+  formatLogDate,
+  formatLogTime,
+  formatPercent,
+  formatRate,
+  formatTime,
+} from "./format";
+import { renderAppTemplate } from "./template";
+import type {
+  AppConfig,
+  DnsDiagnosticsResult,
+  DnsProbeResult,
+  FilterSubscription,
+  QueryLogFilter,
+  QueryLogPage,
+  QueryLogRecord,
+  RefreshOptions,
+  RenderStatusOptions,
+  RuntimeStatus,
+  UpstreamLatencyStat,
+  UpstreamMode,
+  UpstreamRequestStat,
+  ViewName,
+} from "./types";
 import "./style.css";
-
-type ViewName = "dashboard" | "dns" | "filters" | "custom" | "logs" | "settings";
-type QueryLogFilter = "all" | "processed" | "blocked" | "failed";
-
-type FilterSubscription = {
-  id: string;
-  name: string;
-  url: string;
-  enabled: boolean;
-  rule_count: number;
-  last_updated: number | null;
-  last_error: string | null;
-};
-
-type UpstreamMode = "load_balance" | "parallel_requests" | "fastest_addr";
-
-type AppConfig = {
-  enabled: boolean;
-  use_filters: boolean;
-  listen_host: string;
-  listen_port: number;
-  upstream_dns: string;
-  upstream_mode: UpstreamMode;
-  filter_update_interval_hours: number;
-  query_log_enabled: boolean;
-  anonymize_client_ip: boolean;
-  launch_at_startup: boolean;
-  query_log_retention_hours: number;
-  dns_cache_enabled: boolean;
-  dns_cache_size: number;
-  dns_cache_min_ttl: number;
-  dns_cache_max_ttl: number;
-  dns_cache_optimistic: boolean;
-  filters: FilterSubscription[];
-  blacklist: string;
-};
-
-type RuleSummary = {
-  block_rules: number;
-  allow_rules: number;
-  ignored_rules: number;
-};
-
-type TrafficBucket = {
-  minute: number;
-  queries: number;
-  blocked: number;
-};
-
-type UpstreamRequestStat = {
-  upstream: string;
-  requests: number;
-};
-
-type UpstreamLatencyStat = {
-  upstream: string;
-  avg_ms: number;
-};
-
-type DnsStats = {
-  started_at: number | null;
-  queries: number;
-  blocked: number;
-  forwarded: number;
-  failed: number;
-  last_query: string | null;
-  last_blocked: string | null;
-  last_error: string | null;
-  query_domains?: Record<string, number>;
-  blocked_domains?: Record<string, number>;
-  traffic?: TrafficBucket[];
-  upstream_requests?: UpstreamRequestStat[];
-  upstream_avg_latency?: UpstreamLatencyStat[];
-};
-
-type RuntimeStatus = {
-  running: boolean;
-  listen_addr: string;
-  upstream_dns: string;
-  summary: RuleSummary;
-  stats: DnsStats;
-  error: string | null;
-};
-
-type QueryLogRecord = {
-  id: number;
-  timestamp: number;
-  domain: string;
-  client_ip: string | null;
-  blocked: boolean;
-  forwarded: boolean;
-  failed: boolean;
-  upstream_server: string | null;
-  upstream_duration_ms: number | null;
-  error: string | null;
-};
-
-type QueryLogPage = {
-  records: QueryLogRecord[];
-  total: number;
-  page: number;
-  page_size: number;
-};
-
-type FilterUpdateResult = {
-  status: RuntimeStatus;
-  updated: number;
-  failed: number;
-  message: string;
-};
-
-type FilterCacheClearResult = {
-  status: RuntimeStatus;
-  removed_files: number;
-  removed_bytes: number;
-  message: string;
-};
-
-type RefreshOptions = {
-  auto?: boolean;
-  button?: HTMLButtonElement;
-};
-
-type RenderStatusOptions = {
-  renderDashboard?: boolean;
-};
-
-type HistoryPoint = {
-  index: number;
-  value: number;
-  label: string;
-};
-
-type ChartPoint = HistoryPoint & {
-  x: number;
-  y: number;
-};
 
 let messageTimer = 0;
 let updateStatusTimer = 0;
@@ -151,438 +54,7 @@ if (!app) {
   throw new Error("缺少应用挂载节点");
 }
 
-app.innerHTML = `
-  <div class="app-shell">
-    <header class="app-header">
-      <div class="header-inner">
-        <div class="brand">
-          <img class="brand-mark" src="${appIconUrl}" alt="DnsBlackhole" />
-          <div>
-            <h1>DnsBlackhole</h1>
-            <span>DNS sinkhole</span>
-          </div>
-        </div>
-
-        <nav class="module-nav" aria-label="模块">
-          <button class="nav-item active" data-view="dashboard" type="button">仪表盘</button>
-          <div class="nav-menu">
-            <button class="nav-item" data-view="settings" data-nav-group="settings" type="button">设置</button>
-            <div class="nav-dropdown" role="menu">
-              <button data-view="settings" type="button" role="menuitem">常规设置</button>
-              <button data-view="dns" type="button" role="menuitem">DNS 设置</button>
-            </div>
-          </div>
-          <div class="nav-menu">
-            <button class="nav-item" data-view="filters" data-nav-group="filters" type="button">过滤器</button>
-            <div class="nav-dropdown" role="menu">
-              <button data-view="filters" type="button" role="menuitem">DNS 黑名单</button>
-              <button data-view="custom" type="button" role="menuitem">自定义过滤规则</button>
-            </div>
-          </div>
-          <button class="nav-item" data-view="logs" type="button">查询日志</button>
-        </nav>
-      </div>
-    </header>
-
-    <main class="content">
-      <section class="view active" data-view-panel="dashboard">
-        <div class="dashboard-summary" aria-label="统计趋势">
-          <article class="spark-card">
-            <div class="spark-box">
-              <strong id="queries">0</strong>
-              <svg class="sparkline" data-tooltip="query_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
-                <defs>
-                  <linearGradient id="query_spark_gradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stop-color="#7f7f7f" stop-opacity="0.82"></stop>
-                    <stop offset="64%" stop-color="#7f7f7f" stop-opacity="0.6"></stop>
-                    <stop offset="92%" stop-color="#7f7f7f" stop-opacity="0.16"></stop>
-                    <stop offset="100%" stop-color="#7f7f7f" stop-opacity="0"></stop>
-                  </linearGradient>
-                </defs>
-                <line class="spark-baseline" x1="0" y1="72" x2="260" y2="72"></line>
-                <path class="spark-area" fill="url(#query_spark_gradient)" d=""></path>
-                <path class="spark-line" id="query_sparkline" d=""></path>
-                <line class="spark-guide hidden" x1="0" y1="8" x2="0" y2="72"></line>
-                <circle class="spark-point hidden" cx="0" cy="72" r="3"></circle>
-              </svg>
-              <div class="spark-tooltip hidden" id="query_spark_tooltip"></div>
-            </div>
-            <span>DNS 查询</span>
-          </article>
-
-          <article class="spark-card blocked-spark">
-            <div class="spark-box">
-              <strong id="blocked">0</strong>
-              <small id="block_rate">0%</small>
-              <svg class="sparkline" data-tooltip="blocked_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
-                <defs>
-                  <linearGradient id="blocked_spark_gradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stop-color="#f67247" stop-opacity="0.82"></stop>
-                    <stop offset="64%" stop-color="#f67247" stop-opacity="0.6"></stop>
-                    <stop offset="92%" stop-color="#f67247" stop-opacity="0.16"></stop>
-                    <stop offset="100%" stop-color="#f67247" stop-opacity="0"></stop>
-                  </linearGradient>
-                </defs>
-                <line class="spark-baseline" x1="0" y1="72" x2="260" y2="72"></line>
-                <path class="spark-area" fill="url(#blocked_spark_gradient)" d=""></path>
-                <path class="spark-line" id="blocked_sparkline" d=""></path>
-                <line class="spark-guide hidden" x1="0" y1="8" x2="0" y2="72"></line>
-                <circle class="spark-point hidden" cx="0" cy="72" r="3"></circle>
-              </svg>
-              <div class="spark-tooltip hidden" id="blocked_spark_tooltip"></div>
-            </div>
-            <span>已被过滤器拦截</span>
-          </article>
-        </div>
-
-        <div class="dashboard-rank-grid">
-          <section class="panel rank-panel">
-            <div class="rank-title">
-              <div>
-                <h2>请求域名排行</h2>
-                <span id="query_rank_window">最近 90 天</span>
-              </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
-            </div>
-            <div class="rank-table">
-              <div class="rank-head">
-                <span>域名</span>
-                <span>请求数</span>
-              </div>
-              <div class="rank-body" id="query_rank"></div>
-            </div>
-          </section>
-
-          <section class="panel rank-panel blocked-rank">
-            <div class="rank-title">
-              <div>
-                <h2>被拦截域名排行</h2>
-                <span id="blocked_rank_window">最近 90 天</span>
-              </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
-            </div>
-            <div class="rank-table">
-              <div class="rank-head">
-                <span>域名</span>
-                <span>请求数</span>
-              </div>
-              <div class="rank-body" id="blocked_rank"></div>
-            </div>
-          </section>
-        </div>
-
-        <div class="dashboard-rank-grid upstream-rank-grid">
-          <section class="panel rank-panel">
-            <div class="rank-title">
-              <div>
-                <h2>经常请求的上游服务器</h2>
-                <span id="upstream_rank_window">最近 90 天</span>
-              </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
-            </div>
-            <div class="rank-table">
-              <div class="rank-head">
-                <span>上游服务器</span>
-                <span>请求数</span>
-              </div>
-              <div class="rank-body" id="upstream_rank"></div>
-            </div>
-          </section>
-
-          <section class="panel rank-panel">
-            <div class="rank-title">
-              <div>
-                <h2>上游服务器的平均响应时间</h2>
-                <span id="upstream_latency_window">最近 90 天</span>
-              </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
-            </div>
-            <div class="rank-table">
-              <div class="rank-head">
-                <span>上游服务器</span>
-                <span>响应时间</span>
-              </div>
-              <div class="rank-body" id="upstream_latency_rank"></div>
-            </div>
-          </section>
-        </div>
-
-      </section>
-
-      <section class="view query-log-view" data-view-panel="logs">
-        <div class="query-log-toolbar">
-          <div class="query-log-title">
-            <h2>查询日志</h2>
-            <button class="ghost-icon-button" id="query_log_refresh_btn" type="button" title="刷新查询日志">↻</button>
-          </div>
-          <label class="query-log-search">
-            <span aria-hidden="true">⌕</span>
-            <input id="query_log_search" autocomplete="off" spellcheck="false" placeholder="域名或客户端" />
-          </label>
-          <div class="query-log-filter" id="query_log_filter_menu">
-            <button class="query-log-filter-trigger" id="query_log_filter_button" type="button" aria-haspopup="listbox" aria-expanded="false">
-              <span id="query_log_filter_label">所有查询记录</span>
-              <i aria-hidden="true"></i>
-            </button>
-            <div class="query-log-filter-options" role="listbox" aria-label="查询日志筛选">
-              <button class="active" data-filter="all" type="button" role="option" aria-selected="true">所有查询记录</button>
-              <button data-filter="processed" type="button" role="option" aria-selected="false">已处理</button>
-              <button data-filter="blocked" type="button" role="option" aria-selected="false">已过滤</button>
-              <button data-filter="failed" type="button" role="option" aria-selected="false">失败</button>
-            </div>
-            <select id="query_log_filter" aria-hidden="true" tabindex="-1">
-              <option value="all">所有查询记录</option>
-              <option value="processed">已处理</option>
-              <option value="blocked">已过滤</option>
-              <option value="failed">失败</option>
-            </select>
-          </div>
-        </div>
-
-        <section class="query-log-panel">
-          <div class="query-log-head">
-            <span>时间</span>
-            <span>请求</span>
-            <span>响应</span>
-            <span>客户端</span>
-          </div>
-          <div class="query-log-body" id="query_log_body"></div>
-          <div class="query-log-pagination">
-            <span id="query_log_page_info">0 条记录</span>
-            <div class="button-group">
-              <button id="query_log_prev_btn" type="button">上一页</button>
-              <button id="query_log_next_btn" type="button">下一页</button>
-            </div>
-          </div>
-        </section>
-      </section>
-
-      <section class="view" data-view-panel="dns">
-        <section class="panel module-panel">
-          <div class="panel-title with-actions">
-            <h2>DNS 设置</h2>
-            <div class="button-group">
-              <button class="primary" id="save_btn" type="button">保存</button>
-              <button id="start_btn" type="button">启动</button>
-              <button id="stop_btn" type="button">停止</button>
-            </div>
-          </div>
-
-          <div class="settings-stack">
-            <section class="settings-section">
-              <h3>上游 DNS</h3>
-              <div class="dns-settings">
-                <label class="field upstream-field">
-                  <span>上游 DNS 服务器</span>
-                  <textarea id="upstream_dns" autocomplete="off" spellcheck="false"></textarea>
-                </label>
-                <div class="listen-settings">
-                  <label class="field">
-                    <span>监听地址</span>
-                    <input id="listen_host" autocomplete="off" spellcheck="false" placeholder="127.0.0.1" />
-                  </label>
-                  <label class="field compact-field">
-                    <span>端口</span>
-                    <input id="listen_port" type="number" min="1" max="65535" step="1" />
-                  </label>
-                </div>
-              </div>
-              <div class="radio-stack upstream-mode">
-                <label class="radio-row">
-                  <input name="upstream_mode" type="radio" value="load_balance" />
-                  <span>
-                    <strong>负载均衡</strong>
-                    <small>一次查询一台上游服务器，失败后尝试其它服务器。</small>
-                  </span>
-                </label>
-                <label class="radio-row">
-                  <input name="upstream_mode" type="radio" value="parallel_requests" />
-                  <span>
-                    <strong>并行请求</strong>
-                    <small>同时查询所有上游服务器，并使用最先成功的响应。</small>
-                  </span>
-                </label>
-                <label class="radio-row">
-                  <input name="upstream_mode" type="radio" value="fastest_addr" />
-                  <span>
-                    <strong>最快的 IP 地址</strong>
-                    <small>等待上游服务器响应，测速返回的 IP 地址，并优先采用最快的可用结果。</small>
-                  </span>
-                </label>
-              </div>
-            </section>
-
-            <section class="settings-section dns-cache-section">
-              <div class="section-heading">
-                <h3>DNS 缓存配置</h3>
-                <span>您可以在此处配置 DNS 缓存</span>
-              </div>
-              <label class="check-row">
-                <input id="dns_cache_enabled" type="checkbox" />
-                <span>
-                  <strong>启用缓存</strong>
-                  <small>在本地存储 DNS 响应，减少重复查询的上游请求延迟。</small>
-                </span>
-              </label>
-              <div class="dns-cache-grid">
-                <label class="field">
-                  <span>缓存大小</span>
-                  <small>DNS 缓存大小（单位：字节）</small>
-                  <input id="dns_cache_size" type="number" min="1024" max="536870912" step="1024" />
-                </label>
-                <label class="field">
-                  <span>覆盖最小 TTL 值</span>
-                  <small>缓存 DNS 响应时，延长从上游服务器接收到的 TTL 值（秒）。</small>
-                  <input id="dns_cache_min_ttl" type="number" min="0" max="604800" step="1" />
-                </label>
-                <label class="field">
-                  <span>覆盖最大 TTL 值</span>
-                  <small>设定 DNS 缓存条目的最大 TTL 值（秒）。</small>
-                  <input id="dns_cache_max_ttl" type="number" min="0" max="604800" step="1" />
-                </label>
-              </div>
-              <label class="check-row">
-                <input id="dns_cache_optimistic" type="checkbox" />
-                <span>
-                  <strong>乐观缓存</strong>
-                  <small>即使条目已过期，也先从缓存中响应，并在后台刷新它们。</small>
-                </span>
-              </label>
-              <button id="clear_dns_cache_btn" type="button">清除缓存</button>
-            </section>
-          </div>
-        </section>
-      </section>
-
-      <section class="view" data-view-panel="settings">
-        <section class="panel module-panel">
-          <div class="panel-title with-actions">
-            <h2>设置</h2>
-            <button class="primary" id="save_settings_btn" type="button">保存</button>
-          </div>
-
-          <div class="settings-stack">
-            <section class="settings-section">
-              <h3>常规设置</h3>
-              <label class="check-row">
-                <input id="use_filters" type="checkbox" />
-                <span>
-                  <strong>使用过滤器和 Hosts 文件以拦截指定域名</strong>
-                  <small>你可以在 DNS 黑名单和自定义过滤规则中添加过滤规则。</small>
-                </span>
-              </label>
-              <label class="field compact-select">
-                <span>过滤器更新间隔</span>
-                <select id="filter_update_interval">
-                  <option value="6">6 小时</option>
-                  <option value="12">12 小时</option>
-                  <option value="24">24 小时</option>
-                  <option value="72">3 天</option>
-                  <option value="168">7 天</option>
-                </select>
-              </label>
-              <label class="toggle-row">
-                <input id="enabled" type="checkbox" />
-                <span>启动时自动运行 DNS 服务</span>
-              </label>
-              <label class="toggle-row">
-                <input id="launch_at_startup" type="checkbox" />
-                <span>开机时启动应用</span>
-              </label>
-            </section>
-
-            <section class="settings-section cache-maintenance-section">
-              <div>
-                <h3>磁盘缓存</h3>
-                <p>清理已下载的远程黑名单缓存，不会删除配置、查询日志和统计数据。</p>
-              </div>
-              <button id="clear_filter_cache_btn" type="button">清理过滤器缓存</button>
-            </section>
-
-            <section class="settings-section">
-              <h3>日志配置</h3>
-              <label class="check-row">
-                <input id="query_log_enabled" type="checkbox" />
-                <span>
-                  <strong>启用日志</strong>
-                </span>
-              </label>
-              <label class="check-row inline-help-row">
-                <input id="anonymize_client_ip" type="checkbox" />
-                <span>
-                  <strong>匿名化客户端 IP</strong>
-                  <small>不要在日志和统计信息中保存客户端的完整 IP 地址。</small>
-                </span>
-              </label>
-              <div class="retention-settings">
-                <span class="retention-title">查询日志保留时间</span>
-                <div class="retention-options">
-                  <label><input name="query_log_retention" type="radio" value="24" /> 24 小时</label>
-                  <label><input name="query_log_retention" type="radio" value="168" /> 7 天</label>
-                  <label><input name="query_log_retention" type="radio" value="720" /> 30 天</label>
-                  <label><input name="query_log_retention" type="radio" value="2160" /> 90 天</label>
-                  <label><input name="query_log_retention" type="radio" value="4320" /> 180 天</label>
-                  <label><input name="query_log_retention" type="radio" value="8640" /> 360 天</label>
-                  <label><input name="query_log_retention" type="radio" value="custom" /> 自定义</label>
-                </div>
-                <label class="field custom-retention-field" id="custom_retention_field">
-                  <span>自定义保留时间（小时）</span>
-                  <input id="query_log_retention_custom" type="number" min="1" max="8760" step="1" placeholder="例如 120" />
-                </label>
-              </div>
-            </section>
-
-            <section class="settings-section about-section">
-              <h3>关于与更新</h3>
-              <div class="about-row">
-                <span class="about-version">DnsBlackhole v<span id="app_version">-</span></span>
-                <div class="button-group update-actions">
-                  <button id="check_update_btn" type="button">检查更新</button>
-                  <button class="primary hidden" id="install_update_btn" type="button">下载并安装</button>
-                  <button class="hidden" id="manual_download_btn" type="button">浏览器下载</button>
-                </div>
-              </div>
-              <div class="update-status hidden" id="update_status"></div>
-            </section>
-          </div>
-        </section>
-      </section>
-
-      <section class="view" data-view-panel="filters">
-        <section class="panel module-panel">
-          <div class="panel-title with-actions">
-            <h2>DNS 黑名单</h2>
-            <div class="button-group">
-              <button id="add_filter_btn" type="button">添加黑名单</button>
-              <button class="primary" id="update_filters_btn" type="button">检查更新</button>
-            </div>
-          </div>
-          <div class="filters-table">
-            <div class="filters-head">
-              <span>启用</span>
-              <span>名称</span>
-              <span>规则数</span>
-              <span>上次更新</span>
-              <span>状态</span>
-              <span>操作</span>
-            </div>
-            <div id="filters_body" class="filters-body"></div>
-          </div>
-        </section>
-      </section>
-
-      <section class="view" data-view-panel="custom">
-        <section class="panel module-panel">
-          <div class="panel-title with-actions">
-            <h2>自定义过滤规则</h2>
-            <button class="primary" id="save_custom_btn" type="button">保存</button>
-          </div>
-          <textarea id="blacklist" spellcheck="false"></textarea>
-        </section>
-      </section>
-    </main>
-  </div>
-`;
+app.innerHTML = renderAppTemplate(appIconUrl);
 
 let activeView: ViewName = "dashboard";
 let filtersState: FilterSubscription[] = [];
@@ -602,6 +74,7 @@ let queryLogRefreshInFlight = false;
 let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
 let queryLogSearchComposing = false;
+let currentConfigSchemaVersion = 2;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const QUERY_LOG_PAGE_SIZE = 50;
@@ -611,40 +84,19 @@ const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 2_500, 5_000];
 const CHECK_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
 
-// 缓存 Intl 格式化器：构造开销较大，仪表盘每 5 秒刷新会高频调用（sparkline 标签单轮达数十次），复用可避免重复创建
-const countFormatter = new Intl.NumberFormat("zh-CN");
-const percentFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
-const filterTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-});
-const sparkDateFormatter = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" });
-const sparkTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false,
-});
-const logTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hour12: false,
-});
-const logDateFormatter = new Intl.DateTimeFormat("zh-CN", {
-  year: "numeric",
-  month: "numeric",
-  day: "numeric",
-});
-
 const contentElement = query<HTMLDivElement>(".content");
 const enabledInput = query<HTMLInputElement>("#enabled");
 const launchAtStartupInput = query<HTMLInputElement>("#launch_at_startup");
 const useFiltersInput = query<HTMLInputElement>("#use_filters");
 const upstreamInput = query<HTMLTextAreaElement>("#upstream_dns");
+const fallbackInput = query<HTMLTextAreaElement>("#fallback_dns");
+const bootstrapInput = query<HTMLTextAreaElement>("#bootstrap_dns");
 const listenHostInput = query<HTMLInputElement>("#listen_host");
 const listenPortInput = query<HTMLInputElement>("#listen_port");
+const allowedClientsInput = query<HTMLTextAreaElement>("#allowed_clients");
+const blockedClientsInput = query<HTMLTextAreaElement>("#blocked_clients");
+const rateLimitPerSecondInput = query<HTMLInputElement>("#rate_limit_per_second");
+const refuseAnyInput = query<HTMLInputElement>("#refuse_any");
 const filterUpdateIntervalInput = query<HTMLSelectElement>("#filter_update_interval");
 const upstreamModeInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="upstream_mode"]'),
@@ -661,17 +113,24 @@ const dnsCacheSizeInput = query<HTMLInputElement>("#dns_cache_size");
 const dnsCacheMinTtlInput = query<HTMLInputElement>("#dns_cache_min_ttl");
 const dnsCacheMaxTtlInput = query<HTMLInputElement>("#dns_cache_max_ttl");
 const dnsCacheOptimisticInput = query<HTMLInputElement>("#dns_cache_optimistic");
+const diagnosticsDomainInput = query<HTMLInputElement>("#diagnostics_domain");
+const diagnosticsResult = query<HTMLDivElement>("#diagnostics_result");
+const runtimeWatchdogEnabledInput = query<HTMLInputElement>("#runtime_watchdog_enabled");
+const runtimeWatchdogIntervalInput = query<HTMLInputElement>("#runtime_watchdog_interval_seconds");
 const blacklistInput = query<HTMLTextAreaElement>("#blacklist");
 const filtersTable = query<HTMLDivElement>(".filters-table");
 const filtersBody = query<HTMLDivElement>("#filters_body");
 const saveButton = query<HTMLButtonElement>("#save_btn");
 const saveSettingsButton = query<HTMLButtonElement>("#save_settings_btn");
+const saveSecurityButton = query<HTMLButtonElement>("#save_security_btn");
+const saveDiagnosticsButton = query<HTMLButtonElement>("#save_diagnostics_btn");
 const saveCustomButton = query<HTMLButtonElement>("#save_custom_btn");
 const startButton = query<HTMLButtonElement>("#start_btn");
 const stopButton = query<HTMLButtonElement>("#stop_btn");
 const addFilterButton = query<HTMLButtonElement>("#add_filter_btn");
 const updateFiltersButton = query<HTMLButtonElement>("#update_filters_btn");
 const clearDnsCacheButton = query<HTMLButtonElement>("#clear_dns_cache_btn");
+const runDiagnosticsButton = query<HTMLButtonElement>("#run_diagnostics_btn");
 const clearFilterCacheButton = query<HTMLButtonElement>("#clear_filter_cache_btn");
 const appVersionElement = query<HTMLElement>("#app_version");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
@@ -845,6 +304,7 @@ contentElement.addEventListener("scroll", markContentScrolling, { passive: true 
 
 queryLogEnabledInput.addEventListener("change", updateLogControls);
 dnsCacheEnabledInput.addEventListener("change", updateDnsCacheControls);
+runtimeWatchdogEnabledInput.addEventListener("change", updateRuntimeWatchdogControls);
 queryLogRetentionInputs.forEach((input) => {
   input.addEventListener("change", () => {
     updateLogControls();
@@ -862,6 +322,14 @@ saveSettingsButton.addEventListener("click", async () => {
   await saveConfig();
 });
 
+saveSecurityButton.addEventListener("click", async () => {
+  await saveConfig();
+});
+
+saveDiagnosticsButton.addEventListener("click", async () => {
+  await saveConfig();
+});
+
 saveCustomButton.addEventListener("click", async () => {
   await saveConfig();
 });
@@ -870,7 +338,7 @@ startButton.addEventListener("click", async () => {
   setBusy(true);
   try {
     await saveConfigOnly();
-    const status = await invoke<RuntimeStatus>("start_dns");
+    const status = await startDns();
     renderStatus(status);
     showMessage("DNS 服务已启动", false);
     await loadConfig();
@@ -883,7 +351,7 @@ startButton.addEventListener("click", async () => {
 });
 
 stopButton.addEventListener("click", async () => {
-  await runStatusAction(() => invoke<RuntimeStatus>("stop_dns"), "DNS 服务已停止");
+  await runStatusAction(() => stopDns(), "DNS 服务已停止");
 });
 
 addFilterButton.addEventListener("click", () => {
@@ -909,7 +377,7 @@ updateFiltersButton.addEventListener("click", async () => {
   setBusy(true);
   try {
     await waitForPaint();
-    const result = await invoke<FilterUpdateResult>("update_filters", { config: collectConfig() });
+    const result = await updateFiltersCommand(collectConfig());
     renderStatus(result.status);
     showMessage(result.message, result.failed > 0);
     await loadConfig();
@@ -925,7 +393,7 @@ updateFiltersButton.addEventListener("click", async () => {
 clearDnsCacheButton.addEventListener("click", async () => {
   setBusy(true);
   try {
-    const status = await invoke<RuntimeStatus>("clear_dns_cache");
+    const status = await clearDnsCacheCommand();
     renderStatus(status);
     showMessage("DNS 缓存已清除", false);
   } catch (error) {
@@ -933,6 +401,29 @@ clearDnsCacheButton.addEventListener("click", async () => {
   } finally {
     setBusy(false);
     updateDnsCacheControls();
+  }
+});
+
+runDiagnosticsButton.addEventListener("click", async () => {
+  setBusy(true);
+  runDiagnosticsButton.classList.add("loading");
+  renderDiagnosticsLoading();
+  try {
+    const status = await saveConfigOnly();
+    renderStatus(status, { renderDashboard: activeView === "dashboard" });
+    const result = await runDnsDiagnosticsCommand();
+    renderDiagnosticsResult(result);
+    showMessage(
+      result.udp.ok && result.tcp.ok ? "DNS 诊断完成" : "DNS 诊断发现异常",
+      !(result.udp.ok && result.tcp.ok),
+    );
+    await loadConfig();
+  } catch (error) {
+    showMessage(String(error), true);
+    await refreshStatus();
+  } finally {
+    runDiagnosticsButton.classList.remove("loading");
+    setBusy(false);
   }
 });
 
@@ -947,7 +438,7 @@ clearFilterCacheButton.addEventListener("click", async () => {
   setBusy(true);
   clearFilterCacheButton.classList.add("loading");
   try {
-    const result = await invoke<FilterCacheClearResult>("clear_filter_cache");
+    const result = await clearFilterCacheCommand();
     renderStatus(result.status);
     showMessage(result.message, false);
     await loadConfig();
@@ -1111,13 +602,20 @@ document.addEventListener("visibilitychange", () => {
 
 async function loadConfig(): Promise<void> {
   try {
-    const config = await invoke<AppConfig>("get_config");
+    const config = await getConfig();
+    currentConfigSchemaVersion = config.schema_version;
     enabledInput.checked = config.enabled;
     launchAtStartupInput.checked = config.launch_at_startup;
     useFiltersInput.checked = config.use_filters;
     upstreamInput.value = config.upstream_dns;
+    fallbackInput.value = config.fallback_dns;
+    bootstrapInput.value = config.bootstrap_dns;
     listenHostInput.value = config.listen_host;
     listenPortInput.value = String(config.listen_port);
+    allowedClientsInput.value = config.allowed_clients;
+    blockedClientsInput.value = config.blocked_clients;
+    rateLimitPerSecondInput.value = String(config.rate_limit_per_second);
+    refuseAnyInput.checked = config.refuse_any;
     filterUpdateIntervalInput.value = String(config.filter_update_interval_hours);
     setRadioValue(upstreamModeInputs, config.upstream_mode);
     queryLogEnabledInput.checked = config.query_log_enabled;
@@ -1128,11 +626,15 @@ async function loadConfig(): Promise<void> {
     dnsCacheMinTtlInput.value = String(config.dns_cache_min_ttl);
     dnsCacheMaxTtlInput.value = String(config.dns_cache_max_ttl);
     dnsCacheOptimisticInput.checked = config.dns_cache_optimistic;
+    diagnosticsDomainInput.value = config.diagnostics_domain;
+    runtimeWatchdogEnabledInput.checked = config.runtime_watchdog_enabled;
+    runtimeWatchdogIntervalInput.value = String(config.runtime_watchdog_interval_seconds);
     currentQueryLogEnabled = config.query_log_enabled;
     currentQueryLogRetentionHours = config.query_log_retention_hours;
     renderRetentionWindow();
     updateLogControls();
     updateDnsCacheControls();
+    updateRuntimeWatchdogControls();
     blacklistInput.value = config.blacklist;
     filtersState = config.filters;
     renderFilters();
@@ -1146,16 +648,23 @@ async function saveConfig(): Promise<void> {
 }
 
 async function saveConfigOnly(): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("save_config", { config: collectConfig() });
+  return saveConfigCommand(collectConfig());
 }
 
 function collectConfig(): AppConfig {
   return {
+    schema_version: currentConfigSchemaVersion,
     enabled: enabledInput.checked,
     launch_at_startup: launchAtStartupInput.checked,
     use_filters: useFiltersInput.checked,
     upstream_dns: upstreamInput.value.trim(),
+    fallback_dns: fallbackInput.value.trim(),
+    bootstrap_dns: bootstrapInput.value.trim(),
     upstream_mode: selectedRadioValue(upstreamModeInputs, "load_balance") as UpstreamMode,
+    allowed_clients: allowedClientsInput.value.trim(),
+    blocked_clients: blockedClientsInput.value.trim(),
+    rate_limit_per_second: Number(rateLimitPerSecondInput.value || 0),
+    refuse_any: refuseAnyInput.checked,
     filter_update_interval_hours: Number(filterUpdateIntervalInput.value),
     query_log_enabled: queryLogEnabledInput.checked,
     anonymize_client_ip: anonymizeClientIpInput.checked,
@@ -1165,6 +674,9 @@ function collectConfig(): AppConfig {
     dns_cache_min_ttl: Number(dnsCacheMinTtlInput.value || 0),
     dns_cache_max_ttl: Number(dnsCacheMaxTtlInput.value || 0),
     dns_cache_optimistic: dnsCacheOptimisticInput.checked,
+    diagnostics_domain: diagnosticsDomainInput.value.trim(),
+    runtime_watchdog_enabled: runtimeWatchdogEnabledInput.checked,
+    runtime_watchdog_interval_seconds: Number(runtimeWatchdogIntervalInput.value || 0),
     listen_host: listenHostInput.value.trim(),
     listen_port: Number(listenPortInput.value),
     filters: filtersState.map((filter) => ({
@@ -1188,7 +700,7 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
   refreshInFlight = true;
   setRefreshButtonState(options.button, true);
   try {
-    const status = await invoke<RuntimeStatus>("get_status", { force: options.auto !== true });
+    const status = await getStatus(options.auto !== true);
     renderStatus(status, { renderDashboard: activeView === "dashboard" });
   } catch (error) {
     showMessage(String(error), true);
@@ -1197,7 +709,6 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
     setRefreshButtonState(options.button, false);
   }
 }
-
 function scheduleQueryLogSearch(): void {
   if (queryLogSearchComposing) {
     return;
@@ -1222,7 +733,7 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
   try {
     const requestedFilter = queryLogFilterInput.value as QueryLogFilter;
     const requestedSearch = queryLogSearchInput.value.trim();
-    const page = await invoke<QueryLogPage>("get_query_logs", {
+    const page = await getQueryLogs({
       filter: requestedFilter,
       search: requestedSearch,
       page: queryLogPage,
@@ -1276,7 +787,8 @@ function setActiveView(view: ViewName): void {
     const isFilterGroup =
       button.dataset.navGroup === "filters" && (view === "filters" || view === "custom");
     const isSettingsGroup =
-      button.dataset.navGroup === "settings" && (view === "settings" || view === "dns");
+      button.dataset.navGroup === "settings" &&
+      (view === "settings" || view === "dns" || view === "security");
     button.classList.toggle(
       "active",
       button.dataset.view === view || isFilterGroup || isSettingsGroup,
@@ -1374,7 +886,48 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
     status.stats.forwarded,
   );
   renderUpstreamLatencyRank("#upstream_latency_rank", status.stats.upstream_avg_latency ?? []);
+}
 
+function renderDiagnosticsLoading(): void {
+  setHtmlIfChanged(diagnosticsResult, `<div class="diagnostic-empty">正在运行诊断</div>`);
+}
+
+function renderDiagnosticsResult(result: DnsDiagnosticsResult): void {
+  const html = `
+    <div class="diagnostic-meta">
+      <span>监听地址</span>
+      <strong>${escapeHtml(result.listen_addr)}</strong>
+    </div>
+    <div class="diagnostic-meta">
+      <span>诊断域名</span>
+      <strong>${escapeHtml(result.domain)}</strong>
+    </div>
+    <div class="diagnostic-probes">
+      ${renderDiagnosticProbe("UDP", result.udp)}
+      ${renderDiagnosticProbe("TCP", result.tcp)}
+    </div>
+  `;
+  setHtmlIfChanged(diagnosticsResult, html);
+}
+
+function renderDiagnosticProbe(label: string, probe: DnsProbeResult): string {
+  const stateLabel = probe.ok ? "正常" : "失败";
+  const parts = [
+    probe.duration_ms !== null ? `${formatCount(probe.duration_ms)} ms` : "",
+    probe.rcode !== null ? `rcode ${formatCount(probe.rcode)}` : "",
+    probe.answers !== null ? `${formatCount(probe.answers)} 条答案` : "",
+  ].filter(Boolean);
+
+  return `
+    <div class="diagnostic-probe ${probe.ok ? "ok" : "failed"}">
+      <div>
+        <strong>${label}</strong>
+        <span>${stateLabel}</span>
+      </div>
+      <small>${escapeHtml(parts.join(" · ") || "-")}</small>
+      ${probe.error ? `<p>${escapeHtml(probe.error)}</p>` : ""}
+    </div>
+  `;
 }
 
 function renderQueryLogs(page: QueryLogPage): void {
@@ -1610,6 +1163,10 @@ function updateDnsCacheControls(): void {
   clearDnsCacheButton.disabled = !enabled;
 }
 
+function updateRuntimeWatchdogControls(): void {
+  runtimeWatchdogIntervalInput.disabled = !runtimeWatchdogEnabledInput.checked;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -1815,210 +1372,6 @@ function updateFilterField(id: string, target: HTMLInputElement): void {
     }
     return filter;
   });
-}
-
-function buildTrafficSeries(
-  buckets: TrafficBucket[] | undefined,
-  field: "queries" | "blocked",
-  windowHours: number,
-): HistoryPoint[] {
-  const pointCount = 48;
-  const latestMinute = Math.floor(Date.now() / 60000);
-  const windowMinutes = Math.max(pointCount, Math.ceil(windowHours * 60));
-  const bucketMinutes = Math.max(1, Math.ceil(windowMinutes / pointCount));
-  const firstMinute = latestMinute - bucketMinutes * pointCount + 1;
-  const values = Array.from({ length: pointCount }, (_, index) => {
-    const minute = firstMinute + index * bucketMinutes;
-    return {
-      index,
-      value: 0,
-      label: formatSparkBucketLabel(minute, bucketMinutes),
-    };
-  });
-
-  for (const bucket of buckets ?? []) {
-    const index = Math.floor((bucket.minute - firstMinute) / bucketMinutes);
-    if (index >= 0 && index < pointCount) {
-      values[index].value += bucket[field];
-    }
-  }
-
-  return values;
-}
-
-function renderSparkline(selector: string, series: HistoryPoint[]): void {
-  const line = query<SVGPathElement>(selector);
-  const svg = line.ownerSVGElement;
-  if (!svg) {
-    return;
-  }
-
-  const area = svg.querySelector<SVGPathElement>(".spark-area");
-  if (!area) {
-    return;
-  }
-
-  const width = 260;
-  const baseline = 72;
-  const top = 8;
-  const maxValue = Math.max(...series.map((point) => point.value), 1);
-  const coords = series.map<ChartPoint>((point, index) => {
-    const x = series.length === 1 ? width : (index / (series.length - 1)) * width;
-    const y = baseline - (point.value / maxValue) * (baseline - top);
-    return { ...point, x, y };
-  });
-  const linePath = buildMonotonePath(coords);
-  const areaPath = buildAreaPath(coords, baseline);
-
-  if (line.getAttribute("d") !== linePath) {
-    line.setAttribute("d", linePath);
-  }
-  if (area.getAttribute("d") !== areaPath) {
-    area.setAttribute("d", areaPath);
-  }
-
-  bindSparklineHover(svg, coords, width);
-}
-
-function buildAreaPath(points: ChartPoint[], baseline: number): string {
-  const linePath = buildMonotonePath(points);
-  if (!linePath || points.length === 0) {
-    return "";
-  }
-
-  const first = points[0];
-  const last = points[points.length - 1];
-  return `${linePath} L ${last.x.toFixed(1)} ${baseline.toFixed(1)} L ${first.x.toFixed(1)} ${baseline.toFixed(1)} Z`;
-}
-
-function buildMonotonePath(points: ChartPoint[]): string {
-  if (points.length === 0) {
-    return "";
-  }
-  if (points.length === 1) {
-    const point = points[0];
-    return `M ${point.x.toFixed(1)} ${point.y.toFixed(1)}`;
-  }
-
-  const slopes = points.slice(0, -1).map((point, index) => {
-    const next = points[index + 1];
-    return (next.y - point.y) / (next.x - point.x || 1);
-  });
-  const tangents = points.map((_, index) => {
-    if (index === 0) {
-      return slopes[0];
-    }
-    if (index === points.length - 1) {
-      return slopes[slopes.length - 1];
-    }
-
-    const prev = slopes[index - 1];
-    const next = slopes[index];
-    return prev * next <= 0 ? 0 : (prev + next) / 2;
-  });
-
-  let path = `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`;
-  for (let index = 0; index < points.length - 1; index += 1) {
-    const current = points[index];
-    const next = points[index + 1];
-    const dx = next.x - current.x;
-    const cp1x = current.x + dx / 3;
-    const cp1y = current.y + (tangents[index] * dx) / 3;
-    const cp2x = next.x - dx / 3;
-    const cp2y = next.y - (tangents[index + 1] * dx) / 3;
-    path += ` C ${cp1x.toFixed(1)} ${cp1y.toFixed(1)}, ${cp2x.toFixed(1)} ${cp2y.toFixed(1)}, ${next.x.toFixed(1)} ${next.y.toFixed(1)}`;
-  }
-
-  return path;
-}
-
-function bindSparklineHover(svg: SVGSVGElement, coords: ChartPoint[], width: number): void {
-  const guide = svg.querySelector<SVGLineElement>(".spark-guide");
-  const point = svg.querySelector<SVGCircleElement>(".spark-point");
-  const tooltipId = svg.dataset.tooltip;
-  const tooltip = tooltipId ? query<HTMLDivElement>(`#${tooltipId}`) : null;
-  if (!guide || !point || !tooltip) {
-    return;
-  }
-
-  const hideTooltip = () => {
-    guide.classList.add("hidden");
-    point.classList.add("hidden");
-    tooltip.classList.add("hidden");
-  };
-
-  svg.onpointerleave = hideTooltip;
-  svg.onpointermove = (event) => {
-    if (coords.length === 0) {
-      hideTooltip();
-      return;
-    }
-
-    const rect = svg.getBoundingClientRect();
-    const relativeX = clamp(((event.clientX - rect.left) / rect.width) * width, 0, width);
-    const nearest = coords.reduce((best, current) =>
-      Math.abs(current.x - relativeX) < Math.abs(best.x - relativeX) ? current : best,
-    );
-
-    guide.setAttribute("x1", nearest.x.toFixed(1));
-    guide.setAttribute("x2", nearest.x.toFixed(1));
-    point.setAttribute("cx", nearest.x.toFixed(1));
-    point.setAttribute("cy", nearest.y.toFixed(1));
-    tooltip.innerHTML = `<strong>${formatCount(nearest.value)}</strong><span>${escapeHtml(nearest.label)}</span>`;
-
-    // 先显示再测量：.hidden 为 display:none 时取不到 tooltip 的真实尺寸
-    guide.classList.remove("hidden");
-    point.classList.remove("hidden");
-    tooltip.classList.remove("hidden");
-
-    const host = svg.parentElement;
-    const hostRect = host?.getBoundingClientRect();
-    if (!hostRect) {
-      return;
-    }
-    const svgRect = svg.getBoundingClientRect();
-    const pointLeft = svgRect.left - hostRect.left + (nearest.x / width) * svgRect.width;
-    const pointTop = svgRect.top - hostRect.top + (nearest.y / 78) * svgRect.height;
-
-    // tooltip 位于 overflow:hidden 的卡片内，按其真实尺寸把锚点收敛到卡片范围内，避免溢出被裁切。
-    // CSS transform 为 translate(-50%, -105%)：水平相对锚点居中，垂直向上偏移自身高度的 105%
-    const margin = 8;
-    const halfWidth = tooltip.offsetWidth / 2;
-    const tooltipHeight = tooltip.offsetHeight;
-    const minLeft = halfWidth + margin;
-    const maxLeft = Math.max(minLeft, hostRect.width - halfWidth - margin);
-    const minTop = tooltipHeight * 1.05 + margin;
-    const maxTop = Math.max(minTop, hostRect.height - tooltipHeight * 0.05 - margin);
-    tooltip.style.left = `${clamp(pointLeft, minLeft, maxLeft)}px`;
-    tooltip.style.top = `${clamp(pointTop, minTop, maxTop)}px`;
-  };
-}
-
-function runtimeWindowHours(startedAt: number | null): number {
-  if (!startedAt) {
-    return 1;
-  }
-  const elapsedSeconds = Math.max(60, Date.now() / 1000 - startedAt);
-  return Math.max(1, Math.ceil(elapsedSeconds / 3600));
-}
-
-function formatSparkBucketLabel(minute: number, bucketMinutes: number): string {
-  const start = new Date(minute * 60000);
-  const end = new Date((minute + bucketMinutes - 1) * 60000);
-
-  if (bucketMinutes >= 24 * 60) {
-    const startLabel = sparkDateFormatter.format(start);
-    const endLabel = sparkDateFormatter.format(end);
-    return startLabel === endLabel ? startLabel : `${startLabel} - ${endLabel}`;
-  }
-
-  const startLabel = sparkTimeFormatter.format(start);
-  const endLabel = sparkTimeFormatter.format(end);
-  return startLabel === endLabel ? startLabel : `${startLabel} - ${endLabel}`;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(Math.max(value, min), max);
 }
 
 function renderRankTable(
@@ -2240,61 +1593,4 @@ function showMessage(value: string, isError: boolean): void {
     // 错误消息 8 秒后自动消失
     messageTimer = window.setTimeout(dismiss, 8000);
   }
-}
-
-
-function formatCount(value: number): string {
-  return countFormatter.format(value);
-}
-
-function formatRate(blocked: number, queries: number): string {
-  if (queries === 0) {
-    return "0%";
-  }
-  return `${Math.round((blocked / queries) * 100)}%`;
-}
-
-function formatPercent(value: number): string {
-  return `${percentFormatter.format(value * 100)}%`;
-}
-
-function formatDuration(hours: number): string {
-  if (hours % (24 * 30) === 0) {
-    return `${hours / (24 * 30)} 个月`;
-  }
-  if (hours % 24 === 0) {
-    return `${hours / 24} 天`;
-  }
-  return `${hours} 小时`;
-}
-
-function formatTime(value: number | null): string {
-  if (!value) {
-    return "-";
-  }
-  return filterTimeFormatter.format(new Date(value * 1000));
-}
-
-function formatLogTime(value: number): string {
-  return logTimeFormatter.format(new Date(value * 1000));
-}
-
-function formatLogDate(value: number): string {
-  return logDateFormatter.format(new Date(value * 1000));
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function query<T extends Element = HTMLElement>(selector: string): T {
-  const element = document.querySelector<T>(selector);
-  if (!element) {
-    throw new Error(`找不到元素：${selector}`);
-  }
-  return element;
 }

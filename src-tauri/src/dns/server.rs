@@ -1,0 +1,542 @@
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+
+use crate::{config::AppConfig, database::Database};
+
+use super::{
+    access::ClientAccess,
+    cache::{DnsCacheConfig, DnsCacheStore},
+    rules::compile_rules,
+    stats::{DnsStats, record_error, reset_stats},
+    upstream::build_runtime_upstreams,
+    worker::{
+        DnsResponseTarget, DnsWorkItem, DnsWorkerContext, PENDING_QUERY_SHARDS, PendingQueries,
+        QueryLogMessage, dns_worker_loop,
+    },
+};
+
+const UDP_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const TCP_ACCEPT_SLEEP: Duration = Duration::from_millis(100);
+const TCP_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const TCP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const TCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const TCP_MAX_CONNECTIONS: usize = 256;
+const DNS_WORK_QUEUE_CAPACITY: usize = 8192;
+const QUERY_LOG_QUEUE_CAPACITY: usize = 16384;
+const QUERY_LOG_BATCH_SIZE: usize = 128;
+const QUERY_LOG_BATCH_WAIT_TIMEOUT: Duration = Duration::from_millis(10);
+const DNS_MIN_WORKERS: usize = 4;
+const DNS_MAX_WORKERS: usize = 32;
+const DNS_CACHE_SHARDS: usize = 64;
+
+pub struct DnsServer {
+    listen_addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+    cache: Option<Arc<DnsCacheStore>>,
+}
+
+impl DnsServer {
+    pub fn start(
+        config: AppConfig,
+        rules_text: String,
+        stats: Arc<Mutex<DnsStats>>,
+        database: Arc<Database>,
+    ) -> Result<Self, String> {
+        config.validate()?;
+
+        let listen_addr = config.listen_socket_addr()?;
+        let upstream_servers = Arc::new(build_runtime_upstreams(config.upstream_servers()?)?);
+        let fallback_upstream_servers =
+            Arc::new(build_runtime_upstreams(config.fallback_servers()?)?);
+        let upstream_mode = config.upstream_mode.clone();
+        let query_log_enabled = config.query_log_enabled;
+        let anonymize_client_ip = config.anonymize_client_ip;
+        let access = Arc::new(ClientAccess::from_config(&config)?);
+        let refuse_any = config.refuse_any;
+        let dns_cache_config = DnsCacheConfig::from_config(&config);
+        let dns_cache =
+            DnsCacheStore::from_config(dns_cache_config.clone(), DNS_CACHE_SHARDS).map(Arc::new);
+        let dns_cache_config = dns_cache.as_ref().map(|_| dns_cache_config);
+        let rules = Arc::new(compile_rules(&rules_text));
+        let socket =
+            UdpSocket::bind(listen_addr).map_err(|e| format!("监听 {listen_addr} 失败：{e}"))?;
+        configure_udp_listener_socket(&socket)?;
+        socket
+            .set_read_timeout(Some(UDP_READ_TIMEOUT))
+            .map_err(|e| format!("设置 DNS 读取超时失败：{e}"))?;
+        let socket = Arc::new(socket);
+        let tcp_listener = TcpListener::bind(listen_addr)
+            .map_err(|e| format!("监听 TCP {listen_addr} 失败：{e}"))?;
+        tcp_listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("设置 TCP DNS 非阻塞监听失败：{e}"))?;
+        let tcp_listener = Arc::new(tcp_listener);
+
+        reset_stats(&stats);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+
+        let mut query_log_thread = None;
+        let query_log_sender = if query_log_enabled {
+            let (sender, receiver) = mpsc::sync_channel(QUERY_LOG_QUEUE_CAPACITY);
+            query_log_thread = Some(spawn_query_log_writer(Arc::clone(&database), receiver));
+            Some(sender)
+        } else {
+            None
+        };
+
+        let worker_context = Arc::new(DnsWorkerContext {
+            socket: Arc::clone(&socket),
+            upstream_servers,
+            fallback_upstream_servers,
+            upstream_mode,
+            next_upstream: AtomicUsize::new(0),
+            fallback_next_upstream: AtomicUsize::new(0),
+            access,
+            refuse_any,
+            rules,
+            stats: Arc::clone(&stats),
+            dns_cache: dns_cache.clone(),
+            dns_cache_config,
+            pending_queries: Arc::new(PendingQueries::new(PENDING_QUERY_SHARDS)),
+            query_log_sender,
+            anonymize_client_ip,
+            detailed_runtime_stats: !query_log_enabled,
+        });
+
+        let worker_count = dns_worker_count();
+        let worker_queue_capacity = dns_worker_queue_capacity(worker_count);
+        let mut work_senders = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (work_sender, work_receiver) = mpsc::sync_channel(worker_queue_capacity);
+            work_senders.push(work_sender);
+            let worker_context = Arc::clone(&worker_context);
+            let worker_stop = Arc::clone(&stop);
+            threads.push(thread::spawn(move || {
+                dns_worker_loop(work_receiver, worker_context, worker_stop);
+            }));
+        }
+
+        let tcp_listener = Arc::clone(&tcp_listener);
+        let tcp_work_senders = work_senders.clone();
+        let tcp_stats = Arc::clone(&stats);
+        let tcp_stop = Arc::clone(&stop);
+        threads.push(thread::spawn(move || {
+            serve_tcp(tcp_listener, tcp_work_senders, tcp_stats, tcp_stop);
+        }));
+
+        let listener_socket = Arc::clone(&socket);
+        let listener_stats = Arc::clone(&stats);
+        let listener_stop = Arc::clone(&stop);
+        threads.push(thread::spawn(move || {
+            serve_udp(listener_socket, work_senders, listener_stats, listener_stop);
+        }));
+        if let Some(thread) = query_log_thread {
+            threads.push(thread);
+        }
+
+        Ok(Self {
+            listen_addr,
+            stop,
+            threads,
+            cache: dns_cache,
+        })
+    }
+
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
+
+    pub fn clear_cache(&self) -> Result<(), String> {
+        if let Some(cache) = &self.cache {
+            cache.clear();
+        }
+        Ok(())
+    }
+
+    pub fn has_finished_threads(&self) -> bool {
+        self.threads.iter().any(JoinHandle::is_finished)
+    }
+
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn configure_udp_listener_socket(socket: &UdpSocket) -> Result<(), String> {
+    use std::{ffi::c_void, io, os::windows::io::AsRawSocket, ptr};
+
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn WSAIoctl(
+            _: usize,
+            _: u32,
+            _: *mut c_void,
+            _: u32,
+            _: *mut c_void,
+            _: u32,
+            _: *mut u32,
+            _: *mut c_void,
+            _: *mut c_void,
+        ) -> i32;
+    }
+
+    // Windows 默认会把 UDP ICMP reset 映射成下一次 recv_from 的 WSAECONNRESET。
+    // DNS 监听端不应因为客户端端口关闭而中断接收循环，所以关闭该通知。
+    let mut behavior = 0_u32;
+    let mut bytes_returned = 0_u32;
+    let result = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as usize,
+            SIO_UDP_CONNRESET,
+            (&mut behavior as *mut u32).cast::<c_void>(),
+            std::mem::size_of_val(&behavior) as u32,
+            ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "关闭 Windows UDP reset 通知失败：{}",
+            io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn configure_udp_listener_socket(_socket: &UdpSocket) -> Result<(), String> {
+    Ok(())
+}
+
+fn dns_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|count| count.get().saturating_mul(2))
+        .unwrap_or(DNS_MIN_WORKERS)
+        .clamp(DNS_MIN_WORKERS, DNS_MAX_WORKERS)
+}
+
+fn dns_worker_queue_capacity(worker_count: usize) -> usize {
+    DNS_WORK_QUEUE_CAPACITY
+        .checked_div(worker_count.max(1))
+        .unwrap_or(DNS_WORK_QUEUE_CAPACITY)
+        .max(1)
+}
+
+fn spawn_query_log_writer(
+    database: Arc<Database>,
+    receiver: mpsc::Receiver<QueryLogMessage>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut batch = Vec::with_capacity(QUERY_LOG_BATCH_SIZE);
+
+        while let Ok(message) = receiver.recv() {
+            batch.push((message.entry, message.anonymize_client_ip));
+
+            while batch.len() < QUERY_LOG_BATCH_SIZE {
+                match receiver.recv_timeout(QUERY_LOG_BATCH_WAIT_TIMEOUT) {
+                    Ok(message) => batch.push((message.entry, message.anonymize_client_ip)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            if let Err(error) = database.insert_query_logs(&batch) {
+                eprintln!("{error}");
+            }
+            batch.clear();
+        }
+    })
+}
+
+fn serve_udp(
+    socket: Arc<UdpSocket>,
+    work_senders: Vec<mpsc::SyncSender<DnsWorkItem>>,
+    stats: Arc<Mutex<DnsStats>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut buffer = [0_u8; 4096];
+    let mut next_worker = 0_usize;
+
+    while !stop.load(Ordering::Relaxed) {
+        let (len, client_addr) = match socket.recv_from(&mut buffer) {
+            Ok(received) => received,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(error) => {
+                record_error(&stats, format!("接收 DNS 请求失败：{error}"));
+                continue;
+            }
+        };
+
+        if len == 0 {
+            continue;
+        }
+
+        let work_item = DnsWorkItem {
+            query: buffer[..len].to_vec(),
+            client_addr,
+            response_target: DnsResponseTarget::Udp(client_addr),
+        };
+        match dispatch_dns_work(&work_senders, work_item, &mut next_worker) {
+            Ok(()) => {}
+            Err(DispatchDnsWorkError::Full) => {
+                record_error(&stats, "DNS 请求队列已满，已丢弃请求".to_string());
+            }
+            Err(DispatchDnsWorkError::Disconnected) => break,
+        }
+    }
+}
+
+fn serve_tcp(
+    listener: Arc<TcpListener>,
+    work_senders: Vec<mpsc::SyncSender<DnsWorkItem>>,
+    stats: Arc<Mutex<DnsStats>>,
+    stop: Arc<AtomicBool>,
+) {
+    let active_connections = Arc::new(AtomicUsize::new(0));
+
+    while !stop.load(Ordering::Relaxed) {
+        let (stream, client_addr) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(TCP_ACCEPT_SLEEP);
+                continue;
+            }
+            Err(error) => {
+                record_error(&stats, format!("接收 TCP DNS 连接失败：{error}"));
+                thread::sleep(TCP_ACCEPT_SLEEP);
+                continue;
+            }
+        };
+
+        if !try_acquire_tcp_connection_slot(&active_connections) {
+            record_error(&stats, "TCP DNS 连接数已满，已拒绝新连接".to_string());
+            continue;
+        }
+
+        let connection_slot = TcpConnectionSlot {
+            active_connections: Arc::clone(&active_connections),
+        };
+        let work_senders = work_senders.clone();
+        let stats = Arc::clone(&stats);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let _slot = connection_slot;
+            handle_tcp_connection(stream, client_addr, work_senders, stats, stop);
+        });
+    }
+
+    while active_connections.load(Ordering::Acquire) > 0 {
+        thread::sleep(TCP_ACCEPT_SLEEP);
+    }
+}
+
+struct TcpConnectionSlot {
+    active_connections: Arc<AtomicUsize>,
+}
+
+impl Drop for TcpConnectionSlot {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_tcp_connection_slot(active_connections: &AtomicUsize) -> bool {
+    active_connections
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < TCP_MAX_CONNECTIONS).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+fn handle_tcp_connection(
+    mut stream: TcpStream,
+    client_addr: SocketAddr,
+    work_senders: Vec<mpsc::SyncSender<DnsWorkItem>>,
+    stats: Arc<Mutex<DnsStats>>,
+    stop: Arc<AtomicBool>,
+) {
+    if let Err(error) = configure_tcp_stream(&stream) {
+        record_error(&stats, error);
+        return;
+    }
+
+    let mut next_worker = 0_usize;
+    while !stop.load(Ordering::Relaxed) {
+        let query = match read_tcp_dns_query(&mut stream, &stop) {
+            Ok(Some(query)) => query,
+            Ok(None) => break,
+            Err(error) => {
+                record_error(&stats, format!("读取 TCP DNS 请求失败：{error}"));
+                break;
+            }
+        };
+
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        let work_item = DnsWorkItem {
+            query,
+            client_addr,
+            response_target: DnsResponseTarget::Tcp(response_sender),
+        };
+
+        match dispatch_dns_work(&work_senders, work_item, &mut next_worker) {
+            Ok(()) => {}
+            Err(DispatchDnsWorkError::Full) => {
+                record_error(&stats, "DNS 请求队列已满，已丢弃 TCP 请求".to_string());
+                break;
+            }
+            Err(DispatchDnsWorkError::Disconnected) => break,
+        }
+
+        match response_receiver.recv_timeout(TCP_RESPONSE_TIMEOUT) {
+            Ok(Some(response)) => {
+                if let Err(error) = write_tcp_dns_response(&mut stream, &response) {
+                    record_error(&stats, format!("写入 TCP DNS 响应失败：{error}"));
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                record_error(&stats, "等待 TCP DNS 响应超时".to_string());
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn configure_tcp_stream(stream: &TcpStream) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(TCP_READ_TIMEOUT))
+        .map_err(|e| format!("设置 TCP DNS 读取超时失败：{e}"))?;
+    stream
+        .set_write_timeout(Some(TCP_WRITE_TIMEOUT))
+        .map_err(|e| format!("设置 TCP DNS 写入超时失败：{e}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|e| format!("设置 TCP DNS nodelay 失败：{e}"))?;
+    Ok(())
+}
+
+fn read_tcp_dns_query(
+    stream: &mut TcpStream,
+    stop: &Arc<AtomicBool>,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut len_buf = [0_u8; 2];
+    let mut idle_waited = Duration::ZERO;
+    loop {
+        match stream.read_exact(&mut len_buf) {
+            Ok(()) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                idle_waited = idle_waited.saturating_add(TCP_READ_TIMEOUT);
+                if idle_waited >= TCP_IDLE_TIMEOUT {
+                    return Ok(None);
+                }
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    let query_len = u16::from_be_bytes(len_buf) as usize;
+    if query_len == 0 {
+        return Ok(None);
+    }
+
+    let mut query = vec![0_u8; query_len];
+    stream
+        .read_exact(&mut query)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(query))
+}
+
+fn write_tcp_dns_response(stream: &mut TcpStream, response: &[u8]) -> Result<(), String> {
+    let response_len =
+        u16::try_from(response.len()).map_err(|_| "TCP DNS 响应长度超过 65535 字节".to_string())?;
+    stream
+        .write_all(&response_len.to_be_bytes())
+        .and_then(|_| stream.write_all(response))
+        .map_err(|error| error.to_string())
+}
+
+enum DispatchDnsWorkError {
+    Full,
+    Disconnected,
+}
+
+fn dispatch_dns_work(
+    senders: &[mpsc::SyncSender<DnsWorkItem>],
+    work_item: DnsWorkItem,
+    next_worker: &mut usize,
+) -> Result<(), DispatchDnsWorkError> {
+    if senders.is_empty() {
+        return Err(DispatchDnsWorkError::Disconnected);
+    }
+
+    let start = *next_worker % senders.len();
+    let mut pending = Some(work_item);
+    let mut has_full_queue = false;
+    for offset in 0..senders.len() {
+        let index = (start + offset) % senders.len();
+        let item = pending
+            .take()
+            .expect("pending DNS work item should exist before send attempt");
+
+        match senders[index].try_send(item) {
+            Ok(()) => {
+                *next_worker = index.wrapping_add(1);
+                return Ok(());
+            }
+            Err(mpsc::TrySendError::Full(item)) => {
+                has_full_queue = true;
+                pending = Some(item);
+            }
+            Err(mpsc::TrySendError::Disconnected(item)) => {
+                pending = Some(item);
+            }
+        }
+    }
+
+    if has_full_queue {
+        Err(DispatchDnsWorkError::Full)
+    } else {
+        Err(DispatchDnsWorkError::Disconnected)
+    }
+}

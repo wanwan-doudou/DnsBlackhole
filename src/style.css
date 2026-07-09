@@ -1456,6 +1456,19 @@ button.refreshing:disabled {
   resize: vertical;
 }
 
+.upstream-extra-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  max-width: 900px;
+  margin-top: 16px;
+}
+
+.upstream-extra-field textarea {
+  min-height: 132px;
+  resize: vertical;
+}
+
 .field {
   display: flex;
   min-width: 0;
@@ -1532,6 +1545,161 @@ select:focus {
   max-width: 900px;
 }
 
+.diagnostics-section {
+  max-width: 900px;
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.diagnostics-result {
+  min-height: 128px;
+  border: 1px solid #dbe4ee;
+  border-radius: 4px;
+  padding: 14px;
+  background: #ffffff;
+}
+
+.diagnostic-empty {
+  display: grid;
+  min-height: 98px;
+  place-items: center;
+  color: #7a8999;
+  font-size: 13px;
+}
+
+.diagnostic-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #eef2f6;
+  padding: 0 0 10px;
+  color: #738294;
+  font-size: 12px;
+}
+
+.diagnostic-meta + .diagnostic-meta {
+  padding-top: 10px;
+}
+
+.diagnostic-meta strong {
+  min-width: 0;
+  color: #26323f;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.diagnostic-probes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.diagnostic-probe {
+  display: grid;
+  gap: 7px;
+  border: 1px solid #e1e8f0;
+  border-radius: 4px;
+  padding: 11px;
+  background: #f8fafc;
+}
+
+.diagnostic-probe>div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.diagnostic-probe strong {
+  color: #26323f;
+  font-size: 13px;
+}
+
+.diagnostic-probe span {
+  color: #6b7886;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.diagnostic-probe small {
+  color: #7a8999;
+  font-size: 12px;
+}
+
+.diagnostic-probe p {
+  margin: 0;
+  color: #b42323;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.diagnostic-probe.ok {
+  border-color: #b8dfc1;
+  background: #f2faf4;
+}
+
+.diagnostic-probe.ok span {
+  color: #267000;
+}
+
+.diagnostic-probe.failed {
+  border-color: #f2b5b5;
+  background: #fff7f7;
+}
+
+.diagnostic-probe.failed span {
+  color: #b42323;
+}
+
+.runtime-watchdog-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  gap: 18px;
+  align-items: center;
+}
+
+.runtime-watchdog-grid .check-row {
+  margin-bottom: 0;
+}
+
+.runtime-watchdog-grid input:disabled {
+  opacity: 0.58;
+}
+
+.dns-security-section {
+  max-width: 900px;
+}
+
+.dns-security-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.access-list-field textarea {
+  min-height: 132px;
+}
+
+.dns-security-options {
+  display: grid;
+  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: center;
+  margin-top: 18px;
+}
+
+.dns-security-options .field input {
+  height: 42px;
+  font-size: 16px;
+}
+
 .dns-cache-grid {
   display: grid;
   gap: 20px;
@@ -1551,6 +1719,22 @@ select:focus {
 .dns-cache-section input:disabled,
 .dns-cache-section button:disabled {
   opacity: 0.58;
+}
+
+@media (max-width: 900px) {
+  .dns-settings,
+  .upstream-extra-grid,
+  .diagnostics-grid,
+  .diagnostic-probes,
+  .runtime-watchdog-grid,
+  .dns-security-grid,
+  .dns-security-options {
+    grid-template-columns: 1fr;
+  }
+
+  .compact-select {
+    width: 100%;
+  }
 }
 
 .retention-settings {

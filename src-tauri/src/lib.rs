@@ -5,9 +5,11 @@ mod filters;
 mod tray;
 
 use std::{
-    io,
+    io::{self, Read, Write},
+    net::{SocketAddr, TcpStream, UdpSocket},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use config::AppConfig;
@@ -21,6 +23,7 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const LOG_STATS_CACHE_SECONDS: u64 = 15;
 const LOG_PRUNE_INTERVAL_SECONDS: u64 = 60 * 60;
+const DNS_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct AppState {
     config: Mutex<AppConfig>,
@@ -55,6 +58,23 @@ struct FilterCacheClearResult {
     removed_files: usize,
     removed_bytes: u64,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DnsDiagnosticsResult {
+    domain: String,
+    listen_addr: String,
+    udp: DnsProbeResult,
+    tcp: DnsProbeResult,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DnsProbeResult {
+    ok: bool,
+    duration_ms: Option<u64>,
+    rcode: Option<u8>,
+    answers: Option<u16>,
+    error: Option<String>,
 }
 
 impl AppState {
@@ -244,8 +264,9 @@ fn get_config(state: tauri::State<'_, Arc<AppState>>) -> Result<AppConfig, Strin
 fn save_config(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
-    config: AppConfig,
+    mut config: AppConfig,
 ) -> Result<RuntimeStatus, String> {
+    config::migrate_legacy_defaults(&mut config);
     config.validate()?;
     apply_autostart_config(&app, config.launch_at_startup)?;
     state.database.save_config(&config)?;
@@ -327,6 +348,7 @@ fn update_filters_blocking(
     state: Arc<AppState>,
     mut config: AppConfig,
 ) -> Result<FilterUpdateResult, String> {
+    config::migrate_legacy_defaults(&mut config);
     config.validate()?;
     let report = filters::update_enabled_filters(&app, &mut config)?;
     state.database.save_config(&config)?;
@@ -355,6 +377,7 @@ fn start_dns(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<RuntimeStatus, String> {
     let mut config = state.current_config()?;
+    config::migrate_legacy_defaults(&mut config);
     config.enabled = true;
     config.validate()?;
     state.database.save_config(&config)?;
@@ -401,6 +424,19 @@ async fn clear_filter_cache(
     tauri::async_runtime::spawn_blocking(move || clear_filter_cache_blocking(app, state))
         .await
         .map_err(|error| format!("清理过滤器缓存任务异常：{error}"))?
+}
+
+#[tauri::command]
+async fn run_dns_diagnostics(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<DnsDiagnosticsResult, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let config = state.current_config()?;
+        run_dns_diagnostics_blocking(&config)
+    })
+    .await
+    .map_err(|error| format!("DNS 诊断任务异常：{error}"))?
 }
 
 fn clear_filter_cache_blocking(
@@ -460,6 +496,206 @@ fn apply_update_report_error(state: &AppState, report: &FilterUpdateReport) {
     }
 }
 
+fn spawn_runtime_watchdog(state: Arc<AppState>) {
+    thread::spawn(move || {
+        loop {
+            let interval = state
+                .current_config()
+                .map(|config| config.runtime_watchdog_interval_seconds.clamp(10, 3600))
+                .unwrap_or_else(|_| AppConfig::default().runtime_watchdog_interval_seconds);
+            thread::sleep(Duration::from_secs(interval));
+
+            let config = state.current_config().unwrap_or_default();
+            if !config.enabled || !config.runtime_watchdog_enabled {
+                continue;
+            }
+
+            let should_restart = match state.server.lock() {
+                Ok(server) => match server.as_ref() {
+                    Some(server) => server.has_finished_threads(),
+                    None => true,
+                },
+                Err(_) => {
+                    state.set_error(Some("DNS 自恢复无法读取服务状态".to_string()));
+                    false
+                }
+            };
+
+            if should_restart && let Err(error) = state.start_current() {
+                state.set_error(Some(format!("DNS 自恢复重启失败：{error}")));
+            }
+        }
+    });
+}
+
+fn run_dns_diagnostics_blocking(config: &AppConfig) -> Result<DnsDiagnosticsResult, String> {
+    let listen_addr = config.listen_socket_addr()?;
+    let domain = normalize_diagnostics_domain(&config.diagnostics_domain)?;
+    let query = build_diagnostic_dns_query(&domain, 1)?;
+
+    Ok(DnsDiagnosticsResult {
+        domain,
+        listen_addr: listen_addr.to_string(),
+        udp: run_udp_dns_probe(listen_addr, &query),
+        tcp: run_tcp_dns_probe(listen_addr, &query),
+    })
+}
+
+fn run_udp_dns_probe(listen_addr: SocketAddr, query: &[u8]) -> DnsProbeResult {
+    let started = Instant::now();
+    let bind_addr = if listen_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+
+    let socket = match UdpSocket::bind(bind_addr) {
+        Ok(socket) => socket,
+        Err(error) => {
+            return dns_probe_error(started, format!("创建 UDP 诊断 socket 失败：{error}"));
+        }
+    };
+    if let Err(error) = socket.set_read_timeout(Some(DNS_DIAGNOSTIC_TIMEOUT)) {
+        return dns_probe_error(started, format!("设置 UDP 诊断超时失败：{error}"));
+    }
+    if let Err(error) = socket.send_to(query, listen_addr) {
+        return dns_probe_error(started, format!("发送 UDP DNS 诊断请求失败：{error}"));
+    }
+
+    let mut response = [0_u8; 4096];
+    match socket.recv_from(&mut response) {
+        Ok((len, _)) => parse_dns_probe_response(started, &response[..len], query),
+        Err(error) => dns_probe_error(started, format!("读取 UDP DNS 诊断响应失败：{error}")),
+    }
+}
+
+fn run_tcp_dns_probe(listen_addr: SocketAddr, query: &[u8]) -> DnsProbeResult {
+    let started = Instant::now();
+    let query_len = match u16::try_from(query.len()) {
+        Ok(len) => len,
+        Err(_) => return dns_probe_error(started, "DNS 诊断请求过长".to_string()),
+    };
+    let mut stream = match TcpStream::connect_timeout(&listen_addr, DNS_DIAGNOSTIC_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(error) => {
+            return dns_probe_error(started, format!("连接 TCP DNS 诊断端口失败：{error}"));
+        }
+    };
+    if let Err(error) = stream.set_read_timeout(Some(DNS_DIAGNOSTIC_TIMEOUT)) {
+        return dns_probe_error(started, format!("设置 TCP DNS 诊断读取超时失败：{error}"));
+    }
+    if let Err(error) = stream.set_write_timeout(Some(DNS_DIAGNOSTIC_TIMEOUT)) {
+        return dns_probe_error(started, format!("设置 TCP DNS 诊断写入超时失败：{error}"));
+    }
+    if let Err(error) = stream
+        .write_all(&query_len.to_be_bytes())
+        .and_then(|_| stream.write_all(query))
+    {
+        return dns_probe_error(started, format!("发送 TCP DNS 诊断请求失败：{error}"));
+    }
+
+    let mut len_buf = [0_u8; 2];
+    if let Err(error) = stream.read_exact(&mut len_buf) {
+        return dns_probe_error(started, format!("读取 TCP DNS 诊断响应长度失败：{error}"));
+    }
+    let response_len = u16::from_be_bytes(len_buf) as usize;
+    if response_len == 0 {
+        return dns_probe_error(started, "TCP DNS 诊断返回空响应".to_string());
+    }
+
+    let mut response = vec![0_u8; response_len];
+    match stream.read_exact(&mut response) {
+        Ok(()) => parse_dns_probe_response(started, &response, query),
+        Err(error) => dns_probe_error(started, format!("读取 TCP DNS 诊断响应失败：{error}")),
+    }
+}
+
+fn parse_dns_probe_response(started: Instant, response: &[u8], query: &[u8]) -> DnsProbeResult {
+    match parse_dns_probe_response_counts(response, query) {
+        Ok((rcode, answers)) => DnsProbeResult {
+            ok: rcode == 0,
+            duration_ms: Some(duration_ms(started.elapsed())),
+            rcode: Some(rcode),
+            answers: Some(answers),
+            error: (rcode != 0).then(|| format!("DNS 响应 rcode={rcode}")),
+        },
+        Err(error) => dns_probe_error(started, error),
+    }
+}
+
+fn parse_dns_probe_response_counts(response: &[u8], query: &[u8]) -> Result<(u8, u16), String> {
+    if response.len() < 12 || query.len() < 2 {
+        return Err("DNS 诊断响应长度不足".to_string());
+    }
+    if response[0..2] != query[0..2] {
+        return Err("DNS 诊断响应 transaction ID 不匹配".to_string());
+    }
+    if response[2] & 0x80 == 0 {
+        return Err("DNS 诊断收到的不是响应包".to_string());
+    }
+
+    Ok((
+        response[3] & 0x0f,
+        read_u16(response, 6).unwrap_or_default(),
+    ))
+}
+
+fn dns_probe_error(started: Instant, error: String) -> DnsProbeResult {
+    DnsProbeResult {
+        ok: false,
+        duration_ms: Some(duration_ms(started.elapsed())),
+        rcode: None,
+        answers: None,
+        error: Some(error),
+    }
+}
+
+fn build_diagnostic_dns_query(domain: &str, qtype: u16) -> Result<Vec<u8>, String> {
+    let mut packet = vec![0x42, 0x44, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    for label in domain.split('.') {
+        let label_len =
+            u8::try_from(label.len()).map_err(|_| "诊断域名 label 长度超过 63 字节".to_string())?;
+        if label_len == 0 || label_len > 63 {
+            return Err("诊断域名格式无效".to_string());
+        }
+        packet.push(label_len);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0);
+    packet.extend_from_slice(&qtype.to_be_bytes());
+    packet.extend_from_slice(&1_u16.to_be_bytes());
+    Ok(packet)
+}
+
+fn normalize_diagnostics_domain(value: &str) -> Result<String, String> {
+    let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty()
+        || domain.len() > 253
+        || domain.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+    {
+        return Err("诊断域名必须是有效域名，例如 example.com".to_string());
+    }
+    Ok(domain)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let first = *bytes.get(offset)?;
+    let second = *bytes.get(offset + 1)?;
+    Some(u16::from_be_bytes([first, second]))
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn apply_autostart_config(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
     let manager = app.autolaunch();
@@ -511,7 +747,8 @@ pub fn run() {
             start_dns,
             stop_dns,
             clear_dns_cache,
-            clear_filter_cache
+            clear_filter_cache,
+            run_dns_diagnostics
         ])
         .setup(|app| {
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -547,7 +784,9 @@ pub fn run() {
                 eprintln!("DNS 服务启动失败：{error}");
                 state.set_error(Some(error));
             }
+            let watchdog_state = Arc::clone(&state);
             app.manage(state);
+            spawn_runtime_watchdog(watchdog_state);
             Ok(())
         })
         .on_window_event(|window, event| {
