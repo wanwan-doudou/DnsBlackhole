@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, named_params, params};
+use rusqlite::{Connection, OptionalExtension, Row, named_params, params};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -112,8 +112,9 @@ impl Database {
             .map_err(|e| format!("读取数据库配置失败：{e}"))?;
 
         raw.map(|value| {
-            let config: AppConfig =
+            let mut config: AppConfig =
                 serde_json::from_str(&value).map_err(|e| format!("解析数据库配置失败：{e}"))?;
+            config::migrate_legacy_defaults(&mut config);
             config.validate()?;
             Ok(config)
         })
@@ -123,7 +124,7 @@ impl Database {
     pub fn save_config(&self, config: &AppConfig) -> Result<(), String> {
         config.validate()?;
         let raw = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
-        let now = unix_now();
+        let now = u64_to_db_i64(unix_now(), "配置更新时间")?;
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO app_config (id, value, updated_at)
@@ -140,7 +141,9 @@ impl Database {
         entry: &QueryLogEntry,
         anonymize_client_ip: bool,
     ) -> Result<(), String> {
-        let now = unix_now();
+        let now = u64_to_db_i64(unix_now(), "查询日志时间戳")?;
+        let upstream_duration_ms =
+            optional_u64_to_db_i64(entry.upstream_duration_ms, "上游响应时间")?;
         let client_ip = entry.client_ip.as_deref().map(|ip| {
             if anonymize_client_ip {
                 anonymize_ip(ip)
@@ -171,7 +174,7 @@ impl Database {
                 bool_to_i64(entry.forwarded),
                 bool_to_i64(entry.failed),
                 entry.upstream_server,
-                entry.upstream_duration_ms,
+                upstream_duration_ms,
                 entry.error,
             ],
         )
@@ -180,7 +183,10 @@ impl Database {
     }
 
     pub fn prune_query_logs(&self, retention_hours: u32) -> Result<(), String> {
-        let since = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
+        let since = u64_to_db_i64(
+            unix_now().saturating_sub(u64::from(retention_hours) * 3600),
+            "日志清理时间戳",
+        )?;
         let conn = self.lock()?;
         conn.execute(
             "DELETE FROM query_logs WHERE timestamp < ?1",
@@ -192,6 +198,7 @@ impl Database {
 
     pub fn log_stats(&self, retention_hours: u32) -> Result<LogStats, String> {
         let since = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
+        let since_param = u64_to_db_i64(since, "日志统计起始时间戳")?;
         let conn = self.lock()?;
         let (queries, blocked, forwarded, failed) = conn
             .query_row(
@@ -202,13 +209,13 @@ impl Database {
                     COALESCE(SUM(failed), 0)
                  FROM query_logs
                  WHERE timestamp >= ?1",
-                params![since],
+                params![since_param],
                 |row| {
                     Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, u64>(1)?,
-                        row.get::<_, u64>(2)?,
-                        row.get::<_, u64>(3)?,
+                        read_u64(row, 0)?,
+                        read_u64(row, 1)?,
+                        read_u64(row, 2)?,
+                        read_u64(row, 3)?,
                     ))
                 },
             )
@@ -236,6 +243,7 @@ impl Database {
         page_size: u32,
     ) -> Result<QueryLogPage, String> {
         let since = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
+        let since_param = u64_to_db_i64(since, "查询日志起始时间戳")?;
         let filter_sql = match filter {
             "blocked" => " AND blocked = 1",
             "processed" => " AND blocked = 0 AND failed = 0",
@@ -280,10 +288,10 @@ impl Database {
             .query_row(
                 &total_sql,
                 named_params! {
-                    ":since": since,
+                    ":since": since_param,
                     ":search": search_pattern,
                 },
-                |row| row.get::<_, u64>(0),
+                |row| read_u64(row, 0),
             )
             .map_err(|e| format!("统计查询日志失败：{e}"))?;
         let mut stmt = conn
@@ -292,7 +300,7 @@ impl Database {
         let rows = stmt
             .query_map(
                 named_params! {
-                    ":since": since,
+                    ":since": since_param,
                     ":search": search_pattern,
                     ":limit": limit,
                     ":offset": offset,
@@ -300,14 +308,14 @@ impl Database {
                 |row| {
                     Ok(QueryLogRecord {
                         id: row.get(0)?,
-                        timestamp: row.get(1)?,
+                        timestamp: read_u64(row, 1)?,
                         domain: row.get(2)?,
                         client_ip: row.get(3)?,
                         blocked: row.get::<_, i64>(4)? != 0,
                         forwarded: row.get::<_, i64>(5)? != 0,
                         failed: row.get::<_, i64>(6)? != 0,
                         upstream_server: row.get(7)?,
-                        upstream_duration_ms: row.get(8)?,
+                        upstream_duration_ms: read_optional_u64(row, 8)?,
                         error: row.get(9)?,
                     })
                 },
@@ -408,6 +416,7 @@ fn grouped_domain_counts(
     since: u64,
     blocked_only: bool,
 ) -> Result<HashMap<String, u64>, String> {
+    let since = u64_to_db_i64(since, "域名排行起始时间戳")?;
     let sql = if blocked_only {
         "SELECT domain, COUNT(*)
          FROM query_logs
@@ -429,7 +438,7 @@ fn grouped_domain_counts(
         .map_err(|e| format!("准备域名排行查询失败：{e}"))?;
     let rows = stmt
         .query_map(params![since], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
         })
         .map_err(|e| format!("读取域名排行失败：{e}"))?;
 
@@ -442,6 +451,7 @@ fn grouped_domain_counts(
 }
 
 fn traffic_buckets(conn: &Connection, since: u64) -> Result<Vec<TrafficBucket>, String> {
+    let since = u64_to_db_i64(since, "趋势起始时间戳")?;
     let mut stmt = conn
         .prepare(
             "SELECT timestamp / 60 AS minute, COUNT(*), COALESCE(SUM(blocked), 0)
@@ -454,9 +464,9 @@ fn traffic_buckets(conn: &Connection, since: u64) -> Result<Vec<TrafficBucket>, 
     let rows = stmt
         .query_map(params![since], |row| {
             Ok(TrafficBucket {
-                minute: row.get(0)?,
-                queries: row.get(1)?,
-                blocked: row.get(2)?,
+                minute: read_u64(row, 0)?,
+                queries: read_u64(row, 1)?,
+                blocked: read_u64(row, 2)?,
             })
         })
         .map_err(|e| format!("读取趋势数据失败：{e}"))?;
@@ -472,6 +482,7 @@ fn upstream_request_counts(
     conn: &Connection,
     since: u64,
 ) -> Result<Vec<UpstreamRequestStat>, String> {
+    let since = u64_to_db_i64(since, "上游请求排行起始时间戳")?;
     let mut stmt = conn
         .prepare(
             "SELECT upstream_server, COUNT(*)
@@ -488,7 +499,7 @@ fn upstream_request_counts(
         .query_map(params![since], |row| {
             Ok(UpstreamRequestStat {
                 upstream: row.get(0)?,
-                requests: row.get(1)?,
+                requests: read_u64(row, 1)?,
             })
         })
         .map_err(|e| format!("读取上游请求排行失败：{e}"))?;
@@ -501,6 +512,7 @@ fn upstream_request_counts(
 }
 
 fn upstream_avg_latency(conn: &Connection, since: u64) -> Result<Vec<UpstreamLatencyStat>, String> {
+    let since = u64_to_db_i64(since, "上游响应时间排行起始时间戳")?;
     let mut stmt = conn
         .prepare(
             "SELECT upstream_server, CAST(ROUND(AVG(upstream_duration_ms)) AS INTEGER)
@@ -518,7 +530,7 @@ fn upstream_avg_latency(conn: &Connection, since: u64) -> Result<Vec<UpstreamLat
         .query_map(params![since], |row| {
             Ok(UpstreamLatencyStat {
                 upstream: row.get(0)?,
-                avg_ms: row.get(1)?,
+                avg_ms: read_u64(row, 1)?,
             })
         })
         .map_err(|e| format!("读取上游响应时间排行失败：{e}"))?;
@@ -546,6 +558,28 @@ fn unix_now() -> u64 {
 
 fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
+}
+
+fn u64_to_db_i64(value: u64, field: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("{field}超出数据库 INTEGER 范围"))
+}
+
+fn optional_u64_to_db_i64(value: Option<u64>, field: &str) -> Result<Option<i64>, String> {
+    value.map(|value| u64_to_db_i64(value, field)).transpose()
+}
+
+fn db_i64_to_u64(index: usize, value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
+fn read_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    db_i64_to_u64(index, row.get(index)?)
+}
+
+fn read_optional_u64(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|value| db_i64_to_u64(index, value))
+        .transpose()
 }
 
 fn anonymize_ip(value: &str) -> String {

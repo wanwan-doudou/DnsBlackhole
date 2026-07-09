@@ -89,7 +89,7 @@ impl Default for AppConfig {
             enabled: true,
             use_filters: default_use_filters(),
             listen_host: "127.0.0.1".into(),
-            listen_port: 1053,
+            listen_port: 53,
             upstream_dns: default_upstream_dns(),
             upstream_mode: UpstreamMode::default(),
             filter_update_interval_hours: default_filter_update_interval_hours(),
@@ -343,14 +343,14 @@ fn read_config_file(path: &Path) -> Result<AppConfig, String> {
         .map_err(|e| format!("读取配置文件失败：{}：{e}", path.display()))?;
     let mut config: AppConfig = serde_json::from_str(&raw)
         .map_err(|e| format!("解析配置文件失败：{}：{e}", path.display()))?;
-    migrate_default_port(&mut config);
+    migrate_legacy_defaults(&mut config);
     config.validate()?;
     Ok(config)
 }
 
-fn migrate_default_port(config: &mut AppConfig) {
+pub fn migrate_legacy_defaults(config: &mut AppConfig) {
     if config.listen_host.trim() == "127.0.0.1" && config.listen_port == 5353 {
-        config.listen_port = 1053;
+        config.listen_port = 53;
     }
 }
 
@@ -439,8 +439,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.listen_port = 5353;
 
-        migrate_default_port(&mut config);
+        migrate_legacy_defaults(&mut config);
 
-        assert_eq!(config.listen_port, 1053);
+        assert_eq!(config.listen_port, 53);
     }
 }
