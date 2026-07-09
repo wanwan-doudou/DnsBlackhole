@@ -31,6 +31,7 @@ type AppConfig = {
   filter_update_interval_hours: number;
   query_log_enabled: boolean;
   anonymize_client_ip: boolean;
+  launch_at_startup: boolean;
   query_log_retention_hours: number;
   dns_cache_enabled: boolean;
   dns_cache_size: number;
@@ -115,6 +116,13 @@ type FilterUpdateResult = {
   message: string;
 };
 
+type FilterCacheClearResult = {
+  status: RuntimeStatus;
+  removed_files: number;
+  removed_bytes: number;
+  message: string;
+};
+
 type RefreshOptions = {
   auto?: boolean;
   button?: HTMLButtonElement;
@@ -173,11 +181,6 @@ app.innerHTML = `
           </div>
           <button class="nav-item" data-view="logs" type="button">查询日志</button>
         </nav>
-
-        <div class="header-actions">
-          <button id="refresh_btn" type="button">刷新</button>
-          <div class="status-pill" id="running_state">加载中</div>
-        </div>
       </div>
     </header>
 
@@ -482,6 +485,18 @@ app.innerHTML = `
                 <input id="enabled" type="checkbox" />
                 <span>启动时自动运行 DNS 服务</span>
               </label>
+              <label class="toggle-row">
+                <input id="launch_at_startup" type="checkbox" />
+                <span>开机时启动应用</span>
+              </label>
+            </section>
+
+            <section class="settings-section cache-maintenance-section">
+              <div>
+                <h3>磁盘缓存</h3>
+                <p>清理已下载的远程黑名单缓存，不会删除配置、查询日志和统计数据。</p>
+              </div>
+              <button id="clear_filter_cache_btn" type="button">清理过滤器缓存</button>
             </section>
 
             <section class="settings-section">
@@ -502,11 +517,12 @@ app.innerHTML = `
               <div class="retention-settings">
                 <span class="retention-title">查询日志保留时间</span>
                 <div class="retention-options">
-                  <label><input name="query_log_retention" type="radio" value="6" /> 6 小时</label>
                   <label><input name="query_log_retention" type="radio" value="24" /> 24 小时</label>
                   <label><input name="query_log_retention" type="radio" value="168" /> 7 天</label>
                   <label><input name="query_log_retention" type="radio" value="720" /> 30 天</label>
                   <label><input name="query_log_retention" type="radio" value="2160" /> 90 天</label>
+                  <label><input name="query_log_retention" type="radio" value="4320" /> 180 天</label>
+                  <label><input name="query_log_retention" type="radio" value="8640" /> 360 天</label>
                   <label><input name="query_log_retention" type="radio" value="custom" /> 自定义</label>
                 </div>
                 <label class="field custom-retention-field" id="custom_retention_field">
@@ -583,10 +599,13 @@ let manualDownloadUrl = "";
 let queryLogPage = 1;
 let queryLogTotal = 0;
 let queryLogRefreshInFlight = false;
+let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
+let queryLogSearchComposing = false;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const QUERY_LOG_PAGE_SIZE = 50;
+const QUERY_LOG_SEARCH_DEBOUNCE_MS = 800;
 const CHECK_RETRY_DELAYS_MS = [800, 2_000, 5_000];
 const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 2_500, 5_000];
 const CHECK_TIMEOUT_MS = 20_000;
@@ -621,6 +640,7 @@ const logDateFormatter = new Intl.DateTimeFormat("zh-CN", {
 
 const contentElement = query<HTMLDivElement>(".content");
 const enabledInput = query<HTMLInputElement>("#enabled");
+const launchAtStartupInput = query<HTMLInputElement>("#launch_at_startup");
 const useFiltersInput = query<HTMLInputElement>("#use_filters");
 const upstreamInput = query<HTMLTextAreaElement>("#upstream_dns");
 const listenHostInput = query<HTMLInputElement>("#listen_host");
@@ -649,10 +669,10 @@ const saveSettingsButton = query<HTMLButtonElement>("#save_settings_btn");
 const saveCustomButton = query<HTMLButtonElement>("#save_custom_btn");
 const startButton = query<HTMLButtonElement>("#start_btn");
 const stopButton = query<HTMLButtonElement>("#stop_btn");
-const refreshButton = query<HTMLButtonElement>("#refresh_btn");
 const addFilterButton = query<HTMLButtonElement>("#add_filter_btn");
 const updateFiltersButton = query<HTMLButtonElement>("#update_filters_btn");
 const clearDnsCacheButton = query<HTMLButtonElement>("#clear_dns_cache_btn");
+const clearFilterCacheButton = query<HTMLButtonElement>("#clear_filter_cache_btn");
 const appVersionElement = query<HTMLElement>("#app_version");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
 const installUpdateButton = query<HTMLButtonElement>("#install_update_btn");
@@ -731,11 +751,27 @@ queryLogRefreshButton.addEventListener("click", async () => {
 });
 
 queryLogSearchInput.addEventListener("input", () => {
+  scheduleQueryLogSearch();
+});
+
+queryLogSearchInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") {
+    return;
+  }
+  event.preventDefault();
   window.clearTimeout(queryLogSearchTimer);
-  queryLogSearchTimer = window.setTimeout(() => {
-    queryLogPage = 1;
-    void refreshQueryLogs();
-  }, 260);
+  queryLogPage = 1;
+  void refreshQueryLogs();
+});
+
+queryLogSearchInput.addEventListener("compositionstart", () => {
+  queryLogSearchComposing = true;
+  window.clearTimeout(queryLogSearchTimer);
+});
+
+queryLogSearchInput.addEventListener("compositionend", () => {
+  queryLogSearchComposing = false;
+  scheduleQueryLogSearch();
 });
 
 queryLogFilterInput.addEventListener("change", () => {
@@ -850,14 +886,6 @@ stopButton.addEventListener("click", async () => {
   await runStatusAction(() => invoke<RuntimeStatus>("stop_dns"), "DNS 服务已停止");
 });
 
-refreshButton.addEventListener("click", async () => {
-  if (activeView === "logs") {
-    await refreshQueryLogs({ button: refreshButton });
-    return;
-  }
-  await refreshStatus({ button: refreshButton });
-});
-
 addFilterButton.addEventListener("click", () => {
   const id = `custom-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   filtersState = [
@@ -905,6 +933,30 @@ clearDnsCacheButton.addEventListener("click", async () => {
   } finally {
     setBusy(false);
     updateDnsCacheControls();
+  }
+});
+
+clearFilterCacheButton.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "这会删除已下载的远程黑名单缓存，并重载当前过滤规则。配置、查询日志和统计数据不会删除。清理后需要重新检查更新才能恢复远程黑名单缓存。是否继续？",
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  setBusy(true);
+  clearFilterCacheButton.classList.add("loading");
+  try {
+    const result = await invoke<FilterCacheClearResult>("clear_filter_cache");
+    renderStatus(result.status);
+    showMessage(result.message, false);
+    await loadConfig();
+  } catch (error) {
+    showMessage(String(error), true);
+    await refreshStatus();
+  } finally {
+    clearFilterCacheButton.classList.remove("loading");
+    setBusy(false);
   }
 });
 
@@ -1061,6 +1113,7 @@ async function loadConfig(): Promise<void> {
   try {
     const config = await invoke<AppConfig>("get_config");
     enabledInput.checked = config.enabled;
+    launchAtStartupInput.checked = config.launch_at_startup;
     useFiltersInput.checked = config.use_filters;
     upstreamInput.value = config.upstream_dns;
     listenHostInput.value = config.listen_host;
@@ -1099,9 +1152,10 @@ async function saveConfigOnly(): Promise<RuntimeStatus> {
 function collectConfig(): AppConfig {
   return {
     enabled: enabledInput.checked,
+    launch_at_startup: launchAtStartupInput.checked,
     use_filters: useFiltersInput.checked,
     upstream_dns: upstreamInput.value.trim(),
-    upstream_mode: selectedRadioValue(upstreamModeInputs, "parallel_requests") as UpstreamMode,
+    upstream_mode: selectedRadioValue(upstreamModeInputs, "load_balance") as UpstreamMode,
     filter_update_interval_hours: Number(filterUpdateIntervalInput.value),
     query_log_enabled: queryLogEnabledInput.checked,
     anonymize_client_ip: anonymizeClientIpInput.checked,
@@ -1144,8 +1198,21 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
   }
 }
 
+function scheduleQueryLogSearch(): void {
+  if (queryLogSearchComposing) {
+    return;
+  }
+
+  window.clearTimeout(queryLogSearchTimer);
+  queryLogSearchTimer = window.setTimeout(() => {
+    queryLogPage = 1;
+    void refreshQueryLogs();
+  }, QUERY_LOG_SEARCH_DEBOUNCE_MS);
+}
+
 async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
   if (queryLogRefreshInFlight) {
+    queryLogRefreshQueued = true;
     return;
   }
 
@@ -1153,12 +1220,21 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
   setRefreshButtonState(options.button, true);
   setQueryLogLoading(true);
   try {
+    const requestedFilter = queryLogFilterInput.value as QueryLogFilter;
+    const requestedSearch = queryLogSearchInput.value.trim();
     const page = await invoke<QueryLogPage>("get_query_logs", {
-      filter: queryLogFilterInput.value as QueryLogFilter,
-      search: queryLogSearchInput.value.trim(),
+      filter: requestedFilter,
+      search: requestedSearch,
       page: queryLogPage,
       pageSize: QUERY_LOG_PAGE_SIZE,
     });
+    if (
+      requestedFilter !== queryLogFilterInput.value ||
+      requestedSearch !== queryLogSearchInput.value.trim()
+    ) {
+      queryLogRefreshQueued = true;
+      return;
+    }
     queryLogPage = page.page;
     queryLogTotal = page.total;
     renderQueryLogs(page);
@@ -1168,6 +1244,10 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
     queryLogRefreshInFlight = false;
     setQueryLogLoading(false);
     setRefreshButtonState(options.button, false);
+    if (queryLogRefreshQueued) {
+      queryLogRefreshQueued = false;
+      void refreshQueryLogs();
+    }
   }
 }
 
@@ -1268,9 +1348,6 @@ function renderFilter(filter: FilterSubscription): string {
 function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}): void {
   lastStatus = status;
   const renderDashboard = options.renderDashboard ?? true;
-  const state = query<HTMLDivElement>("#running_state");
-  setTextIfChanged(state, status.running ? "运行中" : "已停止");
-  state.classList.toggle("running", status.running);
 
   const lastError = status.error ?? status.stats.last_error;
   if (lastError) {
@@ -1487,7 +1564,8 @@ function selectedRadioValue(inputs: HTMLInputElement[], fallback: string): strin
 }
 
 function setRetentionValue(hours: number): void {
-  const preset = queryLogRetentionInputs.find((input) => input.value === String(hours));
+  const normalizedHours = hours === 6 ? 24 : hours;
+  const preset = queryLogRetentionInputs.find((input) => input.value === String(normalizedHours));
   if (preset) {
     preset.checked = true;
     queryLogRetentionCustomInput.value = "";
@@ -2110,10 +2188,6 @@ function setRefreshButtonState(button: HTMLButtonElement | undefined, refreshing
   button.classList.toggle("refreshing", refreshing);
   button.disabled = refreshing;
   button.setAttribute("aria-busy", String(refreshing));
-
-  if (button === refreshButton) {
-    button.textContent = refreshing ? "刷新中" : "刷新";
-  }
 }
 
 function setFilterUpdating(updating: boolean): void {
@@ -2125,7 +2199,6 @@ function setFilterUpdating(updating: boolean): void {
 function setQueryLogLoading(loading: boolean): void {
   queryLogRefreshButton.classList.toggle("loading", loading);
   queryLogRefreshButton.disabled = loading;
-  queryLogSearchInput.disabled = loading;
   queryLogFilterInput.disabled = loading;
   queryLogFilterButton.disabled = loading;
   if (loading) {

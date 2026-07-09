@@ -16,6 +16,8 @@ use dns::{DnsServer, DnsStats, RuleSummary, RuntimeStatus};
 use filters::FilterUpdateReport;
 use serde::Serialize;
 use tauri::{Manager, WindowEvent};
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 const LOG_STATS_CACHE_SECONDS: u64 = 15;
 const LOG_PRUNE_INTERVAL_SECONDS: u64 = 60 * 60;
@@ -44,6 +46,14 @@ struct FilterUpdateResult {
     status: RuntimeStatus,
     updated: usize,
     failed: usize,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FilterCacheClearResult {
+    status: RuntimeStatus,
+    removed_files: usize,
+    removed_bytes: u64,
     message: String,
 }
 
@@ -175,19 +185,19 @@ impl AppState {
         force_refresh: bool,
     ) -> Result<LogStats, String> {
         let now = unix_now();
-        if !force_refresh {
-            if let Some(cached) = self
-                .log_stats_cache
+        let cached_stats = if force_refresh {
+            None
+        } else {
+            self.log_stats_cache
                 .lock()
                 .map_err(|_| "读取日志统计缓存失败".to_string())?
                 .clone()
-            {
-                if cached.retention_hours == retention_hours
-                    && now.saturating_sub(cached.created_at) < LOG_STATS_CACHE_SECONDS
-                {
-                    return Ok(cached.stats);
-                }
-            }
+        };
+        if let Some(cached) = cached_stats
+            && cached.retention_hours == retention_hours
+            && now.saturating_sub(cached.created_at) < LOG_STATS_CACHE_SECONDS
+        {
+            return Ok(cached.stats);
         }
 
         self.prune_query_logs_if_due(retention_hours, now)?;
@@ -237,6 +247,7 @@ fn save_config(
     config: AppConfig,
 ) -> Result<RuntimeStatus, String> {
     config.validate()?;
+    apply_autostart_config(&app, config.launch_at_startup)?;
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
     state.replace_effective_rules(config::build_effective_rules(&app, &config))?;
@@ -323,9 +334,8 @@ fn update_filters_blocking(
     state.replace_effective_rules(config::build_effective_rules(&app, &config))?;
 
     if config.enabled {
-        state.start_current().map_err(|error| {
+        state.start_current().inspect_err(|error| {
             state.set_error(Some(error.clone()));
-            error
         })?;
     }
 
@@ -350,9 +360,8 @@ fn start_dns(
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
     state.replace_effective_rules(config::build_effective_rules(&app, &config))?;
-    state.start_current().map_err(|error| {
+    state.start_current().inspect_err(|error| {
         state.set_error(Some(error.clone()));
-        error
     })?;
     state.invalidate_log_stats_cache();
     Ok(state.status(true))
@@ -383,11 +392,97 @@ fn clear_dns_cache(state: tauri::State<'_, Arc<AppState>>) -> Result<RuntimeStat
     Ok(state.status(true))
 }
 
+#[tauri::command]
+async fn clear_filter_cache(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<FilterCacheClearResult, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || clear_filter_cache_blocking(app, state))
+        .await
+        .map_err(|error| format!("清理过滤器缓存任务异常：{error}"))?
+}
+
+fn clear_filter_cache_blocking(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+) -> Result<FilterCacheClearResult, String> {
+    let mut config = state.current_config()?;
+    let stats = config::clear_filter_cache(&app, &mut config)?;
+    state.database.save_config(&config)?;
+    state.replace_config(config.clone())?;
+    state.replace_effective_rules(config::build_effective_rules(&app, &config))?;
+
+    if config.enabled {
+        state.start_current().inspect_err(|error| {
+            state.set_error(Some(error.clone()));
+        })?;
+    } else {
+        state.set_error(None);
+    }
+
+    let message = if stats.removed_files == 0 {
+        "没有可清理的过滤器缓存".to_string()
+    } else {
+        format!(
+            "已清理 {} 个过滤器缓存（{}），远程黑名单需要重新检查更新",
+            stats.removed_files,
+            format_bytes(stats.removed_bytes)
+        )
+    };
+
+    Ok(FilterCacheClearResult {
+        status: state.status(true),
+        removed_files: stats.removed_files,
+        removed_bytes: stats.removed_bytes,
+        message,
+    })
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / KIB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MIB)
+    }
+}
+
 fn apply_update_report_error(state: &AppState, report: &FilterUpdateReport) {
     if report.failed > 0 {
         state.set_error(Some(report.message.clone()));
     } else {
         state.set_error(None);
+    }
+}
+
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+fn apply_autostart_config(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let manager = app.autolaunch();
+    let current = manager
+        .is_enabled()
+        .map_err(|error| format!("读取开机自启状态失败：{error}"))?;
+    match (enabled, current) {
+        (true, false) => manager
+            .enable()
+            .map_err(|error| format!("启用开机自启失败：{error}")),
+        (false, true) => manager
+            .disable()
+            .map_err(|error| format!("关闭开机自启失败：{error}")),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn apply_autostart_config(_app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if enabled {
+        Err("当前平台不支持开机自启".to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -415,9 +510,18 @@ pub fn run() {
             update_filters,
             start_dns,
             stop_dns,
-            clear_dns_cache
+            clear_dns_cache,
+            clear_filter_cache
         ])
         .setup(|app| {
+            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+            app.handle()
+                .plugin(tauri_plugin_autostart::init(
+                    MacosLauncher::LaunchAgent,
+                    None,
+                ))
+                .map_err(|error| io::Error::other(format!("开机自启插件初始化失败：{error}")))?;
+
             tray::create(app.handle())?;
             let database = Arc::new(
                 Database::open(app.handle())
@@ -431,13 +535,17 @@ pub fn run() {
                 }
             };
             let should_start = config.enabled;
+            let autostart_error = apply_autostart_config(app.handle(), config.launch_at_startup)
+                .inspect_err(|error| eprintln!("{error}"))
+                .err();
             let effective_rules = config::build_effective_rules(app.handle(), &config);
             let state = Arc::new(AppState::new(config, effective_rules, database));
-            if should_start {
-                if let Err(error) = state.start_current() {
-                    eprintln!("DNS 服务启动失败：{error}");
-                    state.set_error(Some(error));
-                }
+            if let Some(error) = autostart_error {
+                state.set_error(Some(error));
+            }
+            if should_start && let Err(error) = state.start_current() {
+                eprintln!("DNS 服务启动失败：{error}");
+                state.set_error(Some(error));
             }
             app.manage(state);
             Ok(())

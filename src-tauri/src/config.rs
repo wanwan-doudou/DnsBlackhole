@@ -25,6 +25,8 @@ pub struct AppConfig {
     pub query_log_enabled: bool,
     #[serde(default)]
     pub anonymize_client_ip: bool,
+    #[serde(default = "default_launch_at_startup")]
+    pub launch_at_startup: bool,
     #[serde(default = "default_query_log_retention_hours")]
     pub query_log_retention_hours: u32,
     #[serde(default = "default_dns_cache_enabled")]
@@ -43,9 +45,10 @@ pub struct AppConfig {
     pub blacklist: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamMode {
+    #[default]
     LoadBalance,
     ParallelRequests,
     FastestAddr,
@@ -83,6 +86,12 @@ impl Default for FilterSubscription {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FilterCacheClearStats {
+    pub removed_files: usize,
+    pub removed_bytes: u64,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -95,6 +104,7 @@ impl Default for AppConfig {
             filter_update_interval_hours: default_filter_update_interval_hours(),
             query_log_enabled: default_query_log_enabled(),
             anonymize_client_ip: false,
+            launch_at_startup: default_launch_at_startup(),
             query_log_retention_hours: default_query_log_retention_hours(),
             dns_cache_enabled: default_dns_cache_enabled(),
             dns_cache_size: default_dns_cache_size(),
@@ -153,12 +163,6 @@ impl AppConfig {
     }
 }
 
-impl Default for UpstreamMode {
-    fn default() -> Self {
-        Self::ParallelRequests
-    }
-}
-
 fn default_use_filters() -> bool {
     true
 }
@@ -169,6 +173,10 @@ fn default_filter_update_interval_hours() -> u32 {
 
 fn default_query_log_enabled() -> bool {
     true
+}
+
+fn default_launch_at_startup() -> bool {
+    false
 }
 
 fn default_query_log_retention_hours() -> u32 {
@@ -395,6 +403,49 @@ pub fn write_filter_cache(app: &AppHandle, id: &str, content: &str) -> Result<()
     fs::write(&path, content).map_err(|e| format!("写入清单缓存失败：{}：{e}", path.display()))
 }
 
+pub fn clear_filter_cache(
+    app: &AppHandle,
+    config: &mut AppConfig,
+) -> Result<FilterCacheClearStats, String> {
+    let dir = filters_dir(app)?;
+    let stats = clear_filter_cache_dir(&dir)?;
+
+    for filter in &mut config.filters {
+        filter.rule_count = 0;
+        filter.last_updated = None;
+        filter.last_error = None;
+    }
+
+    Ok(stats)
+}
+
+fn clear_filter_cache_dir(dir: &Path) -> Result<FilterCacheClearStats, String> {
+    if !dir.exists() {
+        return Ok(FilterCacheClearStats::default());
+    }
+
+    let mut stats = FilterCacheClearStats::default();
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("读取清单缓存目录失败：{}：{e}", dir.display()))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取清单缓存文件失败：{e}"))?;
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("读取清单缓存文件信息失败：{}：{e}", path.display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+
+        fs::remove_file(&path).map_err(|e| format!("删除清单缓存失败：{}：{e}", path.display()))?;
+        stats.removed_files += 1;
+        stats.removed_bytes += metadata.len();
+    }
+
+    Ok(stats)
+}
+
 pub fn build_effective_rules(app: &AppHandle, config: &AppConfig) -> String {
     if !config.use_filters {
         return String::new();
@@ -436,11 +487,36 @@ mod tests {
 
     #[test]
     fn migrates_old_mdns_default_port() {
-        let mut config = AppConfig::default();
-        config.listen_port = 5353;
+        let mut config = AppConfig {
+            listen_port: 5353,
+            ..AppConfig::default()
+        };
 
         migrate_legacy_defaults(&mut config);
 
         assert_eq!(config.listen_port, 53);
+    }
+
+    #[test]
+    fn clears_filter_cache_files_without_removing_subdirectories() {
+        let dir = std::env::temp_dir().join(format!(
+            "dnsblackhole-filter-cache-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be valid")
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("nested")).expect("test cache directory should create");
+        fs::write(dir.join("a.txt"), "abc").expect("test cache file should write");
+        fs::write(dir.join("nested").join("keep.txt"), "x").expect("nested test file should write");
+
+        let stats = clear_filter_cache_dir(&dir).expect("cache should clear");
+
+        assert_eq!(stats.removed_files, 1);
+        assert_eq!(stats.removed_bytes, 3);
+        assert!(!dir.join("a.txt").exists());
+        assert!(dir.join("nested").join("keep.txt").exists());
+
+        fs::remove_dir_all(dir).expect("test cache directory should remove");
     }
 }
