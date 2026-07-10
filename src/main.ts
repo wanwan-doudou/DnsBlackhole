@@ -8,7 +8,6 @@ import {
   getConfig,
   getQueryLogs,
   getStatus,
-  runDnsDiagnostics as runDnsDiagnosticsCommand,
   saveConfig as saveConfigCommand,
   startDns,
   stopDns,
@@ -30,8 +29,7 @@ import {
 import { renderAppTemplate } from "./template";
 import type {
   AppConfig,
-  DnsDiagnosticsResult,
-  DnsProbeResult,
+  BlockingMode,
   FilterSubscription,
   QueryLogFilter,
   QueryLogPage,
@@ -75,6 +73,7 @@ let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
 let queryLogSearchComposing = false;
 let currentConfigSchemaVersion = 2;
+let clientNameMap = new Map<string, string>();
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const QUERY_LOG_PAGE_SIZE = 50;
@@ -115,24 +114,29 @@ const dnsCacheSizeInput = query<HTMLInputElement>("#dns_cache_size");
 const dnsCacheMinTtlInput = query<HTMLInputElement>("#dns_cache_min_ttl");
 const dnsCacheMaxTtlInput = query<HTMLInputElement>("#dns_cache_max_ttl");
 const dnsCacheOptimisticInput = query<HTMLInputElement>("#dns_cache_optimistic");
-const diagnosticsDomainInput = query<HTMLInputElement>("#diagnostics_domain");
-const diagnosticsResult = query<HTMLDivElement>("#diagnostics_result");
 const runtimeWatchdogEnabledInput = query<HTMLInputElement>("#runtime_watchdog_enabled");
 const runtimeWatchdogIntervalInput = query<HTMLInputElement>("#runtime_watchdog_interval_seconds");
+const blockingModeInputs = Array.from(
+  document.querySelectorAll<HTMLInputElement>('input[name="blocking_mode"]'),
+);
+const blockingCustomFields = query<HTMLDivElement>("#blocking_custom_fields");
+const blockingCustomIpv4Input = query<HTMLInputElement>("#blocking_custom_ipv4");
+const blockingCustomIpv6Input = query<HTMLInputElement>("#blocking_custom_ipv6");
+const dnsRewritesInput = query<HTMLTextAreaElement>("#dns_rewrites");
+const clientNamesInput = query<HTMLTextAreaElement>("#client_names");
+const queryLogIgnoredInput = query<HTMLTextAreaElement>("#query_log_ignored_domains");
 const blacklistInput = query<HTMLTextAreaElement>("#blacklist");
 const filtersTable = query<HTMLDivElement>(".filters-table");
 const filtersBody = query<HTMLDivElement>("#filters_body");
 const saveButton = query<HTMLButtonElement>("#save_btn");
 const saveSettingsButton = query<HTMLButtonElement>("#save_settings_btn");
 const saveSecurityButton = query<HTMLButtonElement>("#save_security_btn");
-const saveDiagnosticsButton = query<HTMLButtonElement>("#save_diagnostics_btn");
 const saveCustomButton = query<HTMLButtonElement>("#save_custom_btn");
 const startButton = query<HTMLButtonElement>("#start_btn");
 const stopButton = query<HTMLButtonElement>("#stop_btn");
 const addFilterButton = query<HTMLButtonElement>("#add_filter_btn");
 const updateFiltersButton = query<HTMLButtonElement>("#update_filters_btn");
 const clearDnsCacheButton = query<HTMLButtonElement>("#clear_dns_cache_btn");
-const runDiagnosticsButton = query<HTMLButtonElement>("#run_diagnostics_btn");
 const clearFilterCacheButton = query<HTMLButtonElement>("#clear_filter_cache_btn");
 const appVersionElement = query<HTMLElement>("#app_version");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
@@ -307,6 +311,9 @@ contentElement.addEventListener("scroll", markContentScrolling, { passive: true 
 queryLogEnabledInput.addEventListener("change", updateLogControls);
 dnsCacheEnabledInput.addEventListener("change", updateDnsCacheControls);
 runtimeWatchdogEnabledInput.addEventListener("change", updateRuntimeWatchdogControls);
+blockingModeInputs.forEach((input) => {
+  input.addEventListener("change", updateBlockingModeControls);
+});
 queryLogRetentionInputs.forEach((input) => {
   input.addEventListener("change", () => {
     updateLogControls();
@@ -325,10 +332,6 @@ saveSettingsButton.addEventListener("click", async () => {
 });
 
 saveSecurityButton.addEventListener("click", async () => {
-  await saveConfig();
-});
-
-saveDiagnosticsButton.addEventListener("click", async () => {
   await saveConfig();
 });
 
@@ -410,29 +413,6 @@ clearDnsCacheButton.addEventListener("click", async () => {
   } finally {
     setBusy(false);
     updateDnsCacheControls();
-  }
-});
-
-runDiagnosticsButton.addEventListener("click", async () => {
-  setBusy(true);
-  runDiagnosticsButton.classList.add("loading");
-  renderDiagnosticsLoading();
-  try {
-    const status = await saveConfigOnly();
-    renderStatus(status, { renderDashboard: activeView === "dashboard" });
-    const result = await runDnsDiagnosticsCommand();
-    renderDiagnosticsResult(result);
-    showMessage(
-      result.udp.ok && result.tcp.ok ? "DNS 诊断完成" : "DNS 诊断发现异常",
-      !(result.udp.ok && result.tcp.ok),
-    );
-    await loadConfig();
-  } catch (error) {
-    showMessage(String(error), true);
-    await refreshStatus();
-  } finally {
-    runDiagnosticsButton.classList.remove("loading");
-    setBusy(false);
   }
 });
 
@@ -637,15 +617,22 @@ async function loadConfig(): Promise<void> {
     dnsCacheMinTtlInput.value = String(config.dns_cache_min_ttl);
     dnsCacheMaxTtlInput.value = String(config.dns_cache_max_ttl);
     dnsCacheOptimisticInput.checked = config.dns_cache_optimistic;
-    diagnosticsDomainInput.value = config.diagnostics_domain;
     runtimeWatchdogEnabledInput.checked = config.runtime_watchdog_enabled;
     runtimeWatchdogIntervalInput.value = String(config.runtime_watchdog_interval_seconds);
+    setRadioValue(blockingModeInputs, config.blocking_mode);
+    blockingCustomIpv4Input.value = config.blocking_custom_ipv4;
+    blockingCustomIpv6Input.value = config.blocking_custom_ipv6;
+    dnsRewritesInput.value = config.dns_rewrites;
+    clientNamesInput.value = config.client_names;
+    queryLogIgnoredInput.value = config.query_log_ignored_domains;
+    clientNameMap = parseClientNames(config.client_names);
     currentQueryLogEnabled = config.query_log_enabled;
     currentQueryLogRetentionHours = config.query_log_retention_hours;
     renderRetentionWindow();
     updateLogControls();
     updateDnsCacheControls();
     updateRuntimeWatchdogControls();
+    updateBlockingModeControls();
     blacklistInput.value = config.blacklist;
     filtersState = config.filters;
     renderFilters();
@@ -687,9 +674,14 @@ function collectConfig(): AppConfig {
     dns_cache_min_ttl: Number(dnsCacheMinTtlInput.value || 0),
     dns_cache_max_ttl: Number(dnsCacheMaxTtlInput.value || 0),
     dns_cache_optimistic: dnsCacheOptimisticInput.checked,
-    diagnostics_domain: diagnosticsDomainInput.value.trim(),
     runtime_watchdog_enabled: runtimeWatchdogEnabledInput.checked,
     runtime_watchdog_interval_seconds: Number(runtimeWatchdogIntervalInput.value || 0),
+    blocking_mode: selectedRadioValue(blockingModeInputs, "null_ip") as BlockingMode,
+    blocking_custom_ipv4: blockingCustomIpv4Input.value.trim(),
+    blocking_custom_ipv6: blockingCustomIpv6Input.value.trim(),
+    dns_rewrites: dnsRewritesInput.value,
+    client_names: clientNamesInput.value,
+    query_log_ignored_domains: queryLogIgnoredInput.value,
     listen_host: listenHostInput.value.trim(),
     listen_port: Number(listenPortInput.value),
     filters: filtersState.map((filter) => ({
@@ -917,52 +909,6 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   renderUpstreamLatencyRank("#upstream_latency_rank", status.stats.upstream_avg_latency ?? []);
 }
 
-function renderDiagnosticsLoading(): void {
-  setHtmlIfChanged(diagnosticsResult, `<div class="diagnostic-empty">正在运行诊断</div>`);
-}
-
-function renderDiagnosticsResult(result: DnsDiagnosticsResult): void {
-  const html = `
-    <div class="diagnostic-meta">
-      <span>监听地址</span>
-      <strong>${escapeHtml(result.listen_addr)}</strong>
-    </div>
-    <div class="diagnostic-meta">
-      <span>诊断目标</span>
-      <strong>${escapeHtml(result.probe_addr)}</strong>
-    </div>
-    <div class="diagnostic-meta">
-      <span>诊断域名</span>
-      <strong>${escapeHtml(result.domain)}</strong>
-    </div>
-    <div class="diagnostic-probes">
-      ${renderDiagnosticProbe("UDP", result.udp)}
-      ${renderDiagnosticProbe("TCP", result.tcp)}
-    </div>
-  `;
-  setHtmlIfChanged(diagnosticsResult, html);
-}
-
-function renderDiagnosticProbe(label: string, probe: DnsProbeResult): string {
-  const stateLabel = probe.ok ? "正常" : "失败";
-  const parts = [
-    probe.duration_ms !== null ? `${formatCount(probe.duration_ms)} ms` : "",
-    probe.rcode !== null ? `rcode ${formatCount(probe.rcode)}` : "",
-    probe.answers !== null ? `${formatCount(probe.answers)} 条答案` : "",
-  ].filter(Boolean);
-
-  return `
-    <div class="diagnostic-probe ${probe.ok ? "ok" : "failed"}">
-      <div>
-        <strong>${label}</strong>
-        <span>${stateLabel}</span>
-      </div>
-      <small>${escapeHtml(parts.join(" · ") || "-")}</small>
-      ${probe.error ? `<p>${escapeHtml(probe.error)}</p>` : ""}
-    </div>
-  `;
-}
-
 function formatFilterRuleSummary(filter: FilterSubscription): string {
   const ignoredParts = [
     filter.ignored_comment_count > 0 ? `空行/注释 ${formatCount(filter.ignored_comment_count)}` : "",
@@ -1040,7 +986,7 @@ function renderQueryLogRow(record: QueryLogRecord): string {
         ${duration ? `<small>${duration}</small>` : ""}
       </div>
       <div class="log-client">
-        <strong>${escapeHtml(record.client_ip || "-")}</strong>
+        <strong>${escapeHtml(clientDisplayName(record.client_ip) ?? record.client_ip ?? "-")}</strong>
         <span>${escapeHtml(record.client_ip || "未知客户端")}</span>
       </div>
     </div>
@@ -1069,7 +1015,7 @@ function renderQueryLogDetail(
     ["域名", record.domain],
     ["类型", "标准 DNS"],
     ["响应", statusLabel],
-    ["客户端", record.client_ip || "未知客户端"],
+    ["客户端", formatClientLabel(record.client_ip)],
     ["详情", detail],
   ];
 
@@ -1216,6 +1162,48 @@ function updateDnsCacheControls(): void {
 
 function updateRuntimeWatchdogControls(): void {
   runtimeWatchdogIntervalInput.disabled = !runtimeWatchdogEnabledInput.checked;
+}
+
+function updateBlockingModeControls(): void {
+  const isCustom = selectedRadioValue(blockingModeInputs, "null_ip") === "custom_ip";
+  blockingCustomFields.classList.toggle("visible", isCustom);
+  blockingCustomIpv4Input.disabled = !isCustom;
+  blockingCustomIpv6Input.disabled = !isCustom;
+}
+
+function parseClientNames(value: string): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const line of value.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith("#") || trimmed.startsWith("!")) {
+      continue;
+    }
+    const spaceIndex = trimmed.search(/\s/);
+    if (spaceIndex <= 0) {
+      continue;
+    }
+    const ip = trimmed.slice(0, spaceIndex);
+    const name = trimmed.slice(spaceIndex).trim();
+    if (name.length > 0) {
+      map.set(ip, name);
+    }
+  }
+  return map;
+}
+
+function clientDisplayName(ip: string | null): string | null {
+  if (!ip) {
+    return null;
+  }
+  return clientNameMap.get(ip) ?? null;
+}
+
+function formatClientLabel(ip: string | null): string {
+  if (!ip) {
+    return "未知客户端";
+  }
+  const name = clientDisplayName(ip);
+  return name ? `${name}（${ip}）` : ip;
 }
 
 function sleep(ms: number): Promise<void> {

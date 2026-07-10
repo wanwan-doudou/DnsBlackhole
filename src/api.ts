@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   AppConfig,
-  DnsDiagnosticsResult,
   FilterCacheClearResult,
   FilterUpdateResult,
   QueryLogFilter,
@@ -51,8 +50,4 @@ export function clearDnsCache(): Promise<RuntimeStatus> {
 
 export function clearFilterCache(): Promise<FilterCacheClearResult> {
   return invoke<FilterCacheClearResult>("clear_filter_cache");
-}
-
-export function runDnsDiagnostics(): Promise<DnsDiagnosticsResult> {
-  return invoke<DnsDiagnosticsResult>("run_dns_diagnostics");
 }

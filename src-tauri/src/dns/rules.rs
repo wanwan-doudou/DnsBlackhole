@@ -105,6 +105,49 @@ impl RuleSet {
     }
 }
 
+/// 简单域名集合：命中域名本身或其任意父域名即算匹配，用于日志忽略等场景。
+#[derive(Clone, Default)]
+pub(crate) struct DomainSet {
+    domains: HashSet<String>,
+}
+
+impl DomainSet {
+    pub(crate) fn contains(&self, domain: &str) -> bool {
+        if self.domains.is_empty() {
+            return false;
+        }
+        if self.domains.contains(domain) {
+            return true;
+        }
+
+        let mut offset = 0;
+        while let Some(dot_index) = domain[offset..].find('.') {
+            offset += dot_index + 1;
+            if self.domains.contains(&domain[offset..]) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+pub(crate) fn compile_domain_set(raw: &str) -> DomainSet {
+    let mut domains = HashSet::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+            continue;
+        }
+
+        let pattern = trimmed.strip_prefix("*.").unwrap_or(trimmed);
+        if let Some(domain) = normalize_domain(pattern) {
+            domains.insert(domain);
+        }
+    }
+    DomainSet { domains }
+}
+
 enum ParsedRule {
     Block(Rule),
     Allow(Rule),

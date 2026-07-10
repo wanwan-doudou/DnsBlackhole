@@ -1,9 +1,12 @@
 mod access;
 mod cache;
+mod filter_runtime;
 mod protocol;
+mod rewrites;
 mod rules;
 mod server;
 mod stats;
+mod task_pool;
 mod upstream;
 mod worker;
 
@@ -22,14 +25,18 @@ mod tests {
 
     use crate::config::UpstreamServer;
 
+    use crate::config::{AppConfig, BlockingMode};
+
     use super::{
         cache::{DnsCache, DnsCacheConfig, QueryCacheKey, cache_ttl_seconds},
         protocol::{
-            RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_SOA, build_block_response,
-            build_error_response, extract_response_ips, parse_question, prepare_cached_response,
-            read_u16, response_is_truncated, response_min_record_ttl, validate_response_for_query,
+            BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_SOA,
+            build_block_response, build_error_response, build_rewrite_response,
+            extract_response_ips, parse_question, prepare_cached_response, read_u16,
+            response_is_truncated, response_min_record_ttl, validate_response_for_query,
         },
-        rules::{compile_rules, summarize_rules},
+        rewrites::compile_rewrites,
+        rules::{compile_domain_set, compile_rules, summarize_rules},
         stats::{DnsStats, current_second, record_blocked, record_query},
         upstream::{
             RuntimeUpstream, is_upstream_temporarily_unhealthy, mark_upstream_available,
@@ -81,11 +88,64 @@ mod tests {
     fn block_response_returns_zero_address_for_a_query() {
         let query = a_query("blocked.test");
         let question = parse_question(&query).expect("query should parse");
-        let response = build_block_response(&query, &question);
+        let response = build_block_response(&query, &question, &BlockingPolicy::default());
 
         assert_eq!(&response[0..2], &query[0..2]);
         assert_eq!(read_u16(&response, 6), Some(1));
         assert_eq!(&response[response.len() - 4..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn block_response_supports_nxdomain_and_custom_ip_modes() {
+        let query = a_query("blocked.test");
+        let question = parse_question(&query).expect("query should parse");
+
+        let nxdomain_policy = BlockingPolicy::from_config(&AppConfig {
+            blocking_mode: BlockingMode::Nxdomain,
+            ..AppConfig::default()
+        });
+        let response = build_block_response(&query, &question, &nxdomain_policy);
+        assert_eq!(response[3] & 0x0f, RCODE_NXDOMAIN);
+        assert_eq!(read_u16(&response, 6), Some(0));
+
+        let custom_policy = BlockingPolicy::from_config(&AppConfig {
+            blocking_mode: BlockingMode::CustomIp,
+            blocking_custom_ipv4: "10.0.0.1".into(),
+            ..AppConfig::default()
+        });
+        let response = build_block_response(&query, &question, &custom_policy);
+        assert_eq!(read_u16(&response, 6), Some(1));
+        assert_eq!(&response[response.len() - 4..], &[10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn rewrite_response_answers_matching_ip_family_only() {
+        let rewrites = compile_rewrites("nas.lan 192.168.1.10");
+        let target = rewrites.lookup("nas.lan").expect("rewrite should match");
+
+        let query = a_query("nas.lan");
+        let question = parse_question(&query).expect("query should parse");
+        let response = build_rewrite_response(&query, &question, &target);
+        assert_eq!(read_u16(&response, 6), Some(1));
+        assert_eq!(&response[response.len() - 4..], &[192, 168, 1, 10]);
+
+        let aaaa_query = typed_query("nas.lan", 28);
+        let aaaa_question = parse_question(&aaaa_query).expect("query should parse");
+        let aaaa_response = build_rewrite_response(&aaaa_query, &aaaa_question, &target);
+        // 只有 IPv4 记录时，AAAA 查询应返回无答案的 NOERROR
+        assert_eq!(aaaa_response[3] & 0x0f, 0);
+        assert_eq!(read_u16(&aaaa_response, 6), Some(0));
+    }
+
+    #[test]
+    fn domain_set_matches_domain_and_subdomains() {
+        let set = compile_domain_set("example.com\n*.lan\n# comment\n");
+
+        assert!(set.contains("example.com"));
+        assert!(set.contains("www.example.com"));
+        assert!(set.contains("nas.lan"));
+        assert!(!set.contains("example.org"));
+        assert!(!set.contains("badexample.com"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, Row, named_params, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params, params};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -60,6 +60,9 @@ const UPSERT_QUERY_LOG_UPSTREAM_STATS_SQL: &str = "
 
 pub struct Database {
     conn: Mutex<Connection>,
+    // WAL 模式下读写可并行；仪表盘/日志查询走独立只读连接，
+    // 避免和批量日志写入互相阻塞。内存库（测试）没有独立连接，回退主连接。
+    read_conn: Option<Mutex<Connection>>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,8 +118,11 @@ impl Database {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("创建数据库目录失败：{e}"))?;
         }
-        let conn = Connection::open(path).map_err(|e| format!("打开数据库失败：{e}"))?;
-        Self::from_connection(conn)
+        let conn = Connection::open(&path).map_err(|e| format!("打开数据库失败：{e}"))?;
+        let mut database = Self::from_connection(conn)?;
+        // 主连接完成建表和 WAL 设置后再打开只读连接
+        database.read_conn = open_read_connection(&path);
+        Ok(database)
     }
 
     #[cfg(test)]
@@ -132,6 +138,7 @@ impl Database {
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            read_conn: None,
         })
     }
 
@@ -250,7 +257,7 @@ impl Database {
         let since = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
         let since_minute = since / 60;
         let since_param = u64_to_db_i64(since_minute, "日志统计起始分钟")?;
-        let conn = self.lock()?;
+        let conn = self.lock_read()?;
         let (queries, blocked, forwarded, failed) = conn
             .query_row(
                 "SELECT
@@ -279,7 +286,7 @@ impl Database {
             failed,
             query_domains: grouped_domain_counts(&conn, since_minute, false)?,
             blocked_domains: grouped_domain_counts(&conn, since_minute, true)?,
-            traffic: traffic_buckets(&conn, since_minute)?,
+            traffic: traffic_buckets(&conn, since_minute, retention_hours)?,
             upstream_requests: upstream_request_counts(&conn, since_minute)?,
             upstream_avg_latency: upstream_avg_latency(&conn, since_minute)?,
         })
@@ -335,7 +342,7 @@ impl Database {
         let page_size = page_size.clamp(20, 200);
         let limit = i64::from(page_size);
         let offset = i64::from(page.saturating_sub(1)) * i64::from(page_size);
-        let conn = self.lock()?;
+        let conn = self.lock_read()?;
         let total_sql = format!("SELECT COUNT(*) FROM query_logs WHERE {where_sql}");
         let total = if search.is_empty() {
             conn.query_row(
@@ -393,6 +400,31 @@ impl Database {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
         self.conn.lock().map_err(|_| "数据库连接已损坏".into())
     }
+
+    fn lock_read(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
+        if let Some(read_conn) = &self.read_conn {
+            return read_conn.lock().map_err(|_| "数据库只读连接已损坏".into());
+        }
+        self.lock()
+    }
+}
+
+fn open_read_connection(path: &std::path::Path) -> Option<Mutex<Connection>> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    if conn.busy_timeout(Duration::from_secs(2)).is_err() {
+        return None;
+    }
+    let _ = conn.execute_batch(
+        "
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -8192;
+        ",
+    );
+    Some(Mutex::new(conn))
 }
 
 fn execute_query_log_insert(
@@ -707,15 +739,31 @@ fn grouped_domain_counts(
     Ok(counts)
 }
 
-fn traffic_buckets(conn: &Connection, since_minute: u64) -> Result<Vec<TrafficBucket>, String> {
+// 超过该窗口的趋势按小时聚合，避免长保留期一次返回十几万分钟桶
+const TRAFFIC_HOUR_BUCKET_THRESHOLD_HOURS: u32 = 48;
+
+fn traffic_buckets(
+    conn: &Connection,
+    since_minute: u64,
+    retention_hours: u32,
+) -> Result<Vec<TrafficBucket>, String> {
     let since = u64_to_db_i64(since_minute, "趋势起始分钟")?;
+    let sql = if retention_hours > TRAFFIC_HOUR_BUCKET_THRESHOLD_HOURS {
+        "SELECT (minute / 60) * 60 AS bucket_minute,
+                COALESCE(SUM(queries), 0),
+                COALESCE(SUM(blocked), 0)
+         FROM query_log_minute_stats
+         WHERE minute >= ?1
+         GROUP BY minute / 60
+         ORDER BY bucket_minute"
+    } else {
+        "SELECT minute, queries, blocked
+         FROM query_log_minute_stats
+         WHERE minute >= ?1
+         ORDER BY minute"
+    };
     let mut stmt = conn
-        .prepare(
-            "SELECT minute, queries, blocked
-             FROM query_log_minute_stats
-             WHERE minute >= ?1
-             ORDER BY minute",
-        )
+        .prepare(sql)
         .map_err(|e| format!("准备趋势查询失败：{e}"))?;
     let rows = stmt
         .query_map(params![since], |row| {

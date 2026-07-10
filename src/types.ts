@@ -5,7 +5,6 @@ export type ViewName =
   | "filters"
   | "custom"
   | "logs"
-  | "diagnostics"
   | "settings";
 export type QueryLogFilter = "all" | "processed" | "blocked" | "failed";
 
@@ -27,6 +26,8 @@ export type FilterSubscription = {
 };
 
 export type UpstreamMode = "load_balance" | "parallel_requests" | "fastest_addr";
+
+export type BlockingMode = "null_ip" | "nxdomain" | "refused" | "custom_ip";
 
 export type AppConfig = {
   schema_version: number;
@@ -54,9 +55,14 @@ export type AppConfig = {
   dns_cache_min_ttl: number;
   dns_cache_max_ttl: number;
   dns_cache_optimistic: boolean;
-  diagnostics_domain: string;
   runtime_watchdog_enabled: boolean;
   runtime_watchdog_interval_seconds: number;
+  blocking_mode: BlockingMode;
+  blocking_custom_ipv4: string;
+  blocking_custom_ipv6: string;
+  dns_rewrites: string;
+  client_names: string;
+  query_log_ignored_domains: string;
   filters: FilterSubscription[];
   blacklist: string;
 };
@@ -148,22 +154,6 @@ export type FilterCacheClearResult = {
   removed_files: number;
   removed_bytes: number;
   message: string;
-};
-
-export type DnsProbeResult = {
-  ok: boolean;
-  duration_ms: number | null;
-  rcode: number | null;
-  answers: number | null;
-  error: string | null;
-};
-
-export type DnsDiagnosticsResult = {
-  domain: string;
-  listen_addr: string;
-  probe_addr: string;
-  udp: DnsProbeResult;
-  tcp: DnsProbeResult;
 };
 
 export type RefreshOptions = {
