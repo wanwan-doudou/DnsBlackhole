@@ -1,12 +1,12 @@
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::{IpAddr, SocketAddr, TcpStream, UdpSocket},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -15,6 +15,7 @@ use crate::config::{UpstreamMode, UpstreamServer};
 use super::{
     protocol::{extract_response_ips, response_is_truncated, validate_response_for_query},
     stats::current_second,
+    task_pool,
 };
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
@@ -23,7 +24,13 @@ const DOH_CLIENT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FASTEST_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_millis(180);
 const FASTEST_ADDR_MAX_IPS_PER_RESPONSE: usize = 8;
 const FASTEST_ADDR_MAX_PROBES: usize = 32;
+const FASTEST_ADDR_PROBE_WAIT: Duration = Duration::from_secs(1);
 const MAX_PARALLEL_UPSTREAMS_PER_QUERY: usize = 8;
+// 上游整体等待需要覆盖单次超时加上线程池排队的余量
+const PARALLEL_RESULT_WAIT: Duration = Duration::from_secs(6);
+const UDP_SOCKET_POOL_CAPACITY: usize = 8;
+const PROBE_CACHE_TTL_SECONDS: u64 = 600;
+const PROBE_CACHE_MAX_ENTRIES: usize = 4096;
 const DNSBLACKHOLE_USER_AGENT: &str = "DnsBlackhole/0.1";
 
 #[derive(Clone)]
@@ -32,6 +39,8 @@ pub(crate) struct RuntimeUpstream {
     label: String,
     doh_client: Option<reqwest::blocking::Client>,
     unhealthy_until: Arc<AtomicU64>,
+    // 已 connect 到该上游的 UDP socket 复用池，省掉每次查询的 bind/connect 系统调用
+    udp_socket_pool: Arc<Mutex<Vec<UdpSocket>>>,
 }
 
 #[derive(Clone)]
@@ -68,6 +77,7 @@ impl RuntimeUpstream {
             label,
             doh_client,
             unhealthy_until: Arc::new(AtomicU64::new(0)),
+            udp_socket_pool: Arc::new(Mutex::new(Vec::new())),
         })
     }
 }
@@ -147,27 +157,19 @@ fn forward_parallel(
         return Err("没有可用的上游 DNS".into());
     }
 
-    let (sender, receiver) = mpsc::channel();
-    let query = Arc::new(query.to_vec());
-    for upstream in &selected_upstreams {
-        let upstream = upstream.clone();
-        let sender = sender.clone();
-        let query = Arc::clone(&query);
-        thread::spawn(move || {
-            let _ = sender.send(forward_to_upstream(query.as_ref().as_slice(), &upstream));
-        });
-    }
-    drop(sender);
-
+    let expected = selected_upstreams.len();
+    let receiver = spawn_parallel_forwards(query, selected_upstreams);
+    let deadline = Instant::now() + PARALLEL_RESULT_WAIT;
     let mut last_error = None;
-    for result in receiver.iter().take(selected_upstreams.len()) {
-        match result {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
+    for _ in 0..expected {
+        match recv_until(&receiver, deadline) {
+            Some(Ok(response)) => return Ok(response),
+            Some(Err(error)) => last_error = Some(error),
+            None => break,
         }
     }
 
-    Err(last_error.unwrap_or_else(|| "没有可用的上游 DNS".into()))
+    Err(last_error.unwrap_or_else(|| "并行请求上游 DNS 超时".into()))
 }
 
 fn forward_fastest_addr(
@@ -179,29 +181,21 @@ fn forward_fastest_addr(
         return Err("没有可用的上游 DNS".into());
     }
 
-    let (sender, receiver) = mpsc::channel();
-    let query = Arc::new(query.to_vec());
-    for upstream in &selected_upstreams {
-        let upstream = upstream.clone();
-        let sender = sender.clone();
-        let query = Arc::clone(&query);
-        thread::spawn(move || {
-            let _ = sender.send(forward_to_upstream(query.as_ref().as_slice(), &upstream));
-        });
-    }
-    drop(sender);
-
+    let expected = selected_upstreams.len();
+    let receiver = spawn_parallel_forwards(query, selected_upstreams);
+    let deadline = Instant::now() + PARALLEL_RESULT_WAIT;
     let mut responses = Vec::new();
     let mut last_error = None;
-    for result in receiver.iter().take(selected_upstreams.len()) {
-        match result {
-            Ok(response) => responses.push(response),
-            Err(error) => last_error = Some(error),
+    for _ in 0..expected {
+        match recv_until(&receiver, deadline) {
+            Some(Ok(response)) => responses.push(response),
+            Some(Err(error)) => last_error = Some(error),
+            None => break,
         }
     }
 
     if responses.is_empty() {
-        return Err(last_error.unwrap_or_else(|| "没有可用的上游 DNS".into()));
+        return Err(last_error.unwrap_or_else(|| "并行请求上游 DNS 超时".into()));
     }
 
     if let Some(index) = fastest_response_index(&responses) {
@@ -209,6 +203,27 @@ fn forward_fastest_addr(
     }
 
     Ok(responses.remove(0))
+}
+
+fn spawn_parallel_forwards(
+    query: &[u8],
+    selected_upstreams: Vec<RuntimeUpstream>,
+) -> mpsc::Receiver<Result<UpstreamForwardResponse, String>> {
+    let (sender, receiver) = mpsc::channel();
+    let query = Arc::new(query.to_vec());
+    for upstream in selected_upstreams {
+        let sender = sender.clone();
+        let query = Arc::clone(&query);
+        task_pool::spawn_task(move || {
+            let _ = sender.send(forward_to_upstream(query.as_ref().as_slice(), &upstream));
+        });
+    }
+    receiver
+}
+
+fn recv_until<T>(receiver: &mpsc::Receiver<T>, deadline: Instant) -> Option<T> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    receiver.recv_timeout(remaining).ok()
 }
 
 fn select_parallel_upstreams(upstream_servers: &[RuntimeUpstream]) -> Vec<RuntimeUpstream> {
@@ -248,24 +263,102 @@ fn fastest_response_index(responses: &[UpstreamForwardResponse]) -> Option<usize
         return None;
     }
 
-    let (sender, receiver) = mpsc::channel();
+    // 先用缓存的拨测结果，只有未知 IP 才真正发起 TCP 探测
+    let now = current_second();
+    let mut best: Option<IpLatencyProbe> = None;
+    let mut pending = Vec::new();
     for (response_index, ip) in candidates {
-        let sender = sender.clone();
-        thread::spawn(move || {
-            if let Some(duration) = measure_ip_latency(ip) {
-                let _ = sender.send(IpLatencyProbe {
+        match cached_probe_duration(ip, now) {
+            Some(Some(duration)) => update_best_probe(
+                &mut best,
+                IpLatencyProbe {
                     response_index,
                     duration,
-                });
-            }
-        });
+                },
+            ),
+            Some(None) => {}
+            None => pending.push((response_index, ip)),
+        }
     }
-    drop(sender);
 
-    receiver
-        .into_iter()
-        .min_by_key(|probe| probe.duration)
-        .map(|probe| probe.response_index)
+    if !pending.is_empty() {
+        let expected = pending.len();
+        let (sender, receiver) = mpsc::channel();
+        for (response_index, ip) in pending {
+            let sender = sender.clone();
+            task_pool::spawn_task(move || {
+                let duration = measure_ip_latency(ip);
+                store_probe_duration(ip, duration);
+                if let Some(duration) = duration {
+                    let _ = sender.send(IpLatencyProbe {
+                        response_index,
+                        duration,
+                    });
+                }
+            });
+        }
+        drop(sender);
+
+        let deadline = Instant::now() + FASTEST_ADDR_PROBE_WAIT;
+        for _ in 0..expected {
+            match recv_until(&receiver, deadline) {
+                Some(probe) => update_best_probe(&mut best, probe),
+                None => break,
+            }
+        }
+    }
+
+    best.map(|probe| probe.response_index)
+}
+
+fn update_best_probe(best: &mut Option<IpLatencyProbe>, probe: IpLatencyProbe) {
+    if best
+        .as_ref()
+        .is_none_or(|current| probe.duration < current.duration)
+    {
+        *best = Some(probe);
+    }
+}
+
+struct ProbeCacheEntry {
+    duration: Option<Duration>,
+    expires_at: u64,
+}
+
+static PROBE_CACHE: OnceLock<Mutex<HashMap<IpAddr, ProbeCacheEntry>>> = OnceLock::new();
+
+fn probe_cache() -> &'static Mutex<HashMap<IpAddr, ProbeCacheEntry>> {
+    PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 返回 None 表示缓存未命中；Some(None) 表示缓存了一次拨测失败。
+fn cached_probe_duration(ip: IpAddr, now: u64) -> Option<Option<Duration>> {
+    let cache = probe_cache().lock().ok()?;
+    let entry = cache.get(&ip)?;
+    if entry.expires_at <= now {
+        return None;
+    }
+    Some(entry.duration)
+}
+
+fn store_probe_duration(ip: IpAddr, duration: Option<Duration>) {
+    let Ok(mut cache) = probe_cache().lock() else {
+        return;
+    };
+    let now = current_second();
+    if cache.len() >= PROBE_CACHE_MAX_ENTRIES {
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() >= PROBE_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+    }
+    cache.insert(
+        ip,
+        ProbeCacheEntry {
+            duration,
+            expires_at: now.saturating_add(PROBE_CACHE_TTL_SECONDS),
+        },
+    );
 }
 
 fn measure_ip_latency(ip: IpAddr) -> Option<Duration> {
@@ -287,7 +380,7 @@ fn forward_to_upstream(
 ) -> Result<UpstreamForwardResponse, String> {
     let started = Instant::now();
     let response = match &upstream.server {
-        UpstreamServer::Udp(addr) => forward_udp(query, *addr),
+        UpstreamServer::Udp(addr) => forward_udp(query, *addr, &upstream.udp_socket_pool),
         UpstreamServer::Doh(url) => {
             let client = upstream
                 .doh_client
@@ -367,7 +460,32 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn forward_udp(query: &[u8], upstream_addr: SocketAddr) -> Result<Vec<u8>, String> {
+fn forward_udp(
+    query: &[u8],
+    upstream_addr: SocketAddr,
+    socket_pool: &Mutex<Vec<UdpSocket>>,
+) -> Result<Vec<u8>, String> {
+    let socket = checkout_udp_socket(socket_pool, upstream_addr)?;
+    // 出错（含超时）的 socket 缓冲区里可能有迟到的旧响应，直接丢弃不归还
+    let response = udp_exchange(&socket, query)?;
+    return_udp_socket(socket_pool, socket);
+
+    if response_is_truncated(&response) {
+        return forward_tcp(query, upstream_addr);
+    }
+    Ok(response)
+}
+
+fn checkout_udp_socket(
+    socket_pool: &Mutex<Vec<UdpSocket>>,
+    upstream_addr: SocketAddr,
+) -> Result<UdpSocket, String> {
+    if let Ok(mut sockets) = socket_pool.lock()
+        && let Some(socket) = sockets.pop()
+    {
+        return Ok(socket);
+    }
+
     let bind_addr = if upstream_addr.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -376,25 +494,43 @@ fn forward_udp(query: &[u8], upstream_addr: SocketAddr) -> Result<Vec<u8>, Strin
     let socket =
         UdpSocket::bind(bind_addr).map_err(|e| format!("创建上游 DNS UDP 连接失败：{e}"))?;
     socket
-        .set_read_timeout(Some(UPSTREAM_TIMEOUT))
-        .map_err(|e| format!("设置上游 DNS 超时失败：{e}"))?;
-    socket
         .connect(upstream_addr)
         .map_err(|e| format!("连接上游 DNS 失败：{e}"))?;
+    Ok(socket)
+}
+
+fn return_udp_socket(socket_pool: &Mutex<Vec<UdpSocket>>, socket: UdpSocket) {
+    if let Ok(mut sockets) = socket_pool.lock()
+        && sockets.len() < UDP_SOCKET_POOL_CAPACITY
+    {
+        sockets.push(socket);
+    }
+}
+
+fn udp_exchange(socket: &UdpSocket, query: &[u8]) -> Result<Vec<u8>, String> {
     socket
         .send(query)
         .map_err(|e| format!("请求上游 DNS 失败：{e}"))?;
 
-    let mut response = vec![0_u8; 4096];
-    let len = socket
-        .recv(&mut response)
-        .map_err(|e| format!("读取上游 DNS 响应失败：{e}"))?;
-    response.truncate(len);
-    if response_is_truncated(&response) {
-        return forward_tcp(query, upstream_addr);
-    }
+    let deadline = Instant::now() + UPSTREAM_TIMEOUT;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| "读取上游 DNS 响应超时".to_string())?;
+        socket
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| format!("设置上游 DNS 超时失败：{e}"))?;
 
-    Ok(response)
+        let len = socket
+            .recv(&mut buffer)
+            .map_err(|e| format!("读取上游 DNS 响应失败：{e}"))?;
+        // 复用的 socket 可能收到上一次超时查询的迟到响应，用 txid 过滤后继续等待
+        if len >= 2 && buffer[0..2] == query[0..2] {
+            return Ok(buffer[..len].to_vec());
+        }
+    }
 }
 
 fn forward_tcp(query: &[u8], upstream_addr: SocketAddr) -> Result<Vec<u8>, String> {

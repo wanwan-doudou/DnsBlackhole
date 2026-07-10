@@ -7,7 +7,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    thread,
     time::Duration,
 };
 
@@ -19,14 +18,16 @@ use super::{
         DnsCacheConfig, DnsCacheStore, QueryCacheKey, insert_cached_response,
         lookup_cached_response,
     },
+    filter_runtime::{FilterRuntime, SharedFilterRuntime, current_filter_runtime},
     protocol::{
-        RCODE_REFUSED, TYPE_ANY, build_block_response, build_error_response, parse_question,
+        RCODE_REFUSED, TYPE_ANY, build_block_response, build_error_response,
+        build_rewrite_response, parse_question,
     },
-    rules::CompiledRules,
     stats::{
         DnsStats, current_second, record_access_denied, record_blocked_query, record_error,
         record_forwarded, record_query, record_rate_limited, record_refused_any,
     },
+    task_pool,
     upstream::{RuntimeUpstream, UpstreamForwardResponse, forward_query},
 };
 
@@ -54,7 +55,7 @@ pub(crate) struct DnsWorkerContext {
     pub(crate) fallback_next_upstream: AtomicUsize,
     pub(crate) access: Arc<ClientAccess>,
     pub(crate) refuse_any: bool,
-    pub(crate) rules: Arc<CompiledRules>,
+    pub(crate) filter_runtime: SharedFilterRuntime,
     pub(crate) stats: Arc<Mutex<DnsStats>>,
     pub(crate) dns_cache: Option<Arc<DnsCacheStore>>,
     pub(crate) dns_cache_config: Option<DnsCacheConfig>,
@@ -198,6 +199,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         }
     };
 
+    // 整包读取当前过滤状态，一次查询内保持一致；规则热替换只影响后续查询
+    let filter = current_filter_runtime(&context.filter_runtime);
+
     if context.refuse_any && question.qtype == TYPE_ANY {
         record_query(
             &context.stats,
@@ -213,6 +217,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     record_error(&context.stats, message.clone());
                     queue_query_log(
                         context,
+                        &filter,
                         &question.domain,
                         client_addr,
                         false,
@@ -230,6 +235,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         record_refused_any(&context.stats);
         queue_query_log(
             context,
+            &filter,
             &question.domain,
             client_addr,
             false,
@@ -242,8 +248,50 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         return;
     }
 
-    if context.rules.is_blocked(&question.domain) {
-        let response = build_block_response(query, &question);
+    // 本地 DNS 重写优先于黑名单，保证局域网自定义记录不被清单误拦
+    if !filter.rewrites.is_empty()
+        && let Some(target) = filter.rewrites.lookup(&question.domain)
+    {
+        record_query(
+            &context.stats,
+            &question.domain,
+            context.detailed_runtime_stats,
+        );
+        let response = build_rewrite_response(query, &question, &target);
+        if let Err(error) = send_dns_response(context, response_target, &response) {
+            let message = format!("返回 DNS 重写响应失败：{error}");
+            record_error(&context.stats, message.clone());
+            queue_query_log(
+                context,
+                &filter,
+                &question.domain,
+                client_addr,
+                false,
+                false,
+                true,
+                None,
+                None,
+                Some(message),
+            );
+        } else {
+            queue_query_log(
+                context,
+                &filter,
+                &question.domain,
+                client_addr,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+            );
+        }
+        return;
+    }
+
+    if filter.rules.is_blocked(&question.domain) {
+        let response = build_block_response(query, &question, &filter.blocking);
         if let Err(error) = send_dns_response(context, response_target, &response) {
             let message = format!("返回黑名单响应失败：{error}");
             record_query(
@@ -254,6 +302,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             record_error(&context.stats, message.clone());
             queue_query_log(
                 context,
+                &filter,
                 &question.domain,
                 client_addr,
                 true,
@@ -272,6 +321,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         );
         queue_query_log(
             context,
+            &filter,
             &question.domain,
             client_addr,
             true,
@@ -299,6 +349,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             record_error(&context.stats, message.clone());
             queue_query_log(
                 context,
+                &filter,
                 &question.domain,
                 client_addr,
                 false,
@@ -311,6 +362,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         } else {
             queue_query_log(
                 context,
+                &filter,
                 &question.domain,
                 client_addr,
                 false,
@@ -346,6 +398,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                         record_error(&context.stats, message.clone());
                         queue_query_log(
                             context,
+                            &filter,
                             &question.domain,
                             client_addr,
                             false,
@@ -358,6 +411,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     } else {
                         queue_query_log(
                             context,
+                            &filter,
                             &question.domain,
                             client_addr,
                             false,
@@ -374,6 +428,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     send_no_response(response_target);
                     queue_query_log(
                         context,
+                        &filter,
                         &question.domain,
                         client_addr,
                         false,
@@ -413,6 +468,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 record_error(&context.stats, message.clone());
                 queue_query_log(
                     context,
+                    &filter,
                     &question.domain,
                     client_addr,
                     false,
@@ -426,6 +482,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 record_forwarded(&context.stats, context.detailed_runtime_stats);
                 queue_query_log(
                     context,
+                    &filter,
                     &question.domain,
                     client_addr,
                     false,
@@ -442,6 +499,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             send_no_response(response_target);
             queue_query_log(
                 context,
+                &filter,
                 &question.domain,
                 client_addr,
                 false,
@@ -593,7 +651,7 @@ fn refresh_expired_cache_async(
         return;
     };
 
-    thread::spawn(move || {
+    task_pool::spawn_task(move || {
         let next_upstream = AtomicUsize::new(0);
         let fallback_next_upstream = AtomicUsize::new(0);
         match forward_query_with_fallback(
@@ -623,6 +681,7 @@ fn refresh_expired_cache_async(
 
 fn queue_query_log(
     context: &DnsWorkerContext,
+    filter: &FilterRuntime,
     domain: &str,
     client_addr: SocketAddr,
     blocked: bool,
@@ -632,6 +691,9 @@ fn queue_query_log(
     upstream_duration_ms: Option<u64>,
     error: Option<String>,
 ) {
+    if filter.log_ignore.contains(domain) {
+        return;
+    }
     let Some(sender) = &context.query_log_sender else {
         return;
     };

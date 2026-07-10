@@ -29,7 +29,6 @@ export function renderAppTemplate(appIconUrl: string): string {
             </div>
           </div>
           <button class="nav-item" data-view="logs" type="button">查询日志</button>
-          <button class="nav-item" data-view="diagnostics" type="button">诊断</button>
         </nav>
       </div>
     </header>
@@ -272,6 +271,53 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
+            <section class="settings-section blocking-mode-section">
+              <div class="section-heading">
+                <h3>拦截响应方式</h3>
+                <span>命中黑名单时返回给客户端的响应类型，保存后立即生效，无需重启服务。</span>
+              </div>
+              <div class="radio-stack">
+                <label class="radio-row">
+                  <input name="blocking_mode" type="radio" value="null_ip" />
+                  <span>
+                    <strong>零地址（默认）</strong>
+                    <small>A 返回 0.0.0.0，AAAA 返回 ::，兼容性最好。</small>
+                  </span>
+                </label>
+                <label class="radio-row">
+                  <input name="blocking_mode" type="radio" value="nxdomain" />
+                  <span>
+                    <strong>NXDOMAIN</strong>
+                    <small>返回“域名不存在”，部分应用对此的处理更干脆。</small>
+                  </span>
+                </label>
+                <label class="radio-row">
+                  <input name="blocking_mode" type="radio" value="refused" />
+                  <span>
+                    <strong>REFUSED</strong>
+                    <small>返回“拒绝服务”，客户端会更快放弃重试。</small>
+                  </span>
+                </label>
+                <label class="radio-row">
+                  <input name="blocking_mode" type="radio" value="custom_ip" />
+                  <span>
+                    <strong>自定义 IP</strong>
+                    <small>返回指定 IP，可指向局域网内的提示页面服务器。</small>
+                  </span>
+                </label>
+              </div>
+              <div class="blocking-custom-grid" id="blocking_custom_fields">
+                <label class="field">
+                  <span>自定义 IPv4</span>
+                  <input id="blocking_custom_ipv4" autocomplete="off" spellcheck="false" placeholder="例如 192.168.1.100" />
+                </label>
+                <label class="field">
+                  <span>自定义 IPv6（可选）</span>
+                  <input id="blocking_custom_ipv6" autocomplete="off" spellcheck="false" placeholder="例如 fd00::1" />
+                </label>
+              </div>
+            </section>
+
             <section class="settings-section dns-cache-section">
               <div class="section-heading">
                 <h3>DNS 缓存配置</h3>
@@ -339,6 +385,11 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <textarea id="blocked_clients" autocomplete="off" spellcheck="false"></textarea>
                 </label>
               </div>
+              <label class="field access-list-field client-names-field">
+                <span>客户端名称</span>
+                <small>每行一条“IP 名称”，例如 192.168.1.23 客厅电视。查询日志会用名称代替 IP 展示。</small>
+                <textarea id="client_names" autocomplete="off" spellcheck="false" placeholder="192.168.1.23 客厅电视"></textarea>
+              </label>
             </section>
 
             <section class="settings-section dns-security-section">
@@ -386,51 +437,6 @@ export function renderAppTemplate(appIconUrl: string): string {
         </section>
       </section>
 
-      <section class="view" data-view-panel="diagnostics">
-        <section class="panel module-panel">
-          <div class="panel-title with-actions">
-            <h2>诊断</h2>
-            <div class="button-group">
-              <button id="run_diagnostics_btn" type="button">运行诊断</button>
-              <button class="primary" id="save_diagnostics_btn" type="button">保存</button>
-            </div>
-          </div>
-
-          <div class="settings-stack">
-            <section class="settings-section diagnostics-section">
-              <div class="diagnostics-grid">
-                <label class="field">
-                  <span>诊断域名</span>
-                  <input id="diagnostics_domain" autocomplete="off" spellcheck="false" placeholder="example.com" />
-                </label>
-                <div class="diagnostics-result" id="diagnostics_result">
-                  <div class="diagnostic-empty">尚未运行诊断</div>
-                </div>
-              </div>
-            </section>
-
-            <section class="settings-section diagnostics-section">
-              <div class="section-heading">
-                <h3>运行监控</h3>
-              </div>
-              <div class="runtime-watchdog-grid">
-                <label class="check-row">
-                  <input id="runtime_watchdog_enabled" type="checkbox" />
-                  <span>
-                    <strong>自动恢复 DNS 服务</strong>
-                    <small>检测到服务未运行或内部线程异常时自动重启 DNS 服务。</small>
-                  </span>
-                </label>
-                <label class="field">
-                  <span>检查间隔（秒）</span>
-                  <input id="runtime_watchdog_interval_seconds" type="number" min="10" max="3600" step="1" />
-                </label>
-              </div>
-            </section>
-          </div>
-        </section>
-      </section>
-
       <section class="view" data-view-panel="settings">
         <section class="panel module-panel">
           <div class="panel-title with-actions">
@@ -466,6 +472,25 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <input id="launch_at_startup" type="checkbox" />
                 <span>开机时启动应用</span>
               </label>
+            </section>
+
+            <section class="settings-section runtime-watchdog-section">
+              <div class="section-heading">
+                <h3>运行监控</h3>
+              </div>
+              <div class="runtime-watchdog-grid">
+                <label class="check-row">
+                  <input id="runtime_watchdog_enabled" type="checkbox" />
+                  <span>
+                    <strong>自动恢复 DNS 服务</strong>
+                    <small>检测到服务未运行或内部线程异常时自动重启 DNS 服务。</small>
+                  </span>
+                </label>
+                <label class="field">
+                  <span>检查间隔（秒）</span>
+                  <input id="runtime_watchdog_interval_seconds" type="number" min="10" max="3600" step="1" />
+                </label>
+              </div>
             </section>
 
             <section class="settings-section cache-maintenance-section">
@@ -507,6 +532,11 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <input id="query_log_retention_custom" type="number" min="1" max="8760" step="1" placeholder="例如 120" />
                 </label>
               </div>
+              <label class="field log-ignore-field">
+                <span>日志忽略域名</span>
+                <small>每行一个域名，自动包含其子域名。命中的查询不会写入日志和统计，可用于过滤 NAS 心跳等高频噪音。</small>
+                <textarea id="query_log_ignored_domains" autocomplete="off" spellcheck="false" placeholder="example.com"></textarea>
+              </label>
             </section>
 
             <section class="settings-section about-section">
@@ -555,6 +585,14 @@ export function renderAppTemplate(appIconUrl: string): string {
             <button class="primary" id="save_custom_btn" type="button">保存</button>
           </div>
           <textarea id="blacklist" spellcheck="false"></textarea>
+
+          <section class="settings-section dns-rewrites-section">
+            <div class="section-heading">
+              <h3>DNS 重写</h3>
+              <span>每行一条“域名 IP”本地记录，优先于黑名单生效。用 *.域名 匹配整个子域，同一域名可以分别写一行 IPv4 和一行 IPv6。</span>
+            </div>
+            <textarea id="dns_rewrites" spellcheck="false" placeholder="nas.lan 192.168.1.10&#10;*.home.lan 192.168.1.1"></textarea>
+          </section>
         </section>
       </section>
     </main>

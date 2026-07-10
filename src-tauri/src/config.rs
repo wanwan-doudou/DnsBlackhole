@@ -63,16 +63,36 @@ pub struct AppConfig {
     pub dns_cache_max_ttl: u32,
     #[serde(default = "default_dns_cache_optimistic")]
     pub dns_cache_optimistic: bool,
-    #[serde(default = "default_diagnostics_domain")]
-    pub diagnostics_domain: String,
     #[serde(default = "default_runtime_watchdog_enabled")]
     pub runtime_watchdog_enabled: bool,
     #[serde(default = "default_runtime_watchdog_interval_seconds")]
     pub runtime_watchdog_interval_seconds: u64,
+    #[serde(default)]
+    pub blocking_mode: BlockingMode,
+    #[serde(default)]
+    pub blocking_custom_ipv4: String,
+    #[serde(default)]
+    pub blocking_custom_ipv6: String,
+    #[serde(default)]
+    pub dns_rewrites: String,
+    #[serde(default)]
+    pub client_names: String,
+    #[serde(default)]
+    pub query_log_ignored_domains: String,
     #[serde(default = "default_filters")]
     pub filters: Vec<FilterSubscription>,
     #[serde(default = "default_custom_rules")]
     pub blacklist: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockingMode {
+    #[default]
+    NullIp,
+    Nxdomain,
+    Refused,
+    CustomIp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -171,9 +191,14 @@ impl Default for AppConfig {
             dns_cache_min_ttl: default_dns_cache_min_ttl(),
             dns_cache_max_ttl: default_dns_cache_max_ttl(),
             dns_cache_optimistic: default_dns_cache_optimistic(),
-            diagnostics_domain: default_diagnostics_domain(),
             runtime_watchdog_enabled: default_runtime_watchdog_enabled(),
             runtime_watchdog_interval_seconds: default_runtime_watchdog_interval_seconds(),
+            blocking_mode: BlockingMode::default(),
+            blocking_custom_ipv4: String::new(),
+            blocking_custom_ipv6: String::new(),
+            dns_rewrites: String::new(),
+            client_names: String::new(),
+            query_log_ignored_domains: String::new(),
             filters: default_filters(),
             blacklist: default_custom_rules(),
         }
@@ -217,7 +242,6 @@ impl AppConfig {
         self.upstream_servers()?;
         self.fallback_servers()?;
         parse_bootstrap_servers(&self.bootstrap_dns)?;
-        validate_diagnostics_domain(&self.diagnostics_domain)?;
         if !(10..=3600).contains(&self.runtime_watchdog_interval_seconds) {
             return Err("自恢复检查间隔必须在 10 到 3600 秒之间".into());
         }
@@ -256,8 +280,106 @@ impl AppConfig {
             return Err("DNS 缓存最小 TTL 不能大于最大 TTL".into());
         }
         validate_filters(&self.filters, self.allow_insecure_http)?;
+        validate_blocking_config(self)?;
+        validate_dns_rewrites(&self.dns_rewrites)?;
+        validate_client_names(&self.client_names)?;
+        validate_ignored_domains(&self.query_log_ignored_domains)?;
         Ok(())
     }
+}
+
+fn validate_blocking_config(config: &AppConfig) -> Result<(), String> {
+    if config.blocking_mode != BlockingMode::CustomIp {
+        return Ok(());
+    }
+
+    let ipv4 = config.blocking_custom_ipv4.trim();
+    let ipv6 = config.blocking_custom_ipv6.trim();
+    if ipv4.is_empty() && ipv6.is_empty() {
+        return Err("自定义拦截 IP 模式需要至少填写一个 IPv4 或 IPv6 地址".into());
+    }
+    if !ipv4.is_empty() && ipv4.parse::<Ipv4Addr>().is_err() {
+        return Err(format!("自定义拦截 IPv4 地址无效：{ipv4}"));
+    }
+    if !ipv6.is_empty() && ipv6.parse::<Ipv6Addr>().is_err() {
+        return Err(format!("自定义拦截 IPv6 地址无效：{ipv6}"));
+    }
+    Ok(())
+}
+
+fn validate_dns_rewrites(value: &str) -> Result<(), String> {
+    for (index, line) in value.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let (Some(domain), Some(ip)) = (parts.next(), parts.next()) else {
+            return Err(format!(
+                "DNS 重写第 {} 行格式必须是“域名 IP”：{trimmed}",
+                index + 1
+            ));
+        };
+        let domain = domain.strip_prefix("*.").unwrap_or(domain);
+        if normalize_hostname(domain).is_none() {
+            return Err(format!("DNS 重写第 {} 行域名无效：{domain}", index + 1));
+        }
+        if ip.parse::<IpAddr>().is_err() {
+            return Err(format!("DNS 重写第 {} 行 IP 地址无效：{ip}", index + 1));
+        }
+        if parts.next().is_some() {
+            return Err(format!(
+                "DNS 重写第 {} 行只能包含“域名 IP”两项：{trimmed}",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_client_names(value: &str) -> Result<(), String> {
+    for (index, line) in value.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+            continue;
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let ip = parts.next().unwrap_or_default();
+        let name = parts.next().map(str::trim).unwrap_or_default();
+        if ip.parse::<IpAddr>().is_err() {
+            return Err(format!(
+                "客户端名称第 {} 行必须以 IP 地址开头：{ip}",
+                index + 1
+            ));
+        }
+        if name.is_empty() {
+            return Err(format!(
+                "客户端名称第 {} 行缺少名称，格式是“IP 名称”",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ignored_domains(value: &str) -> Result<(), String> {
+    for (index, line) in value.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+            continue;
+        }
+
+        let domain = trimmed.strip_prefix("*.").unwrap_or(trimmed);
+        if normalize_hostname(domain).is_none() {
+            return Err(format!(
+                "日志忽略清单第 {} 行域名无效：{trimmed}",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn default_use_filters() -> bool {
@@ -351,10 +473,6 @@ fn default_refuse_any() -> bool {
     true
 }
 
-fn default_diagnostics_domain() -> String {
-    "example.com".into()
-}
-
 fn default_runtime_watchdog_enabled() -> bool {
     true
 }
@@ -418,14 +536,6 @@ fn validate_ip_or_cidr(value: &str) -> Result<(), ()> {
         IpAddr::V6(_) if prefix_len <= 128 => Ok(()),
         _ => Err(()),
     }
-}
-
-fn validate_diagnostics_domain(value: &str) -> Result<(), String> {
-    let domain = value.trim().trim_end_matches('.');
-    if normalize_hostname(domain).is_none() {
-        return Err("诊断域名必须是有效域名，例如 example.com".into());
-    }
-    Ok(())
 }
 
 fn default_custom_rules() -> String {
@@ -833,9 +943,6 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
         if config.fallback_dns.trim().is_empty() {
             config.fallback_dns = default_fallback_dns();
         }
-        if config.diagnostics_domain.trim().is_empty() {
-            config.diagnostics_domain = default_diagnostics_domain();
-        }
     }
     if config.schema_version < 3 && config.runtime_watchdog_interval_seconds == 0 {
         config.runtime_watchdog_interval_seconds = default_runtime_watchdog_interval_seconds();
@@ -1140,7 +1247,6 @@ mod tests {
             refuse_any: false,
             fallback_dns: String::new(),
             bootstrap_dns: String::new(),
-            diagnostics_domain: String::new(),
             ..AppConfig::default()
         };
 
@@ -1155,7 +1261,6 @@ mod tests {
         assert!(config.refuse_any);
         assert!(!config.fallback_dns.trim().is_empty());
         assert!(!config.bootstrap_dns.trim().is_empty());
-        assert_eq!(config.diagnostics_domain, default_diagnostics_domain());
         assert!(config.runtime_watchdog_enabled);
         assert_eq!(
             config.runtime_watchdog_interval_seconds,

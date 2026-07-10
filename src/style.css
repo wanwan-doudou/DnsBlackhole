@@ -1545,117 +1545,8 @@ select:focus {
   max-width: 900px;
 }
 
-.diagnostics-section {
+.runtime-watchdog-section {
   max-width: 900px;
-}
-
-.diagnostics-grid {
-  display: grid;
-  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
-  gap: 18px;
-  align-items: start;
-}
-
-.diagnostics-result {
-  min-height: 128px;
-  border: 1px solid #dbe4ee;
-  border-radius: 4px;
-  padding: 14px;
-  background: #ffffff;
-}
-
-.diagnostic-empty {
-  display: grid;
-  min-height: 98px;
-  place-items: center;
-  color: #7a8999;
-  font-size: 13px;
-}
-
-.diagnostic-meta {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  border-bottom: 1px solid #eef2f6;
-  padding: 0 0 10px;
-  color: #738294;
-  font-size: 12px;
-}
-
-.diagnostic-meta + .diagnostic-meta {
-  padding-top: 10px;
-}
-
-.diagnostic-meta strong {
-  min-width: 0;
-  color: #26323f;
-  text-align: right;
-  overflow-wrap: anywhere;
-}
-
-.diagnostic-probes {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 12px;
-}
-
-.diagnostic-probe {
-  display: grid;
-  gap: 7px;
-  border: 1px solid #e1e8f0;
-  border-radius: 4px;
-  padding: 11px;
-  background: #f8fafc;
-}
-
-.diagnostic-probe>div {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.diagnostic-probe strong {
-  color: #26323f;
-  font-size: 13px;
-}
-
-.diagnostic-probe span {
-  color: #6b7886;
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.diagnostic-probe small {
-  color: #7a8999;
-  font-size: 12px;
-}
-
-.diagnostic-probe p {
-  margin: 0;
-  color: #b42323;
-  overflow-wrap: anywhere;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.diagnostic-probe.ok {
-  border-color: #b8dfc1;
-  background: #f2faf4;
-}
-
-.diagnostic-probe.ok span {
-  color: #267000;
-}
-
-.diagnostic-probe.failed {
-  border-color: #f2b5b5;
-  background: #fff7f7;
-}
-
-.diagnostic-probe.failed span {
-  color: #b42323;
 }
 
 .runtime-watchdog-grid {
@@ -1725,8 +1616,6 @@ select:focus {
   .dashboard-summary,
   .dns-settings,
   .upstream-extra-grid,
-  .diagnostics-grid,
-  .diagnostic-probes,
   .runtime-watchdog-grid,
   .dns-security-grid,
   .dns-security-options {
@@ -1770,6 +1659,43 @@ select:focus {
 
 .custom-retention-field.visible {
   display: flex;
+}
+
+.blocking-mode-section {
+  max-width: 900px;
+}
+
+.blocking-custom-grid {
+  display: none;
+  grid-template-columns: repeat(2, minmax(0, 280px));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.blocking-custom-grid.visible {
+  display: grid;
+}
+
+.client-names-field {
+  margin-top: 16px;
+}
+
+.client-names-field textarea,
+.log-ignore-field textarea {
+  min-height: 108px;
+}
+
+.log-ignore-field {
+  max-width: 560px;
+  margin-top: 16px;
+}
+
+.dns-rewrites-section {
+  margin-top: 22px;
+}
+
+.dns-rewrites-section textarea {
+  min-height: 160px;
 }
 
 .retention-settings input:disabled,

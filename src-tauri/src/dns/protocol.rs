@@ -1,6 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::config::{AppConfig, BlockingMode};
+
+use super::rewrites::RewriteTarget;
+
 pub(crate) const DNS_HEADER_LEN: usize = 12;
+const BLOCK_RESPONSE_TTL: u32 = 60;
+const REWRITE_RESPONSE_TTL: u32 = 300;
 pub(crate) const TYPE_A: u16 = 1;
 pub(crate) const TYPE_NS: u16 = 2;
 pub(crate) const TYPE_SOA: u16 = 6;
@@ -111,35 +117,114 @@ pub(crate) fn build_error_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
     Some(response)
 }
 
-pub(crate) fn build_block_response(query: &[u8], question: &Question) -> Vec<u8> {
-    let answer_count = if matches!(question.qtype, TYPE_A | TYPE_AAAA) {
-        1_u16
+/// 拦截响应策略，由配置编译而来，可随过滤状态热替换。
+#[derive(Clone)]
+pub(crate) struct BlockingPolicy {
+    mode: BlockingMode,
+    custom_ipv4: Option<Ipv4Addr>,
+    custom_ipv6: Option<Ipv6Addr>,
+}
+
+impl Default for BlockingPolicy {
+    fn default() -> Self {
+        Self {
+            mode: BlockingMode::NullIp,
+            custom_ipv4: None,
+            custom_ipv6: None,
+        }
+    }
+}
+
+impl BlockingPolicy {
+    pub(crate) fn from_config(config: &AppConfig) -> Self {
+        Self {
+            mode: config.blocking_mode.clone(),
+            custom_ipv4: config.blocking_custom_ipv4.trim().parse().ok(),
+            custom_ipv6: config.blocking_custom_ipv6.trim().parse().ok(),
+        }
+    }
+}
+
+pub(crate) fn build_block_response(
+    query: &[u8],
+    question: &Question,
+    policy: &BlockingPolicy,
+) -> Vec<u8> {
+    match policy.mode {
+        BlockingMode::NullIp => build_ip_response(
+            query,
+            question,
+            RCODE_NOERROR,
+            Some(Ipv4Addr::UNSPECIFIED),
+            Some(Ipv6Addr::UNSPECIFIED),
+            BLOCK_RESPONSE_TTL,
+        ),
+        BlockingMode::CustomIp => build_ip_response(
+            query,
+            question,
+            RCODE_NOERROR,
+            policy.custom_ipv4,
+            policy.custom_ipv6,
+            BLOCK_RESPONSE_TTL,
+        ),
+        BlockingMode::Nxdomain => {
+            build_ip_response(query, question, RCODE_NXDOMAIN, None, None, 0)
+        }
+        BlockingMode::Refused => build_ip_response(query, question, RCODE_REFUSED, None, None, 0),
+    }
+}
+
+pub(crate) fn build_rewrite_response(
+    query: &[u8],
+    question: &Question,
+    target: &RewriteTarget,
+) -> Vec<u8> {
+    build_ip_response(
+        query,
+        question,
+        RCODE_NOERROR,
+        target.ipv4,
+        target.ipv6,
+        REWRITE_RESPONSE_TTL,
+    )
+}
+
+fn build_ip_response(
+    query: &[u8],
+    question: &Question,
+    rcode: u8,
+    ipv4: Option<Ipv4Addr>,
+    ipv6: Option<Ipv6Addr>,
+    ttl: u32,
+) -> Vec<u8> {
+    let answer_ip = if rcode == RCODE_NOERROR {
+        match question.qtype {
+            TYPE_A => ipv4.map(|addr| addr.octets().to_vec()),
+            TYPE_AAAA => ipv6.map(|addr| addr.octets().to_vec()),
+            _ => None,
+        }
     } else {
-        0_u16
+        None
     };
+    let answer_count = if answer_ip.is_some() { 1_u16 } else { 0_u16 };
     let mut response = Vec::with_capacity(question.question_end + 32);
 
     response.extend_from_slice(&query[0..2]);
     response.push(0x80 | (query[2] & 0x01));
-    response.push(0x80);
+    response.push(0x80 | (rcode & 0x0f));
     write_u16(&mut response, 1);
     write_u16(&mut response, answer_count);
     write_u16(&mut response, 0);
     write_u16(&mut response, 0);
     response.extend_from_slice(&query[DNS_HEADER_LEN..question.question_end]);
 
-    if answer_count == 1 {
+    if let Some(ip_bytes) = answer_ip {
         response.extend_from_slice(&[0xC0, 0x0C]);
         write_u16(&mut response, question.qtype);
         write_u16(&mut response, question.qclass);
-        response.extend_from_slice(&60_u32.to_be_bytes());
-        if question.qtype == TYPE_A {
-            write_u16(&mut response, 4);
-            response.extend_from_slice(&[0, 0, 0, 0]);
-        } else {
-            write_u16(&mut response, 16);
-            response.extend_from_slice(&[0; 16]);
-        }
+        response.extend_from_slice(&ttl.to_be_bytes());
+        write_u16(&mut response, ip_bytes.len() as u16);
+        response.extend_from_slice(&ip_bytes);
     }
 
     response

@@ -15,7 +15,9 @@ use crate::{config::AppConfig, database::Database};
 use super::{
     access::ClientAccess,
     cache::{DnsCacheConfig, DnsCacheStore},
-    rules::compile_rules,
+    filter_runtime::{
+        SharedFilterRuntime, build_filter_runtime, replace_filter_runtime, share_filter_runtime,
+    },
     stats::{DnsStats, record_error, reset_stats},
     upstream::build_runtime_upstreams,
     worker::{
@@ -44,6 +46,7 @@ pub struct DnsServer {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     cache: Option<Arc<DnsCacheStore>>,
+    filter_runtime: SharedFilterRuntime,
 }
 
 impl DnsServer {
@@ -68,7 +71,7 @@ impl DnsServer {
         let dns_cache =
             DnsCacheStore::from_config(dns_cache_config.clone(), DNS_CACHE_SHARDS).map(Arc::new);
         let dns_cache_config = dns_cache.as_ref().map(|_| dns_cache_config);
-        let rules = Arc::new(compile_rules(&rules_text));
+        let filter_runtime = share_filter_runtime(build_filter_runtime(&config, &rules_text));
         let socket =
             UdpSocket::bind(listen_addr).map_err(|e| format!("监听 {listen_addr} 失败：{e}"))?;
         configure_udp_listener_socket(&socket)?;
@@ -105,7 +108,7 @@ impl DnsServer {
             fallback_next_upstream: AtomicUsize::new(0),
             access,
             refuse_any,
-            rules,
+            filter_runtime: Arc::clone(&filter_runtime),
             stats: Arc::clone(&stats),
             dns_cache: dns_cache.clone(),
             dns_cache_config,
@@ -151,6 +154,7 @@ impl DnsServer {
             stop,
             threads,
             cache: dns_cache,
+            filter_runtime,
         })
     }
 
@@ -163,6 +167,14 @@ impl DnsServer {
             cache.clear();
         }
         Ok(())
+    }
+
+    /// 热替换过滤状态（规则/重写/拦截模式/日志忽略），不重启服务、不清空 DNS 缓存。
+    pub fn replace_filter_state(&self, config: &AppConfig, rules_text: &str) {
+        replace_filter_runtime(
+            &self.filter_runtime,
+            build_filter_runtime(config, rules_text),
+        );
     }
 
     pub fn has_finished_threads(&self) -> bool {

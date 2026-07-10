@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use crate::config::AppConfig;
@@ -9,6 +12,8 @@ use crate::config::AppConfig;
 use super::protocol::{Question, prepare_cached_response, response_cache_ttl};
 
 const DNS_CACHE_ENTRY_OVERHEAD_BYTES: usize = 96;
+// 淘汰时随机取样对比 last_used，避免全表扫描找最旧条目
+const DNS_CACHE_EVICT_SAMPLE: usize = 16;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DnsCacheConfig {
@@ -30,8 +35,9 @@ struct CachedDnsResponse {
     response: Vec<u8>,
     expires_at: u64,
     size: usize,
-    last_used: u64,
-    refreshing: bool,
+    // 原子字段让读路径只需要 shard 读锁，多个 worker 可以并行命中缓存
+    last_used: AtomicU64,
+    refreshing: AtomicBool,
 }
 
 pub(crate) struct CacheHit {
@@ -49,11 +55,11 @@ pub(crate) struct DnsCache {
     config: DnsCacheConfig,
     entries: HashMap<QueryCacheKey, CachedDnsResponse>,
     total_size: usize,
-    access_counter: u64,
+    access_counter: AtomicU64,
 }
 
 pub(crate) struct DnsCacheStore {
-    shards: Vec<Mutex<DnsCache>>,
+    shards: Vec<RwLock<DnsCache>>,
 }
 
 impl DnsCacheConfig {
@@ -93,7 +99,7 @@ impl DnsCacheStore {
             let mut shard_config = config.clone();
             shard_config.max_size_bytes = shard_size;
             if let Some(cache) = DnsCache::from_config(shard_config) {
-                shards.push(Mutex::new(cache));
+                shards.push(RwLock::new(cache));
             }
         }
 
@@ -106,7 +112,7 @@ impl DnsCacheStore {
 
     pub(crate) fn lookup(&self, cache_key: &QueryCacheKey, now: u64) -> Option<RawCacheHit> {
         let shard = self.shard(cache_key)?;
-        shard.lock().ok()?.lookup(cache_key, now)
+        shard.read().ok()?.lookup(cache_key, now)
     }
 
     pub(crate) fn insert_with_ttl(
@@ -119,7 +125,7 @@ impl DnsCacheStore {
         let Some(shard) = self.shard(&cache_key) else {
             return;
         };
-        if let Ok(mut cache) = shard.lock() {
+        if let Ok(mut cache) = shard.write() {
             cache.insert_with_ttl(cache_key, response, now, ttl);
         }
     }
@@ -128,20 +134,20 @@ impl DnsCacheStore {
         let Some(shard) = self.shard(cache_key) else {
             return;
         };
-        if let Ok(mut cache) = shard.lock() {
+        if let Ok(cache) = shard.read() {
             cache.finish_refresh(cache_key);
         }
     }
 
     pub(crate) fn clear(&self) {
         for shard in &self.shards {
-            if let Ok(mut cache) = shard.lock() {
+            if let Ok(mut cache) = shard.write() {
                 cache.clear();
             }
         }
     }
 
-    fn shard(&self, cache_key: &QueryCacheKey) -> Option<&Mutex<DnsCache>> {
+    fn shard(&self, cache_key: &QueryCacheKey) -> Option<&RwLock<DnsCache>> {
         self.shards
             .get(query_cache_key_shard_index(cache_key, self.shards.len()))
     }
@@ -163,28 +169,26 @@ impl DnsCache {
             config,
             entries: HashMap::new(),
             total_size: 0,
-            access_counter: 0,
+            access_counter: AtomicU64::new(0),
         })
     }
 
-    pub(crate) fn lookup(&mut self, key: &QueryCacheKey, now: u64) -> Option<RawCacheHit> {
-        self.access_counter = self.access_counter.wrapping_add(1);
-        let access = self.access_counter;
-        let entry = self.entries.get_mut(key)?;
+    pub(crate) fn lookup(&self, key: &QueryCacheKey, now: u64) -> Option<RawCacheHit> {
+        let access = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let entry = self.entries.get(key)?;
 
         let fresh = entry.expires_at > now;
         if !fresh && !self.config.optimistic {
-            let size = entry.size;
-            self.total_size = self.total_size.saturating_sub(size);
-            self.entries.remove(key);
+            // 过期条目留给淘汰或下次插入清理，读路径保持只读
             return None;
         }
 
-        entry.last_used = access;
-        let refresh = !fresh && !entry.refreshing;
-        if refresh {
-            entry.refreshing = true;
-        }
+        entry.last_used.store(access, Ordering::Relaxed);
+        let refresh = !fresh
+            && entry
+                .refreshing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
         let ttl = if fresh {
             u32::try_from(entry.expires_at.saturating_sub(now))
                 .unwrap_or(u32::MAX)
@@ -216,7 +220,7 @@ impl DnsCache {
             return;
         }
 
-        self.access_counter = self.access_counter.wrapping_add(1);
+        let access = self.access_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let size = response
             .len()
             .saturating_add(key.domain.len())
@@ -235,16 +239,16 @@ impl DnsCache {
                 response,
                 expires_at: now.saturating_add(u64::from(ttl)),
                 size,
-                last_used: self.access_counter,
-                refreshing: false,
+                last_used: AtomicU64::new(access),
+                refreshing: AtomicBool::new(false),
             },
         );
         self.evict_over_limit(now);
     }
 
-    fn finish_refresh(&mut self, key: &QueryCacheKey) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.refreshing = false;
+    fn finish_refresh(&self, key: &QueryCacheKey) {
+        if let Some(entry) = self.entries.get(key) {
+            entry.refreshing.store(false, Ordering::Release);
         }
     }
 
@@ -259,10 +263,12 @@ impl DnsCache {
         }
 
         while self.total_size > self.config.max_size_bytes {
+            // 近似 LRU：只取样少量条目挑最旧的淘汰，避免每次淘汰都全表扫描
             let Some(key) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
+                .take(DNS_CACHE_EVICT_SAMPLE)
+                .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
                 .map(|(key, _)| key.clone())
             else {
                 self.total_size = 0;
