@@ -47,6 +47,7 @@ import "./style.css";
 
 let messageTimer = 0;
 let updateStatusTimer = 0;
+let lastStatusErrorKey: string | null = null;
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
@@ -913,9 +914,15 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   const renderDashboard = options.renderDashboard ?? true;
 
   const lastError = status.error ?? status.stats.last_error;
-  if (lastError) {
+  const statusErrorKey = status.error
+    ? `runtime:${status.error}`
+    : lastError
+      ? `dns:${status.stats.failed}:${lastError}`
+      : null;
+  if (lastError && statusErrorKey !== lastStatusErrorKey) {
     showMessage(lastError, true);
   }
+  lastStatusErrorKey = statusErrorKey;
 
   if (!renderDashboard) {
     return;
