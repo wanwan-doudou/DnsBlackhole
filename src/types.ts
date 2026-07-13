@@ -133,6 +133,11 @@ export type QueryLogRecord = {
   upstream_server: string | null;
   upstream_duration_ms: number | null;
   error: string | null;
+  matched_rule: string | null;
+  rule_source: string | null;
+  rule_type: string | null;
+  important_overrode: boolean;
+  allowlist_rule: string | null;
 };
 
 export type QueryLogPage = {

@@ -81,9 +81,27 @@ mod tests {
         let rules = compile_rules("||example.org^$important\n@@||example.org^");
 
         assert!(rules.is_blocked("example.org", TYPE_A));
+        let matched = rules
+            .blocking_match("example.org", TYPE_A)
+            .expect("important block rule should match");
+        assert_eq!(matched.rule, "||example.org^$important");
+        assert_eq!(matched.rule_type, "suffix block");
+        assert!(matched.important_overrode);
+        assert_eq!(matched.allowlist_rule.as_deref(), Some("@@||example.org^"));
 
         let rules = compile_rules("||example.org^$important\n@@||example.org^$important");
         assert!(!rules.is_blocked("example.org", TYPE_A));
+    }
+
+    #[test]
+    fn blocking_match_preserves_filter_source() {
+        let rules = compile_rules("! dnsblackhole-source:\"AdGuard DNS filter\"\n||example.org^");
+
+        let matched = rules
+            .blocking_match("ads.example.org", TYPE_A)
+            .expect("suffix rule should match");
+        assert_eq!(matched.source, "AdGuard DNS filter");
+        assert_eq!(matched.rule, "||example.org^");
     }
 
     #[test]
