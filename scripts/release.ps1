@@ -4,6 +4,12 @@
 
 $ErrorActionPreference = "Stop"
 
+# 外部构建命令执行前保存仓库根目录，避免后续工作目录或自动变量不可用
+$projectRoot = (Get-Location).Path
+if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $projectRoot = Split-Path -Parent $PSScriptRoot
+}
+
 $keyPath = "$env:USERPROFILE\.tauri\dnsblackhole.key"
 if (-not (Test-Path $keyPath)) {
     throw "Updater signing private key not found: $keyPath"
@@ -40,12 +46,12 @@ $latest = [ordered]@{
     }
 }
 
-# [IO.Path]::GetFullPath 基于进程工作目录解析，与 Set-Location 后的 PowerShell 位置可能不一致，须显式锚定
-$latestPath = Join-Path (Get-Location).Path "$bundleDir/latest.json"
+# 使用脚本启动时保存的仓库根目录，避免外部命令改变工作目录
+$latestPath = Join-Path $projectRoot "$bundleDir/latest.json"
 $latestJson = $latest | ConvertTo-Json -Depth 4
 [IO.File]::WriteAllText(
-    $latestPath,
-    $latestJson,
+    [string]$latestPath,
+    [string]$latestJson,
     [Text.UTF8Encoding]::new($false)
 )
 
