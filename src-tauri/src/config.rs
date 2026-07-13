@@ -10,7 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 6;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_FILTER_SIZE_MB: u32 = 256;
 
@@ -445,7 +445,8 @@ fn default_upstream_dns() -> String {
 }
 
 fn default_fallback_dns() -> String {
-    ["1.1.1.1", "8.8.8.8"].join("\n")
+    // 与主上游（阿里/腾讯）基础设施错开的国内服务，国内网络下才起得到兜底作用
+    ["114.114.114.114", "180.76.76.76"].join("\n")
 }
 
 fn default_bootstrap_dns() -> String {
@@ -955,7 +956,20 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
             config.allow_insecure_http = true;
         }
     }
+    // 旧默认 fallback（1.1.1.1/8.8.8.8）在国内网络下基本不可用，仅当用户没改过时替换成新默认值
+    if config.schema_version < 6 && is_legacy_default_fallback_dns(&config.fallback_dns) {
+        config.fallback_dns = default_fallback_dns();
+    }
     config.schema_version = CURRENT_CONFIG_SCHEMA_VERSION;
+}
+
+fn is_legacy_default_fallback_dns(fallback_dns: &str) -> bool {
+    let lines = fallback_dns
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    lines == ["1.1.1.1", "8.8.8.8"]
 }
 
 fn uses_insecure_http_endpoint(config: &AppConfig) -> bool {
@@ -1267,6 +1281,26 @@ mod tests {
             default_runtime_watchdog_interval_seconds()
         );
         assert_eq!(config.filter_max_size_mb, default_filter_max_size_mb());
+    }
+
+    #[test]
+    fn migrates_legacy_default_fallback_dns() {
+        let mut config = AppConfig {
+            schema_version: 5,
+            fallback_dns: "1.1.1.1\n8.8.8.8".into(),
+            ..AppConfig::default()
+        };
+        migrate_legacy_defaults(&mut config);
+        assert_eq!(config.fallback_dns, default_fallback_dns());
+
+        // 用户自定义的 fallback 不应被迁移覆盖
+        let mut custom = AppConfig {
+            schema_version: 5,
+            fallback_dns: "9.9.9.9".into(),
+            ..AppConfig::default()
+        };
+        migrate_legacy_defaults(&mut custom);
+        assert_eq!(custom.fallback_dns, "9.9.9.9");
     }
 
     #[test]
