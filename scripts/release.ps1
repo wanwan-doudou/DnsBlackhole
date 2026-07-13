@@ -40,10 +40,11 @@ $latest = [ordered]@{
     }
 }
 
-$latestPath = "$bundleDir/latest.json"
+# [IO.Path]::GetFullPath 基于进程工作目录解析，与 Set-Location 后的 PowerShell 位置可能不一致，须显式锚定
+$latestPath = Join-Path (Get-Location).Path "$bundleDir/latest.json"
 $latestJson = $latest | ConvertTo-Json -Depth 4
 [IO.File]::WriteAllText(
-    [IO.Path]::GetFullPath($latestPath),
+    $latestPath,
     $latestJson,
     [Text.UTF8Encoding]::new($false)
 )
