@@ -16,7 +16,7 @@ use database::{Database, LogStats, QueryLogPage};
 use dns::{DnsServer, DnsStats, RuleSummary, RuntimeStatus};
 use filters::FilterUpdateReport;
 use serde::Serialize;
-use tauri::{Manager, WindowEvent};
+use tauri::{Emitter, Manager, WindowEvent};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
@@ -414,6 +414,7 @@ fn update_filters_blocking(
     }
 
     apply_update_report_error(&state, &report);
+    let _ = app.emit("filters-updated", &config.filters);
 
     Ok(FilterUpdateResult {
         status: state.status(true),

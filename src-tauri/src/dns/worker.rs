@@ -290,7 +290,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         return;
     }
 
-    if filter.rules.is_blocked(&question.domain) {
+    if filter.rules.is_blocked(&question.domain, question.qtype) {
         let response = build_block_response(query, &question, &filter.blocking);
         if let Err(error) = send_dns_response(context, response_target, &response) {
             let message = format!("返回黑名单响应失败：{error}");

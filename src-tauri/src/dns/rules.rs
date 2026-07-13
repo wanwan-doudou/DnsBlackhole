@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -24,12 +24,30 @@ pub struct CompiledRules {
 struct Rule {
     domain: String,
     include_subdomains: bool,
+    important: bool,
+    query_types: QueryTypes,
+    denyallow: Vec<String>,
 }
 
 #[derive(Clone, Default)]
 struct RuleSet {
-    exact: HashSet<String>,
-    suffix: HashSet<String>,
+    exact: HashMap<String, Vec<RuleOptions>>,
+    suffix: HashMap<String, Vec<RuleOptions>>,
+}
+
+#[derive(Clone)]
+struct RuleOptions {
+    important: bool,
+    query_types: QueryTypes,
+    denyallow: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+enum QueryTypes {
+    #[default]
+    Any,
+    Include(Vec<u16>),
+    Exclude(Vec<u16>),
 }
 
 pub fn summarize_rules(raw: &str) -> RuleSummary {
@@ -41,7 +59,15 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
     let mut allows = RuleSet::default();
     let mut summary = RuleSummary::default();
 
+    let disabled = raw
+        .lines()
+        .filter_map(badfilter_target)
+        .collect::<HashSet<_>>();
+
     for line in raw.lines() {
+        if disabled.contains(line.trim()) {
+            continue;
+        }
         match parse_rule(line) {
             ParsedRule::Block(rule) => {
                 summary.block_rules += 1;
@@ -60,6 +86,7 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
                     IgnoredRuleReason::Invalid => summary.ignored_invalid_rules += 1,
                 }
             }
+            ParsedRule::Disable => {}
         }
     }
 
@@ -71,37 +98,83 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
 }
 
 impl CompiledRules {
-    pub(crate) fn is_blocked(&self, domain: &str) -> bool {
-        if self.allows.contains(domain) {
+    pub(crate) fn is_blocked(&self, domain: &str, qtype: u16) -> bool {
+        let important_allow = self.allows.matches(domain, qtype, true);
+        let important_block = self.blocks.matches(domain, qtype, true);
+        if important_allow {
             return false;
         }
-        self.blocks.contains(domain)
+        if important_block {
+            return true;
+        }
+        if self.allows.matches(domain, qtype, false) {
+            return false;
+        }
+        self.blocks.matches(domain, qtype, false)
     }
 }
 
 impl RuleSet {
     fn insert(&mut self, rule: Rule) {
+        let options = RuleOptions {
+            important: rule.important,
+            query_types: rule.query_types,
+            denyallow: rule.denyallow,
+        };
         if rule.include_subdomains {
-            self.suffix.insert(rule.domain);
+            self.suffix.entry(rule.domain).or_default().push(options);
         } else {
-            self.exact.insert(rule.domain);
+            self.exact.entry(rule.domain).or_default().push(options);
         }
     }
 
-    fn contains(&self, domain: &str) -> bool {
-        if self.exact.contains(domain) || self.suffix.contains(domain) {
+    fn matches(&self, domain: &str, qtype: u16, important: bool) -> bool {
+        if self.exact.get(domain).is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule.matches(domain, qtype, important))
+        }) || self.suffix.get(domain).is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule.matches(domain, qtype, important))
+        }) {
             return true;
         }
 
         let mut offset = 0;
         while let Some(dot_index) = domain[offset..].find('.') {
             offset += dot_index + 1;
-            if self.suffix.contains(&domain[offset..]) {
+            if self.suffix.get(&domain[offset..]).is_some_and(|rules| {
+                rules
+                    .iter()
+                    .any(|rule| rule.matches(domain, qtype, important))
+            }) {
                 return true;
             }
         }
 
         false
+    }
+}
+
+impl RuleOptions {
+    fn matches(&self, domain: &str, qtype: u16, important: bool) -> bool {
+        self.important == important
+            && self.query_types.matches(qtype)
+            && !self
+                .denyallow
+                .iter()
+                .any(|excluded| domain_matches(domain, excluded))
+    }
+}
+
+impl QueryTypes {
+    fn matches(&self, qtype: u16) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Include(types) => types.contains(&qtype),
+            Self::Exclude(types) => !types.contains(&qtype),
+        }
     }
 }
 
@@ -152,6 +225,7 @@ enum ParsedRule {
     Block(Rule),
     Allow(Rule),
     Ignored(IgnoredRuleReason),
+    Disable,
 }
 
 enum IgnoredRuleReason {
@@ -186,6 +260,9 @@ fn parse_hosts_rule(line: &str) -> Option<Rule> {
     normalize_domain(domain).map(|domain| Rule {
         domain,
         include_subdomains: false,
+        important: false,
+        query_types: QueryTypes::Any,
+        denyallow: Vec::new(),
     })
 }
 
@@ -196,13 +273,20 @@ fn parse_filter_rule(line: &str) -> ParsedRule {
         (false, line)
     };
 
-    if rest.contains('$') {
+    let (pattern, modifiers) = rest.split_once('$').unwrap_or((rest, ""));
+    let Ok(modifiers) = parse_modifiers(modifiers) else {
         return ParsedRule::Ignored(IgnoredRuleReason::Unsupported);
+    };
+    if modifiers.badfilter {
+        return ParsedRule::Disable;
     }
 
-    let Some(rule) = parse_pattern(rest.trim()) else {
-        return ParsedRule::Ignored(ignored_pattern_reason(rest.trim()));
+    let Some(mut rule) = parse_pattern(pattern.trim()) else {
+        return ParsedRule::Ignored(ignored_pattern_reason(pattern.trim()));
     };
+    rule.important = modifiers.important;
+    rule.query_types = modifiers.query_types;
+    rule.denyallow = modifiers.denyallow;
 
     if is_allow {
         ParsedRule::Allow(rule)
@@ -221,6 +305,9 @@ fn parse_pattern(pattern: &str) -> Option<Rule> {
         return normalize_domain(domain).map(|domain| Rule {
             domain,
             include_subdomains: true,
+            important: false,
+            query_types: QueryTypes::Any,
+            denyallow: Vec::new(),
         });
     }
 
@@ -234,7 +321,119 @@ fn parse_pattern(pattern: &str) -> Option<Rule> {
     normalize_domain(domain).map(|domain| Rule {
         domain,
         include_subdomains,
+        important: false,
+        query_types: QueryTypes::Any,
+        denyallow: Vec::new(),
     })
+}
+
+#[derive(Default)]
+struct Modifiers {
+    important: bool,
+    badfilter: bool,
+    query_types: QueryTypes,
+    denyallow: Vec<String>,
+}
+
+fn parse_modifiers(raw: &str) -> Result<Modifiers, ()> {
+    let mut parsed = Modifiers::default();
+    if raw.is_empty() {
+        return Ok(parsed);
+    }
+    for modifier in raw.split(',') {
+        let lower = modifier.to_ascii_lowercase();
+        if lower == "important" {
+            parsed.important = true;
+        } else if lower == "badfilter" {
+            parsed.badfilter = true;
+        } else if let Some(value) = lower.strip_prefix("dnstype=") {
+            parsed.query_types = parse_query_types(value)?;
+        } else if let Some(value) = lower.strip_prefix("denyallow=") {
+            parsed.denyallow = value
+                .split('|')
+                .map(normalize_domain)
+                .collect::<Option<Vec<_>>>()
+                .ok_or(())?;
+            if parsed.denyallow.is_empty() {
+                return Err(());
+            }
+        } else {
+            return Err(());
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_query_types(raw: &str) -> Result<QueryTypes, ()> {
+    let values = raw.split('|').collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(());
+    }
+    let excluded = values[0].starts_with('~');
+    let mut types = Vec::with_capacity(values.len());
+    for value in values {
+        if value.starts_with('~') != excluded {
+            return Err(());
+        }
+        types.push(query_type_number(value.trim_start_matches('~')).ok_or(())?);
+    }
+    Ok(if excluded {
+        QueryTypes::Exclude(types)
+    } else {
+        QueryTypes::Include(types)
+    })
+}
+
+fn query_type_number(value: &str) -> Option<u16> {
+    match value.to_ascii_uppercase().as_str() {
+        "A" => Some(1),
+        "NS" => Some(2),
+        "CNAME" => Some(5),
+        "SOA" => Some(6),
+        "PTR" => Some(12),
+        "MX" => Some(15),
+        "TXT" => Some(16),
+        "AAAA" => Some(28),
+        "SRV" => Some(33),
+        "NAPTR" => Some(35),
+        "DS" => Some(43),
+        "RRSIG" => Some(46),
+        "NSEC" => Some(47),
+        "DNSKEY" => Some(48),
+        "TLSA" => Some(52),
+        "SVCB" => Some(64),
+        "HTTPS" => Some(65),
+        "CAA" => Some(257),
+        "ANY" => Some(255),
+        value => value.parse().ok().filter(|value| *value > 0),
+    }
+}
+
+fn badfilter_target(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let (pattern, modifiers) = trimmed.split_once('$')?;
+    let mut remaining = modifiers
+        .split(',')
+        .filter(|modifier| !modifier.eq_ignore_ascii_case("badfilter"))
+        .collect::<Vec<_>>();
+    if remaining.len() == modifiers.split(',').count() {
+        return None;
+    }
+    if remaining.is_empty() {
+        Some(pattern.to_string())
+    } else {
+        Some(format!(
+            "{pattern}${}",
+            remaining.drain(..).collect::<Vec<_>>().join(",")
+        ))
+    }
+}
+
+fn domain_matches(domain: &str, suffix: &str) -> bool {
+    domain == suffix
+        || domain
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn ignored_pattern_reason(pattern: &str) -> IgnoredRuleReason {
