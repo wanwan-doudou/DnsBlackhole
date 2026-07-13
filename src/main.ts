@@ -1060,6 +1060,16 @@ function renderQueryLogDetail(
     rows.push(["耗时", duration]);
   }
 
+  if (record.blocked) {
+    rows.push(
+      ["命中规则", record.matched_rule ?? "旧日志未记录"],
+      ["来源清单", record.rule_source ?? "旧日志未记录"],
+      ["规则类型", record.rule_type ?? "旧日志未记录"],
+      ["important 覆盖", record.important_overrode ? "是" : "否"],
+      ["allowlist", record.allowlist_rule ?? "无"],
+    );
+  }
+
   return `
     <div class="log-detail-popover" role="tooltip">
       <strong>请求详情</strong>

@@ -27,9 +27,14 @@ const INSERT_QUERY_LOG_SQL: &str = "
             failed,
             upstream_server,
             upstream_duration_ms,
-            error
+            error,
+            matched_rule,
+            rule_source,
+            rule_type,
+            important_overrode,
+            allowlist_rule
         )
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
 
 const UPSERT_QUERY_LOG_MINUTE_STATS_SQL: &str = "
     INSERT INTO query_log_minute_stats
@@ -75,6 +80,11 @@ pub struct QueryLogEntry {
     pub upstream_server: Option<String>,
     pub upstream_duration_ms: Option<u64>,
     pub error: Option<String>,
+    pub matched_rule: Option<String>,
+    pub rule_source: Option<String>,
+    pub rule_type: Option<String>,
+    pub important_overrode: bool,
+    pub allowlist_rule: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +99,11 @@ pub struct QueryLogRecord {
     pub upstream_server: Option<String>,
     pub upstream_duration_ms: Option<u64>,
     pub error: Option<String>,
+    pub matched_rule: Option<String>,
+    pub rule_source: Option<String>,
+    pub rule_type: Option<String>,
+    pub important_overrode: bool,
+    pub allowlist_rule: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -331,7 +346,12 @@ impl Database {
                 failed,
                 upstream_server,
                 upstream_duration_ms,
-                error
+                error,
+                matched_rule,
+                rule_source,
+                rule_type,
+                important_overrode,
+                allowlist_rule
              FROM query_logs
              WHERE {where_sql}
              ORDER BY timestamp DESC, id DESC
@@ -453,6 +473,11 @@ fn execute_query_log_insert(
         entry.upstream_server.as_deref(),
         upstream_duration_ms,
         entry.error.as_deref(),
+        entry.matched_rule.as_deref(),
+        entry.rule_source.as_deref(),
+        entry.rule_type.as_deref(),
+        bool_to_i64(entry.important_overrode),
+        entry.allowlist_rule.as_deref(),
     ])
     .map_err(|e| format!("写入查询日志失败：{e}"))?;
     Ok(())
@@ -517,6 +542,11 @@ fn read_query_log_record(row: &Row<'_>) -> rusqlite::Result<QueryLogRecord> {
         upstream_server: row.get(7)?,
         upstream_duration_ms: read_optional_u64(row, 8)?,
         error: row.get(9)?,
+        matched_rule: row.get(10)?,
+        rule_source: row.get(11)?,
+        rule_type: row.get(12)?,
+        important_overrode: row.get::<_, i64>(13)? != 0,
+        allowlist_rule: row.get(14)?,
     })
 }
 
@@ -542,7 +572,12 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             failed INTEGER NOT NULL DEFAULT 0,
             upstream_server TEXT,
             upstream_duration_ms INTEGER,
-            error TEXT
+            error TEXT,
+            matched_rule TEXT,
+            rule_source TEXT,
+            rule_type TEXT,
+            important_overrode INTEGER NOT NULL DEFAULT 0,
+            allowlist_rule TEXT
         );
 
         CREATE TABLE IF NOT EXISTS query_log_minute_stats (
@@ -574,6 +609,16 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("初始化数据库失败：{e}"))?;
     add_column_if_missing(conn, "query_logs", "upstream_server", "TEXT")?;
     add_column_if_missing(conn, "query_logs", "upstream_duration_ms", "INTEGER")?;
+    add_column_if_missing(conn, "query_logs", "matched_rule", "TEXT")?;
+    add_column_if_missing(conn, "query_logs", "rule_source", "TEXT")?;
+    add_column_if_missing(conn, "query_logs", "rule_type", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "query_logs",
+        "important_overrode",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "query_logs", "allowlist_rule", "TEXT")?;
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_query_logs_timestamp
@@ -945,6 +990,11 @@ mod tests {
                     upstream_server: None,
                     upstream_duration_ms: None,
                     error: None,
+                    matched_rule: Some("||example.org^".into()),
+                    rule_source: Some("测试清单".into()),
+                    rule_type: Some("suffix block".into()),
+                    important_overrode: false,
+                    allowlist_rule: None,
                 },
                 true,
             ),
@@ -958,6 +1008,11 @@ mod tests {
                     upstream_server: Some("223.5.5.5:53".into()),
                     upstream_duration_ms: Some(24),
                     error: None,
+                    matched_rule: None,
+                    rule_source: None,
+                    rule_type: None,
+                    important_overrode: false,
+                    allowlist_rule: None,
                 },
                 true,
             ),
@@ -989,6 +1044,10 @@ mod tests {
         assert_eq!(blocked_logs.total, 1);
         assert_eq!(blocked_logs.records.len(), 1);
         assert!(blocked_logs.records[0].blocked);
+        assert_eq!(
+            blocked_logs.records[0].matched_rule.as_deref(),
+            Some("||example.org^")
+        );
     }
 
     #[test]

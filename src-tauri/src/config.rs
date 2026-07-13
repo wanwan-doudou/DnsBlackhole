@@ -1156,12 +1156,17 @@ pub fn build_effective_rules(app: &AppHandle, config: &AppConfig) -> String {
             continue;
         }
         if let Ok(Some(content)) = read_filter_cache(app, &filter.id) {
-            parts.push(format!("! {}\n{}", filter.name, content));
+            let source =
+                serde_json::to_string(&filter.name).unwrap_or_else(|_| "\"未知清单\"".into());
+            parts.push(format!("! dnsblackhole-source:{source}\n{content}"));
         }
     }
 
     if !config.blacklist.trim().is_empty() {
-        parts.push(format!("! 自定义规则\n{}", config.blacklist));
+        parts.push(format!(
+            "! dnsblackhole-source:\"自定义规则\"\n{}",
+            config.blacklist
+        ));
     }
 
     parts.join("\n")

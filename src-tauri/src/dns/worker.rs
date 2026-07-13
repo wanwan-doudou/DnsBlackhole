@@ -290,7 +290,10 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         return;
     }
 
-    if filter.rules.is_blocked(&question.domain, question.qtype) {
+    if let Some(rule_match) = filter
+        .rules
+        .blocking_match(&question.domain, question.qtype)
+    {
         let response = build_block_response(query, &question, &filter.blocking);
         if let Err(error) = send_dns_response(context, response_target, &response) {
             let message = format!("返回黑名单响应失败：{error}");
@@ -300,17 +303,14 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 context.detailed_runtime_stats,
             );
             record_error(&context.stats, message.clone());
-            queue_query_log(
+            queue_blocked_query_log(
                 context,
                 &filter,
                 &question.domain,
                 client_addr,
                 true,
-                false,
-                true,
-                None,
-                None,
                 Some(message),
+                &rule_match,
             );
             return;
         }
@@ -319,17 +319,14 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             &question.domain,
             context.detailed_runtime_stats,
         );
-        queue_query_log(
+        queue_blocked_query_log(
             context,
             &filter,
             &question.domain,
             client_addr,
-            true,
-            false,
             false,
             None,
-            None,
-            None,
+            &rule_match,
         );
         return;
     }
@@ -691,6 +688,59 @@ fn queue_query_log(
     upstream_duration_ms: Option<u64>,
     error: Option<String>,
 ) {
+    queue_query_log_with_match(
+        context,
+        filter,
+        domain,
+        client_addr,
+        blocked,
+        forwarded,
+        failed,
+        upstream_server,
+        upstream_duration_ms,
+        error,
+        None,
+    );
+}
+
+fn queue_blocked_query_log(
+    context: &DnsWorkerContext,
+    filter: &FilterRuntime,
+    domain: &str,
+    client_addr: SocketAddr,
+    failed: bool,
+    error: Option<String>,
+    rule_match: &super::rules::BlockMatch,
+) {
+    queue_query_log_with_match(
+        context,
+        filter,
+        domain,
+        client_addr,
+        true,
+        false,
+        failed,
+        None,
+        None,
+        error,
+        Some(rule_match),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_query_log_with_match(
+    context: &DnsWorkerContext,
+    filter: &FilterRuntime,
+    domain: &str,
+    client_addr: SocketAddr,
+    blocked: bool,
+    forwarded: bool,
+    failed: bool,
+    upstream_server: Option<&str>,
+    upstream_duration_ms: Option<u64>,
+    error: Option<String>,
+    rule_match: Option<&super::rules::BlockMatch>,
+) {
     if filter.log_ignore.contains(domain) {
         return;
     }
@@ -707,6 +757,11 @@ fn queue_query_log(
         upstream_server: upstream_server.map(str::to_string),
         upstream_duration_ms,
         error,
+        matched_rule: rule_match.map(|matched| matched.rule.clone()),
+        rule_source: rule_match.map(|matched| matched.source.clone()),
+        rule_type: rule_match.map(|matched| matched.rule_type.clone()),
+        important_overrode: rule_match.is_some_and(|matched| matched.important_overrode),
+        allowlist_rule: rule_match.and_then(|matched| matched.allowlist_rule.clone()),
     };
 
     let message = QueryLogMessage {

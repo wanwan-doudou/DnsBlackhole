@@ -24,6 +24,9 @@ pub struct CompiledRules {
 struct Rule {
     domain: String,
     include_subdomains: bool,
+    raw: String,
+    source: String,
+    rule_type: RuleType,
     important: bool,
     query_types: QueryTypes,
     denyallow: Vec<String>,
@@ -37,6 +40,9 @@ struct RuleSet {
 
 #[derive(Clone)]
 struct RuleOptions {
+    raw: String,
+    source: String,
+    rule_type: RuleType,
     important: bool,
     query_types: QueryTypes,
     denyallow: Vec<String>,
@@ -49,6 +55,24 @@ enum QueryTypes {
     Include(Vec<u16>),
     Exclude(Vec<u16>),
 }
+
+#[derive(Debug, Clone, Copy)]
+enum RuleType {
+    Exact,
+    Suffix,
+    Hosts,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BlockMatch {
+    pub(crate) rule: String,
+    pub(crate) source: String,
+    pub(crate) rule_type: String,
+    pub(crate) important_overrode: bool,
+    pub(crate) allowlist_rule: Option<String>,
+}
+
+const SOURCE_MARKER_PREFIX: &str = "! dnsblackhole-source:";
 
 pub fn summarize_rules(raw: &str) -> RuleSummary {
     compile_rules(raw).summary
@@ -64,16 +88,25 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
         .filter_map(badfilter_target)
         .collect::<HashSet<_>>();
 
+    let mut source = "自定义规则".to_string();
     for line in raw.lines() {
+        if let Some(encoded) = line.trim().strip_prefix(SOURCE_MARKER_PREFIX) {
+            if let Ok(value) = serde_json::from_str::<String>(encoded) {
+                source = value;
+            }
+            continue;
+        }
         if disabled.contains(line.trim()) {
             continue;
         }
         match parse_rule(line) {
-            ParsedRule::Block(rule) => {
+            ParsedRule::Block(mut rule) => {
+                rule.source.clone_from(&source);
                 summary.block_rules += 1;
                 blocks.insert(rule);
             }
-            ParsedRule::Allow(rule) => {
+            ParsedRule::Allow(mut rule) => {
+                rule.source.clone_from(&source);
                 summary.allow_rules += 1;
                 allows.insert(rule);
             }
@@ -98,25 +131,36 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
 }
 
 impl CompiledRules {
+    #[cfg(test)]
     pub(crate) fn is_blocked(&self, domain: &str, qtype: u16) -> bool {
-        let important_allow = self.allows.matches(domain, qtype, true);
-        let important_block = self.blocks.matches(domain, qtype, true);
-        if important_allow {
-            return false;
+        self.blocking_match(domain, qtype).is_some()
+    }
+
+    pub(crate) fn blocking_match(&self, domain: &str, qtype: u16) -> Option<BlockMatch> {
+        let important_allow = self.allows.find_match(domain, qtype, true);
+        if important_allow.is_some() {
+            return None;
         }
-        if important_block {
-            return true;
+        if let Some(block) = self.blocks.find_match(domain, qtype, true) {
+            let allow = self.allows.find_match(domain, qtype, false);
+            let important_overrode = allow.is_some();
+            return Some(block.to_block_match(allow, important_overrode));
         }
-        if self.allows.matches(domain, qtype, false) {
-            return false;
+        if self.allows.find_match(domain, qtype, false).is_some() {
+            return None;
         }
-        self.blocks.matches(domain, qtype, false)
+        self.blocks
+            .find_match(domain, qtype, false)
+            .map(|block| block.to_block_match(None, false))
     }
 }
 
 impl RuleSet {
     fn insert(&mut self, rule: Rule) {
         let options = RuleOptions {
+            raw: rule.raw,
+            source: rule.source,
+            rule_type: rule.rule_type,
             important: rule.important,
             query_types: rule.query_types,
             denyallow: rule.denyallow,
@@ -128,32 +172,35 @@ impl RuleSet {
         }
     }
 
-    fn matches(&self, domain: &str, qtype: u16, important: bool) -> bool {
-        if self.exact.get(domain).is_some_and(|rules| {
+    fn find_match(&self, domain: &str, qtype: u16, important: bool) -> Option<&RuleOptions> {
+        if let Some(rule) = self.exact.get(domain).and_then(|rules| {
             rules
                 .iter()
-                .any(|rule| rule.matches(domain, qtype, important))
-        }) || self.suffix.get(domain).is_some_and(|rules| {
-            rules
-                .iter()
-                .any(|rule| rule.matches(domain, qtype, important))
+                .find(|rule| rule.matches(domain, qtype, important))
         }) {
-            return true;
+            return Some(rule);
+        }
+        if let Some(rule) = self.suffix.get(domain).and_then(|rules| {
+            rules
+                .iter()
+                .find(|rule| rule.matches(domain, qtype, important))
+        }) {
+            return Some(rule);
         }
 
         let mut offset = 0;
         while let Some(dot_index) = domain[offset..].find('.') {
             offset += dot_index + 1;
-            if self.suffix.get(&domain[offset..]).is_some_and(|rules| {
+            if let Some(rule) = self.suffix.get(&domain[offset..]).and_then(|rules| {
                 rules
                     .iter()
-                    .any(|rule| rule.matches(domain, qtype, important))
+                    .find(|rule| rule.matches(domain, qtype, important))
             }) {
-                return true;
+                return Some(rule);
             }
         }
 
-        false
+        None
     }
 }
 
@@ -165,6 +212,26 @@ impl RuleOptions {
                 .denyallow
                 .iter()
                 .any(|excluded| domain_matches(domain, excluded))
+    }
+
+    fn to_block_match(&self, allow: Option<&RuleOptions>, important_overrode: bool) -> BlockMatch {
+        BlockMatch {
+            rule: self.raw.clone(),
+            source: self.source.clone(),
+            rule_type: format!("{} block", self.rule_type.as_str()),
+            important_overrode,
+            allowlist_rule: allow.map(|rule| rule.raw.clone()),
+        }
+    }
+}
+
+impl RuleType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Suffix => "suffix",
+            Self::Hosts => "hosts",
+        }
     }
 }
 
@@ -260,6 +327,9 @@ fn parse_hosts_rule(line: &str) -> Option<Rule> {
     normalize_domain(domain).map(|domain| Rule {
         domain,
         include_subdomains: false,
+        raw: line.to_string(),
+        source: String::new(),
+        rule_type: RuleType::Hosts,
         important: false,
         query_types: QueryTypes::Any,
         denyallow: Vec::new(),
@@ -284,6 +354,7 @@ fn parse_filter_rule(line: &str) -> ParsedRule {
     let Some(mut rule) = parse_pattern(pattern.trim()) else {
         return ParsedRule::Ignored(ignored_pattern_reason(pattern.trim()));
     };
+    rule.raw = line.to_string();
     rule.important = modifiers.important;
     rule.query_types = modifiers.query_types;
     rule.denyallow = modifiers.denyallow;
@@ -305,6 +376,9 @@ fn parse_pattern(pattern: &str) -> Option<Rule> {
         return normalize_domain(domain).map(|domain| Rule {
             domain,
             include_subdomains: true,
+            raw: String::new(),
+            source: String::new(),
+            rule_type: RuleType::Suffix,
             important: false,
             query_types: QueryTypes::Any,
             denyallow: Vec::new(),
@@ -321,6 +395,13 @@ fn parse_pattern(pattern: &str) -> Option<Rule> {
     normalize_domain(domain).map(|domain| Rule {
         domain,
         include_subdomains,
+        raw: String::new(),
+        source: String::new(),
+        rule_type: if include_subdomains {
+            RuleType::Suffix
+        } else {
+            RuleType::Exact
+        },
         important: false,
         query_types: QueryTypes::Any,
         denyallow: Vec::new(),
