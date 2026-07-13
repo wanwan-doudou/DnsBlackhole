@@ -567,8 +567,10 @@ void getVersion().then((version) => {
 });
 
 await loadConfig();
-await listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
+void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
   syncFilterUpdateMetadata(payload);
+}).catch((error) => {
+  console.error("监听过滤器更新失败", error);
 });
 await refreshStatus();
 setActiveView(activeView);

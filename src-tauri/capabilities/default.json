@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "core:app:allow-version",
+    "core:event:allow-listen",
     "updater:allow-check",
     "updater:allow-download-and-install",
     "process:allow-restart",
