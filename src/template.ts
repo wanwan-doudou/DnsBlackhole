@@ -239,11 +239,13 @@ export function renderAppTemplate(appIconUrl: string): string {
               <div class="upstream-extra-grid">
                 <label class="field upstream-extra-field">
                   <span>Fallback DNS 服务器</span>
-                  <textarea id="fallback_dns" autocomplete="off" spellcheck="false"></textarea>
+                  <small>所有上游服务器都失败时重试的后备 DNS，语法与上游相同。留空则禁用。</small>
+                  <textarea id="fallback_dns" autocomplete="off" spellcheck="false" placeholder="114.114.114.114"></textarea>
                 </label>
                 <label class="field upstream-extra-field">
                   <span>Bootstrap DNS 服务器</span>
-                  <textarea id="bootstrap_dns" autocomplete="off" spellcheck="false"></textarea>
+                  <small>仅用于解析 DoH 上游自身的域名，只支持普通 IP 地址 DNS。</small>
+                  <textarea id="bootstrap_dns" autocomplete="off" spellcheck="false" placeholder="223.5.5.5"></textarea>
                 </label>
               </div>
               <div class="radio-stack upstream-mode">
