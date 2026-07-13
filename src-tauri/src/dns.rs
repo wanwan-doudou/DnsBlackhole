@@ -48,24 +48,24 @@ mod tests {
     fn adguard_style_rule_blocks_domain_and_subdomain() {
         let rules = compile_rules("||example.org^");
 
-        assert!(rules.is_blocked("example.org"));
-        assert!(rules.is_blocked("ads.example.org"));
-        assert!(!rules.is_blocked("badexample.org"));
+        assert!(rules.is_blocked("example.org", TYPE_A));
+        assert!(rules.is_blocked("ads.example.org", TYPE_A));
+        assert!(!rules.is_blocked("badexample.org", TYPE_A));
     }
 
     #[test]
     fn allow_rule_overrides_block_rule() {
         let rules = compile_rules("||example.org^\n@@||safe.example.org^");
 
-        assert!(rules.is_blocked("track.example.org"));
-        assert!(!rules.is_blocked("safe.example.org"));
-        assert!(!rules.is_blocked("cdn.safe.example.org"));
+        assert!(rules.is_blocked("track.example.org", TYPE_A));
+        assert!(!rules.is_blocked("safe.example.org", TYPE_A));
+        assert!(!rules.is_blocked("cdn.safe.example.org", TYPE_A));
     }
 
     #[test]
     fn summarizes_ignored_rule_reasons() {
         let summary = summarize_rules(
-            "! comment\n/ads[0-9]+\\.example/\n||example.org^$dnstype=A\nbad domain\n||valid.example^",
+            "! comment\n/ads[0-9]+\\.example/\n||example.org^$unknown\nbad domain\n||valid.example^",
         );
 
         assert_eq!(summary.block_rules, 1);
@@ -77,11 +77,53 @@ mod tests {
     }
 
     #[test]
+    fn important_rule_overrides_normal_exception() {
+        let rules = compile_rules("||example.org^$important\n@@||example.org^");
+
+        assert!(rules.is_blocked("example.org", TYPE_A));
+
+        let rules = compile_rules("||example.org^$important\n@@||example.org^$important");
+        assert!(!rules.is_blocked("example.org", TYPE_A));
+    }
+
+    #[test]
+    fn dnstype_limits_matching_query_types() {
+        let rules = compile_rules("||example.org^$dnstype=A|AAAA");
+
+        assert!(rules.is_blocked("example.org", TYPE_A));
+        assert!(rules.is_blocked("example.org", 28));
+        assert!(!rules.is_blocked("example.org", 16));
+
+        let rules = compile_rules("||example.net^$dnstype=~AAAA");
+        assert!(rules.is_blocked("example.net", TYPE_A));
+        assert!(!rules.is_blocked("example.net", 28));
+    }
+
+    #[test]
+    fn denyallow_excludes_domain_branch() {
+        let rules = compile_rules("||example.org^$denyallow=safe.example.org");
+
+        assert!(rules.is_blocked("ads.example.org", TYPE_A));
+        assert!(!rules.is_blocked("safe.example.org", TYPE_A));
+        assert!(!rules.is_blocked("cdn.safe.example.org", TYPE_A));
+    }
+
+    #[test]
+    fn badfilter_disables_matching_rule() {
+        let rules = compile_rules("||example.org^$important\n||example.org^$important,badfilter");
+
+        assert!(!rules.is_blocked("example.org", TYPE_A));
+        let summary = summarize_rules("||example.org^$important");
+        assert_eq!(summary.block_rules, 1);
+        assert_eq!(summary.ignored_unsupported_rules, 0);
+    }
+
+    #[test]
     fn hosts_style_rule_blocks_exact_domain_only() {
         let rules = compile_rules("0.0.0.0 example.org");
 
-        assert!(rules.is_blocked("example.org"));
-        assert!(!rules.is_blocked("www.example.org"));
+        assert!(rules.is_blocked("example.org", TYPE_A));
+        assert!(!rules.is_blocked("www.example.org", TYPE_A));
     }
 
     #[test]

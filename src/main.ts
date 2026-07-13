@@ -1,4 +1,5 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -566,6 +567,9 @@ void getVersion().then((version) => {
 });
 
 await loadConfig();
+await listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
+  syncFilterUpdateMetadata(payload);
+});
 await refreshStatus();
 setActiveView(activeView);
 window.setInterval(() => {
@@ -817,6 +821,30 @@ function renderFilters(): void {
   }
 
   filtersBody.innerHTML = filtersState.map(renderFilter).join("");
+}
+
+function syncFilterUpdateMetadata(updatedFilters: FilterSubscription[]): void {
+  const updatedById = new Map(updatedFilters.map((filter) => [filter.id, filter]));
+  filtersState = filtersState.map((filter) => {
+    const updated = updatedById.get(filter.id);
+    if (!updated) {
+      return filter;
+    }
+    return {
+      ...filter,
+      rule_count: updated.rule_count,
+      block_rule_count: updated.block_rule_count,
+      allow_rule_count: updated.allow_rule_count,
+      ignored_rule_count: updated.ignored_rule_count,
+      ignored_comment_count: updated.ignored_comment_count,
+      ignored_regex_count: updated.ignored_regex_count,
+      ignored_unsupported_count: updated.ignored_unsupported_count,
+      ignored_invalid_count: updated.ignored_invalid_count,
+      last_updated: updated.last_updated,
+      last_error: updated.last_error,
+    };
+  });
+  renderFilters();
 }
 
 function renderFilter(filter: FilterSubscription): string {
