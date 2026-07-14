@@ -227,12 +227,19 @@ export function renderAppTemplate(appIconUrl: string): string {
                 </label>
                 <div class="listen-settings">
                   <label class="field">
-                    <span>监听地址</span>
+                    <span>IPv4 监听地址</span>
                     <input id="listen_host" autocomplete="off" spellcheck="false" placeholder="0.0.0.0" />
                   </label>
                   <label class="field compact-field">
                     <span>端口</span>
                     <input id="listen_port" type="number" min="1" max="65535" step="1" />
+                  </label>
+                  <label class="check-row ipv6-listen-row">
+                    <input id="listen_ipv6" type="checkbox" />
+                    <span>
+                      <strong>监听 IPv6</strong>
+                      <small>开启后额外绑定 [::]:同一端口，同时接受 IPv4 与 IPv6 DNS 请求。</small>
+                    </span>
                   </label>
                 </div>
               </div>

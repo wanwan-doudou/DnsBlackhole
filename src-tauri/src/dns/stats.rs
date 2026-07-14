@@ -70,8 +70,14 @@ pub fn empty_status(
     error: Option<String>,
 ) -> RuntimeStatus {
     let listen_addr = config
-        .listen_socket_addr()
-        .map(|addr| addr.to_string())
+        .listen_socket_addrs()
+        .map(|addrs| {
+            addrs
+                .into_iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
         .unwrap_or_else(|_| format!("{}:{}", config.listen_host, config.listen_port));
 
     RuntimeStatus {

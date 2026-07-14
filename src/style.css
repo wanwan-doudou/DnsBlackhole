@@ -1451,6 +1451,10 @@ button.refreshing:disabled {
   gap: 14px;
 }
 
+.listen-settings .ipv6-listen-row {
+  margin-bottom: 0;
+}
+
 .upstream-field textarea {
   min-height: 220px;
   resize: vertical;

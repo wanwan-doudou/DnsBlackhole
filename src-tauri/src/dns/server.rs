@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+use socket2::{Domain, Protocol, Socket, Type};
+
 use crate::{config::AppConfig, database::Database};
 
 use super::{
@@ -58,7 +60,8 @@ impl DnsServer {
     ) -> Result<Self, String> {
         config.validate()?;
 
-        let listen_addr = config.listen_socket_addr()?;
+        let listen_addrs = config.listen_socket_addrs()?;
+        let listen_addr = listen_addrs[0];
         let upstream_servers = Arc::new(build_runtime_upstreams(config.upstream_servers()?)?);
         let fallback_upstream_servers =
             Arc::new(build_runtime_upstreams(config.fallback_servers()?)?);
@@ -72,19 +75,10 @@ impl DnsServer {
             DnsCacheStore::from_config(dns_cache_config.clone(), DNS_CACHE_SHARDS).map(Arc::new);
         let dns_cache_config = dns_cache.as_ref().map(|_| dns_cache_config);
         let filter_runtime = share_filter_runtime(build_filter_runtime(&config, rules_text));
-        let socket =
-            UdpSocket::bind(listen_addr).map_err(|e| format!("监听 {listen_addr} 失败：{e}"))?;
-        configure_udp_listener_socket(&socket)?;
-        socket
-            .set_read_timeout(Some(UDP_READ_TIMEOUT))
-            .map_err(|e| format!("设置 DNS 读取超时失败：{e}"))?;
-        let socket = Arc::new(socket);
-        let tcp_listener = TcpListener::bind(listen_addr)
-            .map_err(|e| format!("监听 TCP {listen_addr} 失败：{e}"))?;
-        tcp_listener
-            .set_nonblocking(true)
-            .map_err(|e| format!("设置 TCP DNS 非阻塞监听失败：{e}"))?;
-        let tcp_listener = Arc::new(tcp_listener);
+        let listeners = listen_addrs
+            .into_iter()
+            .map(|addr| bind_listener_pair(addr, addr.is_ipv6() && config.listen_ipv6))
+            .collect::<Result<Vec<_>, _>>()?;
 
         reset_stats(&stats);
         let stop = Arc::new(AtomicBool::new(false));
@@ -100,7 +94,6 @@ impl DnsServer {
         };
 
         let worker_context = Arc::new(DnsWorkerContext {
-            socket: Arc::clone(&socket),
             upstream_servers,
             fallback_upstream_servers,
             upstream_mode,
@@ -131,20 +124,34 @@ impl DnsServer {
             }));
         }
 
-        let tcp_listener = Arc::clone(&tcp_listener);
-        let tcp_work_senders = work_senders.clone();
-        let tcp_stats = Arc::clone(&stats);
-        let tcp_stop = Arc::clone(&stop);
-        threads.push(thread::spawn(move || {
-            serve_tcp(tcp_listener, tcp_work_senders, tcp_stats, tcp_stop);
-        }));
+        let active_tcp_connections = Arc::new(AtomicUsize::new(0));
+        for listener in listeners {
+            let tcp_work_senders = work_senders.clone();
+            let tcp_stats = Arc::clone(&stats);
+            let tcp_stop = Arc::clone(&stop);
+            let active_tcp_connections = Arc::clone(&active_tcp_connections);
+            threads.push(thread::spawn(move || {
+                serve_tcp(
+                    listener.tcp,
+                    tcp_work_senders,
+                    tcp_stats,
+                    tcp_stop,
+                    active_tcp_connections,
+                );
+            }));
 
-        let listener_socket = Arc::clone(&socket);
-        let listener_stats = Arc::clone(&stats);
-        let listener_stop = Arc::clone(&stop);
-        threads.push(thread::spawn(move || {
-            serve_udp(listener_socket, work_senders, listener_stats, listener_stop);
-        }));
+            let listener_stats = Arc::clone(&stats);
+            let listener_stop = Arc::clone(&stop);
+            let udp_work_senders = work_senders.clone();
+            threads.push(thread::spawn(move || {
+                serve_udp(
+                    listener.udp,
+                    udp_work_senders,
+                    listener_stats,
+                    listener_stop,
+                );
+            }));
+        }
         if let Some(thread) = query_log_thread {
             threads.push(thread);
         }
@@ -187,6 +194,52 @@ impl DnsServer {
             let _ = thread.join();
         }
     }
+}
+
+struct ListenerPair {
+    udp: Arc<UdpSocket>,
+    tcp: Arc<TcpListener>,
+}
+
+fn bind_listener_pair(addr: SocketAddr, ipv6_only: bool) -> Result<ListenerPair, String> {
+    let udp = bind_udp_listener(addr, ipv6_only)
+        .map_err(|error| format!("监听 UDP {addr} 失败：{error}"))?;
+    configure_udp_listener_socket(&udp)?;
+    udp.set_read_timeout(Some(UDP_READ_TIMEOUT))
+        .map_err(|error| format!("设置 UDP DNS 读取超时失败：{error}"))?;
+
+    let tcp = bind_tcp_listener(addr, ipv6_only)
+        .map_err(|error| format!("监听 TCP {addr} 失败：{error}"))?;
+    tcp.set_nonblocking(true)
+        .map_err(|error| format!("设置 TCP DNS 非阻塞监听失败：{error}"))?;
+
+    Ok(ListenerPair {
+        udp: Arc::new(udp),
+        tcp: Arc::new(tcp),
+    })
+}
+
+fn bind_udp_listener(addr: SocketAddr, ipv6_only: bool) -> std::io::Result<UdpSocket> {
+    if !ipv6_only {
+        return UdpSocket::bind(addr);
+    }
+
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+fn bind_tcp_listener(addr: SocketAddr, ipv6_only: bool) -> std::io::Result<TcpListener> {
+    if !ipv6_only {
+        return TcpListener::bind(addr);
+    }
+
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
 }
 
 #[cfg(windows)]
@@ -314,7 +367,10 @@ fn serve_udp(
         let work_item = DnsWorkItem {
             query: buffer[..len].to_vec(),
             client_addr,
-            response_target: DnsResponseTarget::Udp(client_addr),
+            response_target: DnsResponseTarget::Udp {
+                socket: Arc::clone(&socket),
+                client_addr,
+            },
         };
         match dispatch_dns_work(&work_senders, work_item, &mut next_worker) {
             Ok(()) => {}
@@ -331,9 +387,8 @@ fn serve_tcp(
     work_senders: Vec<mpsc::SyncSender<DnsWorkItem>>,
     stats: Arc<Mutex<DnsStats>>,
     stop: Arc<AtomicBool>,
+    active_connections: Arc<AtomicUsize>,
 ) {
-    let active_connections = Arc::new(AtomicUsize::new(0));
-
     while !stop.load(Ordering::Relaxed) {
         let (stream, client_addr) = match listener.accept() {
             Ok(accepted) => accepted,
@@ -550,5 +605,30 @@ fn dispatch_dns_work(
         Err(DispatchDnsWorkError::Full)
     } else {
         Err(DispatchDnsWorkError::Disconnected)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_udp_listener_does_not_claim_ipv4_port() {
+        let ipv6 = bind_udp_listener("[::]:0".parse().unwrap(), true)
+            .expect("IPv6 UDP listener should bind");
+        let port = ipv6.local_addr().unwrap().port();
+
+        bind_udp_listener(SocketAddr::from(([0, 0, 0, 0], port)), false)
+            .expect("IPv4 UDP listener should share the port");
+    }
+
+    #[test]
+    fn ipv6_tcp_listener_does_not_claim_ipv4_port() {
+        let ipv6 = bind_tcp_listener("[::]:0".parse().unwrap(), true)
+            .expect("IPv6 TCP listener should bind");
+        let port = ipv6.local_addr().unwrap().port();
+
+        bind_tcp_listener(SocketAddr::from(([0, 0, 0, 0], port)), false)
+            .expect("IPv4 TCP listener should share the port");
     }
 }

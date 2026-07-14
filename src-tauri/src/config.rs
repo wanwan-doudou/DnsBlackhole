@@ -10,7 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 7;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_FILTER_SIZE_MB: u32 = 256;
 
@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub use_filters: bool,
     pub listen_host: String,
     pub listen_port: u16,
+    #[serde(default = "default_listen_ipv6")]
+    pub listen_ipv6: bool,
     pub upstream_dns: String,
     #[serde(default)]
     pub fallback_dns: String,
@@ -171,6 +173,7 @@ impl Default for AppConfig {
             use_filters: default_use_filters(),
             listen_host: default_listen_host(),
             listen_port: default_listen_port(),
+            listen_ipv6: default_listen_ipv6(),
             upstream_dns: default_upstream_dns(),
             fallback_dns: default_fallback_dns(),
             bootstrap_dns: default_bootstrap_dns(),
@@ -221,6 +224,21 @@ impl AppConfig {
         Ok(SocketAddr::new(ip, self.listen_port))
     }
 
+    pub fn listen_socket_addrs(&self) -> Result<Vec<SocketAddr>, String> {
+        let ipv4_addr = self.listen_socket_addr()?;
+        if !self.listen_ipv6 {
+            return Ok(vec![ipv4_addr]);
+        }
+        if !ipv4_addr.is_ipv4() {
+            return Err("启用 IPv6 双监听时，监听地址必须填写 IPv4 地址".into());
+        }
+
+        Ok(vec![
+            ipv4_addr,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), self.listen_port),
+        ])
+    }
+
     pub fn upstream_servers(&self) -> Result<Vec<UpstreamServer>, String> {
         parse_upstream_servers(
             &self.upstream_dns,
@@ -238,7 +256,7 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        self.listen_socket_addr()?;
+        self.listen_socket_addrs()?;
         self.upstream_servers()?;
         self.fallback_servers()?;
         parse_bootstrap_servers(&self.bootstrap_dns)?;
@@ -392,6 +410,10 @@ fn default_listen_host() -> String {
 
 fn default_listen_port() -> u16 {
     53
+}
+
+fn default_listen_ipv6() -> bool {
+    true
 }
 
 fn default_filter_update_interval_hours() -> u32 {
@@ -928,6 +950,10 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
     {
         config.listen_host = default_listen_host();
     }
+    // 旧版本允许在主监听地址中直接填写 IPv6，迁移时保留其单地址监听行为。
+    if config.schema_version < 7 && config.listen_host.trim().parse::<Ipv6Addr>().is_ok() {
+        config.listen_ipv6 = false;
+    }
     if config.schema_version < 1 {
         if config.allowed_clients.trim().is_empty() {
             config.allowed_clients = default_allowed_clients();
@@ -1197,6 +1223,7 @@ mod tests {
 
         assert_eq!(config.listen_host, "0.0.0.0");
         assert_eq!(config.listen_port, 53);
+        assert!(config.listen_ipv6);
         assert_eq!(config.filter_max_size_mb, 50);
         assert!(!config.allow_insecure_http);
         assert_eq!(
@@ -1286,6 +1313,37 @@ mod tests {
             default_runtime_watchdog_interval_seconds()
         );
         assert_eq!(config.filter_max_size_mb, default_filter_max_size_mb());
+    }
+
+    #[test]
+    fn builds_ipv4_and_ipv6_listen_addresses() {
+        let config = AppConfig::default();
+
+        assert_eq!(
+            config
+                .listen_socket_addrs()
+                .expect("listen addresses should validate"),
+            ["0.0.0.0:53".parse().unwrap(), "[::]:53".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn preserves_legacy_ipv6_only_listener() {
+        let mut config = AppConfig {
+            schema_version: 6,
+            listen_host: "::1".into(),
+            ..AppConfig::default()
+        };
+
+        migrate_legacy_defaults(&mut config);
+
+        assert!(!config.listen_ipv6);
+        assert_eq!(
+            config
+                .listen_socket_addrs()
+                .expect("legacy listener should validate"),
+            ["[::1]:53".parse().unwrap()]
+        );
     }
 
     #[test]
