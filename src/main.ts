@@ -1245,7 +1245,7 @@ function clientDisplayName(ip: string | null): string | null {
   if (!ip) {
     return null;
   }
-  return clientNameMap.get(ip) ?? null;
+  return clientNameMap.get(ip) ?? (ip === "127.0.0.1" || ip === "::1" ? "本机" : null);
 }
 
 function formatClientLabel(ip: string | null): string {
