@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use serde::Serialize;
 
@@ -17,43 +20,63 @@ pub struct RuleSummary {
 pub struct CompiledRules {
     blocks: RuleSet,
     allows: RuleSet,
-    summary: RuleSummary,
-}
-
-#[derive(Clone)]
-struct Rule {
-    domain: String,
-    include_subdomains: bool,
-    raw: String,
-    source: String,
-    rule_type: RuleType,
-    important: bool,
-    query_types: QueryTypes,
-    denyallow: Vec<String>,
+    /// 清单名称表：规则条目里只存索引，避免几百万条规则各克隆一份清单名
+    sources: Vec<Box<str>>,
 }
 
 #[derive(Clone, Default)]
 struct RuleSet {
-    exact: HashMap<String, Vec<RuleOptions>>,
-    suffix: HashMap<String, Vec<RuleOptions>>,
+    exact: HashMap<Box<str>, RuleEntry>,
+    suffix: HashMap<Box<str>, RuleEntry>,
+}
+
+/// 绝大多数规则是无修饰符的规范写法（如 `||domain^`），原文可以在命中时由域名重建，
+/// 压缩成 4 字节的 Simple；带修饰符、非规范写法或同域名多条规则时才升级为完整形态。
+#[derive(Clone)]
+enum RuleEntry {
+    Simple(SimpleRule),
+    Complex(Box<[ComplexRule]>),
+}
+
+#[derive(Clone, Copy)]
+struct SimpleRule {
+    source_id: u16,
+    kind: SimpleKind,
+}
+
+/// 能够由域名逐字节重建规则原文的规范形态
+#[derive(Clone, Copy)]
+enum SimpleKind {
+    /// `||domain^`（允许规则为 `@@||domain^`）
+    Suffix,
+    /// `domain`（允许规则为 `@@domain`）
+    ExactPlain,
+    /// `0.0.0.0 domain`
+    HostsZero4,
+    /// `127.0.0.1 domain`
+    HostsLocal4,
+    /// `:: domain`
+    HostsZero6,
+    /// `::1 domain`
+    HostsLocal6,
 }
 
 #[derive(Clone)]
-struct RuleOptions {
-    raw: String,
-    source: String,
+struct ComplexRule {
+    raw: Box<str>,
+    source_id: u16,
     rule_type: RuleType,
     important: bool,
     query_types: QueryTypes,
-    denyallow: Vec<String>,
+    denyallow: Box<[Box<str>]>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 enum QueryTypes {
     #[default]
     Any,
-    Include(Vec<u16>),
-    Exclude(Vec<u16>),
+    Include(Box<[u16]>),
+    Exclude(Box<[u16]>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,62 +95,125 @@ pub(crate) struct BlockMatch {
     pub(crate) allowlist_rule: Option<String>,
 }
 
-const SOURCE_MARKER_PREFIX: &str = "! dnsblackhole-source:";
+/// 命中结果的只读视图：只有真正命中时才把规则原文物化成 String
+struct MatchedRule<'a> {
+    domain: &'a str,
+    source_id: u16,
+    rule_type: RuleType,
+    raw: MatchedRaw<'a>,
+}
 
+enum MatchedRaw<'a> {
+    Stored(&'a str),
+    Canonical(SimpleKind),
+}
+
+impl MatchedRule<'_> {
+    fn raw_text(&self, is_allow: bool) -> String {
+        match self.raw {
+            MatchedRaw::Stored(raw) => raw.to_string(),
+            MatchedRaw::Canonical(kind) => canonical_rule_text(kind, self.domain, is_allow),
+        }
+    }
+}
+
+const SOURCE_MARKER_PREFIX: &str = "! dnsblackhole-source:";
+const DEFAULT_SOURCE: &str = "自定义规则";
+
+/// 逐行扫描规则文本，统一处理来源标记与 badfilter 禁用行，
+/// 保证 summarize 与 compile 对每一行的判定完全一致。
+fn scan_rules<'a>(raw: &'a str, mut handle: impl FnMut(ScanEvent<'a>)) {
+    let disabled = raw
+        .lines()
+        .filter_map(badfilter_target)
+        .collect::<HashSet<_>>();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(encoded) = trimmed.strip_prefix(SOURCE_MARKER_PREFIX) {
+            if let Ok(value) = serde_json::from_str::<String>(encoded) {
+                handle(ScanEvent::Source(value));
+            }
+            continue;
+        }
+        if disabled.contains(trimmed) {
+            continue;
+        }
+        handle(ScanEvent::Rule(parse_rule(line)));
+    }
+}
+
+enum ScanEvent<'a> {
+    Source(String),
+    Rule(ParsedRule<'a>),
+}
+
+/// 只解析计数，不构建索引结构，避免为了统计条数把几 GB 的规则索引建了又丢
 pub fn summarize_rules(raw: &str) -> RuleSummary {
-    compile_rules(raw).summary
+    let mut summary = RuleSummary::default();
+    scan_rules(raw, |event| {
+        if let ScanEvent::Rule(parsed) = event {
+            count_rule(&mut summary, &parsed);
+        }
+    });
+    summary
 }
 
 pub fn compile_rules(raw: &str) -> CompiledRules {
     let mut blocks = RuleSet::default();
     let mut allows = RuleSet::default();
     let mut summary = RuleSummary::default();
+    let mut sources: Vec<Box<str>> = vec![DEFAULT_SOURCE.into()];
+    let mut source_id: u16 = 0;
 
-    let disabled = raw
-        .lines()
-        .filter_map(badfilter_target)
-        .collect::<HashSet<_>>();
-
-    let mut source = "自定义规则".to_string();
-    for line in raw.lines() {
-        if let Some(encoded) = line.trim().strip_prefix(SOURCE_MARKER_PREFIX) {
-            if let Ok(value) = serde_json::from_str::<String>(encoded) {
-                source = value;
+    scan_rules(raw, |event| match event {
+        ScanEvent::Source(name) => source_id = intern_source(&mut sources, &name),
+        ScanEvent::Rule(parsed) => {
+            count_rule(&mut summary, &parsed);
+            match parsed {
+                ParsedRule::Block(rule) => blocks.insert(rule, source_id, false),
+                ParsedRule::Allow(rule) => allows.insert(rule, source_id, true),
+                ParsedRule::Ignored(_) | ParsedRule::Disable => {}
             }
-            continue;
         }
-        if disabled.contains(line.trim()) {
-            continue;
-        }
-        match parse_rule(line) {
-            ParsedRule::Block(mut rule) => {
-                rule.source.clone_from(&source);
-                summary.block_rules += 1;
-                blocks.insert(rule);
-            }
-            ParsedRule::Allow(mut rule) => {
-                rule.source.clone_from(&source);
-                summary.allow_rules += 1;
-                allows.insert(rule);
-            }
-            ParsedRule::Ignored(reason) => {
-                summary.ignored_rules += 1;
-                match reason {
-                    IgnoredRuleReason::Comment => summary.ignored_comment_rules += 1,
-                    IgnoredRuleReason::Regex => summary.ignored_regex_rules += 1,
-                    IgnoredRuleReason::Unsupported => summary.ignored_unsupported_rules += 1,
-                    IgnoredRuleReason::Invalid => summary.ignored_invalid_rules += 1,
-                }
-            }
-            ParsedRule::Disable => {}
-        }
-    }
+    });
 
     CompiledRules {
         blocks,
         allows,
-        summary,
+        sources,
     }
+}
+
+fn count_rule(summary: &mut RuleSummary, parsed: &ParsedRule<'_>) {
+    match parsed {
+        ParsedRule::Block(_) => summary.block_rules += 1,
+        ParsedRule::Allow(_) => summary.allow_rules += 1,
+        ParsedRule::Ignored(reason) => {
+            summary.ignored_rules += 1;
+            match reason {
+                IgnoredRuleReason::Comment => summary.ignored_comment_rules += 1,
+                IgnoredRuleReason::Regex => summary.ignored_regex_rules += 1,
+                IgnoredRuleReason::Unsupported => summary.ignored_unsupported_rules += 1,
+                IgnoredRuleReason::Invalid => summary.ignored_invalid_rules += 1,
+            }
+        }
+        ParsedRule::Disable => {}
+    }
+}
+
+fn intern_source(sources: &mut Vec<Box<str>>, name: &str) -> u16 {
+    if let Some(index) = sources
+        .iter()
+        .position(|existing| existing.as_ref() == name)
+    {
+        return index as u16;
+    }
+    if sources.len() > usize::from(u16::MAX) {
+        return 0;
+    }
+    sources.push(name.into());
+    (sources.len() - 1) as u16
 }
 
 impl CompiledRules {
@@ -144,59 +230,107 @@ impl CompiledRules {
         if let Some(block) = self.blocks.find_match(domain, qtype, true) {
             let allow = self.allows.find_match(domain, qtype, false);
             let important_overrode = allow.is_some();
-            return Some(block.to_block_match(allow, important_overrode));
+            return Some(self.build_block_match(block, allow, important_overrode));
         }
         if self.allows.find_match(domain, qtype, false).is_some() {
             return None;
         }
         self.blocks
             .find_match(domain, qtype, false)
-            .map(|block| block.to_block_match(None, false))
+            .map(|block| self.build_block_match(block, None, false))
+    }
+
+    fn build_block_match(
+        &self,
+        block: MatchedRule<'_>,
+        allow: Option<MatchedRule<'_>>,
+        important_overrode: bool,
+    ) -> BlockMatch {
+        BlockMatch {
+            rule: block.raw_text(false),
+            source: self.source_name(block.source_id),
+            rule_type: format!("{} block", block.rule_type.as_str()),
+            important_overrode,
+            allowlist_rule: allow.map(|rule| rule.raw_text(true)),
+        }
+    }
+
+    fn source_name(&self, source_id: u16) -> String {
+        self.sources
+            .get(usize::from(source_id))
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| DEFAULT_SOURCE.to_string())
     }
 }
 
 impl RuleSet {
-    fn insert(&mut self, rule: Rule) {
-        let options = RuleOptions {
-            raw: rule.raw,
-            source: rule.source,
-            rule_type: rule.rule_type,
-            important: rule.important,
-            query_types: rule.query_types,
-            denyallow: rule.denyallow,
-        };
-        if rule.include_subdomains {
-            self.suffix.entry(rule.domain).or_default().push(options);
+    fn insert(&mut self, rule: RuleData<'_>, source_id: u16, is_allow: bool) {
+        let RuleData {
+            domain,
+            include_subdomains,
+            raw,
+            rule_type,
+            important,
+            query_types,
+            denyallow,
+            canonical,
+        } = rule;
+        let map = if include_subdomains {
+            &mut self.suffix
         } else {
-            self.exact.entry(rule.domain).or_default().push(options);
+            &mut self.exact
+        };
+
+        if let Some(entry) = map.get_mut(domain.as_ref()) {
+            // 匹配条件完全相同的规则永远只会命中先插入的一条（find 只取第一条），
+            // 多个清单间的重复规则在这里直接去重
+            if entry.covers_semantics(important, &query_types, &denyallow) {
+                return;
+            }
+            entry.push(
+                domain.as_ref(),
+                is_allow,
+                ComplexRule {
+                    raw: raw.into(),
+                    source_id,
+                    rule_type,
+                    important,
+                    query_types,
+                    denyallow: denyallow.into_boxed_slice(),
+                },
+            );
+            return;
         }
+
+        let value = match canonical {
+            Some(kind) => RuleEntry::Simple(SimpleRule { source_id, kind }),
+            None => RuleEntry::Complex(Box::new([ComplexRule {
+                raw: raw.into(),
+                source_id,
+                rule_type,
+                important,
+                query_types,
+                denyallow: denyallow.into_boxed_slice(),
+            }])),
+        };
+        map.insert(domain.into_owned().into_boxed_str(), value);
     }
 
-    fn find_match(&self, domain: &str, qtype: u16, important: bool) -> Option<&RuleOptions> {
-        if let Some(rule) = self.exact.get(domain).and_then(|rules| {
-            rules
-                .iter()
-                .find(|rule| rule.matches(domain, qtype, important))
-        }) {
-            return Some(rule);
+    fn find_match(&self, domain: &str, qtype: u16, important: bool) -> Option<MatchedRule<'_>> {
+        if let Some(found) = lookup_entry(&self.exact, domain, domain, qtype, important) {
+            return Some(found);
         }
-        if let Some(rule) = self.suffix.get(domain).and_then(|rules| {
-            rules
-                .iter()
-                .find(|rule| rule.matches(domain, qtype, important))
-        }) {
-            return Some(rule);
+        if let Some(found) = lookup_entry(&self.suffix, domain, domain, qtype, important) {
+            return Some(found);
         }
 
         let mut offset = 0;
         while let Some(dot_index) = domain[offset..].find('.') {
             offset += dot_index + 1;
-            if let Some(rule) = self.suffix.get(&domain[offset..]).and_then(|rules| {
-                rules
-                    .iter()
-                    .find(|rule| rule.matches(domain, qtype, important))
-            }) {
-                return Some(rule);
+            if let Some(found) =
+                lookup_entry(&self.suffix, &domain[offset..], domain, qtype, important)
+            {
+                return Some(found);
             }
         }
 
@@ -204,7 +338,130 @@ impl RuleSet {
     }
 }
 
-impl RuleOptions {
+fn lookup_entry<'a>(
+    map: &'a HashMap<Box<str>, RuleEntry>,
+    key: &str,
+    query_domain: &str,
+    qtype: u16,
+    important: bool,
+) -> Option<MatchedRule<'a>> {
+    let (stored_key, entry) = map.get_key_value(key)?;
+    match entry {
+        RuleEntry::Simple(rule) => (!important).then(|| MatchedRule {
+            domain: stored_key,
+            source_id: rule.source_id,
+            rule_type: rule.kind.rule_type(),
+            raw: MatchedRaw::Canonical(rule.kind),
+        }),
+        RuleEntry::Complex(rules) => rules
+            .iter()
+            .find(|rule| rule.matches(query_domain, qtype, important))
+            .map(|rule| MatchedRule {
+                domain: stored_key,
+                source_id: rule.source_id,
+                rule_type: rule.rule_type,
+                raw: MatchedRaw::Stored(&rule.raw),
+            }),
+    }
+}
+
+impl RuleEntry {
+    /// 已有条目中是否存在匹配条件完全相同的规则；有则后续同语义规则永远不可能命中
+    fn covers_semantics(
+        &self,
+        important: bool,
+        query_types: &QueryTypes,
+        denyallow: &[Box<str>],
+    ) -> bool {
+        match self {
+            Self::Simple(_) => {
+                !important && *query_types == QueryTypes::Any && denyallow.is_empty()
+            }
+            Self::Complex(rules) => rules.iter().any(|rule| {
+                rule.important == important
+                    && rule.query_types == *query_types
+                    && rule.denyallow.as_ref() == denyallow
+            }),
+        }
+    }
+
+    fn push(&mut self, domain: &str, is_allow: bool, rule: ComplexRule) {
+        match self {
+            Self::Simple(simple) => {
+                let first = simple.to_complex(domain, is_allow);
+                *self = Self::Complex(Box::new([first, rule]));
+            }
+            Self::Complex(rules) => {
+                let mut list = std::mem::take(rules).into_vec();
+                list.push(rule);
+                *rules = list.into_boxed_slice();
+            }
+        }
+    }
+}
+
+impl SimpleRule {
+    fn to_complex(self, domain: &str, is_allow: bool) -> ComplexRule {
+        ComplexRule {
+            raw: canonical_rule_text(self.kind, domain, is_allow).into_boxed_str(),
+            source_id: self.source_id,
+            rule_type: self.kind.rule_type(),
+            important: false,
+            query_types: QueryTypes::Any,
+            denyallow: Box::default(),
+        }
+    }
+}
+
+impl SimpleKind {
+    fn rule_type(self) -> RuleType {
+        match self {
+            Self::Suffix => RuleType::Suffix,
+            Self::ExactPlain => RuleType::Exact,
+            Self::HostsZero4 | Self::HostsLocal4 | Self::HostsZero6 | Self::HostsLocal6 => {
+                RuleType::Hosts
+            }
+        }
+    }
+}
+
+fn canonical_rule_text(kind: SimpleKind, domain: &str, is_allow: bool) -> String {
+    let allow_prefix = if is_allow { "@@" } else { "" };
+    match kind {
+        SimpleKind::Suffix => format!("{allow_prefix}||{domain}^"),
+        SimpleKind::ExactPlain => format!("{allow_prefix}{domain}"),
+        SimpleKind::HostsZero4 => format!("0.0.0.0 {domain}"),
+        SimpleKind::HostsLocal4 => format!("127.0.0.1 {domain}"),
+        SimpleKind::HostsZero6 => format!(":: {domain}"),
+        SimpleKind::HostsLocal6 => format!("::1 {domain}"),
+    }
+}
+
+/// 整行原文是否恰好等于该形态的规范写法（是则无需保存原文，命中时重建）
+fn is_canonical_rule_text(line: &str, kind: SimpleKind, domain: &str, is_allow: bool) -> bool {
+    let rest = if is_allow {
+        match line.strip_prefix("@@") {
+            Some(rest) => rest,
+            None => return false,
+        }
+    } else {
+        line
+    };
+    match kind {
+        SimpleKind::Suffix => {
+            rest.strip_prefix("||")
+                .and_then(|value| value.strip_suffix('^'))
+                == Some(domain)
+        }
+        SimpleKind::ExactPlain => rest == domain,
+        SimpleKind::HostsZero4 => rest.strip_prefix("0.0.0.0 ") == Some(domain),
+        SimpleKind::HostsLocal4 => rest.strip_prefix("127.0.0.1 ") == Some(domain),
+        SimpleKind::HostsZero6 => rest.strip_prefix(":: ") == Some(domain),
+        SimpleKind::HostsLocal6 => rest.strip_prefix("::1 ") == Some(domain),
+    }
+}
+
+impl ComplexRule {
     fn matches(&self, domain: &str, qtype: u16, important: bool) -> bool {
         self.important == important
             && self.query_types.matches(qtype)
@@ -212,16 +469,6 @@ impl RuleOptions {
                 .denyallow
                 .iter()
                 .any(|excluded| domain_matches(domain, excluded))
-    }
-
-    fn to_block_match(&self, allow: Option<&RuleOptions>, important_overrode: bool) -> BlockMatch {
-        BlockMatch {
-            rule: self.raw.clone(),
-            source: self.source.clone(),
-            rule_type: format!("{} block", self.rule_type.as_str()),
-            important_overrode,
-            allowlist_rule: allow.map(|rule| rule.raw.clone()),
-        }
     }
 }
 
@@ -282,15 +529,27 @@ pub(crate) fn compile_domain_set(raw: &str) -> DomainSet {
 
         let pattern = trimmed.strip_prefix("*.").unwrap_or(trimmed);
         if let Some(domain) = normalize_domain(pattern) {
-            domains.insert(domain);
+            domains.insert(domain.into_owned());
         }
     }
     DomainSet { domains }
 }
 
-enum ParsedRule {
-    Block(Rule),
-    Allow(Rule),
+/// 解析出的单条规则：域名尽量借用原文本，只有插入索引时才转为独立分配
+struct RuleData<'a> {
+    domain: Cow<'a, str>,
+    include_subdomains: bool,
+    raw: &'a str,
+    rule_type: RuleType,
+    important: bool,
+    query_types: QueryTypes,
+    denyallow: Vec<Box<str>>,
+    canonical: Option<SimpleKind>,
+}
+
+enum ParsedRule<'a> {
+    Block(RuleData<'a>),
+    Allow(RuleData<'a>),
     Ignored(IgnoredRuleReason),
     Disable,
 }
@@ -302,7 +561,7 @@ enum IgnoredRuleReason {
     Invalid,
 }
 
-fn parse_rule(line: &str) -> ParsedRule {
+fn parse_rule(line: &str) -> ParsedRule<'_> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
         return ParsedRule::Ignored(IgnoredRuleReason::Comment);
@@ -315,28 +574,33 @@ fn parse_rule(line: &str) -> ParsedRule {
     parse_filter_rule(trimmed)
 }
 
-fn parse_hosts_rule(line: &str) -> Option<Rule> {
+fn parse_hosts_rule(line: &str) -> Option<RuleData<'_>> {
     let mut parts = line.split_whitespace();
     let ip = parts.next()?;
-    let domain = parts.next()?;
-    let is_block_ip = matches!(ip, "0.0.0.0" | "127.0.0.1" | "::" | "::1");
-    if !is_block_ip {
-        return None;
-    }
+    let domain_token = parts.next()?;
+    let kind = match ip {
+        "0.0.0.0" => SimpleKind::HostsZero4,
+        "127.0.0.1" => SimpleKind::HostsLocal4,
+        "::" => SimpleKind::HostsZero6,
+        "::1" => SimpleKind::HostsLocal6,
+        _ => return None,
+    };
 
-    normalize_domain(domain).map(|domain| Rule {
+    let domain = normalize_domain(domain_token)?;
+    let canonical = is_canonical_rule_text(line, kind, &domain, false).then_some(kind);
+    Some(RuleData {
         domain,
         include_subdomains: false,
-        raw: line.to_string(),
-        source: String::new(),
+        raw: line,
         rule_type: RuleType::Hosts,
         important: false,
         query_types: QueryTypes::Any,
         denyallow: Vec::new(),
+        canonical,
     })
 }
 
-fn parse_filter_rule(line: &str) -> ParsedRule {
+fn parse_filter_rule(line: &str) -> ParsedRule<'_> {
     let (is_allow, rest) = if let Some(value) = line.strip_prefix("@@") {
         (true, value)
     } else {
@@ -354,10 +618,18 @@ fn parse_filter_rule(line: &str) -> ParsedRule {
     let Some(mut rule) = parse_pattern(pattern.trim()) else {
         return ParsedRule::Ignored(ignored_pattern_reason(pattern.trim()));
     };
-    rule.raw = line.to_string();
+    rule.raw = line;
     rule.important = modifiers.important;
     rule.query_types = modifiers.query_types;
     rule.denyallow = modifiers.denyallow;
+
+    if !rule.important && rule.query_types == QueryTypes::Any && rule.denyallow.is_empty() {
+        let kind = match rule.rule_type {
+            RuleType::Suffix => SimpleKind::Suffix,
+            RuleType::Exact | RuleType::Hosts => SimpleKind::ExactPlain,
+        };
+        rule.canonical = is_canonical_rule_text(line, kind, &rule.domain, is_allow).then_some(kind);
+    }
 
     if is_allow {
         ParsedRule::Allow(rule)
@@ -366,37 +638,33 @@ fn parse_filter_rule(line: &str) -> ParsedRule {
     }
 }
 
-fn parse_pattern(pattern: &str) -> Option<Rule> {
+fn parse_pattern(pattern: &str) -> Option<RuleData<'_>> {
     if pattern.starts_with('/') && pattern.ends_with('/') {
         return None;
     }
 
     if let Some(rest) = pattern.strip_prefix("||") {
         let domain = rest.trim_end_matches('^').trim_end_matches('|');
-        return normalize_domain(domain).map(|domain| Rule {
+        return normalize_domain(domain).map(|domain| RuleData {
             domain,
             include_subdomains: true,
-            raw: String::new(),
-            source: String::new(),
+            raw: "",
             rule_type: RuleType::Suffix,
             important: false,
             query_types: QueryTypes::Any,
             denyallow: Vec::new(),
+            canonical: None,
         });
     }
 
-    let domain = pattern
-        .trim_matches('|')
-        .trim_end_matches('^')
-        .strip_prefix("*.")
-        .unwrap_or_else(|| pattern.trim_matches('|').trim_end_matches('^'));
+    let stripped = pattern.trim_matches('|').trim_end_matches('^');
     let include_subdomains = pattern.starts_with("*.");
+    let domain = stripped.strip_prefix("*.").unwrap_or(stripped);
 
-    normalize_domain(domain).map(|domain| Rule {
+    normalize_domain(domain).map(|domain| RuleData {
         domain,
         include_subdomains,
-        raw: String::new(),
-        source: String::new(),
+        raw: "",
         rule_type: if include_subdomains {
             RuleType::Suffix
         } else {
@@ -405,6 +673,7 @@ fn parse_pattern(pattern: &str) -> Option<Rule> {
         important: false,
         query_types: QueryTypes::Any,
         denyallow: Vec::new(),
+        canonical: None,
     })
 }
 
@@ -413,7 +682,7 @@ struct Modifiers {
     important: bool,
     badfilter: bool,
     query_types: QueryTypes,
-    denyallow: Vec<String>,
+    denyallow: Vec<Box<str>>,
 }
 
 fn parse_modifiers(raw: &str) -> Result<Modifiers, ()> {
@@ -432,7 +701,9 @@ fn parse_modifiers(raw: &str) -> Result<Modifiers, ()> {
         } else if let Some(value) = lower.strip_prefix("denyallow=") {
             parsed.denyallow = value
                 .split('|')
-                .map(normalize_domain)
+                .map(|part| {
+                    normalize_domain(part).map(|domain| domain.into_owned().into_boxed_str())
+                })
                 .collect::<Option<Vec<_>>>()
                 .ok_or(())?;
             if parsed.denyallow.is_empty() {
@@ -459,9 +730,9 @@ fn parse_query_types(raw: &str) -> Result<QueryTypes, ()> {
         types.push(query_type_number(value.trim_start_matches('~')).ok_or(())?);
     }
     Ok(if excluded {
-        QueryTypes::Exclude(types)
+        QueryTypes::Exclude(types.into_boxed_slice())
     } else {
-        QueryTypes::Include(types)
+        QueryTypes::Include(types.into_boxed_slice())
     })
 }
 
@@ -525,8 +796,8 @@ fn ignored_pattern_reason(pattern: &str) -> IgnoredRuleReason {
     }
 }
 
-fn normalize_domain(value: &str) -> Option<String> {
-    let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
+fn normalize_domain(value: &str) -> Option<Cow<'_, str>> {
+    let domain = value.trim().trim_end_matches('.');
 
     if domain.is_empty() {
         return None;
@@ -541,5 +812,9 @@ fn normalize_domain(value: &str) -> Option<String> {
         return None;
     }
 
-    Some(domain)
+    if domain.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Some(Cow::Owned(domain.to_ascii_lowercase()))
+    } else {
+        Some(Cow::Borrowed(domain))
+    }
 }
