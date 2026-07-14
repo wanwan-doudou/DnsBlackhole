@@ -52,7 +52,7 @@ pub struct DnsServer {
 impl DnsServer {
     pub fn start(
         config: AppConfig,
-        rules_text: String,
+        rules_text: &str,
         stats: Arc<Mutex<DnsStats>>,
         database: Arc<Database>,
     ) -> Result<Self, String> {
@@ -71,7 +71,7 @@ impl DnsServer {
         let dns_cache =
             DnsCacheStore::from_config(dns_cache_config.clone(), DNS_CACHE_SHARDS).map(Arc::new);
         let dns_cache_config = dns_cache.as_ref().map(|_| dns_cache_config);
-        let filter_runtime = share_filter_runtime(build_filter_runtime(&config, &rules_text));
+        let filter_runtime = share_filter_runtime(build_filter_runtime(&config, rules_text));
         let socket =
             UdpSocket::bind(listen_addr).map_err(|e| format!("监听 {listen_addr} 失败：{e}"))?;
         configure_udp_listener_socket(&socket)?;

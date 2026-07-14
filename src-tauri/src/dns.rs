@@ -145,6 +145,85 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_rule_across_lists_keeps_first_source() {
+        let rules = compile_rules(
+            "! dnsblackhole-source:\"清单A\"\n||example.org^\n! dnsblackhole-source:\"清单B\"\n||example.org^",
+        );
+
+        let matched = rules
+            .blocking_match("ads.example.org", TYPE_A)
+            .expect("duplicate rule should still match");
+        assert_eq!(matched.source, "清单A");
+        assert_eq!(matched.rule, "||example.org^");
+    }
+
+    #[test]
+    fn non_canonical_rule_text_is_preserved() {
+        let rules = compile_rules("*.example.org\n127.0.0.1  tracker.example.net");
+
+        let wildcard = rules
+            .blocking_match("sub.example.org", TYPE_A)
+            .expect("wildcard rule should match");
+        assert_eq!(wildcard.rule, "*.example.org");
+        assert_eq!(wildcard.rule_type, "suffix block");
+
+        // 行内多余空格无法由域名重建，必须原样保留
+        let hosts = rules
+            .blocking_match("tracker.example.net", TYPE_A)
+            .expect("hosts rule should match");
+        assert_eq!(hosts.rule, "127.0.0.1  tracker.example.net");
+        assert_eq!(hosts.rule_type, "hosts block");
+    }
+
+    #[test]
+    fn canonical_rule_text_is_reconstructed() {
+        let rules = compile_rules("example.com\n0.0.0.0 example.org\n||example.net^");
+
+        let plain = rules
+            .blocking_match("example.com", TYPE_A)
+            .expect("plain rule should match");
+        assert_eq!(plain.rule, "example.com");
+        assert_eq!(plain.rule_type, "exact block");
+
+        let hosts = rules
+            .blocking_match("example.org", TYPE_A)
+            .expect("hosts rule should match");
+        assert_eq!(hosts.rule, "0.0.0.0 example.org");
+        assert_eq!(hosts.rule_type, "hosts block");
+
+        let suffix = rules
+            .blocking_match("cdn.example.net", TYPE_A)
+            .expect("suffix rule should match");
+        assert_eq!(suffix.rule, "||example.net^");
+        assert_eq!(suffix.rule_type, "suffix block");
+    }
+
+    #[test]
+    fn same_domain_rules_match_in_insertion_order() {
+        // 带修饰符的规则在前：A 查询命中它，其余类型回落到通配规则
+        let rules = compile_rules("||example.org^$dnstype=A\n||example.org^");
+        let matched_a = rules
+            .blocking_match("example.org", TYPE_A)
+            .expect("A query should match");
+        assert_eq!(matched_a.rule, "||example.org^$dnstype=A");
+        let matched_txt = rules
+            .blocking_match("example.org", 16)
+            .expect("TXT query should match");
+        assert_eq!(matched_txt.rule, "||example.org^");
+
+        // 通配规则在前：所有查询都命中先插入的通配规则
+        let rules = compile_rules("||example.org^\n||example.org^$dnstype=A");
+        let matched_a = rules
+            .blocking_match("example.org", TYPE_A)
+            .expect("A query should match");
+        assert_eq!(matched_a.rule, "||example.org^");
+        let matched_txt = rules
+            .blocking_match("example.org", 16)
+            .expect("TXT query should match");
+        assert_eq!(matched_txt.rule, "||example.org^");
+    }
+
+    #[test]
     fn block_response_returns_zero_address_for_a_query() {
         let query = a_query("blocked.test");
         let question = parse_question(&query).expect("query should parse");
