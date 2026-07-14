@@ -282,6 +282,7 @@ impl AppState {
 fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool {
     previous.listen_host != next.listen_host
         || previous.listen_port != next.listen_port
+        || previous.listen_ipv6 != next.listen_ipv6
         || previous.upstream_dns != next.upstream_dns
         || previous.fallback_dns != next.fallback_dns
         || previous.bootstrap_dns != next.bootstrap_dns

@@ -35,6 +35,7 @@ export type AppConfig = {
   use_filters: boolean;
   listen_host: string;
   listen_port: number;
+  listen_ipv6: boolean;
   upstream_dns: string;
   fallback_dns: string;
   bootstrap_dns: string;

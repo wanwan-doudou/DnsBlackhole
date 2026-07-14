@@ -42,12 +42,14 @@ pub(crate) struct DnsWorkItem {
 }
 
 pub(crate) enum DnsResponseTarget {
-    Udp(SocketAddr),
+    Udp {
+        socket: Arc<UdpSocket>,
+        client_addr: SocketAddr,
+    },
     Tcp(mpsc::SyncSender<Option<Vec<u8>>>),
 }
 
 pub(crate) struct DnsWorkerContext {
-    pub(crate) socket: Arc<UdpSocket>,
     pub(crate) upstream_servers: Arc<Vec<RuntimeUpstream>>,
     pub(crate) fallback_upstream_servers: Arc<Vec<RuntimeUpstream>>,
     pub(crate) upstream_mode: UpstreamMode,
@@ -175,7 +177,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         ClientAccessDecision::Deny(message) => {
             record_access_denied(
                 &context.stats,
-                matches!(response_target, DnsResponseTarget::Udp(_)),
+                matches!(response_target, DnsResponseTarget::Udp { .. }),
             );
             send_refused_or_drop(context, response_target, query, message);
             return;
@@ -183,7 +185,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         ClientAccessDecision::RateLimited(message) => {
             record_rate_limited(
                 &context.stats,
-                matches!(response_target, DnsResponseTarget::Udp(_)),
+                matches!(response_target, DnsResponseTarget::Udp { .. }),
             );
             send_refused_or_drop(context, response_target, query, message);
             return;
@@ -212,7 +214,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         let response = build_error_response(query, RCODE_REFUSED);
         match response {
             Some(response) => {
-                if let Err(error) = send_dns_response(context, response_target, &response) {
+                if let Err(error) = send_dns_response(response_target, &response) {
                     let message = format!("返回 ANY 拒绝响应失败：{error}");
                     record_error(&context.stats, message.clone());
                     queue_query_log(
@@ -258,7 +260,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             context.detailed_runtime_stats,
         );
         let response = build_rewrite_response(query, &question, &target);
-        if let Err(error) = send_dns_response(context, response_target, &response) {
+        if let Err(error) = send_dns_response(response_target, &response) {
             let message = format!("返回 DNS 重写响应失败：{error}");
             record_error(&context.stats, message.clone());
             queue_query_log(
@@ -295,7 +297,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         .blocking_match(&question.domain, question.qtype)
     {
         let response = build_block_response(query, &question, &filter.blocking);
-        if let Err(error) = send_dns_response(context, response_target, &response) {
+        if let Err(error) = send_dns_response(response_target, &response) {
             let message = format!("返回黑名单响应失败：{error}");
             record_query(
                 &context.stats,
@@ -341,7 +343,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
     if let Some(cache_hit) =
         lookup_cached_response(&context.dns_cache, &cache_key, query, current_second())
     {
-        if let Err(error) = send_dns_response(context, response_target, &cache_hit.response) {
+        if let Err(error) = send_dns_response(response_target, &cache_hit.response) {
             let message = format!("返回 DNS 缓存响应失败：{error}");
             record_error(&context.stats, message.clone());
             queue_query_log(
@@ -390,7 +392,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             match wait_pending_query(&pending_query) {
                 Ok(forwarded) => {
                     let response = prepare_forwarded_response(&forwarded.response, query);
-                    if let Err(error) = send_dns_response(context, response_target, &response) {
+                    if let Err(error) = send_dns_response(response_target, &response) {
                         let message = format!("转发复用响应给客户端失败：{error}");
                         record_error(&context.stats, message.clone());
                         queue_query_log(
@@ -460,7 +462,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 forwarded.response.clone(),
                 current_second(),
             );
-            if let Err(error) = send_dns_response(context, response_target, &forwarded.response) {
+            if let Err(error) = send_dns_response(response_target, &forwarded.response) {
                 let message = format!("转发响应给客户端失败：{error}");
                 record_error(&context.stats, message.clone());
                 queue_query_log(
@@ -517,13 +519,13 @@ fn send_refused_or_drop(
     message: String,
 ) {
     match response_target {
-        DnsResponseTarget::Udp(_) => {}
+        DnsResponseTarget::Udp { .. } => {}
         DnsResponseTarget::Tcp(_) => {
             let Some(response) = build_error_response(query, RCODE_REFUSED) else {
                 send_no_response(response_target);
                 return;
             };
-            if let Err(error) = send_dns_response(context, response_target, &response) {
+            if let Err(error) = send_dns_response(response_target, &response) {
                 record_error(
                     &context.stats,
                     format!("{message}；返回拒绝响应失败：{error}"),
@@ -533,14 +535,12 @@ fn send_refused_or_drop(
     }
 }
 
-fn send_dns_response(
-    context: &DnsWorkerContext,
-    response_target: &DnsResponseTarget,
-    response: &[u8],
-) -> Result<(), String> {
+fn send_dns_response(response_target: &DnsResponseTarget, response: &[u8]) -> Result<(), String> {
     match response_target {
-        DnsResponseTarget::Udp(client_addr) => context
-            .socket
+        DnsResponseTarget::Udp {
+            socket,
+            client_addr,
+        } => socket
             .send_to(response, *client_addr)
             .map(|_| ())
             .map_err(|error| error.to_string()),

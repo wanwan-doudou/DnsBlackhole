@@ -94,6 +94,7 @@ const fallbackInput = query<HTMLTextAreaElement>("#fallback_dns");
 const bootstrapInput = query<HTMLTextAreaElement>("#bootstrap_dns");
 const listenHostInput = query<HTMLInputElement>("#listen_host");
 const listenPortInput = query<HTMLInputElement>("#listen_port");
+const listenIpv6Input = query<HTMLInputElement>("#listen_ipv6");
 const allowedClientsInput = query<HTMLTextAreaElement>("#allowed_clients");
 const blockedClientsInput = query<HTMLTextAreaElement>("#blocked_clients");
 const rateLimitPerSecondInput = query<HTMLInputElement>("#rate_limit_per_second");
@@ -608,6 +609,7 @@ async function loadConfig(): Promise<void> {
     bootstrapInput.value = config.bootstrap_dns;
     listenHostInput.value = config.listen_host;
     listenPortInput.value = String(config.listen_port);
+    listenIpv6Input.checked = config.listen_ipv6;
     allowedClientsInput.value = config.allowed_clients;
     blockedClientsInput.value = config.blocked_clients;
     rateLimitPerSecondInput.value = String(config.rate_limit_per_second);
@@ -691,6 +693,7 @@ function collectConfig(): AppConfig {
     query_log_ignored_domains: queryLogIgnoredInput.value,
     listen_host: listenHostInput.value.trim(),
     listen_port: Number(listenPortInput.value),
+    listen_ipv6: listenIpv6Input.checked,
     filters: filtersState.map((filter) => ({
       ...filter,
       name: filter.name.trim(),
