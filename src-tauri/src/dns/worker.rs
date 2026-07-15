@@ -24,8 +24,8 @@ use super::{
         build_rewrite_response, parse_question,
     },
     stats::{
-        DnsStats, current_second, record_access_denied, record_blocked_query, record_error,
-        record_forwarded, record_query, record_rate_limited, record_refused_any,
+        DnsStats, DnsTransport, current_second, record_access_denied, record_blocked_query,
+        record_error, record_forwarded, record_query, record_rate_limited, record_refused_any,
     },
     task_pool,
     upstream::{RuntimeUpstream, UpstreamForwardResponse, forward_query},
@@ -177,7 +177,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         ClientAccessDecision::Deny(message) => {
             record_access_denied(
                 &context.stats,
-                matches!(response_target, DnsResponseTarget::Udp { .. }),
+                client_addr.ip(),
+                response_transport(response_target),
+                message.clone(),
             );
             send_refused_or_drop(context, response_target, query, message);
             return;
@@ -185,7 +187,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         ClientAccessDecision::RateLimited(message) => {
             record_rate_limited(
                 &context.stats,
-                matches!(response_target, DnsResponseTarget::Udp { .. }),
+                client_addr.ip(),
+                response_transport(response_target),
+                message.clone(),
             );
             send_refused_or_drop(context, response_target, query, message);
             return;
@@ -509,6 +513,13 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 Some(error),
             );
         }
+    }
+}
+
+fn response_transport(response_target: &DnsResponseTarget) -> DnsTransport {
+    match response_target {
+        DnsResponseTarget::Udp { .. } => DnsTransport::Udp,
+        DnsResponseTarget::Tcp(_) => DnsTransport::Tcp,
     }
 }
 

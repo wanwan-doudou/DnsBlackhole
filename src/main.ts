@@ -38,6 +38,7 @@ import type {
   RefreshOptions,
   RenderStatusOptions,
   RuntimeStatus,
+  SecurityEvent,
   UpstreamLatencyStat,
   UpstreamMode,
   UpstreamRequestStat,
@@ -156,6 +157,11 @@ const queryLogBody = query<HTMLDivElement>("#query_log_body");
 const queryLogPageInfo = query<HTMLElement>("#query_log_page_info");
 const queryLogPrevButton = query<HTMLButtonElement>("#query_log_prev_btn");
 const queryLogNextButton = query<HTMLButtonElement>("#query_log_next_btn");
+const securityAccessDenied = query<HTMLElement>("#security_access_denied");
+const securityRateLimited = query<HTMLElement>("#security_rate_limited");
+const securityDroppedUdp = query<HTMLElement>("#security_dropped_udp");
+const securityRefusedAny = query<HTMLElement>("#security_refused_any");
+const securityEventBody = query<HTMLDivElement>("#security_event_body");
 
 document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -926,6 +932,7 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
     showMessage(lastError, true);
   }
   lastStatusErrorKey = statusErrorKey;
+  renderSecurityEvents(status);
 
   if (!renderDashboard) {
     return;
@@ -947,6 +954,50 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
     status.stats.forwarded,
   );
   renderUpstreamLatencyRank("#upstream_latency_rank", status.stats.upstream_avg_latency ?? []);
+}
+
+function renderSecurityEvents(status: RuntimeStatus): void {
+  setTextIfChanged(securityAccessDenied, formatCount(status.stats.access_denied_total));
+  setTextIfChanged(securityRateLimited, formatCount(status.stats.rate_limited_total));
+  setTextIfChanged(securityDroppedUdp, formatCount(status.stats.dropped_udp_total));
+  setTextIfChanged(securityRefusedAny, formatCount(status.stats.refused_any_total));
+
+  const events = [...(status.stats.security_events ?? [])].reverse();
+  if (events.length === 0) {
+    setHtmlIfChanged(
+      securityEventBody,
+      `<div class="security-event-empty">暂无安全事件</div>`,
+    );
+    return;
+  }
+  setHtmlIfChanged(securityEventBody, events.map(renderSecurityEvent).join(""));
+}
+
+function renderSecurityEvent(event: SecurityEvent): string {
+  const eventLabel = event.event_type === "rate_limited" ? "触发限速" : "访问拒绝";
+  const clientLabel = clientDisplayName(event.client_ip) ?? event.client_ip;
+  const detail = `${event.protocol.toUpperCase()} · ${event.reason}`;
+  const detailTitle =
+    event.count > 1
+      ? `${detail}；首次：${formatLogDate(event.first_seen_at)} ${formatLogTime(event.first_seen_at)}`
+      : detail;
+  return `
+    <div class="security-event-row ${event.event_type}">
+      <div>
+        <strong>${escapeHtml(formatLogTime(event.last_seen_at))}</strong>
+        <span>${escapeHtml(formatLogDate(event.last_seen_at))}</span>
+      </div>
+      <div>
+        <strong title="${escapeHtml(event.client_ip)}">${escapeHtml(clientLabel)}</strong>
+        <span>${escapeHtml(event.client_ip)}</span>
+      </div>
+      <div>
+        <strong>${eventLabel}</strong>
+        <span title="${escapeHtml(detailTitle)}">${escapeHtml(detail)}</span>
+      </div>
+      <strong class="security-event-count">${escapeHtml(formatCount(event.count))}</strong>
+    </div>
+  `;
 }
 
 function formatFilterRuleSummary(filter: FilterSubscription): string {

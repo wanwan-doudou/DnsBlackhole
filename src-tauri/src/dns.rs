@@ -408,8 +408,8 @@ mod tests {
 
     #[test]
     fn upstream_failure_backoff_can_be_marked_and_cleared() {
-        let upstream = RuntimeUpstream::new(UpstreamServer::Udp("127.0.0.1:53".parse().unwrap()))
-            .expect("upstream should build");
+        let upstream =
+            RuntimeUpstream::new(UpstreamServer::Udp("127.0.0.1:53".parse().unwrap()), &[]);
 
         assert!(!is_upstream_temporarily_unhealthy(
             &upstream,

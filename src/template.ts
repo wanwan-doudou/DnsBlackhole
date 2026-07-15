@@ -251,7 +251,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 </label>
                 <label class="field upstream-extra-field">
                   <span>Bootstrap DNS 服务器</span>
-                  <small>仅用于解析 DoH 上游自身的域名，只支持普通 IP 地址 DNS。</small>
+                  <small>用于解析 DoH 和域名形式上游自身的地址，并同时查询 IPv4/IPv6；只支持普通 IP 地址 DNS。</small>
                   <textarea id="bootstrap_dns" autocomplete="off" spellcheck="false" placeholder="223.5.5.5"></textarea>
                 </label>
               </div>
@@ -419,6 +419,42 @@ export function renderAppTemplate(appIconUrl: string): string {
                     <small>减少 DNS 放大攻击面，家庭网关场景通常应开启。</small>
                   </span>
                 </label>
+              </div>
+            </section>
+
+            <section class="settings-section dns-security-section">
+              <div class="section-heading">
+                <h3>安全事件</h3>
+                <span>UDP 拒绝仍保持静默丢弃；这里展示本次运行期间的拒绝与限速情况，最多保留最近 200 条聚合事件。</span>
+              </div>
+              <div class="security-stat-grid">
+                <div class="security-stat-card">
+                  <span>访问拒绝</span>
+                  <strong id="security_access_denied">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>限速触发</span>
+                  <strong id="security_rate_limited">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>UDP 静默丢弃</span>
+                  <strong id="security_dropped_udp">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>ANY 拒绝</span>
+                  <strong id="security_refused_any">0</strong>
+                </div>
+              </div>
+              <div class="security-event-table">
+                <div class="security-event-head">
+                  <span>最近发生</span>
+                  <span>来源客户端</span>
+                  <span>事件</span>
+                  <span>次数</span>
+                </div>
+                <div class="security-event-body" id="security_event_body">
+                  <div class="security-event-empty">暂无安全事件</div>
+                </div>
               </div>
             </section>
 

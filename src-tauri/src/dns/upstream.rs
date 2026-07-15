@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::config::{UpstreamMode, UpstreamServer};
+use crate::config::{UpstreamMode, UpstreamServer, resolve_hostname_socket_addrs};
 
 use super::{
     protocol::{extract_response_ips, response_is_truncated, validate_response_for_query},
@@ -37,10 +37,19 @@ const DNSBLACKHOLE_USER_AGENT: &str = "DnsBlackhole/0.1";
 pub(crate) struct RuntimeUpstream {
     server: UpstreamServer,
     label: String,
-    doh_client: Option<reqwest::blocking::Client>,
     unhealthy_until: Arc<AtomicU64>,
-    // 已 connect 到该上游的 UDP socket 复用池，省掉每次查询的 bind/connect 系统调用
-    udp_socket_pool: Arc<Mutex<Vec<UdpSocket>>>,
+    bootstrap_servers: Arc<Vec<SocketAddr>>,
+    resolution_retry_at: Arc<AtomicU64>,
+    udp_state: Arc<Mutex<Option<UdpRuntimeState>>>,
+    doh_client: Arc<Mutex<Option<reqwest::blocking::Client>>>,
+}
+
+#[derive(Clone)]
+struct UdpRuntimeState {
+    addresses: Arc<Vec<SocketAddr>>,
+    // 每个解析地址使用独立的已连接 UDP socket 池，避免不同地址之间误复用。
+    socket_pools: Arc<Vec<Mutex<Vec<UdpSocket>>>>,
+    next_address: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -57,40 +66,158 @@ struct IpLatencyProbe {
 
 pub(crate) fn build_runtime_upstreams(
     upstream_servers: Vec<UpstreamServer>,
-) -> Result<Vec<RuntimeUpstream>, String> {
+    bootstrap_servers: &[SocketAddr],
+) -> Vec<RuntimeUpstream> {
     upstream_servers
         .into_iter()
-        .map(RuntimeUpstream::new)
+        .map(|server| RuntimeUpstream::new(server, bootstrap_servers))
         .collect()
 }
 
 impl RuntimeUpstream {
-    pub(crate) fn new(server: UpstreamServer) -> Result<Self, String> {
+    pub(crate) fn new(server: UpstreamServer, bootstrap_servers: &[SocketAddr]) -> Self {
         let label = format_upstream_server(&server);
-        let doh_client = match &server {
-            UpstreamServer::Udp(_) => None,
-            UpstreamServer::Doh(_) => Some(build_doh_client()?),
+        let initial_udp_state = resolve_udp_state(&server, bootstrap_servers).ok().flatten();
+        let initial_doh_client = match &server {
+            UpstreamServer::Doh(url) => build_doh_client(url, bootstrap_servers).ok(),
+            UpstreamServer::Udp(_) | UpstreamServer::UdpHostname { .. } => None,
+        };
+        let resolution_available = initial_udp_state.is_some() || initial_doh_client.is_some();
+        let resolution_retry_at = if !resolution_available
+            && matches!(
+                server,
+                UpstreamServer::UdpHostname { .. } | UpstreamServer::Doh(_)
+            )
+        {
+            current_second().saturating_add(UPSTREAM_FAILURE_BACKOFF_SECONDS)
+        } else {
+            0
         };
 
-        Ok(Self {
+        Self {
             server,
             label,
-            doh_client,
             unhealthy_until: Arc::new(AtomicU64::new(0)),
-            udp_socket_pool: Arc::new(Mutex::new(Vec::new())),
-        })
+            bootstrap_servers: Arc::new(bootstrap_servers.to_vec()),
+            resolution_retry_at: Arc::new(AtomicU64::new(resolution_retry_at)),
+            udp_state: Arc::new(Mutex::new(initial_udp_state)),
+            doh_client: Arc::new(Mutex::new(initial_doh_client)),
+        }
     }
 }
 
-fn build_doh_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+fn resolve_udp_state(
+    server: &UpstreamServer,
+    bootstrap_servers: &[SocketAddr],
+) -> Result<Option<UdpRuntimeState>, String> {
+    let addresses = match server {
+        UpstreamServer::Udp(addr) => vec![*addr],
+        UpstreamServer::UdpHostname { hostname, port } => {
+            resolve_hostname_socket_addrs(hostname, *port, bootstrap_servers)?
+        }
+        UpstreamServer::Doh(_) => return Ok(None),
+    };
+    let socket_pools = (0..addresses.len())
+        .map(|_| Mutex::new(Vec::new()))
+        .collect::<Vec<_>>();
+    Ok(Some(UdpRuntimeState {
+        addresses: Arc::new(addresses),
+        socket_pools: Arc::new(socket_pools),
+        next_address: Arc::new(AtomicUsize::new(0)),
+    }))
+}
+
+fn build_doh_client(
+    url: &str,
+    bootstrap_servers: &[SocketAddr],
+) -> Result<reqwest::blocking::Client, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("DoH 地址无效：{e}"))?;
+    let hostname = parsed
+        .host_str()
+        .ok_or_else(|| "DoH 地址缺少主机名".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "DoH 地址缺少有效端口".to_string())?;
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(UPSTREAM_TIMEOUT)
         .connect_timeout(UPSTREAM_TIMEOUT)
         .pool_idle_timeout(Some(DOH_CLIENT_POOL_IDLE_TIMEOUT))
         .pool_max_idle_per_host(2)
-        .user_agent(DNSBLACKHOLE_USER_AGENT)
+        .user_agent(DNSBLACKHOLE_USER_AGENT);
+
+    if hostname.parse::<IpAddr>().is_err() {
+        let addrs = resolve_hostname_socket_addrs(hostname, port, bootstrap_servers)?;
+        builder = builder.resolve_to_addrs(hostname, &addrs);
+    }
+
+    builder
         .build()
         .map_err(|e| format!("创建 DoH 客户端失败：{e}"))
+}
+
+fn current_udp_state(upstream: &RuntimeUpstream) -> Result<UdpRuntimeState, String> {
+    let mut current = upstream
+        .udp_state
+        .lock()
+        .map_err(|_| "读取上游 DNS 地址状态失败".to_string())?;
+    if let Some(state) = current.clone() {
+        return Ok(state);
+    }
+    ensure_resolution_retry_due(upstream)?;
+
+    let state = resolve_udp_state(&upstream.server, &upstream.bootstrap_servers)?
+        .ok_or_else(|| "上游 DNS 没有可用地址".to_string())?;
+    *current = Some(state.clone());
+    upstream.resolution_retry_at.store(0, Ordering::Relaxed);
+    Ok(state)
+}
+
+fn current_doh_client(
+    upstream: &RuntimeUpstream,
+    url: &str,
+) -> Result<reqwest::blocking::Client, String> {
+    let mut current = upstream
+        .doh_client
+        .lock()
+        .map_err(|_| "读取 DoH 客户端状态失败".to_string())?;
+    if let Some(client) = current.clone() {
+        return Ok(client);
+    }
+    ensure_resolution_retry_due(upstream)?;
+
+    let client = build_doh_client(url, &upstream.bootstrap_servers)?;
+    *current = Some(client.clone());
+    upstream.resolution_retry_at.store(0, Ordering::Relaxed);
+    Ok(client)
+}
+
+fn ensure_resolution_retry_due(upstream: &RuntimeUpstream) -> Result<(), String> {
+    let now = current_second();
+    let retry_at = upstream.resolution_retry_at.load(Ordering::Relaxed);
+    if retry_at > now {
+        return Err(format!("上游 {} 暂不可用，稍后重新解析", upstream.label));
+    }
+    Ok(())
+}
+
+fn invalidate_resolved_endpoint(upstream: &RuntimeUpstream) {
+    match &upstream.server {
+        UpstreamServer::UdpHostname { .. } => {
+            if let Ok(mut state) = upstream.udp_state.lock() {
+                *state = None;
+            }
+        }
+        UpstreamServer::Doh(_) => {
+            if let Ok(mut client) = upstream.doh_client.lock() {
+                *client = None;
+            }
+        }
+        UpstreamServer::Udp(_) => return,
+    }
+    upstream.resolution_retry_at.store(
+        current_second().saturating_add(UPSTREAM_FAILURE_BACKOFF_SECONDS),
+        Ordering::Relaxed,
+    );
 }
 
 pub(crate) fn forward_query(
@@ -380,13 +507,17 @@ fn forward_to_upstream(
 ) -> Result<UpstreamForwardResponse, String> {
     let started = Instant::now();
     let response = match &upstream.server {
-        UpstreamServer::Udp(addr) => forward_udp(query, *addr, &upstream.udp_socket_pool),
+        UpstreamServer::Udp(_) | UpstreamServer::UdpHostname { .. } => current_udp_state(upstream)
+            .and_then(|state| {
+                forward_udp_addresses(
+                    query,
+                    &state.addresses,
+                    &state.socket_pools,
+                    &state.next_address,
+                )
+            }),
         UpstreamServer::Doh(url) => {
-            let client = upstream
-                .doh_client
-                .as_ref()
-                .ok_or_else(|| "DoH 客户端未初始化".to_string())?;
-            forward_doh(query, url, client)
+            current_doh_client(upstream, url).and_then(|client| forward_doh(query, url, &client))
         }
     };
     let response = match response {
@@ -399,6 +530,7 @@ fn forward_to_upstream(
             response
         }
         Err(error) => {
+            invalidate_resolved_endpoint(upstream);
             mark_upstream_unhealthy(upstream);
             return Err(error);
         }
@@ -432,6 +564,7 @@ fn format_upstream(upstream: &RuntimeUpstream) -> String {
 fn format_upstream_server(server: &UpstreamServer) -> String {
     match server {
         UpstreamServer::Udp(addr) => addr.to_string(),
+        UpstreamServer::UdpHostname { hostname, port } => format!("{hostname}:{port}"),
         UpstreamServer::Doh(url) => normalize_doh_upstream_label(url),
     }
 }
@@ -458,6 +591,29 @@ fn normalize_doh_upstream_label(url: &str) -> String {
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn forward_udp_addresses(
+    query: &[u8],
+    upstream_addrs: &[SocketAddr],
+    socket_pools: &[Mutex<Vec<UdpSocket>>],
+    next_address: &AtomicUsize,
+) -> Result<Vec<u8>, String> {
+    if upstream_addrs.is_empty() || upstream_addrs.len() != socket_pools.len() {
+        return Err("上游 DNS 没有可用地址".into());
+    }
+
+    let start = next_address.fetch_add(1, Ordering::Relaxed) % upstream_addrs.len();
+    let mut last_error = None;
+    for offset in 0..upstream_addrs.len() {
+        let index = (start + offset) % upstream_addrs.len();
+        match forward_udp(query, upstream_addrs[index], &socket_pools[index]) {
+            Ok(response) => return Ok(response),
+            Err(error) => last_error = Some(format!("{}：{error}", upstream_addrs[index])),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "上游 DNS 没有可用地址".into()))
 }
 
 fn forward_udp(
@@ -597,4 +753,45 @@ fn forward_doh(
             response
         })
         .map_err(|e| format!("读取 DoH 响应失败：{e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_hostname_upstream_does_not_abort_runtime_build() {
+        let upstreams = build_runtime_upstreams(
+            vec![
+                UpstreamServer::Doh("https://".into()),
+                UpstreamServer::Udp("127.0.0.1:53".parse().unwrap()),
+            ],
+            &[],
+        );
+
+        assert_eq!(upstreams.len(), 2);
+        assert!(upstreams[0].doh_client.lock().unwrap().is_none());
+        assert!(upstreams[1].udp_state.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn hostname_udp_upstream_can_be_resolved_again_after_failure() {
+        let upstream = RuntimeUpstream::new(
+            UpstreamServer::UdpHostname {
+                hostname: "localhost".into(),
+                port: 53,
+            },
+            &[],
+        );
+        assert!(upstream.udp_state.lock().unwrap().is_some());
+
+        invalidate_resolved_endpoint(&upstream);
+        assert!(upstream.udp_state.lock().unwrap().is_none());
+        assert!(upstream.resolution_retry_at.load(Ordering::Relaxed) > current_second());
+
+        upstream.resolution_retry_at.store(0, Ordering::Relaxed);
+        let state = current_udp_state(&upstream).expect("hostname should resolve again");
+        assert!(!state.addresses.is_empty());
+        assert_eq!(upstream.resolution_retry_at.load(Ordering::Relaxed), 0);
+    }
 }

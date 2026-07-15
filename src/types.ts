@@ -104,6 +104,7 @@ export type DnsStats = {
   rate_limited_total: number;
   refused_any_total: number;
   dropped_udp_total: number;
+  security_events: SecurityEvent[];
   last_query: string | null;
   last_blocked: string | null;
   last_error: string | null;
@@ -112,6 +113,16 @@ export type DnsStats = {
   traffic?: TrafficBucket[];
   upstream_requests?: UpstreamRequestStat[];
   upstream_avg_latency?: UpstreamLatencyStat[];
+};
+
+export type SecurityEvent = {
+  event_type: "access_denied" | "rate_limited";
+  protocol: "udp" | "tcp";
+  client_ip: string;
+  reason: string;
+  first_seen_at: number;
+  last_seen_at: number;
+  count: number;
 };
 
 export type RuntimeStatus = {
