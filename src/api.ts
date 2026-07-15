@@ -24,8 +24,8 @@ export function saveConfig(config: AppConfig): Promise<RuntimeStatus> {
   return invoke<RuntimeStatus>("save_config", { config });
 }
 
-export function getStatus(force: boolean): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("get_status", { force });
+export function getStatus(force: boolean, includeLogStats = true): Promise<RuntimeStatus> {
+  return invoke<RuntimeStatus>("get_status", { force, includeLogStats });
 }
 
 export function getQueryLogs(request: QueryLogRequest): Promise<QueryLogPage> {

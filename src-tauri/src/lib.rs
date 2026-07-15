@@ -37,6 +37,8 @@ struct AppState {
     last_error: Mutex<Option<String>>,
     // 手动更新与自动更新共用，避免并发下载清单互相踩踏
     filter_update_lock: Mutex<()>,
+    // 启停、配置保存和规则热替换串行执行，避免后台初始化与用户操作互相覆盖
+    runtime_update_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,8 +65,8 @@ struct FilterCacheClearResult {
 }
 
 impl AppState {
-    fn new(config: AppConfig, effective_rules: &str, database: Arc<Database>) -> Self {
-        let effective_summary = dns::summarize_rules(effective_rules);
+    fn new(config: AppConfig, database: Arc<Database>) -> Self {
+        let effective_summary = configured_rule_summary(&config);
         Self {
             config: Mutex::new(config),
             server: Mutex::new(None),
@@ -75,6 +77,7 @@ impl AppState {
             last_prune_at: Mutex::new(0),
             last_error: Mutex::new(None),
             filter_update_lock: Mutex::new(()),
+            runtime_update_lock: Mutex::new(()),
         }
     }
 
@@ -91,9 +94,7 @@ impl AppState {
         Ok(())
     }
 
-    /// 规则文本不再常驻内存，这里只留一份轻量的统计摘要供仪表盘展示
-    fn refresh_effective_summary(&self, rules: &str) -> Result<(), String> {
-        let summary = dns::summarize_rules(rules);
+    fn set_effective_summary(&self, summary: RuleSummary) -> Result<(), String> {
         let mut current_summary = self
             .effective_summary
             .lock()
@@ -112,7 +113,18 @@ impl AppState {
             Arc::clone(&self.stats),
             Arc::clone(&self.database),
         )?;
-        let mut current = self.server.lock().map_err(|_| "更新 DNS 服务状态失败")?;
+        let summary = server.rule_summary();
+        if let Err(error) = self.set_effective_summary(summary) {
+            server.stop();
+            return Err(error);
+        }
+        let mut current = match self.server.lock() {
+            Ok(current) => current,
+            Err(_) => {
+                server.stop();
+                return Err("更新 DNS 服务状态失败".into());
+            }
+        };
         *current = Some(server);
         self.set_error(None);
         Ok(())
@@ -130,6 +142,14 @@ impl AppState {
         Ok(())
     }
 
+    fn server_needs_start(&self) -> Result<bool, String> {
+        let server = self
+            .server
+            .lock()
+            .map_err(|_| "读取 DNS 服务状态失败".to_string())?;
+        Ok(server.as_ref().is_none_or(DnsServer::has_finished_threads))
+    }
+
     /// 规则类配置变更时热替换过滤状态，保留运行中的服务与 DNS 缓存。
     /// 返回 false 表示需要走完整重启路径。
     fn try_hot_swap(
@@ -142,20 +162,23 @@ impl AppState {
             return Ok(false);
         }
 
-        let server = self.server.lock().map_err(|_| "读取 DNS 服务状态失败")?;
-        let Some(server) = server.as_ref() else {
-            return Ok(false);
-        };
-        if server.has_finished_threads() {
-            return Ok(false);
-        }
+        let summary = {
+            let server = self.server.lock().map_err(|_| "读取 DNS 服务状态失败")?;
+            let Some(server) = server.as_ref() else {
+                return Ok(false);
+            };
+            if server.has_finished_threads() {
+                return Ok(false);
+            }
 
-        server.replace_filter_state(config, rules_text);
+            server.replace_filter_state(config, rules_text)
+        };
+        self.set_effective_summary(summary)?;
         Ok(true)
     }
 
     /// 应用新配置：能热替换就热替换，否则重启 DNS 服务。
-    /// 调用前需要先完成 replace_config 和 refresh_effective_summary。
+    /// 调用前需要先完成 replace_config。
     fn apply_config_change(
         &self,
         previous: &AppConfig,
@@ -183,6 +206,14 @@ impl AppState {
     }
 
     fn status(&self, force_log_stats: bool) -> RuntimeStatus {
+        self.status_with_log_stats(force_log_stats, true)
+    }
+
+    fn status_with_log_stats(
+        &self,
+        force_log_stats: bool,
+        include_log_stats: bool,
+    ) -> RuntimeStatus {
         let config = self.current_config().unwrap_or_default();
         let summary = self
             .effective_summary
@@ -194,7 +225,7 @@ impl AppState {
             .lock()
             .map(|stats| stats.clone())
             .unwrap_or_default();
-        if config.query_log_enabled {
+        if config.query_log_enabled && include_log_stats {
             match self.cached_log_stats(config.query_log_retention_hours, force_log_stats) {
                 Ok(log_stats) => {
                     stats.queries = log_stats.queries;
@@ -277,6 +308,53 @@ impl AppState {
     }
 }
 
+fn configured_rule_summary(config: &AppConfig) -> RuleSummary {
+    if !config.use_filters {
+        return RuleSummary::default();
+    }
+
+    let mut summary = dns::summarize_rules(&config.blacklist);
+    for filter in config.filters.iter().filter(|filter| filter.enabled) {
+        let block_rules = if filter.block_rule_count == 0
+            && filter.allow_rule_count == 0
+            && filter.rule_count > 0
+        {
+            filter.rule_count
+        } else {
+            filter.block_rule_count
+        };
+        summary.block_rules = summary.block_rules.saturating_add(block_rules);
+        summary.allow_rules = summary.allow_rules.saturating_add(filter.allow_rule_count);
+        summary.ignored_rules = summary
+            .ignored_rules
+            .saturating_add(filter.ignored_rule_count);
+        summary.ignored_comment_rules = summary
+            .ignored_comment_rules
+            .saturating_add(filter.ignored_comment_count);
+        summary.ignored_regex_rules = summary
+            .ignored_regex_rules
+            .saturating_add(filter.ignored_regex_count);
+        summary.ignored_unsupported_rules = summary
+            .ignored_unsupported_rules
+            .saturating_add(filter.ignored_unsupported_count);
+        summary.ignored_invalid_rules = summary
+            .ignored_invalid_rules
+            .saturating_add(filter.ignored_invalid_count);
+    }
+    summary
+}
+
+fn filter_runtime_changed(previous: &AppConfig, next: &AppConfig) -> bool {
+    previous.use_filters != next.use_filters
+        || previous.filters != next.filters
+        || previous.blacklist != next.blacklist
+        || previous.blocking_mode != next.blocking_mode
+        || previous.blocking_custom_ipv4 != next.blocking_custom_ipv4
+        || previous.blocking_custom_ipv6 != next.blocking_custom_ipv6
+        || previous.dns_rewrites != next.dns_rewrites
+        || previous.query_log_ignored_domains != next.query_log_ignored_domains
+}
+
 /// 判断配置差异是否触及 DNS 服务的结构性参数（监听、上游、访问控制、缓存等）。
 /// 规则、清单、重写、拦截模式、日志忽略等过滤类字段支持热替换，不在比较范围内。
 fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool {
@@ -307,23 +385,51 @@ fn get_config(state: tauri::State<'_, Arc<AppState>>) -> Result<AppConfig, Strin
 }
 
 #[tauri::command]
-fn save_config(
+async fn save_config(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
+    config: AppConfig,
+) -> Result<RuntimeStatus, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || save_config_blocking(app, state, config))
+        .await
+        .map_err(|error| format!("保存配置任务异常：{error}"))?
+}
+
+fn save_config_blocking(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
     mut config: AppConfig,
 ) -> Result<RuntimeStatus, String> {
+    let _runtime_guard = state
+        .runtime_update_lock
+        .lock()
+        .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
     config::migrate_legacy_defaults(&mut config);
     config.validate()?;
     apply_autostart_config(&app, config.launch_at_startup)?;
     let previous = state.current_config()?;
+    let filter_changed = filter_runtime_changed(&previous, &config);
+    let restart_required = needs_dns_restart(&previous, &config);
+    let start_required =
+        config.enabled && (!previous.enabled || restart_required || state.server_needs_start()?);
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
-    let rules_text = config::build_effective_rules(&app, &config);
-    state.refresh_effective_summary(&rules_text)?;
 
-    if let Err(error) = state.apply_config_change(&previous, &config, &rules_text) {
-        state.set_error(Some(error.clone()));
-        return Err(error);
+    if !config.enabled {
+        state.stop_current()?;
+        if filter_changed {
+            state.set_effective_summary(configured_rule_summary(&config))?;
+        }
+        state.set_error(None);
+    } else if filter_changed || start_required {
+        let rules_text = config::build_effective_rules(&app, &config);
+        if let Err(error) = state.apply_config_change(&previous, &config, &rules_text) {
+            state.set_error(Some(error.clone()));
+            return Err(error);
+        }
+    } else {
+        state.set_error(None);
     }
 
     state.invalidate_log_stats_cache();
@@ -334,9 +440,15 @@ fn save_config(
 async fn get_status(
     state: tauri::State<'_, Arc<AppState>>,
     force: Option<bool>,
+    include_log_stats: Option<bool>,
 ) -> Result<RuntimeStatus, String> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || state.status(force.unwrap_or(false)))
+    tauri::async_runtime::spawn_blocking(move || {
+        state.status_with_log_stats(
+            force.unwrap_or(false),
+            include_log_stats.unwrap_or(true),
+        )
+    })
         .await
         .map_err(|error| format!("获取状态失败：{error}"))
 }
@@ -397,19 +509,24 @@ fn update_filters_blocking(
         .map_err(|_| "清单更新任务状态异常".to_string())?;
     config::migrate_legacy_defaults(&mut config);
     config.validate()?;
-    let previous = state.current_config()?;
     let report = filters::update_enabled_filters(&app, &mut config)?;
+    let _runtime_guard = state
+        .runtime_update_lock
+        .lock()
+        .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
+    let previous = state.current_config()?;
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
-    let rules_text = config::build_effective_rules(&app, &config);
-    state.refresh_effective_summary(&rules_text)?;
 
     if config.enabled {
+        let rules_text = config::build_effective_rules(&app, &config);
         state
             .apply_config_change(&previous, &config, &rules_text)
             .inspect_err(|error| {
                 state.set_error(Some(error.clone()));
             })?;
+    } else {
+        state.set_effective_summary(configured_rule_summary(&config))?;
     }
 
     apply_update_report_error(&state, &report);
@@ -424,10 +541,24 @@ fn update_filters_blocking(
 }
 
 #[tauri::command]
-fn start_dns(
+async fn start_dns(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<RuntimeStatus, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || start_dns_blocking(app, state))
+        .await
+        .map_err(|error| format!("启动 DNS 服务任务异常：{error}"))?
+}
+
+fn start_dns_blocking(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+) -> Result<RuntimeStatus, String> {
+    let _runtime_guard = state
+        .runtime_update_lock
+        .lock()
+        .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
     let mut config = state.current_config()?;
     config::migrate_legacy_defaults(&mut config);
     config.enabled = true;
@@ -435,7 +566,6 @@ fn start_dns(
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
     let rules_text = config::build_effective_rules(&app, &config);
-    state.refresh_effective_summary(&rules_text)?;
     state.start_current(&rules_text).inspect_err(|error| {
         state.set_error(Some(error.clone()));
     })?;
@@ -444,7 +574,18 @@ fn start_dns(
 }
 
 #[tauri::command]
-fn stop_dns(state: tauri::State<'_, Arc<AppState>>) -> Result<RuntimeStatus, String> {
+async fn stop_dns(state: tauri::State<'_, Arc<AppState>>) -> Result<RuntimeStatus, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || stop_dns_blocking(state))
+        .await
+        .map_err(|error| format!("停止 DNS 服务任务异常：{error}"))?
+}
+
+fn stop_dns_blocking(state: Arc<AppState>) -> Result<RuntimeStatus, String> {
+    let _runtime_guard = state
+        .runtime_update_lock
+        .lock()
+        .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
     let mut config = state.current_config()?;
     config.enabled = false;
     state.database.save_config(&config)?;
@@ -483,21 +624,25 @@ fn clear_filter_cache_blocking(
     app: tauri::AppHandle,
     state: Arc<AppState>,
 ) -> Result<FilterCacheClearResult, String> {
+    let _runtime_guard = state
+        .runtime_update_lock
+        .lock()
+        .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
     let previous = state.current_config()?;
     let mut config = previous.clone();
     let stats = config::clear_filter_cache(&app, &mut config)?;
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
-    let rules_text = config::build_effective_rules(&app, &config);
-    state.refresh_effective_summary(&rules_text)?;
 
     if config.enabled {
+        let rules_text = config::build_effective_rules(&app, &config);
         state
             .apply_config_change(&previous, &config, &rules_text)
             .inspect_err(|error| {
                 state.set_error(Some(error.clone()));
             })?;
     } else {
+        state.set_effective_summary(configured_rule_summary(&config))?;
         state.set_error(None);
     }
 
@@ -598,6 +743,13 @@ fn spawn_runtime_watchdog(app: tauri::AppHandle, state: Arc<AppState>) {
                 .unwrap_or_else(|_| AppConfig::default().runtime_watchdog_interval_seconds);
             thread::sleep(Duration::from_secs(interval));
 
+            let _runtime_guard = match state.runtime_update_lock.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    state.set_error(Some("DNS 自恢复任务状态异常".to_string()));
+                    continue;
+                }
+            };
             let config = state.current_config().unwrap_or_default();
             if !config.enabled || !config.runtime_watchdog_enabled {
                 continue;
@@ -621,6 +773,34 @@ fn spawn_runtime_watchdog(app: tauri::AppHandle, state: Arc<AppState>) {
                     state.set_error(Some(format!("DNS 自恢复重启失败：{error}")));
                 }
             }
+        }
+    });
+}
+
+fn spawn_initial_runtime(app: tauri::AppHandle, state: Arc<AppState>) {
+    thread::spawn(move || {
+        let _runtime_guard = match state.runtime_update_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                state.set_error(Some("DNS 初始化任务状态异常".to_string()));
+                return;
+            }
+        };
+        let config = match state.current_config() {
+            Ok(config) => config,
+            Err(error) => {
+                state.set_error(Some(error));
+                return;
+            }
+        };
+        if !config.enabled {
+            return;
+        }
+
+        let rules_text = config::build_effective_rules(&app, &config);
+        if let Err(error) = state.start_current(&rules_text) {
+            eprintln!("DNS 服务启动失败：{error}");
+            state.set_error(Some(error));
         }
     });
 }
@@ -699,22 +879,18 @@ pub fn run() {
                     AppConfig::default()
                 }
             };
-            let should_start = config.enabled;
             let autostart_error = apply_autostart_config(app.handle(), config.launch_at_startup)
                 .inspect_err(|error| eprintln!("{error}"))
                 .err();
-            let effective_rules = config::build_effective_rules(app.handle(), &config);
-            let state = Arc::new(AppState::new(config, &effective_rules, database));
+            let state = Arc::new(AppState::new(config, database));
             if let Some(error) = autostart_error {
-                state.set_error(Some(error));
-            }
-            if should_start && let Err(error) = state.start_current(&effective_rules) {
-                eprintln!("DNS 服务启动失败：{error}");
                 state.set_error(Some(error));
             }
             let watchdog_state = Arc::clone(&state);
             let auto_update_state = Arc::clone(&state);
+            let initial_runtime_state = Arc::clone(&state);
             app.manage(state);
+            spawn_initial_runtime(app.handle().clone(), initial_runtime_state);
             spawn_runtime_watchdog(app.handle().clone(), watchdog_state);
             spawn_filter_auto_update(app.handle().clone(), auto_update_state);
             Ok(())
@@ -727,4 +903,51 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FilterSubscription;
+
+    #[test]
+    fn unrelated_config_change_does_not_rebuild_filter_runtime() {
+        let previous = AppConfig::default();
+        let mut next = previous.clone();
+        next.launch_at_startup = !next.launch_at_startup;
+        next.query_log_retention_hours = 24;
+
+        assert!(!filter_runtime_changed(&previous, &next));
+        assert!(!needs_dns_restart(&previous, &next));
+    }
+
+    #[test]
+    fn filtering_config_change_rebuilds_filter_runtime() {
+        let previous = AppConfig::default();
+        let mut next = previous.clone();
+        next.dns_rewrites = "nas.lan 192.168.1.10".into();
+
+        assert!(filter_runtime_changed(&previous, &next));
+    }
+
+    #[test]
+    fn configured_summary_uses_filter_metadata_without_reading_cache() {
+        let config = AppConfig {
+            filters: vec![FilterSubscription {
+                block_rule_count: 12,
+                allow_rule_count: 3,
+                ignored_rule_count: 2,
+                ignored_comment_count: 1,
+                ignored_regex_count: 1,
+                ..FilterSubscription::default()
+            }],
+            blacklist: "||custom.example^".into(),
+            ..AppConfig::default()
+        };
+
+        let summary = configured_rule_summary(&config);
+        assert_eq!(summary.block_rules, 13);
+        assert_eq!(summary.allow_rules, 3);
+        assert_eq!(summary.ignored_rules, 2);
+    }
 }

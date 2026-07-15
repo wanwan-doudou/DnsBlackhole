@@ -63,7 +63,7 @@ where
     };
 
     // 池不可用属于异常情况，退回临时线程保证任务不丢
-    thread::spawn(move || task());
+    thread::spawn(task);
 }
 
 #[cfg(test)]

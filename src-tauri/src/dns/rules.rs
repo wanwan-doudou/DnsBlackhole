@@ -22,6 +22,7 @@ pub struct CompiledRules {
     allows: RuleSet,
     /// 清单名称表：规则条目里只存索引，避免几百万条规则各克隆一份清单名
     sources: Vec<Box<str>>,
+    summary: RuleSummary,
 }
 
 #[derive(Clone, Default)]
@@ -182,6 +183,7 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
         blocks,
         allows,
         sources,
+        summary,
     }
 }
 
@@ -217,6 +219,10 @@ fn intern_source(sources: &mut Vec<Box<str>>, name: &str) -> u16 {
 }
 
 impl CompiledRules {
+    pub(crate) fn summary(&self) -> RuleSummary {
+        self.summary.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_blocked(&self, domain: &str, qtype: u16) -> bool {
         self.blocking_match(domain, qtype).is_some()
@@ -764,7 +770,7 @@ fn query_type_number(value: &str) -> Option<u16> {
 fn badfilter_target(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let (pattern, modifiers) = trimmed.split_once('$')?;
-    let mut remaining = modifiers
+    let remaining = modifiers
         .split(',')
         .filter(|modifier| !modifier.eq_ignore_ascii_case("badfilter"))
         .collect::<Vec<_>>();
@@ -776,7 +782,7 @@ fn badfilter_target(line: &str) -> Option<String> {
     } else {
         Some(format!(
             "{pattern}${}",
-            remaining.drain(..).collect::<Vec<_>>().join(",")
+            remaining.join(",")
         ))
     }
 }
