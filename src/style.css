@@ -1595,6 +1595,114 @@ select:focus {
   font-size: 16px;
 }
 
+.security-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.security-stat-card {
+  border: 1px solid #e1e8ef;
+  border-radius: 6px;
+  padding: 13px 15px;
+  background: #f8fafc;
+}
+
+.security-stat-card span {
+  display: block;
+  color: #748396;
+  font-size: 12px;
+}
+
+.security-stat-card strong {
+  display: block;
+  margin-top: 5px;
+  color: #34485c;
+  font-size: 21px;
+  font-weight: 650;
+}
+
+.security-event-table {
+  margin-top: 16px;
+  overflow: hidden;
+  border: 1px solid #e1e8ef;
+  border-radius: 6px;
+}
+
+.security-event-head,
+.security-event-row {
+  display: grid;
+  grid-template-columns: 135px minmax(170px, 0.8fr) minmax(280px, 1.4fr) 70px;
+  align-items: center;
+}
+
+.security-event-head {
+  min-height: 38px;
+  border-bottom: 1px solid #e8edf2;
+  color: #647487;
+  background: #f7f9fb;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.security-event-head span,
+.security-event-row > * {
+  min-width: 0;
+  padding: 0 14px;
+}
+
+.security-event-body {
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.security-event-row {
+  min-height: 58px;
+  border-bottom: 1px solid #edf1f4;
+  color: #4d5b69;
+  background: #ffffff;
+}
+
+.security-event-row:last-child {
+  border-bottom: 0;
+}
+
+.security-event-row.rate_limited {
+  background: #fffaf1;
+}
+
+.security-event-row strong,
+.security-event-row span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.security-event-row strong {
+  color: #465666;
+  font-size: 12.5px;
+  font-weight: 550;
+}
+
+.security-event-row span {
+  margin-top: 3px;
+  color: #8793a1;
+  font-size: 11.5px;
+}
+
+.security-event-row .security-event-count {
+  color: #b05e24;
+  text-align: right;
+}
+
+.security-event-empty {
+  padding: 34px 20px;
+  color: #8a97a7;
+  text-align: center;
+  font-size: 12.5px;
+}
+
 .dns-cache-grid {
   display: grid;
   gap: 20px;
@@ -1622,8 +1730,18 @@ select:focus {
   .upstream-extra-grid,
   .runtime-watchdog-grid,
   .dns-security-grid,
-  .dns-security-options {
+  .dns-security-options,
+  .security-stat-grid {
     grid-template-columns: 1fr;
+  }
+
+  .security-event-table {
+    overflow-x: auto;
+  }
+
+  .security-event-head,
+  .security-event-row {
+    min-width: 720px;
   }
 
   .compact-select {

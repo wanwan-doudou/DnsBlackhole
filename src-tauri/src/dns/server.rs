@@ -62,9 +62,15 @@ impl DnsServer {
 
         let listen_addrs = config.listen_socket_addrs()?;
         let listen_addr = listen_addrs[0];
-        let upstream_servers = Arc::new(build_runtime_upstreams(config.upstream_servers()?)?);
-        let fallback_upstream_servers =
-            Arc::new(build_runtime_upstreams(config.fallback_servers()?)?);
+        let bootstrap_servers = config.bootstrap_servers()?;
+        let upstream_servers = Arc::new(build_runtime_upstreams(
+            config.upstream_servers()?,
+            &bootstrap_servers,
+        ));
+        let fallback_upstream_servers = Arc::new(build_runtime_upstreams(
+            config.fallback_servers()?,
+            &bootstrap_servers,
+        ));
         let upstream_mode = config.upstream_mode.clone();
         let query_log_enabled = config.query_log_enabled;
         let anonymize_client_ip = config.anonymize_client_ip;
@@ -610,7 +616,33 @@ fn dispatch_dns_work(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use crate::{config::AppConfig, database::Database};
+
+    use super::super::stats::{DnsStats, DnsTransport, SecurityEventType};
     use super::*;
+
+    fn example_a_query() -> Vec<u8> {
+        vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ]
+    }
+
+    fn available_local_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("临时 TCP 端口应可绑定")
+            .local_addr()
+            .expect("应可读取临时 TCP 地址")
+            .port()
+    }
 
     #[test]
     fn ipv6_udp_listener_does_not_claim_ipv4_port() {
@@ -630,5 +662,71 @@ mod tests {
 
         bind_tcp_listener(SocketAddr::from(([0, 0, 0, 0], port)), false)
             .expect("IPv4 TCP listener should share the port");
+    }
+
+    #[test]
+    fn denied_client_udp_is_dropped_tcp_is_refused_and_both_are_audited() {
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            blocked_clients: Ipv4Addr::LOCALHOST.to_string(),
+            query_log_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
+        let server = DnsServer::start(config, "", Arc::clone(&stats), database)
+            .expect("测试 DNS 服务应可启动");
+        let query = example_a_query();
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP 客户端应可绑定");
+        udp.set_read_timeout(Some(Duration::from_millis(700)))
+            .expect("应可设置 UDP 读取超时");
+        udp.send_to(&query, (Ipv4Addr::LOCALHOST, port))
+            .expect("应可发送 UDP 查询");
+        let mut udp_response = [0_u8; 512];
+        let udp_error = udp
+            .recv_from(&mut udp_response)
+            .expect_err("被拒 UDP 查询不应收到响应");
+        assert!(matches!(
+            udp_error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+
+        let mut tcp =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("TCP 客户端应可连接测试服务");
+        tcp.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("应可设置 TCP 读取超时");
+        tcp.write_all(&(query.len() as u16).to_be_bytes())
+            .and_then(|_| tcp.write_all(&query))
+            .expect("应可发送 TCP 查询");
+        let mut response_length = [0_u8; 2];
+        tcp.read_exact(&mut response_length)
+            .expect("TCP 查询应收到响应长度");
+        let mut tcp_response = vec![0_u8; u16::from_be_bytes(response_length) as usize];
+        tcp.read_exact(&mut tcp_response)
+            .expect("TCP 查询应收到完整响应");
+        assert_eq!(tcp_response[3] & 0x0f, 5, "TCP 响应应为 REFUSED");
+
+        let snapshot = stats.lock().expect("统计锁不应中毒").clone();
+        assert_eq!(snapshot.access_denied_total, 2);
+        assert_eq!(snapshot.dropped_udp_total, 1);
+        assert_eq!(snapshot.security_events.len(), 2);
+        assert!(snapshot.security_events.iter().any(|event| {
+            event.event_type == SecurityEventType::AccessDenied
+                && event.protocol == DnsTransport::Udp
+                && event.client_ip == Ipv4Addr::LOCALHOST.to_string()
+        }));
+        assert!(snapshot.security_events.iter().any(|event| {
+            event.event_type == SecurityEventType::AccessDenied
+                && event.protocol == DnsTransport::Tcp
+                && event.client_ip == Ipv4Addr::LOCALHOST.to_string()
+        }));
+
+        server.stop();
     }
 }

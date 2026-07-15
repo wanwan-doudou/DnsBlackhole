@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    net::IpAddr,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,6 +12,8 @@ use crate::config::AppConfig;
 use super::rules::RuleSummary;
 
 const TRAFFIC_BUCKET_WINDOW_MINUTES: u64 = 90 * 24 * 60;
+const SECURITY_EVENT_CAPACITY: usize = 200;
+const SECURITY_EVENT_AGGREGATE_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DnsStats {
@@ -23,6 +26,7 @@ pub struct DnsStats {
     pub rate_limited_total: u64,
     pub refused_any_total: u64,
     pub dropped_udp_total: u64,
+    pub security_events: VecDeque<SecurityEvent>,
     pub last_query: Option<String>,
     pub last_blocked: Option<String>,
     pub last_error: Option<String>,
@@ -31,6 +35,31 @@ pub struct DnsStats {
     pub traffic: Vec<TrafficBucket>,
     pub upstream_requests: Vec<UpstreamRequestStat>,
     pub upstream_avg_latency: Vec<UpstreamLatencyStat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityEventType {
+    AccessDenied,
+    RateLimited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsTransport {
+    Udp,
+    Tcp,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SecurityEvent {
+    pub event_type: SecurityEventType,
+    pub protocol: DnsTransport,
+    pub client_ip: String,
+    pub reason: String,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -179,22 +208,81 @@ pub(crate) fn record_error(stats: &Arc<Mutex<DnsStats>>, error: String) {
     }
 }
 
-pub(crate) fn record_access_denied(stats: &Arc<Mutex<DnsStats>>, dropped_udp: bool) {
+pub(crate) fn record_access_denied(
+    stats: &Arc<Mutex<DnsStats>>,
+    client_ip: IpAddr,
+    protocol: DnsTransport,
+    reason: String,
+) {
     if let Ok(mut current) = stats.lock() {
         current.access_denied_total += 1;
-        if dropped_udp {
+        if protocol == DnsTransport::Udp {
             current.dropped_udp_total += 1;
         }
+        record_security_event(
+            &mut current,
+            SecurityEventType::AccessDenied,
+            protocol,
+            client_ip,
+            reason,
+        );
     }
 }
 
-pub(crate) fn record_rate_limited(stats: &Arc<Mutex<DnsStats>>, dropped_udp: bool) {
+pub(crate) fn record_rate_limited(
+    stats: &Arc<Mutex<DnsStats>>,
+    client_ip: IpAddr,
+    protocol: DnsTransport,
+    reason: String,
+) {
     if let Ok(mut current) = stats.lock() {
         current.rate_limited_total += 1;
-        if dropped_udp {
+        if protocol == DnsTransport::Udp {
             current.dropped_udp_total += 1;
         }
+        record_security_event(
+            &mut current,
+            SecurityEventType::RateLimited,
+            protocol,
+            client_ip,
+            reason,
+        );
     }
+}
+
+fn record_security_event(
+    stats: &mut DnsStats,
+    event_type: SecurityEventType,
+    protocol: DnsTransport,
+    client_ip: IpAddr,
+    reason: String,
+) {
+    let now = current_second();
+    let client_ip = client_ip.to_string();
+    if let Some(last) = stats.security_events.back_mut()
+        && last.event_type == event_type
+        && last.protocol == protocol
+        && last.client_ip == client_ip
+        && last.reason == reason
+        && now.saturating_sub(last.last_seen_at) <= SECURITY_EVENT_AGGREGATE_SECONDS
+    {
+        last.last_seen_at = now;
+        last.count = last.count.saturating_add(1);
+        return;
+    }
+
+    if stats.security_events.len() >= SECURITY_EVENT_CAPACITY {
+        stats.security_events.pop_front();
+    }
+    stats.security_events.push_back(SecurityEvent {
+        event_type,
+        protocol,
+        client_ip,
+        reason,
+        first_seen_at: now,
+        last_seen_at: now,
+        count: 1,
+    });
 }
 
 pub(crate) fn record_refused_any(stats: &Arc<Mutex<DnsStats>>) {
@@ -255,4 +343,48 @@ pub(crate) fn current_second() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv6Addr;
+
+    use super::*;
+
+    #[test]
+    fn aggregates_consecutive_security_events_and_counts_udp_drops() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let ip = "192.168.1.20".parse().unwrap();
+        let reason = "客户端 192.168.1.20 不在允许列表中".to_string();
+
+        record_access_denied(&stats, ip, DnsTransport::Udp, reason.clone());
+        record_access_denied(&stats, ip, DnsTransport::Udp, reason);
+
+        let current = stats.lock().unwrap();
+        assert_eq!(current.access_denied_total, 2);
+        assert_eq!(current.dropped_udp_total, 2);
+        assert_eq!(current.security_events.len(), 1);
+        assert_eq!(current.security_events[0].count, 2);
+    }
+
+    #[test]
+    fn bounds_security_event_history() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        for index in 0..=SECURITY_EVENT_CAPACITY {
+            let ip = IpAddr::V6(Ipv6Addr::from(index as u128));
+            record_rate_limited(
+                &stats,
+                ip,
+                DnsTransport::Tcp,
+                format!("客户端 {ip} 触发限速"),
+            );
+        }
+
+        let current = stats.lock().unwrap();
+        assert_eq!(current.security_events.len(), SECURITY_EVENT_CAPACITY);
+        assert_eq!(
+            current.rate_limited_total,
+            (SECURITY_EVENT_CAPACITY + 1) as u64
+        );
+    }
 }

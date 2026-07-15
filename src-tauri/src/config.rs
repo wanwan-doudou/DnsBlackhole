@@ -4,6 +4,8 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU16, Ordering},
+    thread,
     time::Duration,
 };
 
@@ -12,7 +14,9 @@ use tauri::{AppHandle, Manager};
 
 pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 7;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
 const MAX_FILTER_SIZE_MB: u32 = 256;
+static BOOTSTRAP_QUERY_ID: AtomicU16 = AtomicU16::new(0x1234);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -109,6 +113,7 @@ pub enum UpstreamMode {
 #[derive(Debug, Clone)]
 pub enum UpstreamServer {
     Udp(SocketAddr),
+    UdpHostname { hostname: String, port: u16 },
     Doh(String),
 }
 
@@ -240,19 +245,15 @@ impl AppConfig {
     }
 
     pub fn upstream_servers(&self) -> Result<Vec<UpstreamServer>, String> {
-        parse_upstream_servers(
-            &self.upstream_dns,
-            &self.bootstrap_dns,
-            self.allow_insecure_http,
-        )
+        parse_upstream_servers(&self.upstream_dns, self.allow_insecure_http)
     }
 
     pub fn fallback_servers(&self) -> Result<Vec<UpstreamServer>, String> {
-        parse_optional_upstream_servers(
-            &self.fallback_dns,
-            &self.bootstrap_dns,
-            self.allow_insecure_http,
-        )
+        parse_optional_upstream_servers(&self.fallback_dns, self.allow_insecure_http)
+    }
+
+    pub(crate) fn bootstrap_servers(&self) -> Result<Vec<SocketAddr>, String> {
+        parse_bootstrap_servers(&self.bootstrap_dns)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -614,14 +615,13 @@ fn validate_filters(
 
 fn parse_upstream_servers(
     value: &str,
-    bootstrap_dns: &str,
     allow_insecure_http: bool,
 ) -> Result<Vec<UpstreamServer>, String> {
     let servers = value
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
-        .map(|line| parse_upstream_server(line, bootstrap_dns, allow_insecure_http))
+        .map(|line| parse_upstream_server(line, allow_insecure_http))
         .collect::<Result<Vec<_>, _>>()?;
 
     if servers.is_empty() {
@@ -633,28 +633,23 @@ fn parse_upstream_servers(
 
 fn parse_optional_upstream_servers(
     value: &str,
-    bootstrap_dns: &str,
     allow_insecure_http: bool,
 ) -> Result<Vec<UpstreamServer>, String> {
     value
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
-        .map(|line| parse_upstream_server(line, bootstrap_dns, allow_insecure_http))
+        .map(|line| parse_upstream_server(line, allow_insecure_http))
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn parse_upstream_server(
-    value: &str,
-    bootstrap_dns: &str,
-    allow_insecure_http: bool,
-) -> Result<UpstreamServer, String> {
+fn parse_upstream_server(value: &str, allow_insecure_http: bool) -> Result<UpstreamServer, String> {
     if value.starts_with("https://") {
-        return Ok(UpstreamServer::Doh(value.to_string()));
+        return parse_doh_upstream(value);
     }
     if value.starts_with("http://") {
         if allow_insecure_http {
-            return Ok(UpstreamServer::Doh(value.to_string()));
+            return parse_doh_upstream(value);
         }
         return Err(
             "HTTP DoH 上游不安全。默认只允许 HTTPS DoH；如确需使用，请在安全防护中启用“允许不安全 HTTP”。"
@@ -662,39 +657,41 @@ fn parse_upstream_server(
         );
     }
 
-    parse_dns_socket_addr(value, bootstrap_dns).map(UpstreamServer::Udp)
+    parse_dns_upstream(value)
 }
 
-fn parse_dns_socket_addr(value: &str, bootstrap_dns: &str) -> Result<SocketAddr, String> {
+fn parse_doh_upstream(value: &str) -> Result<UpstreamServer, String> {
+    let url = reqwest::Url::parse(value).map_err(|e| format!("DoH 地址无效：{e}"))?;
+    if url.host_str().is_none() || url.port_or_known_default().is_none() {
+        return Err("DoH 地址必须包含有效主机名和端口".into());
+    }
+    Ok(UpstreamServer::Doh(value.to_string()))
+}
+
+fn parse_dns_upstream(value: &str) -> Result<UpstreamServer, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err("上游 DNS 不能为空".into());
     }
 
     if let Ok(addr) = trimmed.parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(UpstreamServer::Udp(addr));
     }
 
     if let Ok(ip) = trimmed.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, 53));
+        return Ok(UpstreamServer::Udp(SocketAddr::new(ip, 53)));
     }
 
-    if let Some((host, port)) = split_host_port(trimmed) {
-        if let Some(host) = normalize_hostname(host) {
-            return resolve_hostname_socket_addr(&host, port, bootstrap_dns);
-        }
+    if let Some((host, port)) = split_host_port(trimmed)
+        && let Some(host) = normalize_hostname(host)
+    {
+        return Ok(UpstreamServer::UdpHostname {
+            hostname: host,
+            port,
+        });
     }
 
-    let socket_value = if trimmed.contains(':') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}:53")
-    };
-    socket_value
-        .to_socket_addrs()
-        .map_err(|_| "上游 DNS 必须是 IP、IP:端口、域名:端口 或 DoH 地址".to_string())?
-        .next()
-        .ok_or_else(|| "无法解析上游 DNS 地址".to_string())
+    Err("上游 DNS 必须是 IP、IP:端口、域名:端口 或 DoH 地址".to_string())
 }
 
 fn split_host_port(value: &str) -> Option<(&str, u16)> {
@@ -726,24 +723,30 @@ fn normalize_hostname(value: &str) -> Option<String> {
     Some(hostname)
 }
 
-fn resolve_hostname_socket_addr(
+pub(crate) fn resolve_hostname_socket_addrs(
     host: &str,
     port: u16,
-    bootstrap_dns: &str,
-) -> Result<SocketAddr, String> {
-    let bootstrap_servers = parse_bootstrap_servers(bootstrap_dns)?;
-    for server in bootstrap_servers {
+    bootstrap_servers: &[SocketAddr],
+) -> Result<Vec<SocketAddr>, String> {
+    for &server in bootstrap_servers {
         match resolve_hostname_with_bootstrap(host, port, server) {
-            Ok(addr) => return Ok(addr),
+            Ok(addrs) if !addrs.is_empty() => return Ok(addrs),
             Err(_) => continue,
+            Ok(_) => continue,
         }
     }
 
-    (host, port)
+    let mut seen = HashSet::new();
+    let addrs = (host, port)
         .to_socket_addrs()
         .map_err(|_| "无法通过 bootstrap 或系统解析上游 DNS 地址".to_string())?
-        .next()
-        .ok_or_else(|| "无法解析上游 DNS 地址".to_string())
+        .filter(|addr| seen.insert(*addr))
+        .take(MAX_RESOLVED_UPSTREAM_ADDRESSES)
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err("无法解析上游 DNS 地址".to_string());
+    }
+    Ok(addrs)
 }
 
 fn parse_bootstrap_servers(value: &str) -> Result<Vec<SocketAddr>, String> {
@@ -775,13 +778,45 @@ fn resolve_hostname_with_bootstrap(
     host: &str,
     port: u16,
     server: SocketAddr,
-) -> Result<SocketAddr, String> {
-    query_bootstrap_record(host, server, 1)
-        .or_else(|_| query_bootstrap_record(host, server, 28))
-        .map(|ip| SocketAddr::new(ip, port))
+) -> Result<Vec<SocketAddr>, String> {
+    let (ipv4, ipv6) = thread::scope(|scope| {
+        let ipv4 = scope.spawn(|| query_bootstrap_records(host, server, 1));
+        let ipv6 = scope.spawn(|| query_bootstrap_records(host, server, 28));
+        (
+            ipv4.join()
+                .unwrap_or_else(|_| Err("bootstrap A 查询线程异常".into())),
+            ipv6.join()
+                .unwrap_or_else(|_| Err("bootstrap AAAA 查询线程异常".into())),
+        )
+    });
+
+    let mut seen = HashSet::new();
+    let mut addrs = Vec::new();
+    let ordered = if server.is_ipv6() {
+        [ipv6, ipv4]
+    } else {
+        [ipv4, ipv6]
+    };
+    for result in ordered.into_iter().flatten() {
+        for ip in result {
+            let addr = SocketAddr::new(ip, port);
+            if seen.insert(addr) {
+                addrs.push(addr);
+            }
+        }
+    }
+    if addrs.is_empty() {
+        return Err("bootstrap DNS 没有返回可用 IP".into());
+    }
+    addrs.truncate(MAX_RESOLVED_UPSTREAM_ADDRESSES);
+    Ok(addrs)
 }
 
-fn query_bootstrap_record(host: &str, server: SocketAddr, qtype: u16) -> Result<IpAddr, String> {
+fn query_bootstrap_records(
+    host: &str,
+    server: SocketAddr,
+    qtype: u16,
+) -> Result<Vec<IpAddr>, String> {
     let query = build_dns_query(host, qtype)?;
     let bind_addr = if server.is_ipv4() {
         "0.0.0.0:0"
@@ -793,7 +828,10 @@ fn query_bootstrap_record(host: &str, server: SocketAddr, qtype: u16) -> Result<
         .set_read_timeout(Some(BOOTSTRAP_TIMEOUT))
         .map_err(|e| format!("设置 bootstrap 查询超时失败：{e}"))?;
     socket
-        .send_to(&query, server)
+        .connect(server)
+        .map_err(|e| format!("连接 bootstrap DNS 失败：{e}"))?;
+    socket
+        .send(&query)
         .map_err(|e| format!("请求 bootstrap DNS 失败：{e}"))?;
 
     let mut response = [0_u8; 4096];
@@ -804,7 +842,9 @@ fn query_bootstrap_record(host: &str, server: SocketAddr, qtype: u16) -> Result<
 }
 
 fn build_dns_query(host: &str, qtype: u16) -> Result<Vec<u8>, String> {
-    let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    let query_id = BOOTSTRAP_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+    let [id_high, id_low] = query_id.to_be_bytes();
+    let mut packet = vec![id_high, id_low, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     for label in host.trim_end_matches('.').split('.') {
         let label_len =
             u8::try_from(label.len()).map_err(|_| "DNS label 长度超过 63 字节".to_string())?;
@@ -824,7 +864,7 @@ fn parse_bootstrap_ip_response(
     response: &[u8],
     query: &[u8],
     qtype: u16,
-) -> Result<IpAddr, String> {
+) -> Result<Vec<IpAddr>, String> {
     if response.len() < 12 || query.len() < 2 || response[0..2] != query[0..2] {
         return Err("bootstrap DNS 响应无效".into());
     }
@@ -843,6 +883,7 @@ fn parse_bootstrap_ip_response(
         }
     }
 
+    let mut ips = Vec::new();
     for _ in 0..answer_count {
         let header_offset =
             skip_dns_name(response, offset).ok_or("bootstrap DNS answer 格式无效")?;
@@ -861,7 +902,7 @@ fn parse_bootstrap_ip_response(
 
         if record_class == 1 && record_type == qtype {
             if qtype == 1 && data_len == 4 {
-                return Ok(IpAddr::V4(Ipv4Addr::new(
+                ips.push(IpAddr::V4(Ipv4Addr::new(
                     response[data_offset],
                     response[data_offset + 1],
                     response[data_offset + 2],
@@ -871,14 +912,17 @@ fn parse_bootstrap_ip_response(
             if qtype == 28 && data_len == 16 {
                 let mut octets = [0_u8; 16];
                 octets.copy_from_slice(&response[data_offset..data_end]);
-                return Ok(IpAddr::V6(Ipv6Addr::from(octets)));
+                ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
             }
         }
 
         offset = data_end;
     }
 
-    Err("bootstrap DNS 没有返回可用 IP".into())
+    if ips.is_empty() {
+        return Err("bootstrap DNS 没有返回可用 IP".into());
+    }
+    Ok(ips)
 }
 
 fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
@@ -1206,7 +1250,6 @@ mod tests {
     fn parses_multiline_upstream_servers() {
         let servers = parse_upstream_servers(
             "https://dns.alidns.com/dns-query\n223.5.5.5\n119.29.29.29:53",
-            &default_bootstrap_dns(),
             false,
         )
         .expect("upstreams should parse");
@@ -1215,6 +1258,95 @@ mod tests {
         assert!(matches!(servers[0], UpstreamServer::Doh(_)));
         assert!(matches!(servers[1], UpstreamServer::Udp(_)));
         assert!(matches!(servers[2], UpstreamServer::Udp(_)));
+    }
+
+    #[test]
+    fn keeps_hostname_upstream_unresolved_until_runtime_start() {
+        let server = parse_upstream_server("dns.example.test:5353", false)
+            .expect("hostname upstream should parse without network access");
+
+        assert!(matches!(
+            server,
+            UpstreamServer::UdpHostname { hostname, port }
+                if hostname == "dns.example.test" && port == 5353
+        ));
+    }
+
+    #[test]
+    fn parses_all_bootstrap_addresses_from_response() {
+        let query = build_dns_query("dns.example.test", 1).expect("query should build");
+        let mut response = query.clone();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        for octets in [[192, 0, 2, 1], [192, 0, 2, 2]] {
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&1_u16.to_be_bytes());
+            response.extend_from_slice(&1_u16.to_be_bytes());
+            response.extend_from_slice(&60_u32.to_be_bytes());
+            response.extend_from_slice(&4_u16.to_be_bytes());
+            response.extend_from_slice(&octets);
+        }
+
+        let ips = parse_bootstrap_ip_response(&response, &query, 1)
+            .expect("all bootstrap addresses should parse");
+
+        assert_eq!(
+            ips,
+            [
+                "192.0.2.1".parse::<IpAddr>().unwrap(),
+                "192.0.2.2".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_a_and_aaaa_with_the_same_bootstrap_server() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("mock bootstrap should bind");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("mock timeout should configure");
+        let server = socket.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut buffer = [0_u8; 512];
+                let (len, peer) = socket
+                    .recv_from(&mut buffer)
+                    .expect("mock bootstrap should receive query");
+                let query = &buffer[..len];
+                let qtype = read_u16(query, len - 4).expect("query type should exist");
+                let mut response = query.to_vec();
+                response[2] = 0x81;
+                response[3] = 0x80;
+                response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                response.extend_from_slice(&[0xc0, 0x0c]);
+                response.extend_from_slice(&qtype.to_be_bytes());
+                response.extend_from_slice(&1_u16.to_be_bytes());
+                response.extend_from_slice(&60_u32.to_be_bytes());
+                if qtype == 1 {
+                    response.extend_from_slice(&4_u16.to_be_bytes());
+                    response.extend_from_slice(&[192, 0, 2, 10]);
+                } else {
+                    response.extend_from_slice(&16_u16.to_be_bytes());
+                    response.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+                }
+                socket
+                    .send_to(&response, peer)
+                    .expect("mock bootstrap should send response");
+            }
+        });
+
+        let addrs = resolve_hostname_with_bootstrap("dns.example.test", 443, server)
+            .expect("A and AAAA should resolve");
+        responder.join().expect("mock bootstrap should finish");
+
+        assert_eq!(
+            addrs,
+            [
+                "192.0.2.10:443".parse().unwrap(),
+                "[::1]:443".parse().unwrap()
+            ]
+        );
     }
 
     #[test]
@@ -1378,6 +1510,16 @@ mod tests {
         config
             .validate()
             .expect("explicit HTTP opt-in should validate");
+    }
+
+    #[test]
+    fn rejects_malformed_doh_url_during_validation() {
+        let config = AppConfig {
+            upstream_dns: "https://".into(),
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_err());
     }
 
     #[test]
