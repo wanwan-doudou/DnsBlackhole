@@ -117,7 +117,7 @@ pub enum UpstreamServer {
     Doh(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct FilterSubscription {
     pub id: String,
@@ -1219,7 +1219,7 @@ pub fn build_effective_rules(app: &AppHandle, config: &AppConfig) -> String {
         return String::new();
     }
 
-    let mut parts = Vec::new();
+    let mut rules = String::new();
 
     for filter in &config.filters {
         if !filter.enabled {
@@ -1228,18 +1228,25 @@ pub fn build_effective_rules(app: &AppHandle, config: &AppConfig) -> String {
         if let Ok(Some(content)) = read_filter_cache(app, &filter.id) {
             let source =
                 serde_json::to_string(&filter.name).unwrap_or_else(|_| "\"未知清单\"".into());
-            parts.push(format!("! dnsblackhole-source:{source}\n{content}"));
+            if !rules.is_empty() {
+                rules.push('\n');
+            }
+            rules.push_str("! dnsblackhole-source:");
+            rules.push_str(&source);
+            rules.push('\n');
+            rules.push_str(&content);
         }
     }
 
     if !config.blacklist.trim().is_empty() {
-        parts.push(format!(
-            "! dnsblackhole-source:\"自定义规则\"\n{}",
-            config.blacklist
-        ));
+        if !rules.is_empty() {
+            rules.push('\n');
+        }
+        rules.push_str("! dnsblackhole-source:\"自定义规则\"\n");
+        rules.push_str(&config.blacklist);
     }
 
-    parts.join("\n")
+    rules
 }
 
 #[cfg(test)]

@@ -17,6 +17,12 @@ pub(crate) struct FilterRuntime {
     pub(crate) log_ignore: DomainSet,
 }
 
+impl FilterRuntime {
+    pub(crate) fn summary(&self) -> super::rules::RuleSummary {
+        self.rules.summary()
+    }
+}
+
 pub(crate) type SharedFilterRuntime = Arc<RwLock<Arc<FilterRuntime>>>;
 
 pub(crate) fn build_filter_runtime(config: &AppConfig, rules_text: &str) -> FilterRuntime {

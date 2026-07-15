@@ -62,7 +62,6 @@ let filtersState: FilterSubscription[] = [];
 let editingFilterIds = new Set<string>();
 let currentQueryLogEnabled = true;
 let currentQueryLogRetentionHours = 90 * 24;
-let lastStatus: RuntimeStatus | null = null;
 let refreshInFlight = false;
 let isContentScrolling = false;
 let queuedAutoRefresh = false;
@@ -591,13 +590,15 @@ window.setInterval(() => {
     void refreshQueryLogs({ auto: true });
     return;
   }
-  void refreshStatus({ auto: true });
+  if (activeView === "dashboard" || activeView === "security") {
+    void refreshStatus({ auto: true });
+  }
 }, 5000);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     if (activeView === "logs") {
       void refreshQueryLogs({ auto: true });
-    } else {
+    } else if (activeView === "dashboard" || activeView === "security") {
       void refreshStatus({ auto: true });
     }
   }
@@ -721,8 +722,9 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
   refreshInFlight = true;
   setRefreshButtonState(options.button, true);
   try {
-    const status = await getStatus(options.auto !== true);
-    renderStatus(status, { renderDashboard: activeView === "dashboard" });
+    const renderDashboard = activeView === "dashboard";
+    const status = await getStatus(options.auto !== true, renderDashboard);
+    renderStatus(status, { renderDashboard });
   } catch (error) {
     showMessage(String(error), true);
   } finally {
@@ -750,19 +752,21 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
 
   queryLogRefreshInFlight = true;
   setRefreshButtonState(options.button, true);
-  setQueryLogLoading(true);
+  setQueryLogLoading(true, options.auto === true);
   try {
     const requestedFilter = queryLogFilterInput.value as QueryLogFilter;
     const requestedSearch = queryLogSearchInput.value.trim();
+    const requestedPage = queryLogPage;
     const page = await getQueryLogs({
       filter: requestedFilter,
       search: requestedSearch,
-      page: queryLogPage,
+      page: requestedPage,
       pageSize: QUERY_LOG_PAGE_SIZE,
     });
     if (
       requestedFilter !== queryLogFilterInput.value ||
-      requestedSearch !== queryLogSearchInput.value.trim()
+      requestedSearch !== queryLogSearchInput.value.trim() ||
+      requestedPage !== queryLogPage
     ) {
       queryLogRefreshQueued = true;
       return;
@@ -774,7 +778,7 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
     showMessage(String(error), true);
   } finally {
     queryLogRefreshInFlight = false;
-    setQueryLogLoading(false);
+    setQueryLogLoading(false, options.auto === true);
     setRefreshButtonState(options.button, false);
     if (queryLogRefreshQueued) {
       queryLogRefreshQueued = false;
@@ -802,6 +806,7 @@ async function runStatusAction(
 }
 
 function setActiveView(view: ViewName): void {
+  const viewChanged = activeView !== view;
   activeView = view;
   showMessage("", false);
   document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
@@ -818,11 +823,14 @@ function setActiveView(view: ViewName): void {
   document.querySelectorAll<HTMLElement>("[data-view-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.viewPanel === view);
   });
-  if (view === "dashboard" && lastStatus) {
-    renderStatus(lastStatus, { renderDashboard: true });
+  if (view === "dashboard" && viewChanged) {
+    void refreshStatus({ auto: true });
   }
   if (view === "logs") {
     void refreshQueryLogs();
+  }
+  if (view === "security") {
+    void refreshStatus({ auto: true });
   }
 }
 
@@ -919,7 +927,6 @@ function renderFilter(filter: FilterSubscription): string {
 }
 
 function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}): void {
-  lastStatus = status;
   const renderDashboard = options.renderDashboard ?? true;
 
   const lastError = status.error ?? status.stats.last_error;
@@ -1689,8 +1696,11 @@ function setFilterUpdating(updating: boolean): void {
   filtersTable.classList.toggle("is-updating", updating);
 }
 
-function setQueryLogLoading(loading: boolean): void {
+function setQueryLogLoading(loading: boolean, background = false): void {
   queryLogRefreshButton.classList.toggle("loading", loading);
+  if (background) {
+    return;
+  }
   queryLogRefreshButton.disabled = loading;
   queryLogFilterInput.disabled = loading;
   queryLogFilterButton.disabled = loading;
@@ -1699,7 +1709,6 @@ function setQueryLogLoading(loading: boolean): void {
   }
   queryLogPrevButton.disabled = loading || queryLogPage <= 1;
   queryLogNextButton.disabled = loading || queryLogPage >= totalQueryLogPages();
-  queryLogBody.classList.toggle("is-loading", loading);
 }
 
 function waitForPaint(): Promise<void> {

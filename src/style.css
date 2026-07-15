@@ -591,10 +591,6 @@ button.refreshing:disabled {
   background: #ffffff;
 }
 
-.query-log-body.is-loading {
-  opacity: 0.62;
-}
-
 .query-log-row {
   position: relative;
   min-height: 68px;

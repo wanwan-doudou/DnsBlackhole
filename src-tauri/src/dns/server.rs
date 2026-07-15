@@ -183,11 +183,15 @@ impl DnsServer {
     }
 
     /// 热替换过滤状态（规则/重写/拦截模式/日志忽略），不重启服务、不清空 DNS 缓存。
-    pub fn replace_filter_state(&self, config: &AppConfig, rules_text: &str) {
-        replace_filter_runtime(
-            &self.filter_runtime,
-            build_filter_runtime(config, rules_text),
-        );
+    pub fn replace_filter_state(&self, config: &AppConfig, rules_text: &str) -> super::RuleSummary {
+        let runtime = build_filter_runtime(config, rules_text);
+        let summary = runtime.summary();
+        replace_filter_runtime(&self.filter_runtime, runtime);
+        summary
+    }
+
+    pub fn rule_summary(&self) -> super::RuleSummary {
+        super::filter_runtime::current_filter_runtime(&self.filter_runtime).summary()
     }
 
     pub fn has_finished_threads(&self) -> bool {
