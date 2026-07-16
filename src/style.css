@@ -706,7 +706,7 @@ button.refreshing:disabled {
   top: calc(100% + 8px);
   left: -6px;
   z-index: 20;
-  width: 320px;
+  width: 380px;
   max-width: calc(100vw - 72px);
   visibility: hidden;
   border: 1px solid #e1e7ee;
@@ -778,7 +778,7 @@ button.refreshing:disabled {
 
 .log-detail-popover dl>div {
   display: grid;
-  grid-template-columns: 54px minmax(0, 1fr);
+  grid-template-columns: 68px minmax(0, 1fr);
   gap: 12px;
   align-items: baseline;
 }
@@ -835,6 +835,14 @@ button.refreshing:disabled {
   color: #d7dde3;
 }
 
+.log-eye-icon.failed {
+  color: #d69a3a;
+}
+
+.log-eye-icon.refused {
+  color: #d69a3a;
+}
+
 .log-detail-trigger:hover .log-eye-icon.blocked,
 .log-detail-trigger:focus-visible .log-eye-icon.blocked {
   color: #2fae4f;
@@ -843,6 +851,16 @@ button.refreshing:disabled {
 .log-detail-trigger:hover .log-eye-icon.processed,
 .log-detail-trigger:focus-visible .log-eye-icon.processed {
   color: #c5ccd4;
+}
+
+.log-detail-trigger:hover .log-eye-icon.failed,
+.log-detail-trigger:focus-visible .log-eye-icon.failed {
+  color: #b56a00;
+}
+
+.log-detail-trigger:hover .log-eye-icon.refused,
+.log-detail-trigger:focus-visible .log-eye-icon.refused {
+  color: #b56a00;
 }
 
 .log-response strong.processed {
@@ -854,6 +872,10 @@ button.refreshing:disabled {
 }
 
 .log-response strong.failed {
+  color: #b56a00;
+}
+
+.log-response strong.refused {
   color: #b56a00;
 }
 

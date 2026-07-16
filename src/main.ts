@@ -1051,17 +1051,20 @@ function renderQueryLogs(page: QueryLogPage): void {
 
 function renderQueryLogRow(record: QueryLogRecord): string {
   const status = queryLogStatus(record);
-  const rowClass = record.blocked ? " blocked" : record.failed ? " failed" : "";
-  const detailText = record.error
-    ? record.error
-    : record.upstream_server
-      ? `上游：${record.upstream_server}`
-      : "本地响应";
+  const rowClass = record.failed ? " failed" : record.blocked ? " blocked" : "";
+  const detailText = queryLogResponseDetail(record);
   const detail = escapeHtml(detailText);
   const duration = record.upstream_duration_ms !== null
     ? `${formatCount(record.upstream_duration_ms)} 毫秒`
     : "";
-  const detailPopover = renderQueryLogDetail(record, status.label, detailText, duration);
+  const requestMeta = [
+    dnsQueryTypeLabel(record.query_type),
+    record.transport?.toUpperCase() ?? "协议未记录",
+  ];
+  if (record.query_class !== null && record.query_class !== 1) {
+    requestMeta.push(dnsQueryClassLabel(record.query_class));
+  }
+  const detailPopover = renderQueryLogDetail(record, status.label, duration);
 
   return `
     <div class="query-log-row${rowClass}">
@@ -1072,13 +1075,13 @@ function renderQueryLogRow(record: QueryLogRecord): string {
       <div class="log-request">
         <div class="log-detail-anchor">
           <button class="log-detail-trigger" type="button" aria-label="查看请求详情">
-            ${renderLogEyeIcon(record.blocked ? "blocked" : "processed")}
+            ${renderLogEyeIcon(status.className)}
           </button>
           ${detailPopover}
         </div>
         <div>
           <strong title="${escapeHtml(record.domain)}">${escapeHtml(record.domain)}</strong>
-          <span>类型：标准 DNS</span>
+          <span>${escapeHtml(requestMeta.join(" · "))}</span>
         </div>
       </div>
       <div class="log-response">
@@ -1107,21 +1110,30 @@ function renderLogEyeIcon(className: string): string {
 function renderQueryLogDetail(
   record: QueryLogRecord,
   statusLabel: string,
-  detail: string,
   duration: string,
 ): string {
   const rows = [
     ["时间", formatLogTime(record.timestamp)],
     ["日期", formatLogDate(record.timestamp)],
     ["域名", record.domain],
-    ["类型", "标准 DNS"],
-    ["响应", statusLabel],
+    ["查询类型", dnsQueryTypeDetail(record.query_type)],
+    ["查询类别", dnsQueryClassLabel(record.query_class)],
+    ["传输协议", record.transport?.toUpperCase() ?? "旧日志未记录"],
+    ["响应状态", statusLabel],
+    ["响应来源", queryLogResponseSourceLabel(record)],
     ["客户端", formatClientLabel(record.client_ip)],
-    ["详情", detail],
   ];
 
+  if (record.upstream_server) {
+    rows.push(["上游服务器", record.upstream_server]);
+  }
+
   if (duration) {
-    rows.push(["耗时", duration]);
+    rows.push([queryLogResponseSource(record) === "cache" ? "缓存耗时" : "响应耗时", duration]);
+  }
+
+  if (record.error) {
+    rows.push([record.failed ? "错误" : "说明", record.error]);
   }
 
   if (record.blocked) {
@@ -1170,14 +1182,129 @@ function totalQueryLogPages(total = queryLogTotal): number {
 }
 
 function queryLogStatus(record: QueryLogRecord): { label: string; className: string } {
-  if (record.blocked) {
-    return { label: "已拦截", className: "blocked" };
-  }
   if (record.failed) {
     return { label: "失败", className: "failed" };
   }
+  if (record.blocked) {
+    return { label: "已拦截", className: "blocked" };
+  }
+  if (queryLogResponseSource(record) === "refused") {
+    return { label: "已拒绝", className: "refused" };
+  }
   return { label: "已处理", className: "processed" };
 }
+
+type ResolvedQueryResponseSource =
+  | "upstream"
+  | "cache"
+  | "rewrite"
+  | "blocked"
+  | "refused"
+  | "local";
+
+function queryLogResponseSource(record: QueryLogRecord): ResolvedQueryResponseSource {
+  if (record.response_source) {
+    return record.response_source;
+  }
+  if (record.blocked) {
+    return "blocked";
+  }
+  if (record.error?.includes("ANY 查询")) {
+    return "refused";
+  }
+  if (record.upstream_server) {
+    return "upstream";
+  }
+  if (record.upstream_duration_ms === 0) {
+    return "cache";
+  }
+  return "local";
+}
+
+function queryLogResponseSourceLabel(record: QueryLogRecord): string {
+  switch (queryLogResponseSource(record)) {
+    case "upstream":
+      return "上游 DNS";
+    case "cache":
+      return "DNS 缓存";
+    case "rewrite":
+      return "本地 DNS 重写";
+    case "blocked":
+      return "过滤器";
+    case "refused":
+      return "本地拒绝";
+    default:
+      return "本地响应（旧日志未记录来源）";
+  }
+}
+
+function queryLogResponseDetail(record: QueryLogRecord): string {
+  if (record.failed && record.error) {
+    return record.error;
+  }
+  switch (queryLogResponseSource(record)) {
+    case "upstream":
+      return record.upstream_server ? `上游：${record.upstream_server}` : "上游 DNS 解析";
+    case "cache":
+      return "DNS 缓存命中";
+    case "rewrite":
+      return "本地 DNS 重写";
+    case "blocked":
+      return record.rule_source ? `过滤器：${record.rule_source}` : "过滤器拦截";
+    case "refused":
+      return record.error ?? "本地拒绝响应";
+    default:
+      return "本地响应（旧日志）";
+  }
+}
+
+function dnsQueryTypeLabel(queryType: number | null): string {
+  if (queryType === null) {
+    return "类型未记录";
+  }
+  return DNS_QUERY_TYPE_LABELS[queryType] ?? `TYPE${queryType}`;
+}
+
+function dnsQueryTypeDetail(queryType: number | null): string {
+  if (queryType === null) {
+    return "旧日志未记录";
+  }
+  return `${dnsQueryTypeLabel(queryType)}（${queryType}）`;
+}
+
+function dnsQueryClassLabel(queryClass: number | null): string {
+  if (queryClass === null) {
+    return "旧日志未记录";
+  }
+  const labels: Record<number, string> = {
+    1: "IN（互联网）",
+    3: "CH（Chaos）",
+    4: "HS（Hesiod）",
+    255: "ANY（任意类别）",
+  };
+  return labels[queryClass] ?? `CLASS${queryClass}`;
+}
+
+const DNS_QUERY_TYPE_LABELS: Record<number, string> = {
+  1: "A",
+  2: "NS",
+  5: "CNAME",
+  6: "SOA",
+  12: "PTR",
+  15: "MX",
+  16: "TXT",
+  28: "AAAA",
+  33: "SRV",
+  41: "OPT",
+  43: "DS",
+  46: "RRSIG",
+  47: "NSEC",
+  48: "DNSKEY",
+  52: "TLSA",
+  64: "SVCB",
+  65: "HTTPS",
+  255: "ANY",
+};
 
 function setQueryLogFilterValue(value: QueryLogFilter): void {
   const options = queryLogFilterMenu.querySelectorAll<HTMLButtonElement>("[data-filter]");

@@ -20,7 +20,7 @@ use super::{
     },
     filter_runtime::{FilterRuntime, SharedFilterRuntime, current_filter_runtime},
     protocol::{
-        RCODE_REFUSED, TYPE_ANY, build_block_response, build_error_response,
+        Question, RCODE_REFUSED, TYPE_ANY, build_block_response, build_error_response,
         build_rewrite_response, parse_question,
     },
     stats::{
@@ -82,6 +82,49 @@ struct PendingQueryState {
 enum PendingQueryRole {
     Leader(PendingQuery),
     Follower(PendingQuery),
+}
+
+struct QueryLogMetadata<'a> {
+    domain: &'a str,
+    query_type: u16,
+    query_class: u16,
+    transport: &'static str,
+}
+
+impl<'a> QueryLogMetadata<'a> {
+    fn new(question: &'a Question, response_target: &DnsResponseTarget) -> Self {
+        let transport = match response_target {
+            DnsResponseTarget::Udp { .. } => "udp",
+            DnsResponseTarget::Tcp(_) => "tcp",
+        };
+        Self {
+            domain: &question.domain,
+            query_type: question.qtype,
+            query_class: question.qclass,
+            transport,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QueryResponseSource {
+    Upstream,
+    Cache,
+    Rewrite,
+    Blocked,
+    Refused,
+}
+
+impl QueryResponseSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Cache => "cache",
+            Self::Rewrite => "rewrite",
+            Self::Blocked => "blocked",
+            Self::Refused => "refused",
+        }
+    }
 }
 
 pub(crate) struct PendingQueries {
@@ -204,6 +247,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             return;
         }
     };
+    let log_metadata = QueryLogMetadata::new(&question, response_target);
 
     // 整包读取当前过滤状态，一次查询内保持一致；规则热替换只影响后续查询
     let filter = current_filter_runtime(&context.filter_runtime);
@@ -224,8 +268,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     queue_query_log(
                         context,
                         &filter,
-                        &question.domain,
+                        &log_metadata,
                         client_addr,
+                        QueryResponseSource::Refused,
                         false,
                         false,
                         true,
@@ -242,8 +287,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         queue_query_log(
             context,
             &filter,
-            &question.domain,
+            &log_metadata,
             client_addr,
+            QueryResponseSource::Refused,
             false,
             false,
             false,
@@ -270,8 +316,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             queue_query_log(
                 context,
                 &filter,
-                &question.domain,
+                &log_metadata,
                 client_addr,
+                QueryResponseSource::Rewrite,
                 false,
                 false,
                 true,
@@ -283,8 +330,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             queue_query_log(
                 context,
                 &filter,
-                &question.domain,
+                &log_metadata,
                 client_addr,
+                QueryResponseSource::Rewrite,
                 false,
                 false,
                 false,
@@ -312,7 +360,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             queue_blocked_query_log(
                 context,
                 &filter,
-                &question.domain,
+                &log_metadata,
                 client_addr,
                 true,
                 Some(message),
@@ -328,7 +376,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         queue_blocked_query_log(
             context,
             &filter,
-            &question.domain,
+            &log_metadata,
             client_addr,
             false,
             None,
@@ -353,8 +401,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             queue_query_log(
                 context,
                 &filter,
-                &question.domain,
+                &log_metadata,
                 client_addr,
+                QueryResponseSource::Cache,
                 false,
                 false,
                 true,
@@ -366,8 +415,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             queue_query_log(
                 context,
                 &filter,
-                &question.domain,
+                &log_metadata,
                 client_addr,
+                QueryResponseSource::Cache,
                 false,
                 false,
                 false,
@@ -402,8 +452,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                         queue_query_log(
                             context,
                             &filter,
-                            &question.domain,
+                            &log_metadata,
                             client_addr,
+                            QueryResponseSource::Upstream,
                             false,
                             true,
                             true,
@@ -415,8 +466,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                         queue_query_log(
                             context,
                             &filter,
-                            &question.domain,
+                            &log_metadata,
                             client_addr,
+                            QueryResponseSource::Upstream,
                             false,
                             false,
                             false,
@@ -432,8 +484,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     queue_query_log(
                         context,
                         &filter,
-                        &question.domain,
+                        &log_metadata,
                         client_addr,
+                        QueryResponseSource::Upstream,
                         false,
                         false,
                         true,
@@ -472,8 +525,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 queue_query_log(
                     context,
                     &filter,
-                    &question.domain,
+                    &log_metadata,
                     client_addr,
+                    QueryResponseSource::Upstream,
                     false,
                     true,
                     true,
@@ -486,8 +540,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 queue_query_log(
                     context,
                     &filter,
-                    &question.domain,
+                    &log_metadata,
                     client_addr,
+                    QueryResponseSource::Upstream,
                     false,
                     true,
                     false,
@@ -503,8 +558,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             queue_query_log(
                 context,
                 &filter,
-                &question.domain,
+                &log_metadata,
                 client_addr,
+                QueryResponseSource::Upstream,
                 false,
                 false,
                 true,
@@ -687,11 +743,13 @@ fn refresh_expired_cache_async(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_query_log(
     context: &DnsWorkerContext,
     filter: &FilterRuntime,
-    domain: &str,
+    metadata: &QueryLogMetadata<'_>,
     client_addr: SocketAddr,
+    response_source: QueryResponseSource,
     blocked: bool,
     forwarded: bool,
     failed: bool,
@@ -702,8 +760,9 @@ fn queue_query_log(
     queue_query_log_with_match(
         context,
         filter,
-        domain,
+        metadata,
         client_addr,
+        response_source,
         blocked,
         forwarded,
         failed,
@@ -717,7 +776,7 @@ fn queue_query_log(
 fn queue_blocked_query_log(
     context: &DnsWorkerContext,
     filter: &FilterRuntime,
-    domain: &str,
+    metadata: &QueryLogMetadata<'_>,
     client_addr: SocketAddr,
     failed: bool,
     error: Option<String>,
@@ -726,8 +785,9 @@ fn queue_blocked_query_log(
     queue_query_log_with_match(
         context,
         filter,
-        domain,
+        metadata,
         client_addr,
+        QueryResponseSource::Blocked,
         true,
         false,
         failed,
@@ -742,8 +802,9 @@ fn queue_blocked_query_log(
 fn queue_query_log_with_match(
     context: &DnsWorkerContext,
     filter: &FilterRuntime,
-    domain: &str,
+    metadata: &QueryLogMetadata<'_>,
     client_addr: SocketAddr,
+    response_source: QueryResponseSource,
     blocked: bool,
     forwarded: bool,
     failed: bool,
@@ -752,7 +813,7 @@ fn queue_query_log_with_match(
     error: Option<String>,
     rule_match: Option<&super::rules::BlockMatch>,
 ) {
-    if filter.log_ignore.contains(domain) {
+    if filter.log_ignore.contains(metadata.domain) {
         return;
     }
     let Some(sender) = &context.query_log_sender else {
@@ -760,7 +821,11 @@ fn queue_query_log_with_match(
     };
 
     let entry = QueryLogEntry {
-        domain: domain.to_string(),
+        domain: metadata.domain.to_string(),
+        query_type: metadata.query_type,
+        query_class: metadata.query_class,
+        transport: metadata.transport.to_string(),
+        response_source: response_source.as_str().to_string(),
         client_ip: Some(client_addr.ip().to_string()),
         blocked,
         forwarded,

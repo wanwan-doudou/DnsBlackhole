@@ -32,9 +32,13 @@ const INSERT_QUERY_LOG_SQL: &str = "
             rule_source,
             rule_type,
             important_overrode,
-            allowlist_rule
+            allowlist_rule,
+            query_type,
+            query_class,
+            transport,
+            response_source
         )
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
 
 const UPSERT_QUERY_LOG_MINUTE_STATS_SQL: &str = "
     INSERT INTO query_log_minute_stats
@@ -73,6 +77,10 @@ pub struct Database {
 #[derive(Debug, Clone)]
 pub struct QueryLogEntry {
     pub domain: String,
+    pub query_type: u16,
+    pub query_class: u16,
+    pub transport: String,
+    pub response_source: String,
     pub client_ip: Option<String>,
     pub blocked: bool,
     pub forwarded: bool,
@@ -92,6 +100,10 @@ pub struct QueryLogRecord {
     pub id: i64,
     pub timestamp: u64,
     pub domain: String,
+    pub query_type: Option<u16>,
+    pub query_class: Option<u16>,
+    pub transport: Option<String>,
+    pub response_source: Option<String>,
     pub client_ip: Option<String>,
     pub blocked: bool,
     pub forwarded: bool,
@@ -351,7 +363,11 @@ impl Database {
                 rule_source,
                 rule_type,
                 important_overrode,
-                allowlist_rule
+                allowlist_rule,
+                query_type,
+                query_class,
+                transport,
+                response_source
              FROM query_logs
              WHERE {where_sql}
              ORDER BY timestamp DESC, id DESC
@@ -478,6 +494,10 @@ fn execute_query_log_insert(
         entry.rule_type.as_deref(),
         bool_to_i64(entry.important_overrode),
         entry.allowlist_rule.as_deref(),
+        i64::from(entry.query_type),
+        i64::from(entry.query_class),
+        entry.transport.as_str(),
+        entry.response_source.as_str(),
     ])
     .map_err(|e| format!("写入查询日志失败：{e}"))?;
     Ok(())
@@ -547,6 +567,10 @@ fn read_query_log_record(row: &Row<'_>) -> rusqlite::Result<QueryLogRecord> {
         rule_type: row.get(12)?,
         important_overrode: row.get::<_, i64>(13)? != 0,
         allowlist_rule: row.get(14)?,
+        query_type: row.get(15)?,
+        query_class: row.get(16)?,
+        transport: row.get(17)?,
+        response_source: row.get(18)?,
     })
 }
 
@@ -577,7 +601,11 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             rule_source TEXT,
             rule_type TEXT,
             important_overrode INTEGER NOT NULL DEFAULT 0,
-            allowlist_rule TEXT
+            allowlist_rule TEXT,
+            query_type INTEGER,
+            query_class INTEGER,
+            transport TEXT,
+            response_source TEXT
         );
 
         CREATE TABLE IF NOT EXISTS query_log_minute_stats (
@@ -619,6 +647,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(conn, "query_logs", "allowlist_rule", "TEXT")?;
+    add_column_if_missing(conn, "query_logs", "query_type", "INTEGER")?;
+    add_column_if_missing(conn, "query_logs", "query_class", "INTEGER")?;
+    add_column_if_missing(conn, "query_logs", "transport", "TEXT")?;
+    add_column_if_missing(conn, "query_logs", "response_source", "TEXT")?;
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_query_logs_timestamp
@@ -983,6 +1015,10 @@ mod tests {
             (
                 QueryLogEntry {
                     domain: "ads.example.org".into(),
+                    query_type: 1,
+                    query_class: 1,
+                    transport: "udp".into(),
+                    response_source: "blocked".into(),
                     client_ip: Some("192.168.1.42".into()),
                     blocked: true,
                     forwarded: false,
@@ -1001,6 +1037,10 @@ mod tests {
             (
                 QueryLogEntry {
                     domain: "www.example.org".into(),
+                    query_type: 28,
+                    query_class: 1,
+                    transport: "tcp".into(),
+                    response_source: "upstream".into(),
                     client_ip: Some("192.168.1.43".into()),
                     blocked: false,
                     forwarded: true,
@@ -1036,6 +1076,10 @@ mod tests {
         assert_eq!(logs.total, 2);
         assert_eq!(logs.records.len(), 2);
         assert_eq!(logs.records[0].domain, "www.example.org");
+        assert_eq!(logs.records[0].query_type, Some(28));
+        assert_eq!(logs.records[0].query_class, Some(1));
+        assert_eq!(logs.records[0].transport.as_deref(), Some("tcp"));
+        assert_eq!(logs.records[0].response_source.as_deref(), Some("upstream"));
         assert_eq!(logs.records[0].client_ip.as_deref(), Some("192.168.1.0"));
 
         let blocked_logs = db
@@ -1091,9 +1135,25 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("upstream index should exist");
+        let query_type: String = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('query_logs') WHERE name = 'query_type'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query_type column should exist");
+        let response_source: String = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('query_logs') WHERE name = 'response_source'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("response_source column should exist");
 
         assert_eq!(upstream_server, "upstream_server");
         assert_eq!(upstream_index, "idx_query_logs_upstream_server");
+        assert_eq!(query_type, "query_type");
+        assert_eq!(response_source, "response_source");
     }
 
     #[test]

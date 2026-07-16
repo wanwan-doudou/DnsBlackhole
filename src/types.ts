@@ -138,6 +138,10 @@ export type QueryLogRecord = {
   id: number;
   timestamp: number;
   domain: string;
+  query_type: number | null;
+  query_class: number | null;
+  transport: "udp" | "tcp" | null;
+  response_source: "upstream" | "cache" | "rewrite" | "blocked" | "refused" | null;
   client_ip: string | null;
   blocked: boolean;
   forwarded: boolean;
