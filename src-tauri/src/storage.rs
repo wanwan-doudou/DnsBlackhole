@@ -112,11 +112,9 @@ pub fn storage_info(default_dir: &Path, current_data_dir: &Path) -> Result<Stora
     let database_bytes = database_files_size(current_data_dir)?;
     let filter_cache_bytes = directory_size(&current_data_dir.join(FILTERS_DIR))?;
     Ok(StorageInfo {
-        current_path: current_data_dir.to_string_lossy().into_owned(),
-        default_path: default_dir.to_string_lossy().into_owned(),
-        pending_path: locator
-            .pending_data_dir
-            .map(|path| path.to_string_lossy().into_owned()),
+        current_path: path_for_display(current_data_dir),
+        default_path: path_for_display(default_dir),
+        pending_path: locator.pending_data_dir.map(|path| path_for_display(&path)),
         migration_error: locator.last_migration_error,
         is_default: same_directory(default_dir, current_data_dir),
         database_bytes,
@@ -451,6 +449,20 @@ fn same_directory(left: &Path, right: &Path) -> bool {
     left == right
 }
 
+fn path_for_display(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(network_path) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{network_path}");
+        }
+        if let Some(local_path) = value.strip_prefix(r"\\?\") {
+            return local_path.to_string();
+        }
+    }
+    value.into_owned()
+}
+
 #[cfg(windows)]
 fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
     use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
@@ -573,5 +585,22 @@ mod tests {
         assert!(is_windows_network_path(Path::new(
             r"\\?\UNC\server\share\DnsBlackhole"
         )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hides_windows_verbatim_prefixes_from_display_paths() {
+        assert_eq!(
+            path_for_display(Path::new(r"\\?\D:\DnsBlackhole\data")),
+            r"D:\DnsBlackhole\data"
+        );
+        assert_eq!(
+            path_for_display(Path::new(r"\\?\UNC\server\share\data")),
+            r"\\server\share\data"
+        );
+        assert_eq!(
+            path_for_display(Path::new(r"D:\DnsBlackhole\data")),
+            r"D:\DnsBlackhole\data"
+        );
     }
 }
