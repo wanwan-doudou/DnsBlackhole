@@ -101,6 +101,10 @@ jobs:
       # beforeBuildCommand 会先执行 pnpm build 和 build-macos-service.sh（universal 分支）
       - name: Tauri 构建（universal）
         run: pnpm tauri build --target universal-apple-darwin --bundles app,dmg
+        env:
+          # 没有 Apple Developer 证书时仍需在生成 DMG 前完成 ad-hoc 签名，
+          # 否则 DMG 内的应用与后台服务会保持未签名状态
+          APPLE_SIGNING_IDENTITY: "-"
 
       - name: 校验双架构与签名
         run: |
