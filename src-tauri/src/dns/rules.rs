@@ -780,10 +780,7 @@ fn badfilter_target(line: &str) -> Option<String> {
     if remaining.is_empty() {
         Some(pattern.to_string())
     } else {
-        Some(format!(
-            "{pattern}${}",
-            remaining.join(",")
-        ))
+        Some(format!("{pattern}${}", remaining.join(",")))
     }
 }
 

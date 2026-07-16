@@ -449,13 +449,10 @@ async fn get_status(
 ) -> Result<RuntimeStatus, String> {
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        state.status_with_log_stats(
-            force.unwrap_or(false),
-            include_log_stats.unwrap_or(true),
-        )
+        state.status_with_log_stats(force.unwrap_or(false), include_log_stats.unwrap_or(true))
     })
-        .await
-        .map_err(|error| format!("获取状态失败：{error}"))
+    .await
+    .map_err(|error| format!("获取状态失败：{error}"))
 }
 
 #[tauri::command]
@@ -727,11 +724,10 @@ fn spawn_filter_auto_update(app: tauri::AppHandle, state: Arc<AppState>) {
                     backoff_until = 0;
                 }
                 _ => {
-                    backoff_seconds = (backoff_seconds * 2)
-                        .clamp(
-                            FILTER_AUTO_UPDATE_MIN_BACKOFF_SECONDS,
-                            FILTER_AUTO_UPDATE_MAX_BACKOFF_SECONDS,
-                        );
+                    backoff_seconds = (backoff_seconds * 2).clamp(
+                        FILTER_AUTO_UPDATE_MIN_BACKOFF_SECONDS,
+                        FILTER_AUTO_UPDATE_MAX_BACKOFF_SECONDS,
+                    );
                     backoff_until = now.saturating_add(backoff_seconds);
                 }
             }

@@ -87,8 +87,7 @@ impl RuntimeUpstream {
             && matches!(
                 server,
                 UpstreamServer::UdpHostname { .. } | UpstreamServer::Doh(_)
-            )
-        {
+            ) {
             current_second().saturating_add(UPSTREAM_FAILURE_BACKOFF_SECONDS)
         } else {
             0

@@ -167,9 +167,7 @@ pub(crate) fn build_block_response(
             policy.custom_ipv6,
             BLOCK_RESPONSE_TTL,
         ),
-        BlockingMode::Nxdomain => {
-            build_ip_response(query, question, RCODE_NXDOMAIN, None, None, 0)
-        }
+        BlockingMode::Nxdomain => build_ip_response(query, question, RCODE_NXDOMAIN, None, None, 0),
         BlockingMode::Refused => build_ip_response(query, question, RCODE_REFUSED, None, None, 0),
     }
 }

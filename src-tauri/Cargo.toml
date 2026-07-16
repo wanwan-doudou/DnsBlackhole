@@ -29,4 +29,4 @@ tauri-plugin-autostart = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
-winreg = "0.55"
+winreg = "0.56"
