@@ -1,5 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -7,9 +8,11 @@ import {
   clearDnsCache as clearDnsCacheCommand,
   clearFilterCache as clearFilterCacheCommand,
   getConfig,
+  getStorageInfo,
   getQueryLogs,
   getStatus,
   saveConfig as saveConfigCommand,
+  requestDataMigration,
   startDns,
   stopDns,
   updateFilters as updateFiltersCommand,
@@ -20,6 +23,7 @@ import { query } from "./dom";
 import {
   escapeHtml,
   formatCount,
+  formatBytes,
   formatDuration,
   formatElapsedMs,
   formatLogDate,
@@ -40,6 +44,7 @@ import type {
   RenderStatusOptions,
   RuntimeStatus,
   SecurityEvent,
+  StorageInfo,
   UpstreamLatencyStat,
   UpstreamMode,
   UpstreamRequestStat,
@@ -77,6 +82,8 @@ let queryLogSearchTimer: number | undefined;
 let queryLogSearchComposing = false;
 let currentConfigSchemaVersion = 2;
 let clientNameMap = new Map<string, string>();
+let currentStorageInfo: StorageInfo | null = null;
+let selectedDataStoragePath = "";
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const QUERY_LOG_PAGE_SIZE = 50;
@@ -142,6 +149,15 @@ const addFilterButton = query<HTMLButtonElement>("#add_filter_btn");
 const updateFiltersButton = query<HTMLButtonElement>("#update_filters_btn");
 const clearDnsCacheButton = query<HTMLButtonElement>("#clear_dns_cache_btn");
 const clearFilterCacheButton = query<HTMLButtonElement>("#clear_filter_cache_btn");
+const dataStoragePathInput = query<HTMLInputElement>("#data_storage_path");
+const dataStorageSizeElement = query<HTMLElement>("#data_storage_size");
+const dataStorageStateElement = query<HTMLElement>("#data_storage_state");
+const dataStoragePending = query<HTMLElement>("#data_storage_pending");
+const dataStoragePendingText = query<HTMLElement>("#data_storage_pending_text");
+const dataStorageError = query<HTMLElement>("#data_storage_error");
+const chooseDataStorageButton = query<HTMLButtonElement>("#choose_data_storage_btn");
+const resetDataStorageButton = query<HTMLButtonElement>("#reset_data_storage_btn");
+const migrateDataStorageButton = query<HTMLButtonElement>("#migrate_data_storage_btn");
 const appVersionElement = query<HTMLElement>("#app_version");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
 const installUpdateButton = query<HTMLButtonElement>("#install_update_btn");
@@ -449,6 +465,61 @@ clearFilterCacheButton.addEventListener("click", async () => {
   }
 });
 
+chooseDataStorageButton.addEventListener("click", async () => {
+  if (!currentStorageInfo) {
+    return;
+  }
+  try {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "选择 DnsBlackhole 数据存储目录",
+      defaultPath: currentStorageInfo.current_path,
+    });
+    if (typeof selected === "string") {
+      selectedDataStoragePath = selected;
+      renderStorageInfo(currentStorageInfo);
+    }
+  } catch (error) {
+    showMessage(`选择数据目录失败：${String(error)}`, true);
+  }
+});
+
+resetDataStorageButton.addEventListener("click", () => {
+  if (!currentStorageInfo) {
+    return;
+  }
+  selectedDataStoragePath = currentStorageInfo.default_path;
+  renderStorageInfo(currentStorageInfo);
+});
+
+migrateDataStorageButton.addEventListener("click", async () => {
+  if (!currentStorageInfo || !hasPendingStorageSelection()) {
+    return;
+  }
+  const targetPath = selectedDataStoragePath;
+  const confirmed = window.confirm(
+    `应用将重启并把数据库与过滤器缓存迁移到：\n${targetPath}\n\n目标数据验证成功后才会清理原目录。是否继续？`,
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  setBusy(true);
+  migrateDataStorageButton.classList.add("loading");
+  try {
+    await requestDataMigration(targetPath);
+    showMessage("迁移任务已保存，正在重启应用…", false);
+    await relaunch();
+  } catch (error) {
+    showMessage(String(error), true);
+    await loadStorageInfo();
+  } finally {
+    migrateDataStorageButton.classList.remove("loading");
+    setBusy(false);
+  }
+});
+
 checkUpdateButton.addEventListener("click", async () => {
   checkUpdateButton.disabled = true;
   checkUpdateButton.classList.add("loading");
@@ -575,6 +646,7 @@ void getVersion().then((version) => {
 });
 
 await loadConfig();
+await loadStorageInfo();
 void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
   syncFilterUpdateMetadata(payload);
 }).catch((error) => {
@@ -656,6 +728,47 @@ async function loadConfig(): Promise<void> {
   } catch (error) {
     showMessage(String(error), true);
   }
+}
+
+async function loadStorageInfo(): Promise<void> {
+  try {
+    currentStorageInfo = await getStorageInfo();
+    selectedDataStoragePath = currentStorageInfo.pending_path ?? currentStorageInfo.current_path;
+    renderStorageInfo(currentStorageInfo);
+  } catch (error) {
+    dataStorageError.textContent = String(error);
+    dataStorageError.classList.remove("hidden");
+  }
+}
+
+function renderStorageInfo(info: StorageInfo): void {
+  const displayPath = selectedDataStoragePath || info.current_path;
+  dataStoragePathInput.value = displayPath;
+  dataStorageSizeElement.textContent = `当前占用 ${formatBytes(info.total_bytes)}（数据库 ${formatBytes(info.database_bytes)}，过滤器缓存 ${formatBytes(info.filter_cache_bytes)}）`;
+  dataStorageStateElement.textContent = info.is_default ? "默认目录" : "自定义目录";
+  dataStorageStateElement.classList.toggle("custom", !info.is_default);
+
+  const pending = hasPendingStorageSelection();
+  dataStoragePending.classList.toggle("hidden", !pending);
+  dataStoragePendingText.textContent = pending
+    ? `重启后迁移到：${displayPath}`
+    : "";
+  migrateDataStorageButton.disabled = !pending;
+  resetDataStorageButton.disabled = info.is_default && !pending;
+
+  dataStorageError.textContent = info.migration_error ?? "";
+  dataStorageError.classList.toggle("hidden", !info.migration_error);
+}
+
+function hasPendingStorageSelection(): boolean {
+  if (!currentStorageInfo || !selectedDataStoragePath) {
+    return false;
+  }
+  return normalizePath(selectedDataStoragePath) !== normalizePath(currentStorageInfo.current_path);
+}
+
+function normalizePath(value: string): string {
+  return value.replace(/[\\/]+$/, "").toLocaleLowerCase();
 }
 
 async function saveConfig(): Promise<void> {
@@ -1788,6 +1901,9 @@ function toggleEditing(current: Set<string>, id: string): Set<string> {
 function setBusy(busy: boolean): void {
   for (const button of document.querySelectorAll<HTMLButtonElement>("button")) {
     button.disabled = busy;
+  }
+  if (!busy && currentStorageInfo) {
+    renderStorageInfo(currentStorageInfo);
   }
 }
 

@@ -7,6 +7,7 @@ import type {
   QueryLogFilter,
   QueryLogPage,
   RuntimeStatus,
+  StorageInfo,
 } from "./types";
 
 type QueryLogRequest = {
@@ -50,4 +51,12 @@ export function clearDnsCache(): Promise<RuntimeStatus> {
 
 export function clearFilterCache(): Promise<FilterCacheClearResult> {
   return invoke<FilterCacheClearResult>("clear_filter_cache");
+}
+
+export function getStorageInfo(): Promise<StorageInfo> {
+  return invoke<StorageInfo>("get_storage_info");
+}
+
+export function requestDataMigration(targetPath: string): Promise<StorageInfo> {
+  return invoke<StorageInfo>("request_data_migration", { targetPath });
 }

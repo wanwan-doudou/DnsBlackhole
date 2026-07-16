@@ -178,6 +178,17 @@ export type FilterCacheClearResult = {
   message: string;
 };
 
+export type StorageInfo = {
+  current_path: string;
+  default_path: string;
+  pending_path: string | null;
+  migration_error: string | null;
+  is_default: boolean;
+  database_bytes: number;
+  filter_cache_bytes: number;
+  total_bytes: number;
+};
+
 export type RefreshOptions = {
   auto?: boolean;
   button?: HTMLButtonElement;

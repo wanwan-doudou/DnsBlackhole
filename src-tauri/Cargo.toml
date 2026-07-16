@@ -19,10 +19,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.6"
 reqwest = { version = "0.13", features = ["blocking"] }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-autostart = "2"

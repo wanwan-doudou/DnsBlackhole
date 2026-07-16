@@ -959,15 +959,8 @@ fn config_path(app: &AppHandle) -> Option<PathBuf> {
         .map(|dir| dir.join("config.json"))
 }
 
-fn filters_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_config_dir()
-        .map(|dir| dir.join("filters"))
-        .map_err(|_| "无法获取配置目录".to_string())
-}
-
-fn filter_cache_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
-    Ok(filters_dir(app)?.join(format!("{id}.txt")))
+fn filter_cache_path(data_dir: &Path, id: &str) -> PathBuf {
+    crate::storage::filters_dir(data_dir).join(format!("{id}.txt"))
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -1078,8 +1071,8 @@ pub fn load(app: &AppHandle) -> Result<AppConfig, String> {
     }
 }
 
-pub fn read_filter_cache(app: &AppHandle, id: &str) -> Result<Option<String>, String> {
-    let path = filter_cache_path(app, id)?;
+pub fn read_filter_cache(data_dir: &Path, id: &str) -> Result<Option<String>, String> {
+    let path = filter_cache_path(data_dir, id);
     if !path.exists() {
         return Ok(None);
     }
@@ -1088,10 +1081,10 @@ pub fn read_filter_cache(app: &AppHandle, id: &str) -> Result<Option<String>, St
         .map_err(|e| format!("读取清单缓存失败：{}：{e}", path.display()))
 }
 
-pub fn write_filter_cache(app: &AppHandle, id: &str, content: &str) -> Result<(), String> {
-    let dir = filters_dir(app)?;
+pub fn write_filter_cache(data_dir: &Path, id: &str, content: &str) -> Result<(), String> {
+    let dir = crate::storage::filters_dir(data_dir);
     fs::create_dir_all(&dir).map_err(|e| format!("创建清单缓存目录失败：{e}"))?;
-    let path = filter_cache_path(app, id)?;
+    let path = filter_cache_path(data_dir, id);
     write_file_atomically(&dir, &path, content.as_bytes())
         .map_err(|e| format!("写入清单缓存失败：{}：{e}", path.display()))
 }
@@ -1165,10 +1158,10 @@ fn sync_directory(dir: &Path) {
 }
 
 pub fn clear_filter_cache(
-    app: &AppHandle,
+    data_dir: &Path,
     config: &mut AppConfig,
 ) -> Result<FilterCacheClearStats, String> {
-    let dir = filters_dir(app)?;
+    let dir = crate::storage::filters_dir(data_dir);
     let stats = clear_filter_cache_dir(&dir)?;
 
     for filter in &mut config.filters {
@@ -1214,7 +1207,7 @@ fn clear_filter_cache_dir(dir: &Path) -> Result<FilterCacheClearStats, String> {
     Ok(stats)
 }
 
-pub fn build_effective_rules(app: &AppHandle, config: &AppConfig) -> String {
+pub fn build_effective_rules(data_dir: &Path, config: &AppConfig) -> String {
     if !config.use_filters {
         return String::new();
     }
@@ -1225,7 +1218,7 @@ pub fn build_effective_rules(app: &AppHandle, config: &AppConfig) -> String {
         if !filter.enabled {
             continue;
         }
-        if let Ok(Some(content)) = read_filter_cache(app, &filter.id) {
+        if let Ok(Some(content)) = read_filter_cache(data_dir, &filter.id) {
             let source =
                 serde_json::to_string(&filter.name).unwrap_or_else(|_| "\"未知清单\"".into());
             if !rules.is_empty() {

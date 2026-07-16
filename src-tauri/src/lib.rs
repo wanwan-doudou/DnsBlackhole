@@ -2,10 +2,12 @@ mod config;
 mod database;
 mod dns;
 mod filters;
+mod storage;
 mod tray;
 
 use std::{
     io,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -18,6 +20,7 @@ use dns::{
 };
 use filters::FilterUpdateReport;
 use serde::Serialize;
+use storage::StorageInfo;
 use tauri::{Emitter, Manager, WindowEvent};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri_plugin_autostart::MacosLauncher;
@@ -39,6 +42,8 @@ struct AppState {
     effective_summary: Mutex<RuleSummary>,
     stats: Arc<Mutex<DnsStats>>,
     database: Arc<Database>,
+    default_data_dir: PathBuf,
+    data_dir: PathBuf,
     log_stats_cache: Mutex<Option<CachedLogStats>>,
     last_prune_at: Mutex<u64>,
     last_error: Mutex<Option<String>>,
@@ -72,7 +77,12 @@ struct FilterCacheClearResult {
 }
 
 impl AppState {
-    fn new(config: AppConfig, database: Arc<Database>) -> Self {
+    fn new(
+        config: AppConfig,
+        database: Arc<Database>,
+        default_data_dir: PathBuf,
+        data_dir: PathBuf,
+    ) -> Self {
         let effective_summary = configured_rule_summary(&config);
         Self {
             config: Mutex::new(config),
@@ -80,6 +90,8 @@ impl AppState {
             effective_summary: Mutex::new(effective_summary),
             stats: Arc::new(Mutex::new(DnsStats::default())),
             database,
+            default_data_dir,
+            data_dir,
             log_stats_cache: Mutex::new(None),
             last_prune_at: Mutex::new(0),
             last_error: Mutex::new(None),
@@ -396,6 +408,23 @@ fn get_config(state: tauri::State<'_, Arc<AppState>>) -> Result<AppConfig, Strin
 }
 
 #[tauri::command]
+fn get_storage_info(state: tauri::State<'_, Arc<AppState>>) -> Result<StorageInfo, String> {
+    storage::storage_info(&state.default_data_dir, &state.data_dir)
+}
+
+#[tauri::command]
+fn request_data_migration(
+    state: tauri::State<'_, Arc<AppState>>,
+    target_path: String,
+) -> Result<StorageInfo, String> {
+    let target_path = Path::new(target_path.trim());
+    if target_path.as_os_str().is_empty() {
+        return Err("请选择新的数据存储目录".to_string());
+    }
+    storage::request_migration(&state.default_data_dir, &state.data_dir, target_path)
+}
+
+#[tauri::command]
 async fn save_config(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
@@ -434,7 +463,7 @@ fn save_config_blocking(
         }
         state.set_error(None);
     } else if filter_changed || start_required {
-        let rules_text = config::build_effective_rules(&app, &config);
+        let rules_text = config::build_effective_rules(&state.data_dir, &config);
         if let Err(error) = state.apply_config_change(&previous, &config, &rules_text) {
             state.set_error(Some(error.clone()));
             return Err(error);
@@ -517,7 +546,7 @@ fn update_filters_blocking(
         .map_err(|_| "清单更新任务状态异常".to_string())?;
     config::migrate_legacy_defaults(&mut config);
     config.validate()?;
-    let report = filters::update_enabled_filters(&app, &mut config)?;
+    let report = filters::update_enabled_filters(&state.data_dir, &mut config)?;
     let _runtime_guard = state
         .runtime_update_lock
         .lock()
@@ -527,7 +556,7 @@ fn update_filters_blocking(
     state.replace_config(config.clone())?;
 
     if config.enabled {
-        let rules_text = config::build_effective_rules(&app, &config);
+        let rules_text = config::build_effective_rules(&state.data_dir, &config);
         state
             .apply_config_change(&previous, &config, &rules_text)
             .inspect_err(|error| {
@@ -549,20 +578,14 @@ fn update_filters_blocking(
 }
 
 #[tauri::command]
-async fn start_dns(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<RuntimeStatus, String> {
+async fn start_dns(state: tauri::State<'_, Arc<AppState>>) -> Result<RuntimeStatus, String> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || start_dns_blocking(app, state))
+    tauri::async_runtime::spawn_blocking(move || start_dns_blocking(state))
         .await
         .map_err(|error| format!("启动 DNS 服务任务异常：{error}"))?
 }
 
-fn start_dns_blocking(
-    app: tauri::AppHandle,
-    state: Arc<AppState>,
-) -> Result<RuntimeStatus, String> {
+fn start_dns_blocking(state: Arc<AppState>) -> Result<RuntimeStatus, String> {
     let _runtime_guard = state
         .runtime_update_lock
         .lock()
@@ -573,7 +596,7 @@ fn start_dns_blocking(
     config.validate()?;
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
-    let rules_text = config::build_effective_rules(&app, &config);
+    let rules_text = config::build_effective_rules(&state.data_dir, &config);
     state.start_current(&rules_text).inspect_err(|error| {
         state.set_error(Some(error.clone()));
     })?;
@@ -619,31 +642,27 @@ fn clear_dns_cache(state: tauri::State<'_, Arc<AppState>>) -> Result<RuntimeStat
 
 #[tauri::command]
 async fn clear_filter_cache(
-    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<FilterCacheClearResult, String> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || clear_filter_cache_blocking(app, state))
+    tauri::async_runtime::spawn_blocking(move || clear_filter_cache_blocking(state))
         .await
         .map_err(|error| format!("清理过滤器缓存任务异常：{error}"))?
 }
 
-fn clear_filter_cache_blocking(
-    app: tauri::AppHandle,
-    state: Arc<AppState>,
-) -> Result<FilterCacheClearResult, String> {
+fn clear_filter_cache_blocking(state: Arc<AppState>) -> Result<FilterCacheClearResult, String> {
     let _runtime_guard = state
         .runtime_update_lock
         .lock()
         .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
     let previous = state.current_config()?;
     let mut config = previous.clone();
-    let stats = config::clear_filter_cache(&app, &mut config)?;
+    let stats = config::clear_filter_cache(&state.data_dir, &mut config)?;
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
 
     if config.enabled {
-        let rules_text = config::build_effective_rules(&app, &config);
+        let rules_text = config::build_effective_rules(&state.data_dir, &config);
         state
             .apply_config_change(&previous, &config, &rules_text)
             .inspect_err(|error| {
@@ -741,7 +760,7 @@ fn spawn_filter_auto_update(app: tauri::AppHandle, state: Arc<AppState>) {
     });
 }
 
-fn spawn_runtime_watchdog(app: tauri::AppHandle, state: Arc<AppState>) {
+fn spawn_runtime_watchdog(state: Arc<AppState>) {
     thread::spawn(move || {
         loop {
             let interval = state
@@ -775,7 +794,7 @@ fn spawn_runtime_watchdog(app: tauri::AppHandle, state: Arc<AppState>) {
 
             if should_restart {
                 // 规则文本不常驻内存，自恢复时从磁盘清单缓存重建
-                let rules_text = config::build_effective_rules(&app, &config);
+                let rules_text = config::build_effective_rules(&state.data_dir, &config);
                 if let Err(error) = state.start_current(&rules_text) {
                     state.set_error(Some(format!("DNS 自恢复重启失败：{error}")));
                 }
@@ -784,7 +803,7 @@ fn spawn_runtime_watchdog(app: tauri::AppHandle, state: Arc<AppState>) {
     });
 }
 
-fn spawn_initial_runtime(app: tauri::AppHandle, state: Arc<AppState>) {
+fn spawn_initial_runtime(state: Arc<AppState>) {
     thread::spawn(move || {
         let _runtime_guard = match state.runtime_update_lock.lock() {
             Ok(guard) => guard,
@@ -804,7 +823,7 @@ fn spawn_initial_runtime(app: tauri::AppHandle, state: Arc<AppState>) {
             return;
         }
 
-        let rules_text = config::build_effective_rules(&app, &config);
+        let rules_text = config::build_effective_rules(&state.data_dir, &config);
         if let Err(error) = state.start_current(&rules_text) {
             eprintln!("DNS 服务启动失败：{error}");
             state.set_error(Some(error));
@@ -914,6 +933,7 @@ fn unix_now() -> u64 {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main_window(app);
         }))
@@ -922,6 +942,8 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             get_config,
+            get_storage_info,
+            request_data_migration,
             save_config,
             get_status,
             get_query_logs,
@@ -946,10 +968,16 @@ pub fn run() {
             }
 
             tray::create(app.handle())?;
+            let storage = storage::initialize(app.handle())
+                .map_err(|error| io::Error::other(format!("数据目录初始化失败：{error}")))?;
             let database = Arc::new(
-                Database::open(app.handle())
+                Database::open(&storage.data_dir)
                     .map_err(|error| io::Error::other(format!("数据库初始化失败：{error}")))?,
             );
+            let cleanup_error =
+                storage::finish_pending_cleanup(&storage.default_dir, &storage.data_dir)
+                    .inspect_err(|error| eprintln!("迁移后清理原数据失败：{error}"))
+                    .err();
             let config = match database.load_or_migrate_config(app.handle()) {
                 Ok(config) => config,
                 Err(error) => {
@@ -960,16 +988,25 @@ pub fn run() {
             let autostart_error = apply_autostart_config(app.handle(), config.launch_at_startup)
                 .inspect_err(|error| eprintln!("{error}"))
                 .err();
-            let state = Arc::new(AppState::new(config, database));
-            if let Some(error) = autostart_error {
+            let state = Arc::new(AppState::new(
+                config,
+                database,
+                storage.default_dir,
+                storage.data_dir,
+            ));
+            let startup_error = storage
+                .migration_error
+                .or(cleanup_error.map(|error| format!("迁移后清理原数据失败：{error}")))
+                .or(autostart_error);
+            if let Some(error) = startup_error {
                 state.set_error(Some(error));
             }
             let watchdog_state = Arc::clone(&state);
             let auto_update_state = Arc::clone(&state);
             let initial_runtime_state = Arc::clone(&state);
             app.manage(state);
-            spawn_initial_runtime(app.handle().clone(), initial_runtime_state);
-            spawn_runtime_watchdog(app.handle().clone(), watchdog_state);
+            spawn_initial_runtime(initial_runtime_state);
+            spawn_runtime_watchdog(watchdog_state);
             spawn_filter_auto_update(app.handle().clone(), auto_update_state);
             Ok(())
         })
@@ -1048,7 +1085,8 @@ mod tests {
             ..AppConfig::default()
         };
         let database = Arc::new(Database::open_in_memory().unwrap());
-        let state = AppState::new(previous.clone(), database);
+        let data_dir = std::env::temp_dir();
+        let state = AppState::new(previous.clone(), database, data_dir.clone(), data_dir);
         state.start_current("").unwrap();
 
         let mut next = previous.clone();

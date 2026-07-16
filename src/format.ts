@@ -29,6 +29,18 @@ export function formatElapsedMs(value: number): string {
   return `${formatted} 毫秒`;
 }
 
+export function formatBytes(value: number): string {
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let size = Math.max(0, value);
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 ? 0 : size >= 100 ? 0 : size >= 10 ? 1 : 2;
+  return `${size.toFixed(digits)} ${units[unit]}`;
+}
+
 export function formatRate(blocked: number, queries: number): string {
   if (queries === 0) {
     return "0%";

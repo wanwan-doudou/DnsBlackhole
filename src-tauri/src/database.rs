@@ -2,14 +2,14 @@ use std::{
     collections::HashMap,
     fs,
     net::IpAddr,
-    path::PathBuf,
+    path::Path,
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params, params};
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::{
     config::{self, AppConfig},
@@ -143,8 +143,8 @@ pub struct LogStats {
 }
 
 impl Database {
-    pub fn open(app: &AppHandle) -> Result<Self, String> {
-        let path = database_path(app)?;
+    pub fn open(data_dir: &Path) -> Result<Self, String> {
+        let path = crate::storage::database_path(data_dir);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("创建数据库目录失败：{e}"))?;
         }
@@ -935,13 +935,6 @@ fn upstream_avg_latency(
         stats.push(row.map_err(|e| format!("解析上游响应时间排行失败：{e}"))?);
     }
     Ok(stats)
-}
-
-fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_config_dir()
-        .map(|dir| dir.join("dnsblackhole.sqlite3"))
-        .map_err(|_| "无法获取数据库目录".to_string())
 }
 
 fn unix_now() -> u64 {

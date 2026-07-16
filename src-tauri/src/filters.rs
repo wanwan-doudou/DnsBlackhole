@@ -1,11 +1,11 @@
 use std::{
     io::Read,
+    path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use serde::Serialize;
-use tauri::AppHandle;
 
 use crate::{
     config::{self, AppConfig},
@@ -23,7 +23,7 @@ pub struct FilterUpdateReport {
 }
 
 pub fn update_enabled_filters(
-    app: &AppHandle,
+    data_dir: &Path,
     config: &mut AppConfig,
 ) -> Result<FilterUpdateReport, String> {
     let client = reqwest::blocking::Client::builder()
@@ -44,7 +44,7 @@ pub fn update_enabled_filters(
         match download_filter(&client, &filter.url, config.filter_max_size_mb) {
             Ok(content) => {
                 let summary = dns::summarize_rules(&content);
-                if let Err(error) = config::write_filter_cache(app, &filter.id, &content) {
+                if let Err(error) = config::write_filter_cache(data_dir, &filter.id, &content) {
                     filter.last_error = Some(error.clone());
                     messages.push(format!("{}：{error}", filter.name));
                     failed += 1;

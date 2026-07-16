@@ -538,6 +538,29 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
+            <section class="settings-section data-storage-section">
+              <div class="section-heading">
+                <h3>数据存储</h3>
+                <span>查询日志、统计数据库和过滤器缓存会保存在此目录。迁移在重启后执行，失败时继续使用原目录。</span>
+              </div>
+              <div class="data-storage-path-row">
+                <input id="data_storage_path" type="text" readonly aria-label="数据存储路径" />
+                <div class="button-group data-storage-actions">
+                  <button id="choose_data_storage_btn" type="button">选择目录</button>
+                  <button id="reset_data_storage_btn" type="button">恢复默认</button>
+                </div>
+              </div>
+              <div class="data-storage-meta">
+                <span id="data_storage_size">正在读取占用空间…</span>
+                <span id="data_storage_state"></span>
+              </div>
+              <div class="data-storage-pending hidden" id="data_storage_pending">
+                <span id="data_storage_pending_text"></span>
+                <button class="primary" id="migrate_data_storage_btn" type="button">迁移并重启</button>
+              </div>
+              <div class="data-storage-error hidden" id="data_storage_error"></div>
+            </section>
+
             <section class="settings-section cache-maintenance-section">
               <div>
                 <h3>磁盘缓存</h3>

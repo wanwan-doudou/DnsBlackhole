@@ -1325,6 +1325,84 @@ button.refreshing:disabled {
   flex: 0 0 auto;
 }
 
+.data-storage-section .section-heading {
+  margin-bottom: 12px;
+}
+
+.data-storage-path-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.data-storage-path-row>input {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 38px;
+  border: 1px solid #d8e1ea;
+  border-radius: 4px;
+  padding: 0 11px;
+  background: #f8fafc;
+  color: #536274;
+  font-size: 13px;
+}
+
+.data-storage-actions {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
+
+.data-storage-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  color: #7a8999;
+  font-size: 12px;
+}
+
+#data_storage_state {
+  flex: 0 0 auto;
+  color: #659574;
+}
+
+#data_storage_state.custom {
+  color: #527fa9;
+}
+
+.data-storage-pending {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 12px;
+  border: 1px solid #d7e8dc;
+  border-radius: 5px;
+  padding: 10px 12px;
+  background: #f4faf6;
+  color: #4e6957;
+  font-size: 12.5px;
+}
+
+.data-storage-pending>span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.data-storage-pending button {
+  flex: 0 0 auto;
+}
+
+.data-storage-error {
+  margin-top: 10px;
+  border-left: 3px solid #d97757;
+  padding: 8px 10px;
+  background: #fff7f3;
+  color: #9a4f37;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
 .check-row,
 .radio-row {
   display: flex;

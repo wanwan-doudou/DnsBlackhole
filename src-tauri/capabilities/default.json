@@ -16,6 +16,7 @@
           "url": "https://github.com/wanwan-doudou/DnsBlackhole/releases*"
         }
       ]
-    }
+    },
+    "dialog:default"
   ]
 }
