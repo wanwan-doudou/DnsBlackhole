@@ -4,6 +4,7 @@ version = "0.1.32"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"
+default-run = "dnsblackhole"
 
 [lib]
 name = "dnsblackhole_lib"
@@ -37,6 +38,10 @@ objc2-service-management = { version = "0.3.2", features = ["objc2", "objc2-foun
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 winreg = "0.56"
+
+[[bin]]
+name = "dnsblackhole"
+path = "src/main.rs"
 
 [[bin]]
 name = "dnsblackhole-service"

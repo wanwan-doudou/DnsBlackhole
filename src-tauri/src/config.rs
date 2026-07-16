@@ -10,6 +10,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "macos"))]
 use tauri::{AppHandle, Manager};
 
 pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 7;
@@ -952,6 +953,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_be_bytes([first, second]))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn config_path(app: &AppHandle) -> Option<PathBuf> {
     app.path()
         .app_config_dir()
@@ -963,10 +965,12 @@ fn filter_cache_path(data_dir: &Path, id: &str) -> PathBuf {
     crate::storage::filters_dir(data_dir).join(format!("{id}.txt"))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name("config.json.bak")
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_config_file(path: &Path) -> Result<AppConfig, String> {
     let raw = fs::read_to_string(path)
         .map_err(|e| format!("读取配置文件失败：{}：{e}", path.display()))?;
@@ -1047,6 +1051,7 @@ fn uses_insecure_http_endpoint(config: &AppConfig) -> bool {
             .any(|filter| filter.url.trim().starts_with("http://"))
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn load(app: &AppHandle) -> Result<AppConfig, String> {
     let Some(path) = config_path(app) else {
         return Err("无法获取配置目录".into());

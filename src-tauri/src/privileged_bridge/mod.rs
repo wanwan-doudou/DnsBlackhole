@@ -1,7 +1,4 @@
-use std::{
-    io::{Read, Write},
-    net::SocketAddr,
-};
+use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -13,7 +10,7 @@ mod daemon;
 mod service_management;
 
 #[cfg(target_os = "macos")]
-pub(crate) use client::{BridgeResponder, PrivilegedBridge};
+pub(crate) use client::ServiceClient;
 #[cfg(target_os = "macos")]
 pub use daemon::run_daemon;
 #[cfg(target_os = "macos")]
@@ -22,9 +19,11 @@ pub(crate) use service_management::{
     macos_service_uninstall,
 };
 
-pub const BRIDGE_PROTOCOL_VERSION: u16 = 1;
+// 协议 2：控制面 RPC。DNS 引擎完整运行在 root 后台服务内，
+// GUI 只通过本协议做配置、状态查询和日志读取，不再转发 DNS 查询。
+pub const BRIDGE_PROTOCOL_VERSION: u16 = 2;
 pub const BRIDGE_SOCKET_PATH: &str = "/var/run/dnsblackhole/service.sock";
-// DNS 报文最大 64KB，serde_json 将字节编码为数字数组最坏膨胀约 4 倍，再留出消息结构开销
+// 单帧上限：查询日志分页（最多 200 条记录）与统计快照都远小于该值
 const MAX_FRAME_SIZE: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,53 +45,33 @@ pub enum MacosServiceState {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BridgeTransport {
-    Udp,
-    Tcp,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RpcRequest {
+    pub id: u64,
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMessage {
-    Hello {
-        protocol_version: u16,
-        app_version: String,
-    },
-    Configure {
-        request_id: u64,
-        listen_addrs: Vec<SocketAddr>,
-    },
-    Stop {
-        request_id: u64,
-    },
-    Response {
-        request_id: u64,
-        response: Option<Vec<u8>>,
-    },
-    Ping {
-        request_id: u64,
-    },
+pub struct RpcResponse {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServiceMessage {
-    Hello {
-        protocol_version: u16,
-        service_version: String,
-    },
-    Result {
-        request_id: u64,
-        error: Option<String>,
-    },
-    Query {
-        request_id: u64,
-        transport: BridgeTransport,
-        client_addr: SocketAddr,
-        query: Vec<u8>,
-    },
+pub struct HelloParams {
+    pub protocol_version: u16,
+    pub app_version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HelloResult {
+    pub protocol_version: u16,
+    pub service_version: String,
 }
 
 pub fn write_message<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<(), String> {
@@ -131,23 +110,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bridge_message_round_trip() {
-        let message = ClientMessage::Configure {
-            request_id: 7,
-            listen_addrs: vec!["127.0.0.1:53".parse().unwrap()],
+    fn rpc_message_round_trip() {
+        let request = RpcRequest {
+            id: 7,
+            method: "get_status".to_string(),
+            params: serde_json::json!({ "force": true }),
         };
         let mut encoded = Vec::new();
-        write_message(&mut encoded, &message).expect("消息应可编码");
-        let decoded: ClientMessage = read_message(&mut encoded.as_slice()).expect("消息应可解码");
-        match decoded {
-            ClientMessage::Configure {
-                request_id,
-                listen_addrs,
-            } => {
-                assert_eq!(request_id, 7);
-                assert_eq!(listen_addrs, vec!["127.0.0.1:53".parse().unwrap()]);
-            }
-            _ => panic!("消息类型错误"),
-        }
+        write_message(&mut encoded, &request).expect("请求应可编码");
+        let decoded: RpcRequest = read_message(&mut encoded.as_slice()).expect("请求应可解码");
+        assert_eq!(decoded.id, 7);
+        assert_eq!(decoded.method, "get_status");
+        assert_eq!(decoded.params["force"], true);
+
+        let response = RpcResponse {
+            id: 7,
+            result: Some(serde_json::json!({ "running": true })),
+            error: None,
+        };
+        let mut encoded = Vec::new();
+        write_message(&mut encoded, &response).expect("响应应可编码");
+        let decoded: RpcResponse = read_message(&mut encoded.as_slice()).expect("响应应可解码");
+        assert_eq!(decoded.id, 7);
+        assert!(decoded.error.is_none());
+        assert_eq!(decoded.result.expect("应有结果")["running"], true);
     }
 }

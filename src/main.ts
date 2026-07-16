@@ -629,6 +629,7 @@ installMacosServiceButton.addEventListener("click", async () => {
       showMessage("请在“系统设置 → 通用 → 登录项与扩展”中批准 DnsBlackhole 后台服务", false);
     } else if (status.enabled) {
       showMessage("macOS DNS 后台服务已启用", false);
+      await refreshAfterMacosServiceEnabled();
     }
   } catch (error) {
     showMessage(String(error), true);
@@ -837,11 +838,24 @@ async function loadMacosServiceStatus(): Promise<void> {
   }
   macosServiceSection.classList.remove("hidden");
   try {
-    renderMacosServiceStatus(await getMacosServiceStatus());
+    const wasEnabled = currentMacosServiceStatus?.enabled ?? false;
+    const status = await getMacosServiceStatus();
+    renderMacosServiceStatus(status);
+    if (status.enabled && !wasEnabled) {
+      await refreshAfterMacosServiceEnabled();
+    }
   } catch (error) {
     currentMacosServiceStatus = null;
     macosServiceStatusElement.textContent = `读取后台服务状态失败：${String(error)}`;
   }
+}
+
+async function refreshAfterMacosServiceEnabled(): Promise<void> {
+  // LaunchDaemon 注册成功后 socket 可能稍晚创建，短暂等待再同步完整状态。
+  await new Promise((resolve) => window.setTimeout(resolve, 400));
+  await loadConfig();
+  await loadStorageInfo();
+  await refreshStatus();
 }
 
 function renderMacosServiceStatus(status: MacosServiceStatus): void {

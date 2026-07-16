@@ -1,64 +1,79 @@
 use std::{
-    collections::HashMap,
     fs,
-    io::{Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
-    os::unix::{
-        fs::{MetadataExt, PermissionsExt},
-        io::AsRawFd,
-        net::{UnixListener, UnixStream},
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{MetadataExt, PermissionsExt},
+            net::{UnixListener, UnixStream},
+        },
     },
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc,
+        Arc,
+        atomic::{AtomicBool, Ordering},
     },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    thread,
+    time::Duration,
 };
 
-use socket2::{Domain, Protocol, Socket, Type};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+
+use crate::{
+    config::AppConfig,
+    database::Database,
+    service_core::{
+        AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, query_logs_blocking,
+        save_config_blocking, spawn_filter_auto_update, spawn_initial_runtime,
+        spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking, update_filters_blocking,
+    },
+    storage,
+};
 
 use super::{
-    BRIDGE_PROTOCOL_VERSION, BRIDGE_SOCKET_PATH, BridgeTransport, ClientMessage, ServiceMessage,
+    BRIDGE_PROTOCOL_VERSION, BRIDGE_SOCKET_PATH, HelloParams, HelloResult, RpcRequest, RpcResponse,
     read_message, write_message,
 };
 
-const DNS_PACKET_SIZE: usize = 65_535;
-const IO_TIMEOUT: Duration = Duration::from_millis(500);
+const SYSTEM_DATA_DIR: &str = "/Library/Application Support/DnsBlackhole";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const TCP_MAX_CONNECTIONS: usize = 256;
-// 等待 GUI 响应的查询上限：超过说明 GUI 处理不过来，直接丢弃新请求让客户端重试
-const MAX_PENDING_QUERIES: usize = 4096;
-const PENDING_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
-// 特权 daemon 只服务 DNS：低位端口仅允许 53，防止本机进程借 root 绑定任意特权端口
-const ALLOWED_PRIVILEGED_PORT: u16 = 53;
-const MAX_LISTEN_ADDRS: usize = 16;
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-// UDP 响应由 IPC 读循环直接回写 socket，TCP 响应交还给各自的连接线程
-enum PendingTarget {
-    Udp {
-        socket: Arc<UdpSocket>,
-        client_addr: SocketAddr,
-    },
-    Tcp(mpsc::SyncSender<Option<Vec<u8>>>),
+#[derive(Debug, Deserialize)]
+struct StatusParams {
+    #[serde(default)]
+    force_log_stats: bool,
+    #[serde(default = "default_true")]
+    include_log_stats: bool,
 }
 
-struct PendingEntry {
-    target: PendingTarget,
-    created: Instant,
+#[derive(Debug, Deserialize)]
+struct QueryLogsParams {
+    filter: Option<String>,
+    search: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
 }
 
-type PendingResponses = Arc<Mutex<HashMap<u64, PendingEntry>>>;
-type SharedWriter = Arc<Mutex<UnixStream>>;
+#[derive(Debug, Deserialize)]
+struct ConfigParams {
+    config: AppConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct MigrationParams {
+    target_path: String,
+}
 
 pub fn run_daemon() -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
-        return Err("dnsblackhole-service 必须由 macOS LaunchDaemon 以 root 身份运行".to_string());
+        return Err("macOS DNS 后台服务必须以 root 身份运行".to_string());
     }
+
+    let state = initialize_state()?;
+    spawn_initial_runtime(Arc::clone(&state));
+    spawn_runtime_watchdog(Arc::clone(&state));
+    spawn_filter_auto_update(Arc::clone(&state), |_| {});
 
     let socket_path = Path::new(BRIDGE_SOCKET_PATH);
     let socket_dir = socket_path
@@ -76,18 +91,56 @@ pub fn run_daemon() -> Result<(), String> {
         .map_err(|error| format!("创建后台服务 IPC 失败：{error}"))?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o666))
         .map_err(|error| format!("设置后台服务 IPC 权限失败：{error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("设置后台服务 IPC 非阻塞失败：{error}"))?;
 
-    loop {
-        let (stream, _) = listener
-            .accept()
-            .map_err(|error| format!("接受后台服务 IPC 连接失败：{error}"))?;
-        if let Err(error) = handle_client(stream) {
-            eprintln!("{error}");
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    while !restart_requested.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let state = Arc::clone(&state);
+                let restart_requested = Arc::clone(&restart_requested);
+                thread::spawn(move || {
+                    if let Err(error) = handle_client(stream, state, restart_requested) {
+                        eprintln!("{error}");
+                    }
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(error) => return Err(format!("接受后台服务 IPC 连接失败：{error}")),
         }
     }
+
+    state.shutdown();
+    let _ = fs::remove_file(socket_path);
+    Ok(())
 }
 
-fn handle_client(mut stream: UnixStream) -> Result<(), String> {
+fn initialize_state() -> Result<Arc<AppState>, String> {
+    let bootstrap = storage::initialize_at(PathBuf::from(SYSTEM_DATA_DIR))?;
+    let database = Arc::new(Database::open(&bootstrap.data_dir)?);
+    let config = database.load_or_default_config()?;
+    storage::finish_pending_cleanup(&bootstrap.default_dir, &bootstrap.data_dir)?;
+    let state = Arc::new(AppState::new(
+        config,
+        database,
+        bootstrap.default_dir,
+        bootstrap.data_dir,
+    ));
+    if let Some(error) = bootstrap.migration_error {
+        state.set_error(Some(error));
+    }
+    Ok(state)
+}
+
+fn handle_client(
+    mut stream: UnixStream,
+    state: Arc<AppState>,
+    restart_requested: Arc<AtomicBool>,
+) -> Result<(), String> {
     verify_peer(&stream)?;
     stream
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
@@ -96,145 +149,116 @@ fn handle_client(mut stream: UnixStream) -> Result<(), String> {
         .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
         .map_err(|error| format!("设置 IPC 写入超时失败：{error}"))?;
 
-    match read_message::<_, ClientMessage>(&mut stream)? {
-        ClientMessage::Hello {
-            protocol_version,
-            app_version: _,
-        } if protocol_version == BRIDGE_PROTOCOL_VERSION => {}
-        ClientMessage::Hello {
-            protocol_version, ..
-        } => {
-            return Err(format!(
-                "客户端 IPC 协议版本不兼容：服务 {}，客户端 {protocol_version}",
-                BRIDGE_PROTOCOL_VERSION
-            ));
-        }
-        _ => return Err("客户端未执行 IPC 握手".to_string()),
+    let request: RpcRequest = read_message(&mut stream)?;
+    if request.method != "hello" {
+        return Err("客户端未执行 IPC 握手".to_string());
     }
-
-    write_message(
+    let hello: HelloParams = parse_params(request.params)?;
+    if hello.protocol_version != BRIDGE_PROTOCOL_VERSION {
+        write_error(
+            &mut stream,
+            request.id,
+            format!(
+                "客户端 IPC 协议版本不兼容：服务 {}，客户端 {}",
+                BRIDGE_PROTOCOL_VERSION, hello.protocol_version
+            ),
+        )?;
+        return Ok(());
+    }
+    write_result(
         &mut stream,
-        &ServiceMessage::Hello {
+        request.id,
+        &HelloResult {
             protocol_version: BRIDGE_PROTOCOL_VERSION,
             service_version: env!("CARGO_PKG_VERSION").to_string(),
         },
     )?;
-    // 握手完成后改为阻塞读：带超时的 read_exact 一旦部分读取会破坏帧边界，
-    // 连接的终止统一依赖对端关闭或本端 shutdown
     stream
         .set_read_timeout(None)
         .map_err(|error| format!("设置 IPC 阻塞读取失败：{error}"))?;
 
-    let writer = Arc::new(Mutex::new(
-        stream
-            .try_clone()
-            .map_err(|error| format!("复制 IPC 连接失败：{error}"))?,
-    ));
-    let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
-    let next_request_id = Arc::new(AtomicU64::new(1));
-    let mut runtime: Option<NetworkRuntime> = None;
-
-    let result = loop {
-        let message = match read_message::<_, ClientMessage>(&mut stream) {
-            Ok(message) => message,
-            Err(error) => break Err(error),
+    loop {
+        let request: RpcRequest = match read_message(&mut stream) {
+            Ok(request) => request,
+            Err(error)
+                if error.contains("UnexpectedEof")
+                    || error.contains("failed to fill whole buffer") =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
-
-        match message {
-            ClientMessage::Configure {
-                request_id,
-                listen_addrs,
-            } => {
-                fail_pending(&pending);
-                if let Some(runtime) = runtime.take() {
-                    runtime.stop();
-                }
-                let start_result = validate_listen_addrs(&listen_addrs).and_then(|_| {
-                    NetworkRuntime::start(
-                        listen_addrs,
-                        Arc::clone(&writer),
-                        Arc::clone(&pending),
-                        Arc::clone(&next_request_id),
-                    )
-                });
-                match start_result {
-                    Ok(new_runtime) => {
-                        runtime = Some(new_runtime);
-                        send_result(&writer, request_id, None)?;
-                    }
-                    Err(error) => {
-                        send_result(&writer, request_id, Some(error))?;
-                    }
+        match dispatch_request(&state, &request.method, request.params) {
+            Ok((result, should_restart)) => {
+                write_response(
+                    &mut stream,
+                    RpcResponse {
+                        id: request.id,
+                        result: Some(result),
+                        error: None,
+                    },
+                )?;
+                if should_restart {
+                    restart_requested.store(true, Ordering::Release);
+                    return Ok(());
                 }
             }
-            ClientMessage::Stop { request_id } => {
-                fail_pending(&pending);
-                if let Some(runtime) = runtime.take() {
-                    runtime.stop();
-                }
-                send_result(&writer, request_id, None)?;
-            }
-            ClientMessage::Response {
-                request_id,
-                response,
-            } => {
-                let entry = pending
-                    .lock()
-                    .ok()
-                    .and_then(|mut pending| pending.remove(&request_id));
-                if let Some(entry) = entry {
-                    dispatch_response(entry.target, response);
-                }
-            }
-            ClientMessage::Ping { request_id } => {
-                send_result(&writer, request_id, None)?;
-            }
-            ClientMessage::Hello { .. } => {}
+            Err(error) => write_error(&mut stream, request.id, error)?,
         }
+    }
+}
+
+fn dispatch_request(
+    state: &Arc<AppState>,
+    method: &str,
+    params: Value,
+) -> Result<(Value, bool), String> {
+    let result = match method {
+        "get_config" => to_value(state.current_config()?)?,
+        "get_storage_info" => to_value(storage::storage_info(
+            &state.default_data_dir,
+            &state.data_dir,
+        )?)?,
+        "request_data_migration" => {
+            let params: MigrationParams = parse_params(params)?;
+            let target_path = Path::new(params.target_path.trim());
+            if target_path.as_os_str().is_empty() {
+                return Err("请选择新的数据存储目录".to_string());
+            }
+            let info =
+                storage::request_migration(&state.default_data_dir, &state.data_dir, target_path)?;
+            let should_restart = info.pending_path.is_some();
+            return Ok((to_value(info)?, should_restart));
+        }
+        "save_config" => {
+            let params: ConfigParams = parse_params(params)?;
+            to_value(save_config_blocking(Arc::clone(state), params.config)?)?
+        }
+        "get_status" => {
+            let params: StatusParams = parse_params(params)?;
+            to_value(state.status_with_log_stats(params.force_log_stats, params.include_log_stats))?
+        }
+        "get_query_logs" => {
+            let params: QueryLogsParams = parse_params(params)?;
+            to_value(query_logs_blocking(
+                Arc::clone(state),
+                params.filter,
+                params.search,
+                params.page,
+                params.page_size,
+            )?)?
+        }
+        "update_filters" => {
+            let params: ConfigParams = parse_params(params)?;
+            to_value(update_filters_blocking(Arc::clone(state), params.config)?)?
+        }
+        "start_dns" => to_value(start_dns_blocking(Arc::clone(state))?)?,
+        "stop_dns" => to_value(stop_dns_blocking(Arc::clone(state))?)?,
+        "clear_dns_cache" => to_value(clear_dns_cache_blocking(state)?)?,
+        "clear_filter_cache" => to_value(clear_filter_cache_blocking(Arc::clone(state))?)?,
+        _ => return Err(format!("未知的后台服务方法：{method}")),
     };
-
-    if let Some(runtime) = runtime.take() {
-        runtime.stop();
-    }
-    fail_pending(&pending);
-    result
-}
-
-fn dispatch_response(target: PendingTarget, response: Option<Vec<u8>>) {
-    match target {
-        PendingTarget::Udp {
-            socket,
-            client_addr,
-        } => {
-            if let Some(response) = response {
-                let _ = socket.send_to(&response, client_addr);
-            }
-        }
-        PendingTarget::Tcp(sender) => {
-            let _ = sender.try_send(response);
-        }
-    }
-}
-
-fn validate_listen_addrs(listen_addrs: &[SocketAddr]) -> Result<(), String> {
-    if listen_addrs.is_empty() {
-        return Err("DNS 监听地址不能为空".to_string());
-    }
-    if listen_addrs.len() > MAX_LISTEN_ADDRS {
-        return Err(format!(
-            "DNS 监听地址数量超过上限 {MAX_LISTEN_ADDRS}：{}",
-            listen_addrs.len()
-        ));
-    }
-    for addr in listen_addrs {
-        let port = addr.port();
-        if port < 1024 && port != ALLOWED_PRIVILEGED_PORT {
-            return Err(format!(
-                "后台服务只允许监听 DNS 端口 {ALLOWED_PRIVILEGED_PORT} 或非特权端口，拒绝 {addr}"
-            ));
-        }
-    }
-    Ok(())
+    Ok((result, false))
 }
 
 fn verify_peer(stream: &UnixStream) -> Result<(), String> {
@@ -257,404 +281,40 @@ fn verify_peer(stream: &UnixStream) -> Result<(), String> {
     Ok(())
 }
 
-fn send_result(
-    writer: &SharedWriter,
-    request_id: u64,
-    error: Option<String>,
-) -> Result<(), String> {
-    let mut writer = writer
-        .lock()
-        .map_err(|_| "后台服务 IPC 写入锁已损坏".to_string())?;
-    write_message(&mut *writer, &ServiceMessage::Result { request_id, error })
+fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, String> {
+    serde_json::from_value(params).map_err(|error| format!("后台服务请求参数无效：{error}"))
 }
 
-// IPC 写失败后帧边界已不可信，立即关闭连接促使双方走重连恢复
-fn send_query_or_shutdown(writer: &SharedWriter, message: &ServiceMessage) -> bool {
-    let Ok(mut writer) = writer.lock() else {
-        return false;
-    };
-    if let Err(error) = write_message(&mut *writer, message) {
-        eprintln!("{error}");
-        let _ = writer.shutdown(Shutdown::Both);
-        return false;
-    }
-    true
+fn to_value<T: Serialize>(result: T) -> Result<Value, String> {
+    serde_json::to_value(result).map_err(|error| format!("序列化后台服务响应失败：{error}"))
 }
 
-fn fail_pending(pending: &PendingResponses) {
-    let targets = pending
-        .lock()
-        .map(|mut pending| {
-            pending
-                .drain()
-                .map(|(_, entry)| entry.target)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for target in targets {
-        dispatch_response(target, None);
-    }
-}
-
-fn prune_expired_pending(pending: &PendingResponses) {
-    if let Ok(mut pending) = pending.lock() {
-        pending.retain(|_, entry| entry.created.elapsed() < RESPONSE_TIMEOUT);
-    }
-}
-
-fn register_pending(pending: &PendingResponses, request_id: u64, target: PendingTarget) -> bool {
-    let Ok(mut pending) = pending.lock() else {
-        return false;
-    };
-    if pending.len() >= MAX_PENDING_QUERIES {
-        return false;
-    }
-    pending.insert(
-        request_id,
-        PendingEntry {
-            target,
-            created: Instant::now(),
+fn write_result<T: Serialize>(stream: &mut UnixStream, id: u64, result: &T) -> Result<(), String> {
+    write_response(
+        stream,
+        RpcResponse {
+            id,
+            result: Some(to_value(result)?),
+            error: None,
         },
-    );
+    )
+}
+
+fn write_error(stream: &mut UnixStream, id: u64, error: String) -> Result<(), String> {
+    write_response(
+        stream,
+        RpcResponse {
+            id,
+            result: None,
+            error: Some(error),
+        },
+    )
+}
+
+fn write_response(stream: &mut UnixStream, response: RpcResponse) -> Result<(), String> {
+    write_message(stream, &response)
+}
+
+fn default_true() -> bool {
     true
-}
-
-struct NetworkRuntime {
-    stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
-}
-
-impl NetworkRuntime {
-    fn start(
-        listen_addrs: Vec<SocketAddr>,
-        writer: SharedWriter,
-        pending: PendingResponses,
-        next_request_id: Arc<AtomicU64>,
-    ) -> Result<Self, String> {
-        let mut listeners = Vec::with_capacity(listen_addrs.len());
-        for addr in listen_addrs {
-            listeners.push(bind_listener_pair(addr)?);
-        }
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let active_tcp_connections = Arc::new(AtomicUsize::new(0));
-        let mut threads = Vec::with_capacity(listeners.len() * 2);
-        for listener in listeners {
-            let udp_stop = Arc::clone(&stop);
-            let udp_writer = Arc::clone(&writer);
-            let udp_pending = Arc::clone(&pending);
-            let udp_next_request_id = Arc::clone(&next_request_id);
-            threads.push(thread::spawn(move || {
-                serve_udp(
-                    listener.udp,
-                    udp_writer,
-                    udp_pending,
-                    udp_next_request_id,
-                    udp_stop,
-                );
-            }));
-
-            let tcp_stop = Arc::clone(&stop);
-            let tcp_writer = Arc::clone(&writer);
-            let tcp_pending = Arc::clone(&pending);
-            let tcp_next_request_id = Arc::clone(&next_request_id);
-            let tcp_connections = Arc::clone(&active_tcp_connections);
-            threads.push(thread::spawn(move || {
-                serve_tcp(
-                    listener.tcp,
-                    tcp_writer,
-                    tcp_pending,
-                    tcp_next_request_id,
-                    tcp_stop,
-                    tcp_connections,
-                );
-            }));
-        }
-        Ok(Self { stop, threads })
-    }
-
-    fn stop(self) {
-        self.stop.store(true, Ordering::Relaxed);
-        for thread in self.threads {
-            let _ = thread.join();
-        }
-    }
-}
-
-struct ListenerPair {
-    udp: Arc<UdpSocket>,
-    tcp: Arc<TcpListener>,
-}
-
-fn bind_listener_pair(addr: SocketAddr) -> Result<ListenerPair, String> {
-    let only_v6 = addr.is_ipv6();
-    let udp = bind_udp(addr, only_v6)
-        .map_err(|error| format!("后台服务监听 UDP {addr} 失败：{error}"))?;
-    udp.set_read_timeout(Some(IO_TIMEOUT))
-        .map_err(|error| format!("设置 UDP {addr} 读取超时失败：{error}"))?;
-
-    let tcp = bind_tcp(addr, only_v6)
-        .map_err(|error| format!("后台服务监听 TCP {addr} 失败：{error}"))?;
-    tcp.set_nonblocking(true)
-        .map_err(|error| format!("设置 TCP {addr} 非阻塞失败：{error}"))?;
-
-    Ok(ListenerPair {
-        udp: Arc::new(udp),
-        tcp: Arc::new(tcp),
-    })
-}
-
-fn bind_udp(addr: SocketAddr, only_v6: bool) -> std::io::Result<UdpSocket> {
-    if !only_v6 {
-        return UdpSocket::bind(addr);
-    }
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_only_v6(true)?;
-    socket.bind(&addr.into())?;
-    Ok(socket.into())
-}
-
-fn bind_tcp(addr: SocketAddr, only_v6: bool) -> std::io::Result<TcpListener> {
-    if !only_v6 {
-        return TcpListener::bind(addr);
-    }
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_only_v6(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(128)?;
-    Ok(socket.into())
-}
-
-fn serve_udp(
-    socket: Arc<UdpSocket>,
-    writer: SharedWriter,
-    pending: PendingResponses,
-    next_request_id: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-) {
-    let mut buffer = [0_u8; DNS_PACKET_SIZE];
-    let mut last_prune = Instant::now();
-    while !stop.load(Ordering::Relaxed) {
-        if last_prune.elapsed() >= PENDING_PRUNE_INTERVAL {
-            prune_expired_pending(&pending);
-            last_prune = Instant::now();
-        }
-
-        let (length, client_addr) = match socket.recv_from(&mut buffer) {
-            Ok(received) => received,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                eprintln!("后台服务接收 UDP DNS 请求失败：{error}");
-                continue;
-            }
-        };
-        if length == 0 {
-            continue;
-        }
-
-        // 只登记查询并转发给 GUI，响应由 IPC 读循环异步回写，避免慢查询阻塞收包
-        let request_id = next_request_id.fetch_add(1, Ordering::Relaxed);
-        let target = PendingTarget::Udp {
-            socket: Arc::clone(&socket),
-            client_addr,
-        };
-        if !register_pending(&pending, request_id, target) {
-            prune_expired_pending(&pending);
-            continue;
-        }
-        let message = ServiceMessage::Query {
-            request_id,
-            transport: BridgeTransport::Udp,
-            client_addr,
-            query: buffer[..length].to_vec(),
-        };
-        if !send_query_or_shutdown(&writer, &message) {
-            if let Ok(mut pending) = pending.lock() {
-                pending.remove(&request_id);
-            }
-            return;
-        }
-    }
-}
-
-fn serve_tcp(
-    listener: Arc<TcpListener>,
-    writer: SharedWriter,
-    pending: PendingResponses,
-    next_request_id: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    active_connections: Arc<AtomicUsize>,
-) {
-    while !stop.load(Ordering::Relaxed) {
-        let (stream, client_addr) = match listener.accept() {
-            Ok(accepted) => accepted,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            Err(error) => {
-                eprintln!("后台服务接受 TCP DNS 连接失败：{error}");
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-        };
-
-        if active_connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < TCP_MAX_CONNECTIONS).then_some(current + 1)
-            })
-            .is_err()
-        {
-            continue;
-        }
-
-        let writer = Arc::clone(&writer);
-        let pending = Arc::clone(&pending);
-        let next_request_id = Arc::clone(&next_request_id);
-        let stop = Arc::clone(&stop);
-        let active_connections = Arc::clone(&active_connections);
-        thread::spawn(move || {
-            handle_tcp_connection(stream, client_addr, writer, pending, next_request_id, stop);
-            active_connections.fetch_sub(1, Ordering::AcqRel);
-        });
-    }
-
-    while active_connections.load(Ordering::Acquire) > 0 {
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn handle_tcp_connection(
-    mut stream: TcpStream,
-    client_addr: SocketAddr,
-    writer: SharedWriter,
-    pending: PendingResponses,
-    next_request_id: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-) {
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    while !stop.load(Ordering::Relaxed) {
-        let query = match read_tcp_query(&mut stream, &stop) {
-            Ok(Some(query)) => query,
-            Ok(None) => break,
-            Err(error) => {
-                eprintln!("后台服务读取 TCP DNS 请求失败：{error}");
-                break;
-            }
-        };
-        let Some(response) = forward_tcp_query(
-            &writer,
-            &pending,
-            &next_request_id,
-            client_addr,
-            query,
-        ) else {
-            break;
-        };
-        let Ok(length) = u16::try_from(response.len()) else {
-            break;
-        };
-        if stream
-            .write_all(&length.to_be_bytes())
-            .and_then(|_| stream.write_all(&response))
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
-fn read_tcp_query(stream: &mut TcpStream, stop: &AtomicBool) -> Result<Option<Vec<u8>>, String> {
-    let deadline = Instant::now() + TCP_IDLE_TIMEOUT;
-    let mut length = [0_u8; 2];
-    if !read_until(stream, &mut length, stop, deadline, true)? {
-        return Ok(None);
-    }
-    let length = u16::from_be_bytes(length) as usize;
-    if length == 0 {
-        return Ok(None);
-    }
-    let mut query = vec![0_u8; length];
-    if !read_until(stream, &mut query, stop, deadline, false)? {
-        return Ok(None);
-    }
-    Ok(Some(query))
-}
-
-fn read_until(
-    stream: &mut TcpStream,
-    target: &mut [u8],
-    stop: &AtomicBool,
-    deadline: Instant,
-    clean_eof_if_empty: bool,
-) -> Result<bool, String> {
-    let mut offset = 0;
-    while offset < target.len() {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(false);
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok(false);
-        };
-        stream
-            .set_read_timeout(Some(remaining.min(IO_TIMEOUT)))
-            .map_err(|error| error.to_string())?;
-        match stream.read(&mut target[offset..]) {
-            Ok(0) if clean_eof_if_empty && offset == 0 => return Ok(false),
-            Ok(0) => return Err("TCP DNS 请求在完整读取前关闭".to_string()),
-            Ok(length) => offset += length,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return Ok(false),
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(true)
-}
-
-fn forward_tcp_query(
-    writer: &SharedWriter,
-    pending: &PendingResponses,
-    next_request_id: &AtomicU64,
-    client_addr: SocketAddr,
-    query: Vec<u8>,
-) -> Option<Vec<u8>> {
-    let request_id = next_request_id.fetch_add(1, Ordering::Relaxed);
-    let (response_sender, response_receiver) = mpsc::sync_channel(1);
-    if !register_pending(pending, request_id, PendingTarget::Tcp(response_sender)) {
-        return None;
-    }
-
-    let message = ServiceMessage::Query {
-        request_id,
-        transport: BridgeTransport::Tcp,
-        client_addr,
-        query,
-    };
-    if !send_query_or_shutdown(writer, &message) {
-        if let Ok(mut pending) = pending.lock() {
-            pending.remove(&request_id);
-        }
-        return None;
-    }
-
-    let response = response_receiver
-        .recv_timeout(RESPONSE_TIMEOUT)
-        .ok()
-        .flatten();
-    if let Ok(mut pending) = pending.lock() {
-        pending.remove(&request_id);
-    }
-    response
 }

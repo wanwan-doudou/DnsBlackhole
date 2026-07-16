@@ -20,8 +20,18 @@ env:
 
 jobs:
   test:
-    name: 原生测试（Apple Silicon）
-    runs-on: macos-15
+    name: 原生测试（${{ matrix.arch }}）
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - arch: Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.target }}
 
       - name: 安装前端依赖
         run: pnpm install --frozen-lockfile
@@ -52,7 +63,7 @@ jobs:
       - name: 构建 macOS 后台服务 sidecar
         run: bash scripts/build-macos-service.sh
         env:
-          TAURI_ENV_TARGET_TRIPLE: aarch64-apple-darwin
+          TAURI_ENV_TARGET_TRIPLE: ${{ matrix.target }}
 
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
@@ -129,8 +140,8 @@ jobs:
              然后在「系统设置 → 通用 → 登录项与扩展」中批准 DnsBlackhole。
           4. 回到应用点击「启动」。局域网设备把 DNS 指向这台 Mac 的 IP 即可使用。
 
-          注意：当前为过渡架构，关闭窗口后 DNS 继续运行，
-          但完全退出应用（菜单栏「退出」或 Command+Q）会停止 DNS 服务。
+          后台 DNS 服务由 macOS LaunchDaemon 独立运行。关闭窗口或退出 GUI 后，
+          DNS 仍会继续工作；可在应用设置中停止或卸载后台服务。
           EOF
           if gh release view "$tag" > /dev/null 2>&1; then
             gh release upload "$tag" "$dmg" --clobber

@@ -3,9 +3,9 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuleSummary {
     pub block_rules: usize,
     pub allow_rules: usize,

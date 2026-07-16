@@ -8,7 +8,8 @@ use std::{
 };
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "macos"))]
 use tauri::AppHandle;
 
 use crate::{
@@ -97,7 +98,7 @@ pub struct QueryLogEntry {
     pub allowlist_rule: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryLogRecord {
     pub id: i64,
     pub timestamp: u64,
@@ -121,7 +122,7 @@ pub struct QueryLogRecord {
     pub allowlist_rule: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryLogPage {
     pub records: Vec<QueryLogRecord>,
     pub total: u64,
@@ -172,12 +173,24 @@ impl Database {
         })
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn load_or_migrate_config(&self, app: &AppHandle) -> Result<AppConfig, String> {
         if let Some(config) = self.load_config()? {
             return Ok(config);
         }
 
         let config = config::load(app).unwrap_or_default();
+        self.save_config(&config)?;
+        Ok(config)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn load_or_default_config(&self) -> Result<AppConfig, String> {
+        if let Some(config) = self.load_config()? {
+            return Ok(config);
+        }
+
+        let config = AppConfig::default();
         self.save_config(&config)?;
         Ok(config)
     }
