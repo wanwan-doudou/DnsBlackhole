@@ -218,7 +218,7 @@ fn validate_target_directory(
         return Err("数据存储路径必须是绝对路径".to_string());
     }
     #[cfg(windows)]
-    if selected_dir.to_string_lossy().starts_with(r"\\") {
+    if is_windows_network_path(selected_dir) {
         return Err("数据存储路径不支持网络共享目录".to_string());
     }
     fs::create_dir_all(selected_dir).map_err(|error| {
@@ -246,6 +246,17 @@ fn validate_target_directory(
         verify_writable(&selected_dir)?;
     }
     Ok(selected_dir)
+}
+
+#[cfg(windows)]
+fn is_windows_network_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    )
 }
 
 fn ensure_target_available(target_dir: &Path) -> Result<(), String> {
@@ -549,5 +560,18 @@ mod tests {
         assert!(!database_path(&target).exists());
         assert!(!filters_dir(&target).exists());
         fs::remove_dir_all(root).expect("temporary directory should remove");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn distinguishes_local_verbatim_paths_from_network_paths() {
+        assert!(!is_windows_network_path(Path::new(r"D:\DnsBlackhole")));
+        assert!(!is_windows_network_path(Path::new(r"\\?\D:\DnsBlackhole")));
+        assert!(is_windows_network_path(Path::new(
+            r"\\server\share\DnsBlackhole"
+        )));
+        assert!(is_windows_network_path(Path::new(
+            r"\\?\UNC\server\share\DnsBlackhole"
+        )));
     }
 }
