@@ -156,8 +156,10 @@ dig @127.0.0.1 -p 53 example-blocked.local
 
 ```bash
 pnpm install
-pnpm tauri dev
+pnpm tauri:dev
 ```
+
+开发版使用独立的应用标识和数据目录，并且不会写入系统开机自启项。开机自启请通过安装后的生产版本验证，避免系统登录时启动依赖 Vite 服务的 debug 可执行文件。
 
 生产构建：
 

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DnsBlackhole Dev",
+  "identifier": "com.dnsblackhole.app.dev",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "url": "index.html",
+        "title": "DnsBlackhole Dev",
+        "width": 980,
+        "height": 720,
+        "minWidth": 980,
+        "minHeight": 560,
+        "visible": true,
+        "center": true
+      }
+    ]
+  }
+}

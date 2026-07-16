@@ -18,7 +18,12 @@ use filters::FilterUpdateReport;
 use serde::Serialize;
 use tauri::{Emitter, Manager, WindowEvent};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_autostart::MacosLauncher;
+#[cfg(all(
+    any(target_os = "macos", windows, target_os = "linux"),
+    not(debug_assertions)
+))]
+use tauri_plugin_autostart::ManagerExt;
 
 const LOG_STATS_CACHE_SECONDS: u64 = 15;
 const LOG_PRUNE_INTERVAL_SECONDS: u64 = 60 * 60;
@@ -805,12 +810,34 @@ fn spawn_initial_runtime(app: tauri::AppHandle, state: Arc<AppState>) {
     });
 }
 
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+#[cfg(all(
+    any(target_os = "macos", windows, target_os = "linux"),
+    not(debug_assertions)
+))]
 fn apply_autostart_config(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
     let manager = app.autolaunch();
     let current = manager
         .is_enabled()
         .map_err(|error| format!("读取开机自启状态失败：{error}"))?;
+
+    #[cfg(windows)]
+    {
+        // Windows 自启项可能仍指向旧安装目录或开发版。启用时始终刷新为当前 exe，
+        // 不能只根据注册表中是否存在同名项来判断。
+        if enabled {
+            return manager
+                .enable()
+                .map_err(|error| format!("启用开机自启失败：{error}"));
+        }
+        if current {
+            return manager
+                .disable()
+                .map_err(|error| format!("关闭开机自启失败：{error}"));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
     match (enabled, current) {
         (true, false) => manager
             .enable()
@@ -822,6 +849,15 @@ fn apply_autostart_config(app: &tauri::AppHandle, enabled: bool) -> Result<(), S
     }
 }
 
+#[cfg(all(
+    any(target_os = "macos", windows, target_os = "linux"),
+    debug_assertions
+))]
+fn apply_autostart_config(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), String> {
+    // 开发版依赖 Vite dev server，不能注册为系统自启程序。
+    Ok(())
+}
+
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn apply_autostart_config(_app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
     if enabled {
@@ -829,6 +865,41 @@ fn apply_autostart_config(_app: &tauri::AppHandle, enabled: bool) -> Result<(), 
     } else {
         Ok(())
     }
+}
+
+#[cfg(all(windows, debug_assertions))]
+fn cleanup_legacy_debug_autostart(app: &tauri::AppHandle) -> Result<(), String> {
+    use winreg::{
+        RegKey,
+        enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE},
+    };
+
+    const RUN_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+    let current_exe =
+        std::env::current_exe().map_err(|error| format!("读取开发版程序路径失败：{error}"))?;
+    let current_exe = current_exe.to_string_lossy();
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_SET_VALUE)
+        .map_err(|error| format!("读取开机自启注册表失败：{error}"))?;
+
+    let mut app_names = vec![app.package_info().name.clone()];
+    if !app_names.iter().any(|name| name == "DnsBlackhole") {
+        app_names.push("DnsBlackhole".to_string());
+    }
+
+    for app_name in app_names {
+        let Ok(command) = key.get_value::<String, _>(&app_name) else {
+            continue;
+        };
+        let registered_exe = command.trim().trim_matches('"');
+        if registered_exe.eq_ignore_ascii_case(&current_exe) {
+            key.delete_value(&app_name)
+                .map_err(|error| format!("清理开发版开机自启项失败：{error}"))?;
+        }
+    }
+
+    Ok(())
 }
 
 fn unix_now() -> u64 {
@@ -866,6 +937,11 @@ pub fn run() {
                     None,
                 ))
                 .map_err(|error| io::Error::other(format!("开机自启插件初始化失败：{error}")))?;
+
+            #[cfg(all(windows, debug_assertions))]
+            if let Err(error) = cleanup_legacy_debug_autostart(app.handle()) {
+                eprintln!("{error}");
+            }
 
             tray::create(app.handle())?;
             let database = Arc::new(
