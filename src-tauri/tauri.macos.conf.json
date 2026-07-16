@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "pnpm build && bash scripts/build-macos-service.sh"
+  },
+  "bundle": {
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "createUpdaterArtifacts": false,
+    "externalBin": [
+      "binaries/dnsblackhole-service"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "hardenedRuntime": true,
+      "files": {
+        "Library/LaunchDaemons/com.dnsblackhole.app.service.plist": "./macos/com.dnsblackhole.app.service.plist"
+      }
+    }
+  }
+}

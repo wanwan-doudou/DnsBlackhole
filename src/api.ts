@@ -4,6 +4,7 @@ import type {
   AppConfig,
   FilterCacheClearResult,
   FilterUpdateResult,
+  MacosServiceStatus,
   QueryLogFilter,
   QueryLogPage,
   RuntimeStatus,
@@ -59,4 +60,20 @@ export function getStorageInfo(): Promise<StorageInfo> {
 
 export function requestDataMigration(targetPath: string): Promise<StorageInfo> {
   return invoke<StorageInfo>("request_data_migration", { targetPath });
+}
+
+export function getMacosServiceStatus(): Promise<MacosServiceStatus> {
+  return invoke<MacosServiceStatus>("get_macos_service_status");
+}
+
+export function installMacosService(force = false): Promise<MacosServiceStatus> {
+  return invoke<MacosServiceStatus>("install_macos_service", { force });
+}
+
+export function uninstallMacosService(): Promise<MacosServiceStatus> {
+  return invoke<MacosServiceStatus>("uninstall_macos_service");
+}
+
+export function openMacosServiceSettings(): Promise<void> {
+  return invoke<void>("open_macos_service_settings");
 }

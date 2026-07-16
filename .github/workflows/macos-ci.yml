@@ -1,0 +1,142 @@
+# macOS 构建与测试（维护者无 Mac，本工作流是 macOS 产物的唯一构建途径）。
+# 产物为 ad-hoc 签名、未经 Apple 公证的过渡版本：
+# 仅保存为 Actions artifact 或 Draft Release，按 MACOS_PORTING_PLAN.md 不得公开为正式版本。
+name: macOS CI
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      draft-release:
+        description: "构建后创建 Draft Release 并上传 DMG"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: 原生测试（Apple Silicon）
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 输出环境信息
+        run: |
+          sw_vers
+          uname -m
+          rustc --version
+          xcodebuild -version | head -1
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 前端类型检查与构建
+        run: pnpm build
+
+      - name: 构建 macOS 后台服务 sidecar
+        run: bash scripts/build-macos-service.sh
+        env:
+          TAURI_ENV_TARGET_TRIPLE: aarch64-apple-darwin
+
+      - name: Rust 单元测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  build:
+    name: 构建 Universal DMG
+    runs-on: macos-15
+    needs: test
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust 双架构目标
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: universal
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      # beforeBuildCommand 会先执行 pnpm build 和 build-macos-service.sh（universal 分支）
+      - name: Tauri 构建（universal）
+        run: pnpm tauri build --target universal-apple-darwin --bundles app,dmg
+
+      - name: 校验双架构与签名
+        run: |
+          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/DnsBlackhole.app"
+          lipo -info "$app/Contents/MacOS/DnsBlackhole"
+          lipo -info "$app/Contents/MacOS/dnsblackhole-service"
+          test -f "$app/Contents/Library/LaunchDaemons/com.dnsblackhole.app.service.plist"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      - name: 上传 DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DnsBlackhole-macos-universal-dmg
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: 创建 Draft Release 并上传 DMG
+        if: github.event_name == 'workflow_dispatch' && inputs.draft-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          tag="macos-preview-v${version}"
+          dmg="$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)"
+          notes_file="$(mktemp)"
+          cat > "$notes_file" <<'EOF'
+          ## macOS 预览版（未经 Apple 公证）
+
+          本版本使用 ad-hoc 签名、未经 Apple 公证，属于内部测试版本。安装步骤：
+
+          1. 下载 DMG 并打开，把 DnsBlackhole 拖入「应用程序」文件夹。
+          2. 首次打开会提示无法验证开发者。请打开「系统设置 → 隐私与安全性」，
+             在页面底部找到 DnsBlackhole 的提示，点击「仍要打开」。
+             如果没有出现提示，可在终端执行：
+             `xattr -cr /Applications/DnsBlackhole.app`，然后重新打开。
+          3. 打开应用后，进入「设置」页，点击「安装或修复」安装后台 DNS 服务，
+             然后在「系统设置 → 通用 → 登录项与扩展」中批准 DnsBlackhole。
+          4. 回到应用点击「启动」。局域网设备把 DNS 指向这台 Mac 的 IP 即可使用。
+
+          注意：当前为过渡架构，关闭窗口后 DNS 继续运行，
+          但完全退出应用（菜单栏「退出」或 Command+Q）会停止 DNS 服务。
+          EOF
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" "$dmg" --clobber
+          else
+            gh release create "$tag" "$dmg" \
+              --draft \
+              --title "DnsBlackhole ${version} macOS 预览版" \
+              --notes-file "$notes_file"
+          fi

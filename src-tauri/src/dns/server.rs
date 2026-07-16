@@ -47,6 +47,8 @@ pub struct DnsServer {
     threads: Vec<JoinHandle<()>>,
     cache: Option<Arc<DnsCacheStore>>,
     filter_runtime: SharedFilterRuntime,
+    #[cfg(target_os = "macos")]
+    privileged_bridge: Option<crate::privileged_bridge::PrivilegedBridge>,
 }
 
 impl DnsServer {
@@ -78,10 +80,16 @@ impl DnsServer {
             DnsCacheStore::from_config(dns_cache_config.clone(), DNS_CACHE_SHARDS).map(Arc::new);
         let dns_cache_config = dns_cache.as_ref().map(|_| dns_cache_config);
         let filter_runtime = share_filter_runtime(build_filter_runtime(&config, rules_text));
-        let listeners = listen_addrs
-            .into_iter()
-            .map(|addr| bind_listener_pair(addr, addr.is_ipv6() && config.listen_ipv6))
-            .collect::<Result<Vec<_>, _>>()?;
+        let use_privileged_bridge = requires_privileged_bridge(&listen_addrs);
+        let listeners = if use_privileged_bridge {
+            Vec::new()
+        } else {
+            listen_addrs
+                .iter()
+                .copied()
+                .map(|addr| bind_listener_pair(addr, addr.is_ipv6() && config.listen_ipv6))
+                .collect::<Result<Vec<_>, _>>()?
+        };
 
         reset_stats(&stats);
         let stop = Arc::new(AtomicBool::new(false));
@@ -127,6 +135,18 @@ impl DnsServer {
             }));
         }
 
+        #[cfg(target_os = "macos")]
+        let privileged_bridge = if use_privileged_bridge {
+            Some(crate::privileged_bridge::PrivilegedBridge::start(
+                listen_addrs,
+                work_senders.clone(),
+                Arc::clone(&stats),
+                Arc::clone(&stop),
+            )?)
+        } else {
+            None
+        };
+
         let active_tcp_connections = Arc::new(AtomicUsize::new(0));
         for listener in listeners {
             let tcp_work_senders = work_senders.clone();
@@ -164,6 +184,8 @@ impl DnsServer {
             threads,
             cache: dns_cache,
             filter_runtime,
+            #[cfg(target_os = "macos")]
+            privileged_bridge,
         })
     }
 
@@ -183,15 +205,38 @@ impl DnsServer {
     }
 
     pub fn has_finished_threads(&self) -> bool {
+        // 桥接读线程退出等同监听线程异常，交给看门狗重启以重连 macOS 后台服务
+        #[cfg(target_os = "macos")]
+        if self
+            .privileged_bridge
+            .as_ref()
+            .is_some_and(crate::privileged_bridge::PrivilegedBridge::is_finished)
+        {
+            return true;
+        }
         self.threads.iter().any(JoinHandle::is_finished)
     }
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = self.privileged_bridge.take() {
+            bridge.stop();
+        }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn requires_privileged_bridge(listen_addrs: &[SocketAddr]) -> bool {
+    listen_addrs.iter().any(|addr| addr.port() < 1024)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn requires_privileged_bridge(_listen_addrs: &[SocketAddr]) -> bool {
+    false
 }
 
 struct ListenerPair {
@@ -592,12 +637,12 @@ fn write_tcp_dns_response(stream: &mut TcpStream, response: &[u8]) -> Result<(),
         .map_err(|error| error.to_string())
 }
 
-enum DispatchDnsWorkError {
+pub(crate) enum DispatchDnsWorkError {
     Full,
     Disconnected,
 }
 
-fn dispatch_dns_work(
+pub(crate) fn dispatch_dns_work(
     senders: &[mpsc::SyncSender<DnsWorkItem>],
     work_item: DnsWorkItem,
     next_worker: &mut usize,
@@ -733,6 +778,8 @@ mod tests {
             threads: vec![finished_thread],
             cache: None,
             filter_runtime: share_filter_runtime(build_filter_runtime(&AppConfig::default(), "")),
+            #[cfg(target_os = "macos")]
+            privileged_bridge: None,
         };
 
         assert!(server.has_finished_threads());

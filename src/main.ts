@@ -8,13 +8,17 @@ import {
   clearDnsCache as clearDnsCacheCommand,
   clearFilterCache as clearFilterCacheCommand,
   getConfig,
+  getMacosServiceStatus,
   getStorageInfo,
   getQueryLogs,
   getStatus,
   saveConfig as saveConfigCommand,
   requestDataMigration,
+  installMacosService,
+  openMacosServiceSettings,
   startDns,
   stopDns,
+  uninstallMacosService,
   updateFilters as updateFiltersCommand,
 } from "./api";
 import appIconUrl from "./app-icon.png";
@@ -37,6 +41,8 @@ import type {
   AppConfig,
   BlockingMode,
   FilterSubscription,
+  MacosServiceState,
+  MacosServiceStatus,
   QueryLogFilter,
   QueryLogPage,
   QueryLogRecord,
@@ -84,6 +90,8 @@ let currentConfigSchemaVersion = 2;
 let clientNameMap = new Map<string, string>();
 let currentStorageInfo: StorageInfo | null = null;
 let selectedDataStoragePath = "";
+const isMacOS = navigator.userAgent.includes("Macintosh");
+let currentMacosServiceStatus: MacosServiceStatus | null = null;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const QUERY_LOG_PAGE_SIZE = 50;
@@ -158,6 +166,13 @@ const dataStorageError = query<HTMLElement>("#data_storage_error");
 const chooseDataStorageButton = query<HTMLButtonElement>("#choose_data_storage_btn");
 const resetDataStorageButton = query<HTMLButtonElement>("#reset_data_storage_btn");
 const migrateDataStorageButton = query<HTMLButtonElement>("#migrate_data_storage_btn");
+const macosServiceSection = query<HTMLElement>("#macos_service_section");
+const macosServiceStatusElement = query<HTMLElement>("#macos_service_status");
+const installMacosServiceButton = query<HTMLButtonElement>("#install_macos_service_btn");
+const uninstallMacosServiceButton = query<HTMLButtonElement>("#uninstall_macos_service_btn");
+const openMacosServiceSettingsButton = query<HTMLButtonElement>(
+  "#open_macos_service_settings_btn",
+);
 const appVersionElement = query<HTMLElement>("#app_version");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
 const installUpdateButton = query<HTMLButtonElement>("#install_update_btn");
@@ -545,7 +560,19 @@ checkUpdateButton.addEventListener("click", async () => {
     }
   } catch (error) {
     console.error("检查更新失败", error);
-    setUpdateStatus("err", `检查更新失败：${formatUpdateError(error)}`);
+    const message = formatUpdateError(error);
+    if (/platform.+(was )?not found/i.test(message)) {
+      // 更新清单里还没有当前平台的自动更新包（例如 macOS 过渡版本）
+      setUpdateStatus(
+        "err",
+        "当前平台暂无自动更新包，可点击“浏览器下载”前往 GitHub Releases 手动下载",
+      );
+    } else {
+      setUpdateStatus("err", `检查更新失败：${message}`);
+    }
+    manualDownloadUrl = "";
+    manualDownloadButton.classList.remove("hidden");
+    manualDownloadButton.disabled = false;
   } finally {
     checkUpdateButton.disabled = false;
     checkUpdateButton.classList.remove("loading");
@@ -587,6 +614,56 @@ manualDownloadButton.addEventListener("click", async () => {
     setUpdateStatus("err", `打开浏览器失败：${formatUpdateError(error)}\n下载地址：${url}`);
   } finally {
     manualDownloadButton.disabled = false;
+  }
+});
+
+installMacosServiceButton.addEventListener("click", async () => {
+  installMacosServiceButton.disabled = true;
+  installMacosServiceButton.classList.add("loading");
+  try {
+    // 服务已启用时执行强制重装，用于修复版本不一致或服务损坏
+    const force = currentMacosServiceStatus?.enabled ?? false;
+    const status = await installMacosService(force);
+    renderMacosServiceStatus(status);
+    if (status.state === "requires_approval") {
+      showMessage("请在“系统设置 → 通用 → 登录项与扩展”中批准 DnsBlackhole 后台服务", false);
+    } else if (status.enabled) {
+      showMessage("macOS DNS 后台服务已启用", false);
+    }
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    installMacosServiceButton.disabled = false;
+    installMacosServiceButton.classList.remove("loading");
+  }
+});
+
+uninstallMacosServiceButton.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "卸载后台服务后，DNS 将无法监听 53 端口，局域网设备的 DNS 查询会立即失败。是否继续卸载？",
+  );
+  if (!confirmed) {
+    return;
+  }
+  uninstallMacosServiceButton.disabled = true;
+  uninstallMacosServiceButton.classList.add("loading");
+  try {
+    const status = await uninstallMacosService();
+    renderMacosServiceStatus(status);
+    showMessage("macOS DNS 后台服务已卸载", false);
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    uninstallMacosServiceButton.disabled = false;
+    uninstallMacosServiceButton.classList.remove("loading");
+  }
+});
+
+openMacosServiceSettingsButton.addEventListener("click", async () => {
+  try {
+    await openMacosServiceSettings();
+  } catch (error) {
+    showMessage(String(error), true);
   }
 });
 
@@ -647,6 +724,7 @@ void getVersion().then((version) => {
 
 await loadConfig();
 await loadStorageInfo();
+await loadMacosServiceStatus();
 void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
   syncFilterUpdateMetadata(payload);
 }).catch((error) => {
@@ -673,6 +751,10 @@ document.addEventListener("visibilitychange", () => {
       void refreshQueryLogs({ auto: true });
     } else if (activeView === "dashboard" || activeView === "security") {
       void refreshStatus({ auto: true });
+    }
+    // 用户可能刚从系统设置批准完服务回来，切回窗口时同步最新授权状态
+    if (currentMacosServiceStatus?.requiresApproval) {
+      void loadMacosServiceStatus();
     }
   }
 });
@@ -739,6 +821,38 @@ async function loadStorageInfo(): Promise<void> {
     dataStorageError.textContent = String(error);
     dataStorageError.classList.remove("hidden");
   }
+}
+
+const MACOS_SERVICE_STATE_TEXT: Record<MacosServiceState, string> = {
+  not_registered: "后台服务尚未安装。安装并授权后，DNS 才能监听 53 端口。",
+  enabled: "后台服务已启用，DNS 可以监听 53 端口。",
+  requires_approval: "等待批准：请在“系统设置 → 通用 → 登录项与扩展”中允许 DnsBlackhole。",
+  not_found: "未找到后台服务，可能已被系统移除，请重新安装。",
+  unknown: "后台服务状态未知，可尝试“安装或修复”。",
+};
+
+async function loadMacosServiceStatus(): Promise<void> {
+  if (!isMacOS) {
+    return;
+  }
+  macosServiceSection.classList.remove("hidden");
+  try {
+    renderMacosServiceStatus(await getMacosServiceStatus());
+  } catch (error) {
+    currentMacosServiceStatus = null;
+    macosServiceStatusElement.textContent = `读取后台服务状态失败：${String(error)}`;
+  }
+}
+
+function renderMacosServiceStatus(status: MacosServiceStatus): void {
+  currentMacosServiceStatus = status;
+  macosServiceSection.classList.toggle("is-ready", status.enabled);
+  macosServiceSection.classList.toggle("needs-approval", status.requiresApproval);
+  macosServiceStatusElement.textContent =
+    MACOS_SERVICE_STATE_TEXT[status.state] ?? MACOS_SERVICE_STATE_TEXT.unknown;
+  openMacosServiceSettingsButton.classList.toggle("hidden", !status.requiresApproval);
+  uninstallMacosServiceButton.disabled =
+    status.state === "not_registered" || status.state === "not_found";
 }
 
 function renderStorageInfo(info: StorageInfo): void {
@@ -945,6 +1059,9 @@ function setActiveView(view: ViewName): void {
   }
   if (view === "security") {
     void refreshStatus({ auto: true });
+  }
+  if (view === "settings" && viewChanged) {
+    void loadMacosServiceStatus();
   }
 }
 
@@ -1653,25 +1770,25 @@ function extractUrl(value: unknown): string | null {
   return null;
 }
 
+// WKWebView 的 UA 无法区分 Apple Silicon 与 Intel，macOS 上按顺序尝试两个架构键
+const MANUAL_DOWNLOAD_PLATFORM_KEYS = isMacOS
+  ? ["darwin-aarch64", "darwin-x86_64"]
+  : ["windows-x86_64"];
+
 function resolveManualDownloadUrl(update: Update): string {
   const platforms = update.rawJson.platforms;
   if (platforms && typeof platforms === "object" && !Array.isArray(platforms)) {
     const platformMap = platforms as Record<string, unknown>;
-    const currentPlatformUrl = extractUrl(platformMap["windows-x86_64"]);
-    if (currentPlatformUrl) {
-      return currentPlatformUrl;
-    }
-
-    for (const platform of Object.values(platformMap)) {
-      const platformUrl = extractUrl(platform);
-      if (platformUrl) {
-        return platformUrl;
+    for (const key of MANUAL_DOWNLOAD_PLATFORM_KEYS) {
+      const currentPlatformUrl = extractUrl(platformMap[key]);
+      if (currentPlatformUrl) {
+        return currentPlatformUrl;
       }
     }
+    // 找不到当前平台键时不回退到其他平台的安装包，避免下错文件
   }
 
-  const directUrl = extractUrl(update.rawJson);
-  return directUrl ?? `${RELEASES_URL}/tag/v${update.version}`;
+  return `${RELEASES_URL}/tag/v${update.version}`;
 }
 
 async function checkForUpdateWithRetry(): Promise<Update | null> {

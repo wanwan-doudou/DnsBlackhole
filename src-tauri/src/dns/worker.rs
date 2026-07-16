@@ -48,6 +48,10 @@ pub(crate) enum DnsResponseTarget {
         client_addr: SocketAddr,
     },
     Tcp(mpsc::SyncSender<Option<Vec<u8>>>),
+    #[cfg(target_os = "macos")]
+    BridgeUdp(crate::privileged_bridge::BridgeResponder),
+    #[cfg(target_os = "macos")]
+    BridgeTcp(crate::privileged_bridge::BridgeResponder),
 }
 
 pub(crate) struct DnsWorkerContext {
@@ -102,6 +106,10 @@ impl<'a> QueryLogMetadata<'a> {
         let transport = match response_target {
             DnsResponseTarget::Udp { .. } => "udp",
             DnsResponseTarget::Tcp(_) => "tcp",
+            #[cfg(target_os = "macos")]
+            DnsResponseTarget::BridgeUdp(_) => "udp",
+            #[cfg(target_os = "macos")]
+            DnsResponseTarget::BridgeTcp(_) => "tcp",
         };
         Self {
             domain: &question.domain,
@@ -594,6 +602,10 @@ fn response_transport(response_target: &DnsResponseTarget) -> DnsTransport {
     match response_target {
         DnsResponseTarget::Udp { .. } => DnsTransport::Udp,
         DnsResponseTarget::Tcp(_) => DnsTransport::Tcp,
+        #[cfg(target_os = "macos")]
+        DnsResponseTarget::BridgeUdp(_) => DnsTransport::Udp,
+        #[cfg(target_os = "macos")]
+        DnsResponseTarget::BridgeTcp(_) => DnsTransport::Tcp,
     }
 }
 
@@ -606,6 +618,22 @@ fn send_refused_or_drop(
     match response_target {
         DnsResponseTarget::Udp { .. } => {}
         DnsResponseTarget::Tcp(_) => {
+            let Some(response) = build_error_response(query, RCODE_REFUSED) else {
+                send_no_response(response_target);
+                return;
+            };
+            if let Err(error) = send_dns_response(response_target, query, &response) {
+                record_error(
+                    &context.stats,
+                    format!("{message}；返回拒绝响应失败：{error}"),
+                );
+            }
+        }
+        // 与本机 UDP 路径一致：拒绝的 UDP 查询静默丢弃，但需回空响应清理桥接等待记录
+        #[cfg(target_os = "macos")]
+        DnsResponseTarget::BridgeUdp(_) => send_no_response(response_target),
+        #[cfg(target_os = "macos")]
+        DnsResponseTarget::BridgeTcp(_) => {
             let Some(response) = build_error_response(query, RCODE_REFUSED) else {
                 send_no_response(response_target);
                 return;
@@ -647,12 +675,32 @@ fn send_dns_response(
         DnsResponseTarget::Tcp(sender) => sender
             .try_send(Some(response.to_vec()))
             .map_err(|error| error.to_string()),
+        #[cfg(target_os = "macos")]
+        DnsResponseTarget::BridgeUdp(responder) => {
+            let max_size = udp_payload_size(query);
+            let response = if response.len() <= max_size {
+                response.to_vec()
+            } else {
+                truncate_response_for_udp(query, response, max_size)
+                    .ok_or_else(|| "无法构造符合客户端 UDP 大小限制的 DNS 响应".to_string())?
+            };
+            responder.respond(Some(response))
+        }
+        #[cfg(target_os = "macos")]
+        DnsResponseTarget::BridgeTcp(responder) => responder.respond(Some(response.to_vec())),
     }
 }
 
 fn send_no_response(response_target: &DnsResponseTarget) {
-    if let DnsResponseTarget::Tcp(sender) = response_target {
-        let _ = sender.try_send(None);
+    match response_target {
+        DnsResponseTarget::Tcp(sender) => {
+            let _ = sender.try_send(None);
+        }
+        #[cfg(target_os = "macos")]
+        DnsResponseTarget::BridgeUdp(responder) | DnsResponseTarget::BridgeTcp(responder) => {
+            let _ = responder.respond(None);
+        }
+        DnsResponseTarget::Udp { .. } => {}
     }
 }
 

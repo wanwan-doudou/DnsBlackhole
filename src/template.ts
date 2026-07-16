@@ -538,6 +538,19 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
+            <section class="settings-section macos-service-section hidden" id="macos_service_section">
+              <div>
+                <h3>macOS DNS 后台服务</h3>
+                <p id="macos_service_status">正在读取后台服务状态…</p>
+                <small>正式版通过系统后台服务监听 UDP/TCP 53。首次安装需要管理员在“系统设置 → 通用 → 登录项与扩展”中批准。</small>
+              </div>
+              <div class="button-group macos-service-actions">
+                <button class="primary" id="install_macos_service_btn" type="button">安装或修复</button>
+                <button class="hidden" id="open_macos_service_settings_btn" type="button">打开系统设置</button>
+                <button id="uninstall_macos_service_btn" type="button">卸载服务</button>
+              </div>
+            </section>
+
             <section class="settings-section data-storage-section">
               <div class="section-heading">
                 <h3>数据存储</h3>

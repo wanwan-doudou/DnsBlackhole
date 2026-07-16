@@ -2,6 +2,7 @@ mod config;
 mod database;
 mod dns;
 mod filters;
+pub mod privileged_bridge;
 mod storage;
 mod tray;
 
@@ -422,6 +423,58 @@ fn request_data_migration(
         return Err("请选择新的数据存储目录".to_string());
     }
     storage::request_migration(&state.default_data_dir, &state.data_dir, target_path)
+}
+
+#[tauri::command]
+fn get_macos_service_status() -> Result<privileged_bridge::MacosServiceStatus, String> {
+    #[cfg(target_os = "macos")]
+    {
+        privileged_bridge::macos_service_status()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("当前平台不支持 macOS DNS 后台服务".to_string())
+    }
+}
+
+#[tauri::command]
+fn install_macos_service(
+    force: Option<bool>,
+) -> Result<privileged_bridge::MacosServiceStatus, String> {
+    #[cfg(target_os = "macos")]
+    {
+        privileged_bridge::macos_service_install(force.unwrap_or(false))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = force;
+        Err("当前平台不支持 macOS DNS 后台服务".to_string())
+    }
+}
+
+#[tauri::command]
+fn uninstall_macos_service() -> Result<privileged_bridge::MacosServiceStatus, String> {
+    #[cfg(target_os = "macos")]
+    {
+        privileged_bridge::macos_service_uninstall()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("当前平台不支持 macOS DNS 后台服务".to_string())
+    }
+}
+
+#[tauri::command]
+fn open_macos_service_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        privileged_bridge::macos_service_open_settings();
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("当前平台不支持 macOS DNS 后台服务".to_string())
+    }
 }
 
 #[tauri::command]
@@ -944,6 +997,10 @@ pub fn run() {
             get_config,
             get_storage_info,
             request_data_migration,
+            get_macos_service_status,
+            install_macos_service,
+            uninstall_macos_service,
+            open_macos_service_settings,
             save_config,
             get_status,
             get_query_logs,
@@ -1016,8 +1073,15 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, _event| {
+            // macOS 关闭窗口后点击 Dock 图标应恢复主窗口
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                tray::show_main_window(_app);
+            }
+        });
 }
 
 #[cfg(test)]

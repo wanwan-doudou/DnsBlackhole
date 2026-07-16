@@ -4,11 +4,12 @@ mod filter_runtime;
 mod protocol;
 mod rewrites;
 mod rules;
-mod server;
-mod stats;
+// macOS 特权桥接（privileged_bridge）需要访问服务分发、统计与工作项类型
+pub(crate) mod server;
+pub(crate) mod stats;
 mod task_pool;
 mod upstream;
-mod worker;
+pub(crate) mod worker;
 
 pub(crate) use filter_runtime::{build_filter_runtime, replace_filter_runtime};
 pub use rules::{RuleSummary, summarize_rules};

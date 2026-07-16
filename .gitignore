@@ -16,6 +16,12 @@ dist-ssr
 src-tauri/.cargo/
 src-tauri/target/
 
+# macOS 后台服务 sidecar 构建产物（由 scripts/build-macos-service.sh 生成）
+src-tauri/binaries/
+
+# 内部移植执行清单，只在本地维护，不进入公开仓库
+MACOS_PORTING_PLAN.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
