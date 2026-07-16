@@ -10,6 +10,10 @@ default-run = "dnsblackhole"
 name = "dnsblackhole_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+macos-service = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -46,3 +50,4 @@ path = "src/main.rs"
 [[bin]]
 name = "dnsblackhole-service"
 path = "src/bin/dnsblackhole-service.rs"
+required-features = ["macos-service"]
