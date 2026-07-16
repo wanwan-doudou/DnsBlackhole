@@ -9,10 +9,12 @@ use std::{
 
 use crate::config::AppConfig;
 
-use super::protocol::{Question, prepare_cached_response, response_cache_ttl};
+#[cfg(test)]
+use super::protocol::Question;
+use super::protocol::{ParsedQuery, prepare_cached_response, response_cache_ttl};
 
 const DNS_CACHE_ENTRY_OVERHEAD_BYTES: usize = 96;
-// 淘汰时随机取样对比 last_used，避免全表扫描找最旧条目
+// 淘汰时从迭代起点抽样对比 last_used，避免全表扫描找最旧条目
 const DNS_CACHE_EVICT_SAMPLE: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,11 @@ pub(crate) struct QueryCacheKey {
     domain: String,
     qtype: u16,
     qclass: u16,
+    recursion_desired: bool,
+    authentic_data: bool,
+    checking_disabled: bool,
+    dnssec_ok: bool,
+    edns_udp_size: Option<u16>,
 }
 
 struct CachedDnsResponse {
@@ -75,11 +82,30 @@ impl DnsCacheConfig {
 }
 
 impl QueryCacheKey {
+    pub(crate) fn from_query(query: &ParsedQuery) -> Option<Self> {
+        query.cache_safe.then(|| Self {
+            domain: query.question.domain.clone(),
+            qtype: query.question.qtype,
+            qclass: query.question.qclass,
+            recursion_desired: query.recursion_desired,
+            authentic_data: query.authentic_data,
+            checking_disabled: query.checking_disabled,
+            dnssec_ok: query.dnssec_ok,
+            edns_udp_size: query.edns_udp_size,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_question(question: &Question) -> Self {
         Self {
             domain: question.domain.clone(),
             qtype: question.qtype,
             qclass: question.qclass,
+            recursion_desired: true,
+            authentic_data: false,
+            checking_disabled: false,
+            dnssec_ok: false,
+            edns_udp_size: None,
         }
     }
 }

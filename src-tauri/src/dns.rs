@@ -10,6 +10,7 @@ mod task_pool;
 mod upstream;
 mod worker;
 
+pub(crate) use filter_runtime::{build_filter_runtime, replace_filter_runtime};
 pub use rules::{RuleSummary, summarize_rules};
 pub use server::DnsServer;
 pub use stats::{
@@ -32,8 +33,9 @@ mod tests {
         protocol::{
             BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_SOA,
             build_block_response, build_error_response, build_rewrite_response,
-            extract_response_ips, parse_question, prepare_cached_response, read_u16,
-            response_is_truncated, response_min_record_ttl, validate_response_for_query,
+            extract_response_ips, parse_query, parse_question, prepare_cached_response, read_u16,
+            response_is_truncated, response_min_record_ttl, truncate_response_for_udp,
+            udp_payload_size, validate_response_for_query,
         },
         rewrites::compile_rewrites,
         rules::{compile_domain_set, compile_rules, summarize_rules},
@@ -134,6 +136,15 @@ mod tests {
         let summary = summarize_rules("||example.org^$important");
         assert_eq!(summary.block_rules, 1);
         assert_eq!(summary.ignored_unsupported_rules, 0);
+    }
+
+    #[test]
+    fn hosts_line_supports_multiple_domains() {
+        let rules = compile_rules("0.0.0.0 ads.example.org tracker.example.org # comment");
+
+        assert!(rules.is_blocked("ads.example.org", TYPE_A));
+        assert!(rules.is_blocked("tracker.example.org", TYPE_A));
+        assert_eq!(rules.summary().block_rules, 2);
     }
 
     #[test]
@@ -312,6 +323,69 @@ mod tests {
 
         let wrong_question = a_response("other.example.org", [1, 2, 3, 4]);
         assert!(validate_response_for_query(&query, &wrong_question).is_err());
+    }
+
+    #[test]
+    fn query_context_isolates_cache_and_bypasses_edns_options() {
+        let query = a_query("example.org");
+        let parsed = parse_query(&query).expect("query should parse");
+        let base_key = QueryCacheKey::from_query(&parsed).expect("plain query should be cacheable");
+
+        let mut cd_query = query.clone();
+        cd_query[3] |= 0x10;
+        let cd_key = QueryCacheKey::from_query(&parse_query(&cd_query).unwrap()).unwrap();
+        assert_ne!(base_key, cd_key);
+
+        let mut edns_query = query.clone();
+        edns_query[11] = 1;
+        edns_query.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 0]);
+        let edns = parse_query(&edns_query).expect("EDNS query should parse");
+        assert_eq!(edns.edns_udp_size, Some(1232));
+        assert!(edns.dnssec_ok);
+        assert_eq!(udp_payload_size(&edns_query), 1232);
+        assert_ne!(base_key, QueryCacheKey::from_query(&edns).unwrap());
+
+        let mut option_query = edns_query;
+        let len = option_query.len();
+        option_query[len - 2..].copy_from_slice(&4_u16.to_be_bytes());
+        option_query.extend_from_slice(&[0, 8, 0, 0]);
+        let with_option = parse_query(&option_query).expect("EDNS option query should parse");
+        assert!(!with_option.cache_safe);
+        assert!(QueryCacheKey::from_query(&with_option).is_none());
+    }
+
+    #[test]
+    fn rejects_non_ascii_dns_labels() {
+        let mut query = a_query("example.org");
+        query[13] = 0xff;
+        assert!(parse_question(&query).is_err());
+    }
+
+    #[test]
+    fn cached_response_echoes_current_question_case() {
+        let cached = a_response("example.org", [1, 2, 3, 4]);
+        let query = a_query("EXAMPLE.org");
+        let question = parse_question(&query).unwrap();
+        let response = prepare_cached_response(&cached, &query, 30).unwrap();
+
+        assert_eq!(
+            &response[12..question.question_end],
+            &query[12..question.question_end]
+        );
+    }
+
+    #[test]
+    fn oversized_udp_response_sets_tc_and_keeps_question() {
+        let query = a_query("example.org");
+        let mut response = a_response("example.org", [1, 2, 3, 4]);
+        response.resize(700, 0);
+        let truncated = truncate_response_for_udp(&query, &response, 512).unwrap();
+
+        assert!(response_is_truncated(&truncated));
+        assert_eq!(read_u16(&truncated, 6), Some(0));
+        assert_eq!(read_u16(&truncated, 8), Some(0));
+        assert_eq!(read_u16(&truncated, 10), Some(0));
+        assert!(truncated.len() <= 512);
     }
 
     #[test]

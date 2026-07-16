@@ -13,7 +13,9 @@ use std::{
 
 use config::AppConfig;
 use database::{Database, LogStats, QueryLogPage};
-use dns::{DnsServer, DnsStats, RuleSummary, RuntimeStatus};
+use dns::{
+    DnsServer, DnsStats, RuleSummary, RuntimeStatus, build_filter_runtime, replace_filter_runtime,
+};
 use filters::FilterUpdateReport;
 use serde::Serialize;
 use tauri::{Emitter, Manager, WindowEvent};
@@ -167,7 +169,7 @@ impl AppState {
             return Ok(false);
         }
 
-        let summary = {
+        let filter_runtime = {
             let server = self.server.lock().map_err(|_| "读取 DNS 服务状态失败")?;
             let Some(server) = server.as_ref() else {
                 return Ok(false);
@@ -176,8 +178,12 @@ impl AppState {
                 return Ok(false);
             }
 
-            server.replace_filter_state(config, rules_text)
+            server.filter_runtime_handle()
         };
+        // 规则编译可能较耗时，不占用 server 状态锁，避免状态查询和停止操作被长时间阻塞。
+        let runtime = build_filter_runtime(config, rules_text);
+        let summary = runtime.summary();
+        replace_filter_runtime(&filter_runtime, runtime);
         self.set_effective_summary(summary)?;
         Ok(true)
     }
@@ -251,8 +257,8 @@ impl AppState {
             .server
             .lock()
             .ok()
-            .and_then(|server| server.as_ref().map(|server| server.listen_addr()))
-            .is_some();
+            .and_then(|server| server.as_ref().map(|server| !server.has_finished_threads()))
+            .unwrap_or(false);
 
         dns::empty_status(&config, running, summary, stats, error)
     }
@@ -979,6 +985,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, TcpListener};
+
     use super::*;
     use crate::config::FilterSubscription;
 
@@ -1021,5 +1029,38 @@ mod tests {
         assert_eq!(summary.block_rules, 13);
         assert_eq!(summary.allow_rules, 3);
         assert_eq!(summary.ignored_rules, 2);
+    }
+
+    #[test]
+    fn filter_state_can_be_hot_swapped_without_restarting_server() {
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let previous = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            query_log_enabled: false,
+            ..AppConfig::default()
+        };
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let state = AppState::new(previous.clone(), database);
+        state.start_current("").unwrap();
+
+        let mut next = previous.clone();
+        next.blacklist = "||example.org^".into();
+        assert!(
+            state
+                .try_hot_swap(&previous, &next, &next.blacklist)
+                .unwrap()
+        );
+        assert_eq!(state.effective_summary.lock().unwrap().block_rules, 1);
+        assert!(!state.server_needs_start().unwrap());
+
+        state.stop_current().unwrap();
     }
 }

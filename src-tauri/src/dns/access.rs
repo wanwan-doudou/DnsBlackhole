@@ -177,10 +177,12 @@ impl ClientRateLimiter {
     }
 
     fn allow(&mut self, ip: IpAddr, now: u64) -> bool {
-        if now.saturating_sub(self.last_prune_at) >= RATE_LIMITER_PRUNE_INTERVAL_SECONDS
-            || self.clients.len() > RATE_LIMITER_MAX_CLIENTS
-        {
+        if now.saturating_sub(self.last_prune_at) >= RATE_LIMITER_PRUNE_INTERVAL_SECONDS {
             self.prune(now);
+        }
+
+        if !self.clients.contains_key(&ip) && self.clients.len() >= RATE_LIMITER_MAX_CLIENTS {
+            return false;
         }
 
         let bucket = self.clients.entry(ip).or_insert(RateBucket {
@@ -212,11 +214,11 @@ impl ClientRateLimiter {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use crate::config::AppConfig;
 
-    use super::{ClientAccess, ClientAccessDecision};
+    use super::{ClientAccess, ClientAccessDecision, ClientRateLimiter, RATE_LIMITER_MAX_CLIENTS};
 
     #[test]
     fn access_allowlist_allows_private_default_clients() {
@@ -264,5 +266,19 @@ mod tests {
             ClientAccessDecision::RateLimited(_)
         ));
         assert!(matches!(access.check(ip, 101), ClientAccessDecision::Allow));
+    }
+
+    #[test]
+    fn rate_limiter_never_exceeds_client_capacity() {
+        let mut limiter = ClientRateLimiter::new(10);
+        for index in 0..RATE_LIMITER_MAX_CLIENTS {
+            assert!(limiter.allow(IpAddr::V6(Ipv6Addr::from(index as u128 + 1)), 100));
+        }
+
+        assert!(!limiter.allow(
+            IpAddr::V6(Ipv6Addr::from(RATE_LIMITER_MAX_CLIENTS as u128 + 1)),
+            100
+        ));
+        assert_eq!(limiter.clients.len(), RATE_LIMITER_MAX_CLIENTS);
     }
 }

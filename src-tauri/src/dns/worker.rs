@@ -21,7 +21,8 @@ use super::{
     filter_runtime::{FilterRuntime, SharedFilterRuntime, current_filter_runtime},
     protocol::{
         Question, RCODE_REFUSED, TYPE_ANY, build_block_response, build_error_response,
-        build_rewrite_response, parse_question,
+        build_rewrite_response, parse_query, prepare_response_for_query, truncate_response_for_udp,
+        udp_payload_size,
     },
     stats::{
         DnsStats, DnsTransport, current_second, record_access_denied, record_blocked_query,
@@ -239,15 +240,16 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         }
     }
 
-    let question = match parse_question(query) {
-        Ok(question) => question,
+    let parsed_query = match parse_query(query) {
+        Ok(query) => query,
         Err(error) => {
             record_error(&context.stats, error);
             send_no_response(response_target);
             return;
         }
     };
-    let log_metadata = QueryLogMetadata::new(&question, response_target);
+    let question = &parsed_query.question;
+    let log_metadata = QueryLogMetadata::new(question, response_target);
 
     // 整包读取当前过滤状态，一次查询内保持一致；规则热替换只影响后续查询
     let filter = current_filter_runtime(&context.filter_runtime);
@@ -262,7 +264,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         let response = build_error_response(query, RCODE_REFUSED);
         match response {
             Some(response) => {
-                if let Err(error) = send_dns_response(response_target, &response) {
+                if let Err(error) = send_dns_response(response_target, query, &response) {
                     let message = format!("返回 ANY 拒绝响应失败：{error}");
                     record_error(&context.stats, message.clone());
                     queue_query_log(
@@ -309,8 +311,8 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             &question.domain,
             context.detailed_runtime_stats,
         );
-        let response = build_rewrite_response(query, &question, &target);
-        if let Err(error) = send_dns_response(response_target, &response) {
+        let response = build_rewrite_response(query, question, &target);
+        if let Err(error) = send_dns_response(response_target, query, &response) {
             let message = format!("返回 DNS 重写响应失败：{error}");
             record_error(&context.stats, message.clone());
             queue_query_log(
@@ -348,8 +350,8 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         .rules
         .blocking_match(&question.domain, question.qtype)
     {
-        let response = build_block_response(query, &question, &filter.blocking);
-        if let Err(error) = send_dns_response(response_target, &response) {
+        let response = build_block_response(query, question, &filter.blocking);
+        if let Err(error) = send_dns_response(response_target, query, &response) {
             let message = format!("返回黑名单响应失败：{error}");
             record_query(
                 &context.stats,
@@ -391,11 +393,12 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         context.detailed_runtime_stats,
     );
 
-    let cache_key = QueryCacheKey::from_question(&question);
-    if let Some(cache_hit) =
-        lookup_cached_response(&context.dns_cache, &cache_key, query, current_second())
+    let cache_key = QueryCacheKey::from_query(&parsed_query);
+    if let Some(cache_key) = cache_key.as_ref()
+        && let Some(cache_hit) =
+            lookup_cached_response(&context.dns_cache, cache_key, query, current_second())
     {
-        if let Err(error) = send_dns_response(response_target, &cache_hit.response) {
+        if let Err(error) = send_dns_response(response_target, query, &cache_hit.response) {
             let message = format!("返回 DNS 缓存响应失败：{error}");
             record_error(&context.stats, message.clone());
             queue_query_log(
@@ -428,7 +431,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             if cache_hit.refresh {
                 refresh_expired_cache_async(
                     work_item.query,
-                    cache_key,
+                    cache_key.clone(),
                     Arc::clone(&context.upstream_servers),
                     Arc::clone(&context.fallback_upstream_servers),
                     context.upstream_mode.clone(),
@@ -440,15 +443,48 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         return;
     }
 
-    let pending_query = match begin_pending_query(context, &cache_key) {
-        PendingQueryRole::Leader(pending_query) => pending_query,
-        PendingQueryRole::Follower(pending_query) => {
-            match wait_pending_query(&pending_query) {
-                Ok(forwarded) => {
-                    let response = prepare_forwarded_response(&forwarded.response, query);
-                    if let Err(error) = send_dns_response(response_target, &response) {
-                        let message = format!("转发复用响应给客户端失败：{error}");
-                        record_error(&context.stats, message.clone());
+    let pending_query = if let Some(cache_key) = cache_key.as_ref() {
+        match begin_pending_query(context, cache_key) {
+            PendingQueryRole::Leader(pending_query) => Some(pending_query),
+            PendingQueryRole::Follower(pending_query) => {
+                match wait_pending_query(&pending_query) {
+                    Ok(forwarded) => {
+                        let response = prepare_forwarded_response(&forwarded.response, query);
+                        if let Err(error) = send_dns_response(response_target, query, &response) {
+                            let message = format!("转发复用响应给客户端失败：{error}");
+                            record_error(&context.stats, message.clone());
+                            queue_query_log(
+                                context,
+                                &filter,
+                                &log_metadata,
+                                client_addr,
+                                QueryResponseSource::Upstream,
+                                false,
+                                true,
+                                true,
+                                Some(&forwarded.upstream),
+                                Some(forwarded.duration_ms),
+                                Some(message),
+                            );
+                        } else {
+                            queue_query_log(
+                                context,
+                                &filter,
+                                &log_metadata,
+                                client_addr,
+                                QueryResponseSource::Upstream,
+                                false,
+                                false,
+                                false,
+                                Some(&forwarded.upstream),
+                                Some(forwarded.duration_ms),
+                                None,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        record_error(&context.stats, error.clone());
+                        send_no_response(response_target);
                         queue_query_log(
                             context,
                             &filter,
@@ -456,48 +492,19 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                             client_addr,
                             QueryResponseSource::Upstream,
                             false,
+                            false,
                             true,
-                            true,
-                            Some(&forwarded.upstream),
-                            Some(forwarded.duration_ms),
-                            Some(message),
-                        );
-                    } else {
-                        queue_query_log(
-                            context,
-                            &filter,
-                            &log_metadata,
-                            client_addr,
-                            QueryResponseSource::Upstream,
-                            false,
-                            false,
-                            false,
-                            Some(&forwarded.upstream),
-                            Some(forwarded.duration_ms),
                             None,
+                            None,
+                            Some(error),
                         );
                     }
                 }
-                Err(error) => {
-                    record_error(&context.stats, error.clone());
-                    send_no_response(response_target);
-                    queue_query_log(
-                        context,
-                        &filter,
-                        &log_metadata,
-                        client_addr,
-                        QueryResponseSource::Upstream,
-                        false,
-                        false,
-                        true,
-                        None,
-                        None,
-                        Some(error),
-                    );
-                }
+                return;
             }
-            return;
         }
+    } else {
+        None
     };
 
     let forward_result = forward_query_with_fallback(
@@ -508,18 +515,22 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         &context.next_upstream,
         &context.fallback_next_upstream,
     );
-    finish_pending_query(context, &cache_key, &pending_query, forward_result.clone());
+    if let (Some(cache_key), Some(pending_query)) = (cache_key.as_ref(), pending_query.as_ref()) {
+        finish_pending_query(context, cache_key, pending_query, forward_result.clone());
+    }
 
     match forward_result {
         Ok(forwarded) => {
-            insert_cached_response(
-                &context.dns_cache,
-                context.dns_cache_config.as_ref(),
-                cache_key,
-                forwarded.response.clone(),
-                current_second(),
-            );
-            if let Err(error) = send_dns_response(response_target, &forwarded.response) {
+            if let Some(cache_key) = cache_key {
+                insert_cached_response(
+                    &context.dns_cache,
+                    context.dns_cache_config.as_ref(),
+                    cache_key,
+                    forwarded.response.clone(),
+                    current_second(),
+                );
+            }
+            if let Err(error) = send_dns_response(response_target, query, &forwarded.response) {
                 let message = format!("转发响应给客户端失败：{error}");
                 record_error(&context.stats, message.clone());
                 queue_query_log(
@@ -592,7 +603,7 @@ fn send_refused_or_drop(
                 send_no_response(response_target);
                 return;
             };
-            if let Err(error) = send_dns_response(response_target, &response) {
+            if let Err(error) = send_dns_response(response_target, query, &response) {
                 record_error(
                     &context.stats,
                     format!("{message}；返回拒绝响应失败：{error}"),
@@ -602,15 +613,30 @@ fn send_refused_or_drop(
     }
 }
 
-fn send_dns_response(response_target: &DnsResponseTarget, response: &[u8]) -> Result<(), String> {
+fn send_dns_response(
+    response_target: &DnsResponseTarget,
+    query: &[u8],
+    response: &[u8],
+) -> Result<(), String> {
     match response_target {
         DnsResponseTarget::Udp {
             socket,
             client_addr,
-        } => socket
-            .send_to(response, *client_addr)
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
+        } => {
+            let max_size = udp_payload_size(query);
+            if response.len() <= max_size {
+                return socket
+                    .send_to(response, *client_addr)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+            }
+            let response = truncate_response_for_udp(query, response, max_size)
+                .ok_or_else(|| "无法构造符合客户端 UDP 大小限制的 DNS 响应".to_string())?;
+            socket
+                .send_to(&response, *client_addr)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
         DnsResponseTarget::Tcp(sender) => sender
             .try_send(Some(response.to_vec()))
             .map_err(|error| error.to_string()),
@@ -692,11 +718,13 @@ fn forward_query_with_fallback(
 }
 
 pub(crate) fn prepare_forwarded_response(response: &[u8], query: &[u8]) -> Vec<u8> {
-    let mut response = response.to_vec();
-    if response.len() >= 2 && query.len() >= 2 {
-        response[0..2].copy_from_slice(&query[0..2]);
-    }
-    response
+    prepare_response_for_query(response, query).unwrap_or_else(|| {
+        let mut response = response.to_vec();
+        if response.len() >= 2 && query.len() >= 2 {
+            response[0..2].copy_from_slice(&query[0..2]);
+        }
+        response
+    })
 }
 
 fn refresh_expired_cache_async(
@@ -715,7 +743,9 @@ fn refresh_expired_cache_async(
         return;
     };
 
-    task_pool::spawn_task(move || {
+    let cache_on_reject = Arc::clone(&cache);
+    let cache_key_on_reject = cache_key.clone();
+    if !task_pool::spawn_task(move || {
         let next_upstream = AtomicUsize::new(0);
         let fallback_next_upstream = AtomicUsize::new(0);
         match forward_query_with_fallback(
@@ -740,7 +770,9 @@ fn refresh_expired_cache_async(
                 cache.finish_refresh(&cache_key);
             }
         }
-    });
+    }) {
+        cache_on_reject.finish_refresh(&cache_key_on_reject);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

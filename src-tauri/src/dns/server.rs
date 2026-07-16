@@ -7,7 +7,7 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -17,9 +17,8 @@ use crate::{config::AppConfig, database::Database};
 use super::{
     access::ClientAccess,
     cache::{DnsCacheConfig, DnsCacheStore},
-    filter_runtime::{
-        SharedFilterRuntime, build_filter_runtime, replace_filter_runtime, share_filter_runtime,
-    },
+    filter_runtime::{SharedFilterRuntime, build_filter_runtime, share_filter_runtime},
+    protocol::MAX_DNS_PACKET_SIZE,
     stats::{DnsStats, record_error, reset_stats},
     upstream::build_runtime_upstreams,
     worker::{
@@ -44,7 +43,6 @@ const DNS_MAX_WORKERS: usize = 32;
 const DNS_CACHE_SHARDS: usize = 64;
 
 pub struct DnsServer {
-    listen_addr: SocketAddr,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     cache: Option<Arc<DnsCacheStore>>,
@@ -61,7 +59,6 @@ impl DnsServer {
         config.validate()?;
 
         let listen_addrs = config.listen_socket_addrs()?;
-        let listen_addr = listen_addrs[0];
         let bootstrap_servers = config.bootstrap_servers()?;
         let upstream_servers = Arc::new(build_runtime_upstreams(
             config.upstream_servers()?,
@@ -163,16 +160,11 @@ impl DnsServer {
         }
 
         Ok(Self {
-            listen_addr,
             stop,
             threads,
             cache: dns_cache,
             filter_runtime,
         })
-    }
-
-    pub fn listen_addr(&self) -> SocketAddr {
-        self.listen_addr
     }
 
     pub fn clear_cache(&self) -> Result<(), String> {
@@ -182,12 +174,8 @@ impl DnsServer {
         Ok(())
     }
 
-    /// 热替换过滤状态（规则/重写/拦截模式/日志忽略），不重启服务、不清空 DNS 缓存。
-    pub fn replace_filter_state(&self, config: &AppConfig, rules_text: &str) -> super::RuleSummary {
-        let runtime = build_filter_runtime(config, rules_text);
-        let summary = runtime.summary();
-        replace_filter_runtime(&self.filter_runtime, runtime);
-        summary
+    pub(crate) fn filter_runtime_handle(&self) -> SharedFilterRuntime {
+        Arc::clone(&self.filter_runtime)
     }
 
     pub fn rule_summary(&self) -> super::RuleSummary {
@@ -352,7 +340,7 @@ fn serve_udp(
     stats: Arc<Mutex<DnsStats>>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut buffer = [0_u8; 4096];
+    let mut buffer = [0_u8; MAX_DNS_PACKET_SIZE];
     let mut next_worker = 0_usize;
 
     while !stop.load(Ordering::Relaxed) {
@@ -526,30 +514,18 @@ fn read_tcp_dns_query(
     stream: &mut TcpStream,
     stop: &Arc<AtomicBool>,
 ) -> Result<Option<Vec<u8>>, String> {
+    read_tcp_dns_query_with_timeout(stream, stop, TCP_IDLE_TIMEOUT)
+}
+
+fn read_tcp_dns_query_with_timeout(
+    stream: &mut TcpStream,
+    stop: &Arc<AtomicBool>,
+    total_timeout: Duration,
+) -> Result<Option<Vec<u8>>, String> {
+    let deadline = Instant::now() + total_timeout;
     let mut len_buf = [0_u8; 2];
-    let mut idle_waited = Duration::ZERO;
-    loop {
-        match stream.read_exact(&mut len_buf) {
-            Ok(()) => break,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if stop.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-                idle_waited = idle_waited.saturating_add(TCP_READ_TIMEOUT);
-                if idle_waited >= TCP_IDLE_TIMEOUT {
-                    return Ok(None);
-                }
-                continue;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
-            Err(error) => return Err(error.to_string()),
-        }
+    if !read_tcp_bytes_until(stream, &mut len_buf, stop, deadline, true)? {
+        return Ok(None);
     }
 
     let query_len = u16::from_be_bytes(len_buf) as usize;
@@ -558,10 +534,53 @@ fn read_tcp_dns_query(
     }
 
     let mut query = vec![0_u8; query_len];
-    stream
-        .read_exact(&mut query)
-        .map_err(|error| error.to_string())?;
+    if !read_tcp_bytes_until(stream, &mut query, stop, deadline, false)? {
+        return Ok(None);
+    }
     Ok(Some(query))
+}
+
+fn read_tcp_bytes_until(
+    stream: &mut TcpStream,
+    target: &mut [u8],
+    stop: &AtomicBool,
+    deadline: Instant,
+    clean_eof_if_empty: bool,
+) -> Result<bool, String> {
+    let mut offset = 0;
+    while offset < target.len() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero());
+        let Some(remaining) = remaining else {
+            if clean_eof_if_empty && offset == 0 {
+                return Ok(false);
+            }
+            return Err("读取 TCP DNS 请求总超时".into());
+        };
+        stream
+            .set_read_timeout(Some(remaining.min(TCP_READ_TIMEOUT)))
+            .map_err(|error| error.to_string())?;
+
+        match stream.read(&mut target[offset..]) {
+            Ok(0) if clean_eof_if_empty && offset == 0 => return Ok(false),
+            Ok(0) => return Err("TCP DNS 请求在完整读取前关闭".into()),
+            Ok(read) => offset += read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(true)
 }
 
 fn write_tcp_dns_response(stream: &mut TcpStream, response: &[u8]) -> Result<(), String> {
@@ -666,6 +685,58 @@ mod tests {
 
         bind_tcp_listener(SocketAddr::from(([0, 0, 0, 0], port)), false)
             .expect("IPv4 TCP listener should share the port");
+    }
+
+    #[test]
+    fn tcp_query_body_has_cumulative_read_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.write_all(&4_u16.to_be_bytes()).unwrap();
+        client.write_all(&[1]).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let error = read_tcp_dns_query_with_timeout(&mut server, &stop, Duration::from_millis(100))
+            .expect_err("partial TCP query should time out");
+
+        assert!(error.contains("总超时"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tcp_query_reports_disconnect_during_body() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.write_all(&4_u16.to_be_bytes()).unwrap();
+        client.write_all(&[1]).unwrap();
+        drop(client);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let error = read_tcp_dns_query_with_timeout(&mut server, &stop, Duration::from_millis(500))
+            .expect_err("partial TCP query should report disconnect");
+
+        assert!(error.contains("完整读取前关闭"));
+    }
+
+    #[test]
+    fn finished_runtime_thread_marks_server_unhealthy() {
+        let finished_thread = thread::spawn(|| {});
+        while !finished_thread.is_finished() {
+            thread::yield_now();
+        }
+        let server = DnsServer {
+            stop: Arc::new(AtomicBool::new(false)),
+            threads: vec![finished_thread],
+            cache: None,
+            filter_runtime: share_filter_runtime(build_filter_runtime(&AppConfig::default(), "")),
+        };
+
+        assert!(server.has_finished_threads());
+        server.stop();
     }
 
     #[test]

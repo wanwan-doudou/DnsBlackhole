@@ -28,7 +28,7 @@ pub fn update_enabled_filters(
 ) -> Result<FilterUpdateReport, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
-        .user_agent("DnsBlackhole/0.1")
+        .user_agent(concat!("DnsBlackhole/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| format!("创建下载客户端失败：{e}"))?;
 

@@ -558,7 +558,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <input id="anonymize_client_ip" type="checkbox" />
                 <span>
                   <strong>匿名化客户端 IP</strong>
-                  <small>不要在日志和统计信息中保存客户端的完整 IP 地址。</small>
+                  <small>持久化查询日志中仅保存匿名化后的客户端 IP；运行期安全事件仍会显示来源 IP。</small>
                 </span>
               </label>
               <div class="retention-settings">

@@ -140,6 +140,32 @@ fn scan_rules<'a>(raw: &'a str, mut handle: impl FnMut(ScanEvent<'a>)) {
         if disabled.contains(trimmed) {
             continue;
         }
+        if let Some((kind, domains)) = parse_hosts_rules(trimmed) {
+            let single_domain = domains.len() == 1;
+            for domain in domains {
+                match domain {
+                    Some(domain) => {
+                        let canonical = (single_domain
+                            && is_canonical_rule_text(trimmed, kind, &domain, false))
+                        .then_some(kind);
+                        handle(ScanEvent::Rule(ParsedRule::Block(RuleData {
+                            domain,
+                            include_subdomains: false,
+                            raw: trimmed,
+                            rule_type: RuleType::Hosts,
+                            important: false,
+                            query_types: QueryTypes::Any,
+                            denyallow: Vec::new(),
+                            canonical,
+                        })));
+                    }
+                    None => handle(ScanEvent::Rule(ParsedRule::Ignored(
+                        IgnoredRuleReason::Invalid,
+                    ))),
+                }
+            }
+            continue;
+        }
         handle(ScanEvent::Rule(parse_rule(line)));
     }
 }
@@ -573,17 +599,12 @@ fn parse_rule(line: &str) -> ParsedRule<'_> {
         return ParsedRule::Ignored(IgnoredRuleReason::Comment);
     }
 
-    if let Some(rule) = parse_hosts_rule(trimmed) {
-        return ParsedRule::Block(rule);
-    }
-
     parse_filter_rule(trimmed)
 }
 
-fn parse_hosts_rule(line: &str) -> Option<RuleData<'_>> {
+fn parse_hosts_rules(line: &str) -> Option<(SimpleKind, Vec<Option<Cow<'_, str>>>)> {
     let mut parts = line.split_whitespace();
     let ip = parts.next()?;
-    let domain_token = parts.next()?;
     let kind = match ip {
         "0.0.0.0" => SimpleKind::HostsZero4,
         "127.0.0.1" => SimpleKind::HostsLocal4,
@@ -591,19 +612,14 @@ fn parse_hosts_rule(line: &str) -> Option<RuleData<'_>> {
         "::1" => SimpleKind::HostsLocal6,
         _ => return None,
     };
-
-    let domain = normalize_domain(domain_token)?;
-    let canonical = is_canonical_rule_text(line, kind, &domain, false).then_some(kind);
-    Some(RuleData {
-        domain,
-        include_subdomains: false,
-        raw: line,
-        rule_type: RuleType::Hosts,
-        important: false,
-        query_types: QueryTypes::Any,
-        denyallow: Vec::new(),
-        canonical,
-    })
+    let domains = parts
+        .take_while(|token| !token.starts_with('#') && !token.starts_with('!'))
+        .map(normalize_domain)
+        .collect::<Vec<_>>();
+    if domains.is_empty() {
+        return Some((kind, vec![None]));
+    }
+    Some((kind, domains))
 }
 
 fn parse_filter_rule(line: &str) -> ParsedRule<'_> {

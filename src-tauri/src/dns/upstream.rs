@@ -11,9 +11,13 @@ use std::{
 };
 
 use crate::config::{UpstreamMode, UpstreamServer, resolve_hostname_socket_addrs};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 
 use super::{
-    protocol::{extract_response_ips, response_is_truncated, validate_response_for_query},
+    protocol::{
+        MAX_DNS_PACKET_SIZE, extract_response_ips, response_is_truncated,
+        validate_response_for_query,
+    },
     stats::current_second,
     task_pool,
 };
@@ -31,7 +35,7 @@ const PARALLEL_RESULT_WAIT: Duration = Duration::from_secs(6);
 const UDP_SOCKET_POOL_CAPACITY: usize = 8;
 const PROBE_CACHE_TTL_SECONDS: u64 = 600;
 const PROBE_CACHE_MAX_ENTRIES: usize = 4096;
-const DNSBLACKHOLE_USER_AGENT: &str = "DnsBlackhole/0.1";
+const DNSBLACKHOLE_USER_AGENT: &str = concat!("DnsBlackhole/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone)]
 pub(crate) struct RuntimeUpstream {
@@ -283,8 +287,13 @@ fn forward_parallel(
         return Err("没有可用的上游 DNS".into());
     }
 
-    let expected = selected_upstreams.len();
-    let receiver = spawn_parallel_forwards(query, selected_upstreams);
+    let (receiver, expected, synchronous_fallback) =
+        spawn_parallel_forwards(query, selected_upstreams);
+    if expected == 0 {
+        return synchronous_fallback
+            .ok_or_else(|| "并发任务队列已满".to_string())
+            .and_then(|upstream| forward_to_upstream(query, &upstream));
+    }
     let deadline = Instant::now() + PARALLEL_RESULT_WAIT;
     let mut last_error = None;
     for _ in 0..expected {
@@ -307,8 +316,13 @@ fn forward_fastest_addr(
         return Err("没有可用的上游 DNS".into());
     }
 
-    let expected = selected_upstreams.len();
-    let receiver = spawn_parallel_forwards(query, selected_upstreams);
+    let (receiver, expected, synchronous_fallback) =
+        spawn_parallel_forwards(query, selected_upstreams);
+    if expected == 0 {
+        return synchronous_fallback
+            .ok_or_else(|| "并发任务队列已满".to_string())
+            .and_then(|upstream| forward_to_upstream(query, &upstream));
+    }
     let deadline = Instant::now() + PARALLEL_RESULT_WAIT;
     let mut responses = Vec::new();
     let mut last_error = None;
@@ -334,17 +348,29 @@ fn forward_fastest_addr(
 fn spawn_parallel_forwards(
     query: &[u8],
     selected_upstreams: Vec<RuntimeUpstream>,
-) -> mpsc::Receiver<Result<UpstreamForwardResponse, String>> {
+) -> (
+    mpsc::Receiver<Result<UpstreamForwardResponse, String>>,
+    usize,
+    Option<RuntimeUpstream>,
+) {
     let (sender, receiver) = mpsc::channel();
     let query = Arc::new(query.to_vec());
+    let mut scheduled = 0;
+    let mut synchronous_fallback = None;
     for upstream in selected_upstreams {
         let sender = sender.clone();
         let query = Arc::clone(&query);
-        task_pool::spawn_task(move || {
+        let fallback = upstream.clone();
+        if task_pool::spawn_task(move || {
             let _ = sender.send(forward_to_upstream(query.as_ref().as_slice(), &upstream));
-        });
+        }) {
+            scheduled += 1;
+        } else {
+            synchronous_fallback = Some(fallback);
+            break;
+        }
     }
-    receiver
+    (receiver, scheduled, synchronous_fallback)
 }
 
 fn recv_until<T>(receiver: &mpsc::Receiver<T>, deadline: Instant) -> Option<T> {
@@ -379,6 +405,7 @@ fn fastest_response_index(responses: &[UpstreamForwardResponse]) -> Option<usize
         .flat_map(|(index, response)| {
             extract_response_ips(&response.response)
                 .into_iter()
+                .filter(|ip| is_probe_allowed(*ip))
                 .take(FASTEST_ADDR_MAX_IPS_PER_RESPONSE)
                 .map(move |ip| (index, ip))
         })
@@ -408,11 +435,11 @@ fn fastest_response_index(responses: &[UpstreamForwardResponse]) -> Option<usize
     }
 
     if !pending.is_empty() {
-        let expected = pending.len();
+        let mut expected = 0;
         let (sender, receiver) = mpsc::channel();
         for (response_index, ip) in pending {
             let sender = sender.clone();
-            task_pool::spawn_task(move || {
+            if task_pool::spawn_task(move || {
                 let duration = measure_ip_latency(ip);
                 store_probe_duration(ip, duration);
                 if let Some(duration) = duration {
@@ -421,7 +448,9 @@ fn fastest_response_index(responses: &[UpstreamForwardResponse]) -> Option<usize
                         duration,
                     });
                 }
-            });
+            }) {
+                expected += 1;
+            }
         }
         drop(sender);
 
@@ -498,6 +527,44 @@ fn measure_ip_latency(ip: IpAddr) -> Option<Duration> {
                 .map(|_| start.elapsed())
         })
         .min()
+}
+
+fn is_probe_allowed(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !matches!(
+                (a, b, c),
+                (0, _, _)
+                    | (10, _, _)
+                    | (100, 64..=127, _)
+                    | (127, _, _)
+                    | (169, 254, _)
+                    | (172, 16..=31, _)
+                    | (192, 0, 0)
+                    | (192, 0, 2)
+                    | (192, 168, _)
+                    | (198, 18..=19, _)
+                    | (198, 51, 100)
+                    | (203, 0, 113)
+                    | (224..=255, _, _)
+            )
+        }
+        IpAddr::V6(ip) => {
+            if let Some(ipv4) = ip.to_ipv4_mapped() {
+                return is_probe_allowed(IpAddr::V4(ipv4));
+            }
+            let segments = ip.segments();
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && segments[..6] != [0; 6]
+                && segments[0] & 0xfe00 != 0xfc00
+                && segments[0] & 0xffc0 != 0xfe80
+                && segments[0] & 0xffc0 != 0xfec0
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
 }
 
 fn forward_to_upstream(
@@ -668,7 +735,7 @@ fn udp_exchange(socket: &UdpSocket, query: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("请求上游 DNS 失败：{e}"))?;
 
     let deadline = Instant::now() + UPSTREAM_TIMEOUT;
-    let mut buffer = [0_u8; 4096];
+    let mut buffer = [0_u8; MAX_DNS_PACKET_SIZE];
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -732,7 +799,7 @@ fn forward_doh(
         request_body[1] = 0;
     }
 
-    let response = client
+    let mut response = client
         .post(url)
         .header("accept", "application/dns-message")
         .header("content-type", "application/dns-message")
@@ -742,20 +809,54 @@ fn forward_doh(
         .error_for_status()
         .map_err(|e| format!("DoH 上游返回错误：{e}"))?;
 
-    response
-        .bytes()
-        .map(|bytes| {
-            let mut response = bytes.to_vec();
-            if response.len() >= 2 && query.len() >= 2 {
-                response[0..2].copy_from_slice(&query[0..2]);
-            }
-            response
-        })
-        .map_err(|e| format!("读取 DoH 响应失败：{e}"))
+    validate_doh_response_headers(response.headers())?;
+    let mut response = read_limited_doh_body(&mut response)?;
+    if response.len() >= 2 && query.len() >= 2 {
+        response[0..2].copy_from_slice(&query[0..2]);
+    }
+    Ok(response)
+}
+
+fn validate_doh_response_headers(headers: &reqwest::header::HeaderMap) -> Result<(), String> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/dns-message"))
+    {
+        return Err(format!("DoH 上游返回了无效 Content-Type：{content_type}"));
+    }
+
+    if let Some(content_length) = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        && content_length > MAX_DNS_PACKET_SIZE as u64
+    {
+        return Err("DoH 响应长度超过 65535 字节".into());
+    }
+    Ok(())
+}
+
+fn read_limited_doh_body(reader: &mut impl Read) -> Result<Vec<u8>, String> {
+    let mut response = Vec::new();
+    reader
+        .take((MAX_DNS_PACKET_SIZE + 1) as u64)
+        .read_to_end(&mut response)
+        .map_err(|e| format!("读取 DoH 响应失败：{e}"))?;
+    if response.len() > MAX_DNS_PACKET_SIZE {
+        return Err("DoH 响应长度超过 65535 字节".into());
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     #[test]
@@ -792,5 +893,45 @@ mod tests {
         let state = current_udp_state(&upstream).expect("hostname should resolve again");
         assert!(!state.addresses.is_empty());
         assert_eq!(upstream.resolution_retry_at.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fastest_address_probe_rejects_non_public_targets() {
+        assert!(!is_probe_allowed("127.0.0.1".parse().unwrap()));
+        assert!(!is_probe_allowed("192.168.1.1".parse().unwrap()));
+        assert!(!is_probe_allowed("169.254.169.254".parse().unwrap()));
+        assert!(!is_probe_allowed("::1".parse().unwrap()));
+        assert!(!is_probe_allowed("fc00::1".parse().unwrap()));
+        assert!(is_probe_allowed("8.8.8.8".parse().unwrap()));
+        assert!(is_probe_allowed("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn doh_body_reader_enforces_dns_message_limit() {
+        let mut valid = Cursor::new(vec![0_u8; MAX_DNS_PACKET_SIZE]);
+        assert_eq!(
+            read_limited_doh_body(&mut valid).unwrap().len(),
+            MAX_DNS_PACKET_SIZE
+        );
+
+        let mut oversized = Cursor::new(vec![0_u8; MAX_DNS_PACKET_SIZE + 1]);
+        assert!(read_limited_doh_body(&mut oversized).is_err());
+    }
+
+    #[test]
+    fn doh_headers_require_dns_message_content_type() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/dns-message".parse().unwrap());
+        assert!(validate_doh_response_headers(&headers).is_ok());
+
+        headers.insert(CONTENT_TYPE, "text/html".parse().unwrap());
+        assert!(validate_doh_response_headers(&headers).is_err());
+
+        headers.insert(CONTENT_TYPE, "application/dns-message".parse().unwrap());
+        headers.insert(
+            CONTENT_LENGTH,
+            (MAX_DNS_PACKET_SIZE + 1).to_string().parse().unwrap(),
+        );
+        assert!(validate_doh_response_headers(&headers).is_err());
     }
 }

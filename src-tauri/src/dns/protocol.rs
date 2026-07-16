@@ -5,6 +5,8 @@ use crate::config::{AppConfig, BlockingMode};
 use super::rewrites::RewriteTarget;
 
 pub(crate) const DNS_HEADER_LEN: usize = 12;
+pub(crate) const MAX_DNS_PACKET_SIZE: usize = u16::MAX as usize;
+const MAX_UDP_DNS_PAYLOAD: usize = 65_507;
 const BLOCK_RESPONSE_TTL: u32 = 60;
 const REWRITE_RESPONSE_TTL: u32 = 300;
 pub(crate) const TYPE_A: u16 = 1;
@@ -22,6 +24,77 @@ pub(crate) struct Question {
     pub(crate) qtype: u16,
     pub(crate) qclass: u16,
     pub(crate) question_end: usize,
+}
+
+pub(crate) struct ParsedQuery {
+    pub(crate) question: Question,
+    pub(crate) recursion_desired: bool,
+    pub(crate) authentic_data: bool,
+    pub(crate) checking_disabled: bool,
+    pub(crate) dnssec_ok: bool,
+    pub(crate) edns_udp_size: Option<u16>,
+    pub(crate) cache_safe: bool,
+}
+
+pub(crate) fn parse_query(packet: &[u8]) -> Result<ParsedQuery, String> {
+    if packet.len() < DNS_HEADER_LEN {
+        return Err("DNS 请求长度不足".into());
+    }
+
+    let flags = read_u16(packet, 2).ok_or("DNS flags 读取失败")?;
+    if flags & 0x8000 != 0 {
+        return Err("DNS 请求的 QR 标志无效".into());
+    }
+    if flags & 0x7800 != 0 {
+        return Err("暂不支持非标准 DNS opcode".into());
+    }
+    if flags & 0x0040 != 0 {
+        return Err("DNS 请求设置了保留标志位".into());
+    }
+
+    let question = parse_question(packet)?;
+    let answer_count = read_u16(packet, 6).unwrap_or(0);
+    let authority_count = read_u16(packet, 8).unwrap_or(0);
+    let additional_count = read_u16(packet, 10).unwrap_or(0);
+    let mut offset = question.question_end;
+    let mut cache_safe = answer_count == 0 && authority_count == 0;
+
+    for _ in 0..answer_count.saturating_add(authority_count) {
+        let record = read_dns_record(packet, offset).ok_or("DNS 请求资源记录格式无效")?;
+        offset = record.next_offset;
+    }
+
+    let mut edns_udp_size = None;
+    let mut dnssec_ok = false;
+    for _ in 0..additional_count {
+        let owner_is_root = packet.get(offset).is_some_and(|value| *value == 0);
+        let record = read_dns_record(packet, offset).ok_or("DNS 请求附加记录格式无效")?;
+        if record.record_type == TYPE_OPT && edns_udp_size.is_none() && owner_is_root {
+            edns_udp_size = Some(record.record_class.max(512));
+            dnssec_ok = record.ttl & 0x0000_8000 != 0;
+            if record.data_len != 0 || record.ttl & 0xffff_7fff != 0 {
+                // ECS、Cookie 等 EDNS 选项会影响响应，不参与缓存或重复请求合并。
+                cache_safe = false;
+            }
+        } else {
+            cache_safe = false;
+        }
+        offset = record.next_offset;
+    }
+
+    if offset != packet.len() {
+        return Err("DNS 请求包含未解析的尾部数据".into());
+    }
+
+    Ok(ParsedQuery {
+        question,
+        recursion_desired: flags & 0x0100 != 0,
+        authentic_data: flags & 0x0020 != 0,
+        checking_disabled: flags & 0x0010 != 0,
+        dnssec_ok,
+        edns_udp_size,
+        cache_safe,
+    })
 }
 
 pub(crate) fn parse_question(packet: &[u8]) -> Result<Question, String> {
@@ -64,7 +137,7 @@ pub(crate) fn parse_question(packet: &[u8]) -> Result<Question, String> {
         if !domain.is_empty() {
             domain.push('.');
         }
-        push_ascii_lowercase_lossy(&mut domain, &packet[offset..offset + label_len]);
+        push_ascii_lowercase(&mut domain, &packet[offset..offset + label_len])?;
         offset += label_len;
     }
 
@@ -84,21 +157,14 @@ pub(crate) fn parse_question(packet: &[u8]) -> Result<Question, String> {
     })
 }
 
-fn push_ascii_lowercase_lossy(target: &mut String, bytes: &[u8]) {
-    if bytes.is_ascii() {
-        for byte in bytes {
-            target.push(char::from(byte.to_ascii_lowercase()));
-        }
-        return;
+fn push_ascii_lowercase(target: &mut String, bytes: &[u8]) -> Result<(), String> {
+    if !bytes.is_ascii() {
+        return Err("DNS label 必须使用 ASCII/Punycode 编码".into());
     }
-
-    for ch in String::from_utf8_lossy(bytes).chars() {
-        if ch.is_ascii() {
-            target.push(ch.to_ascii_lowercase());
-        } else {
-            target.push(ch);
-        }
+    for byte in bytes {
+        target.push(char::from(byte.to_ascii_lowercase()));
     }
+    Ok(())
 }
 
 pub(crate) fn build_error_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
@@ -403,6 +469,7 @@ struct DnsRecordHeader {
     record_type: u16,
     record_class: u16,
     ttl: u32,
+    data_len: usize,
     next_offset: usize,
 }
 
@@ -425,6 +492,7 @@ fn read_dns_record(packet: &[u8], offset: usize) -> Option<DnsRecordHeader> {
         record_type,
         record_class,
         ttl,
+        data_len,
         next_offset,
     })
 }
@@ -439,14 +507,60 @@ pub(crate) fn prepare_cached_response(
     query: &[u8],
     ttl: u32,
 ) -> Option<Vec<u8>> {
-    if cached_response.len() < 2 || query.len() < 2 {
+    let mut response = prepare_response_for_query(cached_response, query)?;
+    rewrite_response_ttls(&mut response, ttl)?;
+    Some(response)
+}
+
+pub(crate) fn prepare_response_for_query(response: &[u8], query: &[u8]) -> Option<Vec<u8>> {
+    let response_question = parse_question(response).ok()?;
+    let query_question = parse_question(query).ok()?;
+    if response_question.domain != query_question.domain
+        || response_question.qtype != query_question.qtype
+        || response_question.qclass != query_question.qclass
+        || response_question.question_end != query_question.question_end
+    {
         return None;
     }
 
-    let mut response = cached_response.to_vec();
-    response[0..2].copy_from_slice(&query[0..2]);
-    rewrite_response_ttls(&mut response, ttl)?;
-    Some(response)
+    let mut prepared = response.to_vec();
+    prepared[0..2].copy_from_slice(&query[0..2]);
+    prepared[DNS_HEADER_LEN..response_question.question_end]
+        .copy_from_slice(&query[DNS_HEADER_LEN..query_question.question_end]);
+    Some(prepared)
+}
+
+pub(crate) fn udp_payload_size(query: &[u8]) -> usize {
+    parse_query(query)
+        .ok()
+        .and_then(|parsed| parsed.edns_udp_size)
+        .map_or(512, usize::from)
+        .clamp(512, MAX_UDP_DNS_PAYLOAD)
+}
+
+pub(crate) fn truncate_response_for_udp(
+    query: &[u8],
+    response: &[u8],
+    max_size: usize,
+) -> Option<Vec<u8>> {
+    if response.len() <= max_size {
+        return Some(response.to_vec());
+    }
+    if response.len() < DNS_HEADER_LEN {
+        return None;
+    }
+
+    let question = parse_question(query).ok()?;
+    let mut truncated = Vec::with_capacity(question.question_end);
+    truncated.extend_from_slice(query.get(0..2)?);
+    truncated.push(response[2] | 0x02);
+    truncated.push(response[3]);
+    write_u16(&mut truncated, 1);
+    write_u16(&mut truncated, 0);
+    write_u16(&mut truncated, 0);
+    write_u16(&mut truncated, 0);
+    truncated.extend_from_slice(query.get(DNS_HEADER_LEN..question.question_end)?);
+    (truncated.len() <= max_size).then_some(truncated)
 }
 
 fn rewrite_response_ttls(packet: &mut [u8], ttl: u32) -> Option<()> {
