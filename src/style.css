@@ -918,15 +918,24 @@ button.refreshing:disabled {
   font-weight: 600;
 }
 
-.spark-card>span {
-  display: block;
+.spark-card>.spark-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin: 9px 0 0 4px;
   color: #566472;
   font-size: 13px;
   font-weight: 500;
 }
 
-.blocked-spark>span {
+.spark-caption>small {
+  color: #8a98a7;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.blocked-spark>.spark-caption>span {
   color: #f0644a;
 }
 

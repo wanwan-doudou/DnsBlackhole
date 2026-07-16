@@ -15,7 +15,7 @@ import {
   updateFilters as updateFiltersCommand,
 } from "./api";
 import appIconUrl from "./app-icon.png";
-import { buildTrafficSeries, renderSparkline, runtimeWindowHours } from "./charts";
+import { buildDailyTrafficSeries, renderSparkline } from "./charts";
 import { query } from "./dom";
 import {
   escapeHtml,
@@ -948,11 +948,14 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#queries"), formatCount(status.stats.queries));
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
-  const trafficWindowHours = currentQueryLogEnabled
-    ? currentQueryLogRetentionHours
-    : runtimeWindowHours(status.stats.started_at);
-  renderSparkline("#query_sparkline", buildTrafficSeries(status.stats.traffic, "queries", trafficWindowHours));
-  renderSparkline("#blocked_sparkline", buildTrafficSeries(status.stats.traffic, "blocked", trafficWindowHours));
+  renderSparkline(
+    "#query_sparkline",
+    buildDailyTrafficSeries(status.stats.traffic, "queries"),
+  );
+  renderSparkline(
+    "#blocked_sparkline",
+    buildDailyTrafficSeries(status.stats.traffic, "blocked"),
+  );
   renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries);
   renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked);
   renderUpstreamRequestRank(

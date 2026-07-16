@@ -8,11 +8,6 @@ const filterTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   minute: "2-digit",
 });
 const sparkDateFormatter = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" });
-const sparkTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false,
-});
 const logTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   hour: "2-digit",
   minute: "2-digit",
@@ -65,19 +60,8 @@ export function formatLogDate(value: number): string {
   return logDateFormatter.format(new Date(value * 1000));
 }
 
-export function formatSparkBucketLabel(minute: number, bucketMinutes: number): string {
-  const start = new Date(minute * 60000);
-  const end = new Date((minute + bucketMinutes - 1) * 60000);
-
-  if (bucketMinutes >= 24 * 60) {
-    const startLabel = sparkDateFormatter.format(start);
-    const endLabel = sparkDateFormatter.format(end);
-    return startLabel === endLabel ? startLabel : `${startLabel} - ${endLabel}`;
-  }
-
-  const startLabel = sparkTimeFormatter.format(start);
-  const endLabel = sparkTimeFormatter.format(end);
-  return startLabel === endLabel ? startLabel : `${startLabel} - ${endLabel}`;
+export function formatSparkDayLabel(minute: number): string {
+  return sparkDateFormatter.format(new Date(minute * 60000));
 }
 
 export function escapeHtml(value: string): string {

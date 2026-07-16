@@ -56,7 +56,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </svg>
               <div class="spark-tooltip hidden" id="query_spark_tooltip"></div>
             </div>
-            <span>DNS 查询</span>
+            <span class="spark-caption"><span>DNS 查询</span><small>最近 15 天 · 每日</small></span>
           </article>
 
           <article class="spark-card blocked-spark">
@@ -80,7 +80,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </svg>
               <div class="spark-tooltip hidden" id="blocked_spark_tooltip"></div>
             </div>
-            <span>已被过滤器拦截</span>
+            <span class="spark-caption"><span>已被过滤器拦截</span><small>最近 15 天 · 每日</small></span>
           </article>
         </div>
 

@@ -1,29 +1,38 @@
 import { query } from "./dom";
-import { escapeHtml, formatCount, formatSparkBucketLabel } from "./format";
+import { escapeHtml, formatCount, formatSparkDayLabel } from "./format";
 import type { ChartPoint, HistoryPoint, TrafficBucket } from "./types";
 
-export function buildTrafficSeries(
+export const DAILY_TREND_DAYS = 15;
+
+export function buildDailyTrafficSeries(
   buckets: TrafficBucket[] | undefined,
   field: "queries" | "blocked",
-  windowHours: number,
+  dayCount = DAILY_TREND_DAYS,
+  now = Date.now(),
 ): HistoryPoint[] {
-  const pointCount = 48;
-  const latestMinute = Math.floor(Date.now() / 60000);
-  const windowMinutes = Math.max(pointCount, Math.ceil(windowHours * 60));
-  const bucketMinutes = Math.max(1, Math.ceil(windowMinutes / pointCount));
-  const firstMinute = latestMinute - bucketMinutes * pointCount + 1;
-  const values = Array.from({ length: pointCount }, (_, index) => {
-    const minute = firstMinute + index * bucketMinutes;
+  const pointCount = Math.max(1, Math.floor(dayCount));
+  const today = new Date(now);
+  today.setHours(0, 0, 0, 0);
+
+  const dayStarts = Array.from({ length: pointCount }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (pointCount - index - 1));
+    return date.getTime();
+  });
+  const dayIndex = new Map(dayStarts.map((timestamp, index) => [timestamp, index]));
+  const values = dayStarts.map((timestamp, index) => {
     return {
       index,
       value: 0,
-      label: formatSparkBucketLabel(minute, bucketMinutes),
+      label: formatSparkDayLabel(Math.floor(timestamp / 60000)),
     };
   });
 
   for (const bucket of buckets ?? []) {
-    const index = Math.floor((bucket.minute - firstMinute) / bucketMinutes);
-    if (index >= 0 && index < pointCount) {
+    const date = new Date(bucket.minute * 60000);
+    date.setHours(0, 0, 0, 0);
+    const index = dayIndex.get(date.getTime());
+    if (index !== undefined) {
       values[index].value += bucket[field];
     }
   }
@@ -177,14 +186,6 @@ function bindSparklineHover(svg: SVGSVGElement, coords: ChartPoint[], width: num
     tooltip.style.left = `${clamp(pointLeft, minLeft, maxLeft)}px`;
     tooltip.style.top = `${clamp(pointTop, minTop, maxTop)}px`;
   };
-}
-
-export function runtimeWindowHours(startedAt: number | null): number {
-  if (!startedAt) {
-    return 1;
-  }
-  const elapsedSeconds = Math.max(60, Date.now() / 1000 - startedAt);
-  return Math.max(1, Math.ceil(elapsedSeconds / 3600));
 }
 
 function clamp(value: number, min: number, max: number): number {
