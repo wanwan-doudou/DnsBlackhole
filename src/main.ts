@@ -21,6 +21,7 @@ import {
   escapeHtml,
   formatCount,
   formatDuration,
+  formatElapsedMs,
   formatLogDate,
   formatLogTime,
   formatPercent,
@@ -1054,9 +1055,8 @@ function renderQueryLogRow(record: QueryLogRecord): string {
   const rowClass = record.failed ? " failed" : record.blocked ? " blocked" : "";
   const detailText = queryLogResponseDetail(record);
   const detail = escapeHtml(detailText);
-  const duration = record.upstream_duration_ms !== null
-    ? `${formatCount(record.upstream_duration_ms)} 毫秒`
-    : "";
+  const measuredDuration = record.processing_duration_ms ?? record.upstream_duration_ms;
+  const duration = measuredDuration !== null ? formatElapsedMs(measuredDuration) : "";
   const requestMeta = [
     dnsQueryTypeLabel(record.query_type),
     record.transport?.toUpperCase() ?? "协议未记录",
@@ -1129,7 +1129,7 @@ function renderQueryLogDetail(
   }
 
   if (duration) {
-    rows.push([queryLogResponseSource(record) === "cache" ? "缓存耗时" : "响应耗时", duration]);
+    rows.push(["处理耗时", duration]);
   }
 
   if (record.error) {

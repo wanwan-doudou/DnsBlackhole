@@ -24,6 +24,11 @@ export function formatCount(value: number): string {
   return countFormatter.format(value);
 }
 
+export function formatElapsedMs(value: number): string {
+  const formatted = value < 1 ? value.toFixed(2) : Math.floor(value).toString();
+  return `${formatted} 毫秒`;
+}
+
 export function formatRate(blocked: number, queries: number): string {
   if (queries === 0) {
     return "0%";

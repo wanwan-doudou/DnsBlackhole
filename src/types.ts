@@ -148,6 +148,7 @@ export type QueryLogRecord = {
   failed: boolean;
   upstream_server: string | null;
   upstream_duration_ms: number | null;
+  processing_duration_ms: number | null;
   error: string | null;
   matched_rule: string | null;
   rule_source: string | null;

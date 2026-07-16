@@ -27,6 +27,7 @@ const INSERT_QUERY_LOG_SQL: &str = "
             failed,
             upstream_server,
             upstream_duration_ms,
+            processing_duration_ms,
             error,
             matched_rule,
             rule_source,
@@ -38,7 +39,7 @@ const INSERT_QUERY_LOG_SQL: &str = "
             transport,
             response_source
         )
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
 
 const UPSERT_QUERY_LOG_MINUTE_STATS_SQL: &str = "
     INSERT INTO query_log_minute_stats
@@ -87,6 +88,7 @@ pub struct QueryLogEntry {
     pub failed: bool,
     pub upstream_server: Option<String>,
     pub upstream_duration_ms: Option<u64>,
+    pub processing_duration_ms: f64,
     pub error: Option<String>,
     pub matched_rule: Option<String>,
     pub rule_source: Option<String>,
@@ -110,6 +112,7 @@ pub struct QueryLogRecord {
     pub failed: bool,
     pub upstream_server: Option<String>,
     pub upstream_duration_ms: Option<u64>,
+    pub processing_duration_ms: Option<f64>,
     pub error: Option<String>,
     pub matched_rule: Option<String>,
     pub rule_source: Option<String>,
@@ -358,6 +361,7 @@ impl Database {
                 failed,
                 upstream_server,
                 upstream_duration_ms,
+                processing_duration_ms,
                 error,
                 matched_rule,
                 rule_source,
@@ -488,6 +492,7 @@ fn execute_query_log_insert(
         bool_to_i64(entry.failed),
         entry.upstream_server.as_deref(),
         upstream_duration_ms,
+        entry.processing_duration_ms,
         entry.error.as_deref(),
         entry.matched_rule.as_deref(),
         entry.rule_source.as_deref(),
@@ -561,16 +566,17 @@ fn read_query_log_record(row: &Row<'_>) -> rusqlite::Result<QueryLogRecord> {
         failed: row.get::<_, i64>(6)? != 0,
         upstream_server: row.get(7)?,
         upstream_duration_ms: read_optional_u64(row, 8)?,
-        error: row.get(9)?,
-        matched_rule: row.get(10)?,
-        rule_source: row.get(11)?,
-        rule_type: row.get(12)?,
-        important_overrode: row.get::<_, i64>(13)? != 0,
-        allowlist_rule: row.get(14)?,
-        query_type: row.get(15)?,
-        query_class: row.get(16)?,
-        transport: row.get(17)?,
-        response_source: row.get(18)?,
+        processing_duration_ms: row.get(9)?,
+        error: row.get(10)?,
+        matched_rule: row.get(11)?,
+        rule_source: row.get(12)?,
+        rule_type: row.get(13)?,
+        important_overrode: row.get::<_, i64>(14)? != 0,
+        allowlist_rule: row.get(15)?,
+        query_type: row.get(16)?,
+        query_class: row.get(17)?,
+        transport: row.get(18)?,
+        response_source: row.get(19)?,
     })
 }
 
@@ -596,6 +602,7 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             failed INTEGER NOT NULL DEFAULT 0,
             upstream_server TEXT,
             upstream_duration_ms INTEGER,
+            processing_duration_ms REAL,
             error TEXT,
             matched_rule TEXT,
             rule_source TEXT,
@@ -637,6 +644,7 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("初始化数据库失败：{e}"))?;
     add_column_if_missing(conn, "query_logs", "upstream_server", "TEXT")?;
     add_column_if_missing(conn, "query_logs", "upstream_duration_ms", "INTEGER")?;
+    add_column_if_missing(conn, "query_logs", "processing_duration_ms", "REAL")?;
     add_column_if_missing(conn, "query_logs", "matched_rule", "TEXT")?;
     add_column_if_missing(conn, "query_logs", "rule_source", "TEXT")?;
     add_column_if_missing(conn, "query_logs", "rule_type", "TEXT")?;
@@ -1025,6 +1033,7 @@ mod tests {
                     failed: false,
                     upstream_server: None,
                     upstream_duration_ms: None,
+                    processing_duration_ms: 0.26,
                     error: None,
                     matched_rule: Some("||example.org^".into()),
                     rule_source: Some("测试清单".into()),
@@ -1047,6 +1056,7 @@ mod tests {
                     failed: false,
                     upstream_server: Some("223.5.5.5:53".into()),
                     upstream_duration_ms: Some(24),
+                    processing_duration_ms: 24.75,
                     error: None,
                     matched_rule: None,
                     rule_source: None,
@@ -1080,6 +1090,7 @@ mod tests {
         assert_eq!(logs.records[0].query_class, Some(1));
         assert_eq!(logs.records[0].transport.as_deref(), Some("tcp"));
         assert_eq!(logs.records[0].response_source.as_deref(), Some("upstream"));
+        assert_eq!(logs.records[0].processing_duration_ms, Some(24.75));
         assert_eq!(logs.records[0].client_ip.as_deref(), Some("192.168.1.0"));
 
         let blocked_logs = db
@@ -1149,11 +1160,19 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("response_source column should exist");
+        let processing_duration_ms: String = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('query_logs') WHERE name = 'processing_duration_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("processing_duration_ms column should exist");
 
         assert_eq!(upstream_server, "upstream_server");
         assert_eq!(upstream_index, "idx_query_logs_upstream_server");
         assert_eq!(query_type, "query_type");
         assert_eq!(response_source, "response_source");
+        assert_eq!(processing_duration_ms, "processing_duration_ms");
     }
 
     #[test]

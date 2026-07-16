@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{config::UpstreamMode, database::QueryLogEntry};
@@ -90,10 +90,15 @@ struct QueryLogMetadata<'a> {
     query_type: u16,
     query_class: u16,
     transport: &'static str,
+    processing_started: Instant,
 }
 
 impl<'a> QueryLogMetadata<'a> {
-    fn new(question: &'a Question, response_target: &DnsResponseTarget) -> Self {
+    fn new(
+        question: &'a Question,
+        response_target: &DnsResponseTarget,
+        processing_started: Instant,
+    ) -> Self {
         let transport = match response_target {
             DnsResponseTarget::Udp { .. } => "udp",
             DnsResponseTarget::Tcp(_) => "tcp",
@@ -103,6 +108,7 @@ impl<'a> QueryLogMetadata<'a> {
             query_type: question.qtype,
             query_class: question.qclass,
             transport,
+            processing_started,
         }
     }
 }
@@ -212,6 +218,7 @@ pub(crate) fn dns_worker_loop(
 }
 
 fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
+    let processing_started = Instant::now();
     let query = work_item.query.as_slice();
     let client_addr = work_item.client_addr;
     let response_target = &work_item.response_target;
@@ -249,7 +256,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         }
     };
     let question = &parsed_query.question;
-    let log_metadata = QueryLogMetadata::new(question, response_target);
+    let log_metadata = QueryLogMetadata::new(question, response_target, processing_started);
 
     // 整包读取当前过滤状态，一次查询内保持一致；规则热替换只影响后续查询
     let filter = current_filter_runtime(&context.filter_runtime);
@@ -425,7 +432,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 false,
                 false,
                 None,
-                Some(0),
+                None,
                 None,
             );
             if cache_hit.refresh {
@@ -864,6 +871,7 @@ fn queue_query_log_with_match(
         failed,
         upstream_server: upstream_server.map(str::to_string),
         upstream_duration_ms,
+        processing_duration_ms: duration_ms(metadata.processing_started.elapsed()),
         error,
         matched_rule: rule_match.map(|matched| matched.rule.clone()),
         rule_source: rule_match.map(|matched| matched.source.clone()),
@@ -885,4 +893,8 @@ fn queue_query_log_with_match(
             record_error(&context.stats, "查询日志写入队列已关闭".to_string());
         }
     }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
