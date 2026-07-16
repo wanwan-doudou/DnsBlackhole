@@ -103,7 +103,7 @@ fn request_data_migration(
 fn get_macos_service_status() -> Result<privileged_bridge::MacosServiceStatus, String> {
     #[cfg(target_os = "macos")]
     {
-        privileged_bridge::macos_service_status()
+        privileged_bridge::ensure_macos_service_current()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -499,6 +499,9 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 app.manage(Arc::new(GuiState {}));
+                if let Err(error) = privileged_bridge::ensure_macos_service_current() {
+                    eprintln!("自动修复 macOS DNS 后台服务失败：{error}");
+                }
                 if let Ok(config) = privileged_bridge::ServiceClient::call::<_, AppConfig>(
                     "get_config",
                     &serde_json::json!({}),

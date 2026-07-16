@@ -20,6 +20,8 @@ export type MacosServiceStatus = {
   enabled: boolean;
   requiresApproval: boolean;
   expectedVersion: string;
+  serviceVersion: string | null;
+  needsRepair: boolean;
 };
 
 export type FilterSubscription = {

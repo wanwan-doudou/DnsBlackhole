@@ -862,8 +862,15 @@ function renderMacosServiceStatus(status: MacosServiceStatus): void {
   currentMacosServiceStatus = status;
   macosServiceSection.classList.toggle("is-ready", status.enabled);
   macosServiceSection.classList.toggle("needs-approval", status.requiresApproval);
-  macosServiceStatusElement.textContent =
+  const stateText =
     MACOS_SERVICE_STATE_TEXT[status.state] ?? MACOS_SERVICE_STATE_TEXT.unknown;
+  const versionText =
+    status.enabled && status.serviceVersion
+      ? ` 当前服务版本 v${status.serviceVersion}。`
+      : "";
+  macosServiceStatusElement.textContent = status.needsRepair
+    ? "后台服务版本异常，应用将在启动时自动修复。"
+    : `${stateText}${versionText}`;
   openMacosServiceSettingsButton.classList.toggle("hidden", !status.requiresApproval);
   uninstallMacosServiceButton.disabled =
     status.state === "not_registered" || status.state === "not_found";

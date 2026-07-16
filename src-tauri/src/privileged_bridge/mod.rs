@@ -15,7 +15,7 @@ pub(crate) use client::ServiceClient;
 pub use daemon::run_daemon;
 #[cfg(target_os = "macos")]
 pub(crate) use service_management::{
-    macos_service_install, macos_service_open_settings, macos_service_status,
+    ensure_macos_service_current, macos_service_install, macos_service_open_settings,
     macos_service_uninstall,
 };
 
@@ -33,6 +33,8 @@ pub struct MacosServiceStatus {
     pub enabled: bool,
     pub requires_approval: bool,
     pub expected_version: String,
+    pub service_version: Option<String>,
+    pub needs_repair: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -68,7 +70,7 @@ pub struct HelloParams {
     pub app_version: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloResult {
     pub protocol_version: u16,
     pub service_version: String,

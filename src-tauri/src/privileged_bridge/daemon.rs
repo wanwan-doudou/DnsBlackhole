@@ -256,6 +256,7 @@ fn dispatch_request(
         "stop_dns" => to_value(stop_dns_blocking(Arc::clone(state))?)?,
         "clear_dns_cache" => to_value(clear_dns_cache_blocking(state)?)?,
         "clear_filter_cache" => to_value(clear_filter_cache_blocking(Arc::clone(state))?)?,
+        "restart_service" => return Ok((Value::Null, true)),
         _ => return Err(format!("未知的后台服务方法：{method}")),
     };
     Ok((result, false))

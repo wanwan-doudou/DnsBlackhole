@@ -8,40 +8,42 @@ use super::{
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const EXPECTED_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) struct ServiceClient;
 
 impl ServiceClient {
+    pub(crate) fn hello() -> Result<HelloResult, String> {
+        let (_, hello) = connect_and_hello()?;
+        Ok(hello)
+    }
+
     pub(crate) fn call<P, R>(method: &str, params: &P) -> Result<R, String>
     where
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let mut stream = UnixStream::connect(BRIDGE_SOCKET_PATH).map_err(|error| {
-            format!("无法连接 macOS DNS 后台服务，请先在设置中安装或修复后台服务：{error}")
-        })?;
-        stream
-            .set_read_timeout(Some(RPC_TIMEOUT))
-            .map_err(|error| format!("设置后台服务读取超时失败：{error}"))?;
-        stream
-            .set_write_timeout(Some(RPC_TIMEOUT))
-            .map_err(|error| format!("设置后台服务写入超时失败：{error}"))?;
+        Self::call_with_version_policy(method, params, true)
+    }
 
-        let hello = RpcRequest {
-            id: 1,
-            method: "hello".to_string(),
-            params: serde_json::to_value(HelloParams {
-                protocol_version: BRIDGE_PROTOCOL_VERSION,
-                app_version: env!("CARGO_PKG_VERSION").to_string(),
-            })
-            .map_err(|error| format!("构造后台服务握手失败：{error}"))?,
-        };
-        write_message(&mut stream, &hello)?;
-        let hello: HelloResult = read_result(&mut stream, 1)?;
-        if hello.protocol_version != BRIDGE_PROTOCOL_VERSION {
+    pub(crate) fn request_restart() -> Result<(), String> {
+        Self::call_with_version_policy("restart_service", &serde_json::json!({}), false)
+    }
+
+    fn call_with_version_policy<P, R>(
+        method: &str,
+        params: &P,
+        require_current_version: bool,
+    ) -> Result<R, String>
+    where
+        P: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        let (mut stream, hello) = connect_and_hello()?;
+        if require_current_version && hello.service_version != EXPECTED_SERVICE_VERSION {
             return Err(format!(
-                "macOS 后台服务协议版本不兼容：应用 {}，服务 {}。请在设置中修复后台服务",
-                BRIDGE_PROTOCOL_VERSION, hello.protocol_version
+                "macOS 后台服务版本不一致：应用 {}，服务 {}。应用将自动修复后台服务",
+                EXPECTED_SERVICE_VERSION, hello.service_version
             ));
         }
 
@@ -54,6 +56,37 @@ impl ServiceClient {
         write_message(&mut stream, &request)?;
         read_result(&mut stream, 2)
     }
+}
+
+fn connect_and_hello() -> Result<(UnixStream, HelloResult), String> {
+    let mut stream = UnixStream::connect(BRIDGE_SOCKET_PATH).map_err(|error| {
+        format!("无法连接 macOS DNS 后台服务，请先在设置中安装或修复后台服务：{error}")
+    })?;
+    stream
+        .set_read_timeout(Some(RPC_TIMEOUT))
+        .map_err(|error| format!("设置后台服务读取超时失败：{error}"))?;
+    stream
+        .set_write_timeout(Some(RPC_TIMEOUT))
+        .map_err(|error| format!("设置后台服务写入超时失败：{error}"))?;
+
+    let request = RpcRequest {
+        id: 1,
+        method: "hello".to_string(),
+        params: serde_json::to_value(HelloParams {
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            app_version: EXPECTED_SERVICE_VERSION.to_string(),
+        })
+        .map_err(|error| format!("构造后台服务握手失败：{error}"))?,
+    };
+    write_message(&mut stream, &request)?;
+    let hello: HelloResult = read_result(&mut stream, 1)?;
+    if hello.protocol_version != BRIDGE_PROTOCOL_VERSION {
+        return Err(format!(
+            "macOS 后台服务协议版本不兼容：应用 {}，服务 {}。应用将自动修复后台服务",
+            BRIDGE_PROTOCOL_VERSION, hello.protocol_version
+        ));
+    }
+    Ok((stream, hello))
 }
 
 fn read_result<R: DeserializeOwned>(
