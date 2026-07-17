@@ -4,18 +4,19 @@
 
 [下载最新版](https://github.com/wanwan-doudou/DnsBlackhole/releases/latest) · [查看发布记录](https://github.com/wanwan-doudou/DnsBlackhole/releases) · [MIT License](LICENSE)
 
-DnsBlackhole 可以运行在 Windows 电脑或家庭网关上，通过远程黑名单、自定义规则和 DNS 重写过滤广告、跟踪及指定域名，同时提供查询日志、统计、客户端访问控制和 DNS 缓存。它是一个带图形界面的本地转发器，不是完整的权威 DNS 或递归解析器。
+DnsBlackhole 可以运行在 Windows 或 macOS 主机上，通过远程黑名单、自定义规则和 DNS 重写过滤广告、跟踪及指定域名，同时提供查询日志、统计、客户端访问控制和 DNS 缓存。它是一个带图形界面的本地转发器，不是完整的权威 DNS 或递归解析器。
 
-> 当前 GitHub Release 提供 Windows x64 的 NSIS 安装程序和 MSI 安装包。源码保留 Tauri 的跨平台结构，但其他平台暂未提供经过验证的官方构建。
+> 当前 GitHub Release 同时提供 Windows x64 的 NSIS/MSI 安装包和 macOS Universal DMG。
 
 ## 安装
 
 1. 打开 [最新 Release](https://github.com/wanwan-doudou/DnsBlackhole/releases/latest)。
-2. 普通用户下载 `DnsBlackhole_<版本>_x64-setup.exe`；需要 MSI 部署时下载 `DnsBlackhole_<版本>_x64_en-US.msi`。
-3. 安装并启动应用，在“DNS 黑名单”中检查更新，下载已启用的远程清单。
-4. 将本机、路由器或局域网设备的 DNS 地址指向运行 DnsBlackhole 的主机。
+2. Windows 普通用户下载 `DnsBlackhole_<版本>_x64-setup.exe`；需要 MSI 部署时下载 `DnsBlackhole_<版本>_x64_en-US.msi`。
+3. macOS 用户下载 `DnsBlackhole_<版本>_universal.dmg`，将应用拖入“应用程序”文件夹；首次启动后，在“设置”中安装后台 DNS 服务，并按系统提示批准后台项目。
+4. 启动应用，在“DNS 黑名单”中检查更新，下载已启用的远程清单。
+5. 将本机、路由器或局域网设备的 DNS 地址指向运行 DnsBlackhole 的主机。
 
-应用支持在“设置 → 关于与更新”中检查、下载并安装带签名的新版本。
+Windows 版本支持在“设置 → 关于与更新”中检查、下载并安装带签名的新版本。
 
 ## 快速开始
 
@@ -71,7 +72,7 @@ Bootstrap DNS 只接受 IP 或 `IP:端口`，不能填写域名或 DoH 地址，
 - 查询日志支持按已处理、已过滤、失败筛选，并可按域名或客户端搜索。
 - 拦截详情显示命中规则、来源清单、规则类型、`important` 覆盖和 allowlist 信息。
 - 支持客户端名称映射、日志忽略域名、日志保留时间及客户端 IP 匿名化。
-- 仪表盘展示查询趋势、拦截率、域名排行、上游请求排行和平均响应时间。
+- 仪表盘展示查询趋势、拦截率、域名排行、客户端排行、DNS 黑名单排行、上游请求排行和平均响应时间。
 - DNS 响应缓存支持容量、最小/最大 TTL、乐观缓存和手动清理。
 - 可清理远程过滤器磁盘缓存，不影响配置、查询日志和统计数据库。
 
@@ -180,8 +181,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 1. 同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的版本号。
 2. 完成前端构建、Rust 测试和 Clippy 检查。
-3. 执行 `./scripts/release.ps1` 生成签名安装包与 `latest.json`。
-4. 创建 `v<版本号>` GitHub Release，上传 NSIS、MSI 和 `latest.json`。
+3. 在 Windows 执行 `./scripts/release.ps1`，生成签名的 NSIS、MSI 安装包与 `latest.json`。
+4. 推送 `main` 并等待 macOS CI 完成，下载 `DnsBlackhole-macos-universal-dmg` artifact。
+5. 创建一个 `v<版本号>` GitHub Release，统一上传 NSIS、MSI、`latest.json` 和 Universal DMG。
 
 更新私钥位于维护者机器的 `%USERPROFILE%\.tauri\dnsblackhole.key`。私钥丢失后，旧版本将无法验证后续自动更新，必须妥善离线备份且不得提交到仓库。
 
