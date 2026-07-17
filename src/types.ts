@@ -8,6 +8,22 @@ export type ViewName =
   | "settings";
 export type QueryLogFilter = "all" | "processed" | "blocked" | "failed";
 
+export type MacosServiceState =
+  | "not_registered"
+  | "enabled"
+  | "requires_approval"
+  | "not_found"
+  | "unknown";
+
+export type MacosServiceStatus = {
+  state: MacosServiceState;
+  enabled: boolean;
+  requiresApproval: boolean;
+  expectedVersion: string;
+  serviceVersion: string | null;
+  needsRepair: boolean;
+};
+
 export type FilterSubscription = {
   id: string;
   name: string;

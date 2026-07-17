@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 
@@ -15,7 +15,7 @@ const TRAFFIC_BUCKET_WINDOW_MINUTES: u64 = 90 * 24 * 60;
 const SECURITY_EVENT_CAPACITY: usize = 200;
 const SECURITY_EVENT_AGGREGATE_SECONDS: u64 = 10;
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DnsStats {
     pub started_at: Option<u64>,
     pub queries: u64,
@@ -37,21 +37,21 @@ pub struct DnsStats {
     pub upstream_avg_latency: Vec<UpstreamLatencyStat>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecurityEventType {
     AccessDenied,
     RateLimited,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsTransport {
     Udp,
     Tcp,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityEvent {
     pub event_type: SecurityEventType,
     pub protocol: DnsTransport,
@@ -62,26 +62,26 @@ pub struct SecurityEvent {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrafficBucket {
     pub minute: u64,
     pub queries: u64,
     pub blocked: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpstreamRequestStat {
     pub upstream: String,
     pub requests: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpstreamLatencyStat {
     pub upstream: String,
     pub avg_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub running: bool,
     pub listen_addr: String,

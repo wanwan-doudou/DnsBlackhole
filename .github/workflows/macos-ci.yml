@@ -1,0 +1,197 @@
+# macOS 构建与测试（维护者无 Mac，本工作流是 macOS 产物的唯一构建途径）。
+# 产物使用仓库 Secret 中的自签名证书签名（应用与后台服务同一身份，macOS 26 启动约束要求；
+# 缺少 Secret 时回退 ad-hoc，此时后台服务无法通过 AMFI 校验），未经 Apple 公证：
+# 仅保存为 Actions artifact 或 Draft Release，按 MACOS_PORTING_PLAN.md 不得公开为正式版本。
+name: macOS CI
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      draft-release:
+        description: "构建后创建 Draft Release 并上传 DMG"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: 原生测试（${{ matrix.arch }}）
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - arch: Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 输出环境信息
+        run: |
+          sw_vers
+          uname -m
+          rustc --version
+          xcodebuild -version | head -1
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 前端类型检查与构建
+        run: pnpm build
+
+      - name: 构建 macOS 后台服务 sidecar
+        run: bash scripts/build-macos-service.sh
+        env:
+          TAURI_ENV_TARGET_TRIPLE: ${{ matrix.target }}
+
+      - name: Rust 单元测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  build:
+    name: 构建 Universal DMG
+    runs-on: macos-15
+    needs: test
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust 双架构目标
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: universal
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      # 导入仓库 Secret 中的自签名证书：macOS 26 的 AMFI 启动约束要求 LaunchDaemon
+      # 与容器应用使用同一签名身份，ad-hoc 每次构建身份都不同，daemon 会在 exec 前被拒。
+      # 缺少 Secret 时回退 ad-hoc，产物仍可构建但后台服务无法安装。
+      - name: 准备代码签名身份
+        env:
+          SIGNING_P12_BASE64: ${{ secrets.DNSBLACKHOLE_SIGNING_P12 }}
+          SIGNING_P12_PASSWORD: ${{ secrets.DNSBLACKHOLE_SIGNING_P12_PASSWORD }}
+        run: |
+          if [ -z "${SIGNING_P12_BASE64}" ] || [ -z "${SIGNING_P12_PASSWORD}" ]; then
+            echo "未配置 DNSBLACKHOLE_SIGNING_P12 Secret，回退 ad-hoc 签名"
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          p12="$RUNNER_TEMP/signing.p12"
+          cert="$RUNNER_TEMP/signing.crt"
+          keychain="$RUNNER_TEMP/dnsblackhole-signing.keychain-db"
+          echo "${SIGNING_P12_BASE64}" | base64 -d > "$p12"
+          openssl pkcs12 -in "$p12" -passin "pass:${SIGNING_P12_PASSWORD}" -clcerts -nokeys -out "$cert"
+          security create-keychain -p "${SIGNING_P12_PASSWORD}" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "${SIGNING_P12_PASSWORD}" "$keychain"
+          security import "$p12" -k "$keychain" -P "${SIGNING_P12_PASSWORD}" -A -t cert -f pkcs12
+          security set-key-partition-list -S "apple-tool:,apple:,codesign:" -s -k "${SIGNING_P12_PASSWORD}" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          # 自签证书需加入系统信任，否则 codesign 会把它当作无效身份
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$cert"
+          echo "APPLE_SIGNING_IDENTITY=DnsBlackhole Signing" >> "$GITHUB_ENV"
+
+      # beforeBuildCommand 会先执行 pnpm build 和 build-macos-service.sh（universal 分支），
+      # 后者用同一身份先签好后台服务，Tauri 再签外层 .app 并生成 DMG
+      - name: Tauri 构建（universal）
+        run: pnpm tauri build --target universal-apple-darwin --bundles app,dmg
+
+      - name: 校验双架构与签名
+        run: |
+          app="src-tauri/target/universal-apple-darwin/release/bundle/macos/DnsBlackhole.app"
+          service="$app/Contents/MacOS/dnsblackhole-service"
+          lipo -info "$app/Contents/MacOS/DnsBlackhole"
+          lipo -info "$service"
+          test -f "$app/Contents/Library/LaunchDaemons/com.dnsblackhole.app.service.plist"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          echo "--- 应用签名 ---"
+          codesign -dvv "$app" 2>&1 | grep -E "Identifier|Authority|Signature|TeamIdentifier" || true
+          echo "--- 后台服务签名 ---"
+          codesign -dvv "$service" 2>&1 | grep -E "Identifier|Authority|Signature|TeamIdentifier" || true
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ "${APPLE_SIGNING_IDENTITY}" != "-" ]; then
+            # macOS 26 启动约束的两个前提：helper 标识符稳定（拒绝链接器哈希名）、与主应用同一身份
+            codesign -dv "$service" 2>&1 | grep -Eq "Identifier=(com\.dnsblackhole\.app\.service|dnsblackhole-service)$" \
+              || { echo "后台服务签名标识符不稳定"; exit 1; }
+            codesign -dvv "$app" 2>&1 | grep -q "Authority=${APPLE_SIGNING_IDENTITY}" \
+              || { echo "应用未使用预期签名身份"; exit 1; }
+            codesign -dvv "$service" 2>&1 | grep -q "Authority=${APPLE_SIGNING_IDENTITY}" \
+              || { echo "后台服务未使用预期签名身份"; exit 1; }
+          fi
+
+      - name: 上传 DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DnsBlackhole-macos-universal-dmg
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: 创建 Draft Release 并上传 DMG
+        if: github.event_name == 'workflow_dispatch' && inputs.draft-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          tag="macos-preview-v${version}"
+          dmg="$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)"
+          notes_file="$(mktemp)"
+          cat > "$notes_file" <<'EOF'
+          ## macOS 预览版（未经 Apple 公证）
+
+          本版本使用自签名证书签名、未经 Apple 公证，属于内部测试版本。安装步骤：
+
+          1. 下载 DMG 并打开，把 DnsBlackhole 拖入「应用程序」文件夹。
+          2. 首次打开会提示无法验证开发者。请打开「系统设置 → 隐私与安全性」，
+             在页面底部找到 DnsBlackhole 的提示，点击「仍要打开」。
+             如果没有出现提示，可在终端执行：
+             `xattr -cr /Applications/DnsBlackhole.app`，然后重新打开。
+          3. 打开应用后，进入「设置」页，点击「安装或修复」安装后台 DNS 服务，
+             然后在「系统设置 → 通用 → 登录项与扩展」中批准 DnsBlackhole。
+          4. 回到应用点击「启动」。局域网设备把 DNS 指向这台 Mac 的 IP 即可使用。
+
+          后台 DNS 服务由 macOS LaunchDaemon 独立运行。关闭窗口或退出 GUI 后，
+          DNS 仍会继续工作；可在应用设置中停止或卸载后台服务。
+          EOF
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" "$dmg" --clobber
+          else
+            gh release create "$tag" "$dmg" \
+              --draft \
+              --title "DnsBlackhole ${version} macOS 预览版" \
+              --notes-file "$notes_file"
+          fi

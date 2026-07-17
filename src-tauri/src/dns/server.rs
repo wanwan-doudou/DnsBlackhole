@@ -79,7 +79,8 @@ impl DnsServer {
         let dns_cache_config = dns_cache.as_ref().map(|_| dns_cache_config);
         let filter_runtime = share_filter_runtime(build_filter_runtime(&config, rules_text));
         let listeners = listen_addrs
-            .into_iter()
+            .iter()
+            .copied()
             .map(|addr| bind_listener_pair(addr, addr.is_ipv6() && config.listen_ipv6))
             .collect::<Result<Vec<_>, _>>()?;
 

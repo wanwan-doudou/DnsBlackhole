@@ -409,7 +409,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               <div class="dns-security-options">
                 <label class="field">
                   <span>每客户端限速</span>
-                  <small>每秒允许的 DNS 查询数，0 表示关闭限速。</small>
+                  <small>持续每秒允许的 DNS 查询数；默认 2000 并可容纳约 10 秒短时突发，适合路由器汇聚多台设备，0 表示关闭限速。</small>
                   <input id="rate_limit_per_second" type="number" min="0" max="100000" step="1" />
                 </label>
                 <label class="check-row">
@@ -535,6 +535,19 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <span>检查间隔（秒）</span>
                   <input id="runtime_watchdog_interval_seconds" type="number" min="10" max="3600" step="1" />
                 </label>
+              </div>
+            </section>
+
+            <section class="settings-section macos-service-section hidden" id="macos_service_section">
+              <div>
+                <h3>macOS DNS 后台服务</h3>
+                <p id="macos_service_status">正在读取后台服务状态…</p>
+                <small>正式版通过系统后台服务监听 UDP/TCP 53。首次安装需要管理员在“系统设置 → 通用 → 登录项与扩展”中批准。</small>
+              </div>
+              <div class="button-group macos-service-actions">
+                <button class="primary" id="install_macos_service_btn" type="button">安装或修复</button>
+                <button class="hidden" id="open_macos_service_settings_btn" type="button">打开系统设置</button>
+                <button id="uninstall_macos_service_btn" type="button">卸载服务</button>
               </div>
             </section>
 

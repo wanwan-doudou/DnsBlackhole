@@ -7,6 +7,7 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "macos"))]
 use tauri::{AppHandle, Manager};
 
 const DATABASE_FILE: &str = "dnsblackhole.sqlite3";
@@ -20,7 +21,7 @@ pub struct StorageBootstrap {
     pub migration_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageInfo {
     pub current_path: String,
     pub default_path: String,
@@ -44,8 +45,13 @@ struct StorageLocator {
     last_migration_error: Option<String>,
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn initialize(app: &AppHandle) -> Result<StorageBootstrap, String> {
     let default_dir = default_data_dir(app)?;
+    initialize_at(default_dir)
+}
+
+pub(crate) fn initialize_at(default_dir: PathBuf) -> Result<StorageBootstrap, String> {
     fs::create_dir_all(&default_dir)
         .map_err(|error| format!("创建默认数据目录失败（{}）：{error}", default_dir.display()))?;
     let mut locator = read_locator(&default_dir)?;
@@ -148,6 +154,7 @@ pub fn filters_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(FILTERS_DIR)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn default_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
@@ -231,6 +238,16 @@ fn validate_target_directory(
             selected_dir.display()
         )
     })?;
+    // SQLite WAL 在网络卷和云同步目录上可能损坏，与 Windows 拒绝 UNC 的策略对等
+    #[cfg(target_os = "macos")]
+    {
+        if is_macos_network_volume(&selected_dir) {
+            return Err("数据存储路径不支持网络卷，请选择本机磁盘目录".to_string());
+        }
+        if is_macos_cloud_synced_dir(&selected_dir) {
+            return Err("数据存储路径不支持 iCloud 云同步目录，请选择本机磁盘目录".to_string());
+        }
+    }
     let current = current_data_dir
         .canonicalize()
         .unwrap_or_else(|_| current_data_dir.to_path_buf());
@@ -255,6 +272,29 @@ fn is_windows_network_path(path: &Path) -> bool {
         Some(Component::Prefix(prefix))
             if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
     )
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_network_volume(path: &Path) -> bool {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        // 无法判断卷类型时不拦截，后续的写入测试仍会兜底
+        return false;
+    }
+    let stats = unsafe { stats.assume_init() };
+    stats.f_flags & (libc::MNT_LOCAL as u32) == 0
+}
+
+// iCloud Drive 实际落盘在 ~/Library/Mobile Documents，同步冲突会破坏 SQLite
+#[cfg(target_os = "macos")]
+fn is_macos_cloud_synced_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "Mobile Documents")
 }
 
 fn ensure_target_available(target_dir: &Path) -> Result<(), String> {
@@ -502,10 +542,14 @@ mod tests {
     use super::*;
 
     fn temporary_directory(name: &str) -> PathBuf {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
             "dnsblackhole-storage-{name}-{}-{}",
             std::process::id(),
-            crate::unix_now()
+            timestamp
         ));
         fs::create_dir_all(&path).expect("temporary directory should create");
         path

@@ -1,13 +1,18 @@
 [package]
 name = "dnsblackhole"
-version = "0.1.32"
+version = "0.1.35"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"
+default-run = "dnsblackhole"
 
 [lib]
 name = "dnsblackhole_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+macos-service = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -28,6 +33,21 @@ tauri-plugin-dialog = "2"
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-autostart = "2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSError", "NSString"] }
+objc2-service-management = { version = "0.3.2", features = ["objc2", "objc2-foundation", "SMAppService"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 winreg = "0.56"
+
+[[bin]]
+name = "dnsblackhole"
+path = "src/main.rs"
+
+[[bin]]
+name = "dnsblackhole-service"
+path = "src/bin/dnsblackhole-service.rs"
+required-features = ["macos-service"]

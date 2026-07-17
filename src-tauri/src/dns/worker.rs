@@ -651,8 +651,11 @@ fn send_dns_response(
 }
 
 fn send_no_response(response_target: &DnsResponseTarget) {
-    if let DnsResponseTarget::Tcp(sender) = response_target {
-        let _ = sender.try_send(None);
+    match response_target {
+        DnsResponseTarget::Tcp(sender) => {
+            let _ = sender.try_send(None);
+        }
+        DnsResponseTarget::Udp { .. } => {}
     }
 }
 
