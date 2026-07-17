@@ -100,6 +100,13 @@ pub fn run_daemon() -> Result<(), String> {
     while !restart_requested.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
+                let stream = match prepare_accepted_stream(stream) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        continue;
+                    }
+                };
                 let state = Arc::clone(&state);
                 let restart_requested = Arc::clone(&restart_requested);
                 thread::spawn(move || {
@@ -135,6 +142,14 @@ fn initialize_state() -> Result<Arc<AppState>, String> {
         state.set_error(Some(error));
     }
     Ok(state)
+}
+
+/// 将从非阻塞 listener 接收的客户端连接恢复为阻塞模式，保证帧读取等待客户端写入。
+fn prepare_accepted_stream(stream: UnixStream) -> Result<UnixStream, String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("设置后台服务 IPC 客户端阻塞模式失败：{error}"))?;
+    Ok(stream)
 }
 
 fn handle_client(
@@ -338,6 +353,7 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn handshake_keeps_connection_open_for_rpc_request() {
@@ -391,5 +407,69 @@ mod tests {
             .join()
             .expect("服务端测试线程不应 panic")
             .expect("服务端握手与业务请求应成功");
+    }
+
+    // 验证真实非阻塞 listener 接收的连接会等待延迟到达的握手请求。
+    #[test]
+    fn accepted_stream_from_nonblocking_listener_waits_for_handshake() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("系统时间应晚于 UNIX_EPOCH")
+            .as_nanos();
+        let socket_path =
+            std::path::PathBuf::from(format!("/tmp/dbh-{}-{unique}.sock", std::process::id()));
+
+        let listener = UnixListener::bind(&socket_path).expect("应能绑定临时 Unix listener");
+        listener
+            .set_nonblocking(true)
+            .expect("应能设置 listener 非阻塞");
+
+        let server_thread = thread::spawn(move || -> Result<(), String> {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let mut stream = prepare_accepted_stream(stream)?;
+                        assert!(perform_handshake(&mut stream)?);
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(ACCEPT_POLL_INTERVAL);
+                    }
+                    Err(error) => return Err(format!("测试 listener accept 失败：{error}")),
+                }
+            }
+        });
+
+        let mut client = UnixStream::connect(&socket_path).expect("客户端应能连接临时 socket");
+        client
+            .set_read_timeout(Some(RPC_TIMEOUT))
+            .expect("应能设置客户端读取超时");
+        client
+            .set_write_timeout(Some(RPC_TIMEOUT))
+            .expect("应能设置客户端写入超时");
+
+        thread::sleep(Duration::from_millis(50));
+        write_message(
+            &mut client,
+            &RpcRequest {
+                id: 1,
+                method: "hello".to_string(),
+                params: serde_json::to_value(HelloParams {
+                    protocol_version: BRIDGE_PROTOCOL_VERSION,
+                    app_version: env!("CARGO_PKG_VERSION").to_string(),
+                })
+                .expect("握手参数应可序列化"),
+            },
+        )
+        .expect("延迟写入握手请求后服务端仍应等待");
+        let hello: RpcResponse = read_message(&mut client).expect("应能读取握手响应");
+        assert_eq!(hello.id, 1);
+        assert!(hello.error.is_none());
+
+        server_thread
+            .join()
+            .expect("服务端测试线程不应 panic")
+            .expect("服务端应能等待延迟到达的握手请求");
+        let _ = fs::remove_file(&socket_path);
     }
 }
