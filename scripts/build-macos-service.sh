@@ -21,6 +21,22 @@ build_service() {
     --target "${target}"
 }
 
+# daemon 由 launchd 直接拉起，macOS 26 的启动约束要求它与容器应用使用同一签名身份，
+# 且标识符必须跨版本稳定——链接器 ad-hoc 签名生成的哈希后缀名不满足要求。
+# 必须先签 helper 再由 Tauri 签外层 .app，外层资源封装才会记录最终的 helper 签名。
+sign_service() {
+  local path="$1"
+  local identity="${APPLE_SIGNING_IDENTITY:-}"
+  if [[ -z "${identity}" || "${identity}" == "-" ]]; then
+    return 0
+  fi
+  codesign --force --options runtime --timestamp=none \
+    --identifier com.dnsblackhole.app.service \
+    --sign "${identity}" \
+    "${path}"
+  codesign --verify --strict "${path}"
+}
+
 target="${TAURI_ENV_TARGET_TRIPLE:-${CARGO_BUILD_TARGET:-}}"
 if [[ -z "${target}" ]]; then
   target="$(rustc -vV | awk '/^host:/ { print $2 }')"
@@ -34,6 +50,7 @@ case "${target}" in
     cp \
       "src-tauri/target/${target}/release/dnsblackhole-service" \
       "src-tauri/binaries/dnsblackhole-service-${target}"
+    sign_service "src-tauri/binaries/dnsblackhole-service-${target}"
     ;;
   universal-apple-darwin)
     # Tauri universal 构建要求 sidecar 也是双架构，分别编译后用 lipo 合成
@@ -44,6 +61,7 @@ case "${target}" in
       src-tauri/target/x86_64-apple-darwin/release/dnsblackhole-service \
       -output src-tauri/binaries/dnsblackhole-service-universal-apple-darwin
     lipo -info src-tauri/binaries/dnsblackhole-service-universal-apple-darwin
+    sign_service src-tauri/binaries/dnsblackhole-service-universal-apple-darwin
     ;;
   *)
     echo "不支持的 macOS 构建目标：${target}" >&2
