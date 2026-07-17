@@ -9,6 +9,7 @@ use crate::config::AppConfig;
 const RATE_LIMITER_CLIENT_TTL_SECONDS: u64 = 120;
 const RATE_LIMITER_PRUNE_INTERVAL_SECONDS: u64 = 60;
 const RATE_LIMITER_MAX_CLIENTS: usize = 4096;
+const RATE_LIMITER_BURST_SECONDS: u64 = 10;
 
 pub(crate) enum ClientAccessDecision {
     Allow,
@@ -47,8 +48,8 @@ struct ClientRateLimiter {
 }
 
 struct RateBucket {
-    second: u64,
-    count: u32,
+    tokens: u64,
+    last_refill: u64,
     last_seen: u64,
 }
 
@@ -80,8 +81,8 @@ impl ClientAccess {
             && !rate_limiter.allow(ip, now)
         {
             return ClientAccessDecision::RateLimited(format!(
-                "客户端 {ip} 触发每秒 {} 次查询限速",
-                rate_limiter.limit_per_second
+                "客户端 {ip} 触发每秒 {} 次持续查询限速（已用完 {} 秒突发容量）",
+                rate_limiter.limit_per_second, RATE_LIMITER_BURST_SECONDS
             ));
         }
 
@@ -185,23 +186,34 @@ impl ClientRateLimiter {
             return false;
         }
 
+        let capacity = u64::from(self.limit_per_second).saturating_mul(RATE_LIMITER_BURST_SECONDS);
         let bucket = self.clients.entry(ip).or_insert(RateBucket {
-            second: now,
-            count: 0,
+            tokens: capacity,
+            last_refill: now,
             last_seen: now,
         });
 
-        if bucket.second != now {
-            bucket.second = now;
-            bucket.count = 0;
+        if now < bucket.last_refill {
+            // 系统时间被向后校准时重置桶，避免客户端长时间无法恢复额度。
+            bucket.tokens = capacity;
+            bucket.last_refill = now;
+        } else {
+            let elapsed = now.saturating_sub(bucket.last_refill);
+            if elapsed > 0 {
+                bucket.tokens = bucket
+                    .tokens
+                    .saturating_add(elapsed.saturating_mul(u64::from(self.limit_per_second)))
+                    .min(capacity);
+                bucket.last_refill = now;
+            }
         }
         bucket.last_seen = now;
 
-        if bucket.count >= self.limit_per_second {
+        if bucket.tokens == 0 {
             return false;
         }
 
-        bucket.count = bucket.count.saturating_add(1);
+        bucket.tokens -= 1;
         true
     }
 
@@ -218,7 +230,10 @@ mod tests {
 
     use crate::config::AppConfig;
 
-    use super::{ClientAccess, ClientAccessDecision, ClientRateLimiter, RATE_LIMITER_MAX_CLIENTS};
+    use super::{
+        ClientAccess, ClientAccessDecision, ClientRateLimiter, RATE_LIMITER_BURST_SECONDS,
+        RATE_LIMITER_MAX_CLIENTS,
+    };
 
     #[test]
     fn access_allowlist_allows_private_default_clients() {
@@ -250,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn client_rate_limit_is_per_second() {
+    fn client_rate_limit_allows_burst_and_enforces_sustained_rate() {
         let config = AppConfig {
             allowed_clients: "127.0.0.1".into(),
             rate_limit_per_second: 2,
@@ -258,14 +273,31 @@ mod tests {
         };
         let access = ClientAccess::from_config(&config).expect("access should build");
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let burst_capacity = 2 * RATE_LIMITER_BURST_SECONDS;
 
-        assert!(matches!(access.check(ip, 100), ClientAccessDecision::Allow));
-        assert!(matches!(access.check(ip, 100), ClientAccessDecision::Allow));
+        for _ in 0..burst_capacity {
+            assert!(matches!(access.check(ip, 100), ClientAccessDecision::Allow));
+        }
         assert!(matches!(
             access.check(ip, 100),
             ClientAccessDecision::RateLimited(_)
         ));
         assert!(matches!(access.check(ip, 101), ClientAccessDecision::Allow));
+        assert!(matches!(access.check(ip, 101), ClientAccessDecision::Allow));
+        assert!(matches!(
+            access.check(ip, 101),
+            ClientAccessDecision::RateLimited(_)
+        ));
+    }
+
+    #[test]
+    fn default_rate_limit_accepts_normal_reconnect_burst() {
+        let access = ClientAccess::from_config(&AppConfig::default()).expect("access should build");
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
+
+        for _ in 0..500 {
+            assert!(matches!(access.check(ip, 100), ClientAccessDecision::Allow));
+        }
     }
 
     #[test]
