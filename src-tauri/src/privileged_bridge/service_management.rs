@@ -10,6 +10,8 @@ const EXPECTED_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_PROBE_ATTEMPTS: usize = 4;
 const RESTART_PROBE_ATTEMPTS: usize = 20;
+const SERVICE_TRANSITION_ATTEMPTS: usize = 20;
+const REGISTER_ATTEMPTS: usize = 4;
 
 /// 已获批启用的服务在应用升级后自动切换到当前 bundle 内的 helper。
 /// 尚未安装或等待系统批准时不主动注册，避免应用启动时擅自触发授权流程。
@@ -19,7 +21,7 @@ pub fn ensure_macos_service_current() -> Result<MacosServiceStatus, String> {
         return Ok(status_from_raw(raw));
     }
 
-    match probe_hello(INITIAL_PROBE_ATTEMPTS) {
+    match probe_service(INITIAL_PROBE_ATTEMPTS) {
         Ok(hello) if service_is_current(&hello) => {
             return Ok(status_with_runtime(raw, Some(hello)));
         }
@@ -56,7 +58,11 @@ pub fn macos_service_uninstall() -> Result<MacosServiceStatus, String> {
         unsafe { service.unregisterAndReturnError() }
             .map_err(|error| service_error("卸载 macOS DNS 后台服务失败", &error))?;
     }
-    Ok(status_from_raw(unsafe { service.status() }))
+    let current = wait_for_service_stopped(&service);
+    if current == SMAppServiceStatus::Enabled {
+        return Err("卸载 macOS DNS 后台服务超时，服务仍处于启用状态".to_string());
+    }
+    Ok(status_from_raw(current))
 }
 
 pub fn macos_service_open_settings() {
@@ -75,16 +81,53 @@ fn register_service(force: bool) -> Result<(), String> {
     if current == SMAppServiceStatus::Enabled {
         unsafe { service.unregisterAndReturnError() }
             .map_err(|error| service_error("移除旧版 macOS DNS 后台服务失败", &error))?;
+        let current = wait_for_service_stopped(&service);
+        if current == SMAppServiceStatus::Enabled {
+            return Err("移除旧版 macOS DNS 后台服务超时，服务仍处于启用状态".to_string());
+        }
+        // Apple 的 Service Management 在注销完成后仍可能短暂拒绝重新注册，
+        // 留出一次状态转换间隔再注册，避免升级 helper 时偶发 Operation not permitted。
+        thread::sleep(PROBE_INTERVAL);
     }
 
-    unsafe { service.registerAndReturnError() }
-        .map_err(|error| service_error("注册 macOS DNS 后台服务失败", &error))
+    let mut last_error = "注册 macOS DNS 后台服务失败".to_string();
+    for attempt in 0..REGISTER_ATTEMPTS {
+        match unsafe { service.registerAndReturnError() } {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = service_error("注册 macOS DNS 后台服务失败", &error);
+                let current = unsafe { service.status() };
+                if current == SMAppServiceStatus::Enabled
+                    || current == SMAppServiceStatus::RequiresApproval
+                {
+                    return Ok(());
+                }
+            }
+        }
+        if attempt + 1 < REGISTER_ATTEMPTS {
+            thread::sleep(PROBE_INTERVAL);
+        }
+    }
+    Err(last_error)
 }
 
-fn probe_hello(attempts: usize) -> Result<HelloResult, String> {
+fn wait_for_service_stopped(service: &SMAppService) -> SMAppServiceStatus {
+    for attempt in 0..SERVICE_TRANSITION_ATTEMPTS {
+        let current = unsafe { service.status() };
+        if current != SMAppServiceStatus::Enabled {
+            return current;
+        }
+        if attempt + 1 < SERVICE_TRANSITION_ATTEMPTS {
+            thread::sleep(PROBE_INTERVAL);
+        }
+    }
+    unsafe { service.status() }
+}
+
+fn probe_service(attempts: usize) -> Result<HelloResult, String> {
     let mut last_error = "后台服务尚未响应".to_string();
     for attempt in 0..attempts.max(1) {
-        match ServiceClient::hello() {
+        match ServiceClient::probe() {
             Ok(hello) => return Ok(hello),
             Err(error) => last_error = error,
         }
@@ -98,7 +141,7 @@ fn probe_hello(attempts: usize) -> Result<HelloResult, String> {
 fn wait_for_current_service(attempts: usize) -> Result<HelloResult, String> {
     let mut last_error = "后台服务尚未响应".to_string();
     for attempt in 0..attempts.max(1) {
-        match ServiceClient::hello() {
+        match ServiceClient::probe() {
             Ok(hello) if service_is_current(&hello) => return Ok(hello),
             Ok(hello) => {
                 last_error = format!(

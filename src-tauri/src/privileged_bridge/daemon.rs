@@ -37,6 +37,7 @@ use super::{
 
 const SYSTEM_DATA_DIR: &str = "/Library/Application Support/DnsBlackhole";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Deserialize)]
@@ -142,40 +143,9 @@ fn handle_client(
     restart_requested: Arc<AtomicBool>,
 ) -> Result<(), String> {
     verify_peer(&stream)?;
-    stream
-        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
-        .map_err(|error| format!("设置 IPC 读取超时失败：{error}"))?;
-    stream
-        .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
-        .map_err(|error| format!("设置 IPC 写入超时失败：{error}"))?;
-
-    let request: RpcRequest = read_message(&mut stream)?;
-    if request.method != "hello" {
-        return Err("客户端未执行 IPC 握手".to_string());
-    }
-    let hello: HelloParams = parse_params(request.params)?;
-    if hello.protocol_version != BRIDGE_PROTOCOL_VERSION {
-        write_error(
-            &mut stream,
-            request.id,
-            format!(
-                "客户端 IPC 协议版本不兼容：服务 {}，客户端 {}",
-                BRIDGE_PROTOCOL_VERSION, hello.protocol_version
-            ),
-        )?;
+    if !perform_handshake(&mut stream)? {
         return Ok(());
     }
-    write_result(
-        &mut stream,
-        request.id,
-        &HelloResult {
-            protocol_version: BRIDGE_PROTOCOL_VERSION,
-            service_version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    )?;
-    stream
-        .set_read_timeout(None)
-        .map_err(|error| format!("设置 IPC 阻塞读取失败：{error}"))?;
 
     loop {
         let request: RpcRequest = match read_message(&mut stream) {
@@ -208,12 +178,56 @@ fn handle_client(
     }
 }
 
+fn perform_handshake(stream: &mut UnixStream) -> Result<bool, String> {
+    stream
+        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|error| format!("设置 IPC 读取超时失败：{error}"))?;
+    stream
+        .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|error| format!("设置 IPC 写入超时失败：{error}"))?;
+
+    let request: RpcRequest = read_message(stream)?;
+    if request.method != "hello" {
+        return Err("客户端未执行 IPC 握手".to_string());
+    }
+    let hello: HelloParams = parse_params(request.params)?;
+    if hello.protocol_version != BRIDGE_PROTOCOL_VERSION {
+        write_error(
+            stream,
+            request.id,
+            format!(
+                "客户端 IPC 协议版本不兼容：服务 {}，客户端 {}",
+                BRIDGE_PROTOCOL_VERSION, hello.protocol_version
+            ),
+        )?;
+        return Ok(false);
+    }
+    write_result(
+        stream,
+        request.id,
+        &HelloResult {
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+    )?;
+    // Darwin 要求 SO_RCVTIMEO 的 timeval 为正值；用 None 清除超时会返回 EDOM，
+    // 导致服务端在握手响应后立即关闭连接，客户端随后写入业务请求时收到 EPIPE。
+    stream
+        .set_read_timeout(Some(RPC_TIMEOUT))
+        .map_err(|error| format!("设置 IPC 请求读取超时失败：{error}"))?;
+    stream
+        .set_write_timeout(Some(RPC_TIMEOUT))
+        .map_err(|error| format!("设置 IPC 请求写入超时失败：{error}"))?;
+    Ok(true)
+}
+
 fn dispatch_request(
     state: &Arc<AppState>,
     method: &str,
     params: Value,
 ) -> Result<(Value, bool), String> {
     let result = match method {
+        "ping" => Value::Null,
         "get_config" => to_value(state.current_config()?)?,
         "get_storage_info" => to_value(storage::storage_info(
             &state.default_data_dir,
@@ -318,4 +332,63 @@ fn write_response(stream: &mut UnixStream, response: RpcResponse) -> Result<(), 
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshake_keeps_connection_open_for_rpc_request() {
+        let (mut client, mut server) = UnixStream::pair().expect("应能创建 Unix socket 对");
+        client
+            .set_read_timeout(Some(RPC_TIMEOUT))
+            .expect("应能设置客户端读取超时");
+        client
+            .set_write_timeout(Some(RPC_TIMEOUT))
+            .expect("应能设置客户端写入超时");
+
+        let server_thread = thread::spawn(move || -> Result<(), String> {
+            assert!(perform_handshake(&mut server)?);
+            let request: RpcRequest = read_message(&mut server)?;
+            assert_eq!(request.id, 2);
+            assert_eq!(request.method, "get_storage_info");
+            write_result(&mut server, request.id, &serde_json::json!({ "ok": true }))
+        });
+
+        write_message(
+            &mut client,
+            &RpcRequest {
+                id: 1,
+                method: "hello".to_string(),
+                params: serde_json::to_value(HelloParams {
+                    protocol_version: BRIDGE_PROTOCOL_VERSION,
+                    app_version: env!("CARGO_PKG_VERSION").to_string(),
+                })
+                .expect("握手参数应可序列化"),
+            },
+        )
+        .expect("应能写入握手请求");
+        let hello: RpcResponse = read_message(&mut client).expect("应能读取握手响应");
+        assert_eq!(hello.id, 1);
+        assert!(hello.error.is_none());
+
+        write_message(
+            &mut client,
+            &RpcRequest {
+                id: 2,
+                method: "get_storage_info".to_string(),
+                params: serde_json::json!({}),
+            },
+        )
+        .expect("握手后仍应能写入业务请求");
+        let response: RpcResponse = read_message(&mut client).expect("应能读取业务响应");
+        assert_eq!(response.id, 2);
+        assert_eq!(response.result.expect("业务响应应有结果")["ok"], true);
+
+        server_thread
+            .join()
+            .expect("服务端测试线程不应 panic")
+            .expect("服务端握手与业务请求应成功");
+    }
 }

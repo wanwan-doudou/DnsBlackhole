@@ -13,8 +13,15 @@ const EXPECTED_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) struct ServiceClient;
 
 impl ServiceClient {
-    pub(crate) fn hello() -> Result<HelloResult, String> {
-        let (_, hello) = connect_and_hello()?;
+    pub(crate) fn probe() -> Result<HelloResult, String> {
+        let (mut stream, hello) = connect_and_hello()?;
+        let request = RpcRequest {
+            id: 2,
+            method: "ping".to_string(),
+            params: serde_json::Value::Null,
+        };
+        write_message(&mut stream, &request)?;
+        let _: serde_json::Value = read_result(&mut stream, 2)?;
         Ok(hello)
     }
 
