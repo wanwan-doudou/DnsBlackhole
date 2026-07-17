@@ -146,7 +146,7 @@ jobs:
           codesign -dvv "$service" 2>&1 | grep -E "Identifier|Authority|Signature|TeamIdentifier" || true
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ "${APPLE_SIGNING_IDENTITY}" != "-" ]; then
             # macOS 26 启动约束的两个前提：helper 标识符稳定（拒绝链接器哈希名）、与主应用同一身份
-            codesign -d "$service" 2>&1 | grep -Eq "Identifier=(com\.dnsblackhole\.app\.service|dnsblackhole-service)$" \
+            codesign -dv "$service" 2>&1 | grep -Eq "Identifier=(com\.dnsblackhole\.app\.service|dnsblackhole-service)$" \
               || { echo "后台服务签名标识符不稳定"; exit 1; }
             codesign -dvv "$app" 2>&1 | grep -q "Authority=${APPLE_SIGNING_IDENTITY}" \
               || { echo "应用未使用预期签名身份"; exit 1; }
