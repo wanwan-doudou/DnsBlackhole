@@ -81,7 +81,16 @@ fn verify_connection_alive(stream: &mut UnixStream) -> Result<(), String> {
 
 fn connect_and_hello() -> Result<(UnixStream, HelloResult), String> {
     let mut stream = UnixStream::connect(BRIDGE_SOCKET_PATH).map_err(|error| {
-        format!("无法连接 macOS DNS 后台服务，请先在设置中安装或修复后台服务：{error}")
+        // 区分“服务根本没在运行”（socket 不存在或无人监听）与其他连接故障，
+        // 前者最常见的原因是服务尚未安装、等待系统设置批准或正在启动。
+        let hint = match error.kind() {
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                "后台服务未在运行。若已安装，请在“系统设置 → 通用 → 登录项与扩展”中\
+                批准 DnsBlackhole 后稍候重试；若未安装，请在设置中点击“安装或修复”"
+            }
+            _ => "请先在设置中安装或修复后台服务",
+        };
+        format!("无法连接 macOS DNS 后台服务，{hint}：{error}")
     })?;
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))

@@ -621,15 +621,22 @@ installMacosServiceButton.addEventListener("click", async () => {
   installMacosServiceButton.disabled = true;
   installMacosServiceButton.classList.add("loading");
   try {
-    // 服务已启用时执行强制重装，用于修复版本不一致或服务损坏
+    // 服务已启用但无响应时刷新注册并等待重新就绪（不会注销、不影响已有批准）
     const force = currentMacosServiceStatus?.enabled ?? false;
     const status = await installMacosService(force);
     renderMacosServiceStatus(status);
     if (status.state === "requires_approval") {
       showMessage("请在“系统设置 → 通用 → 登录项与扩展”中批准 DnsBlackhole 后台服务", false);
-    } else if (status.enabled) {
+      // 直接带用户到批准页面，避免在设置里找不到入口
+      await openMacosServiceSettings();
+    } else if (status.enabled && !status.needsRepair) {
       showMessage("macOS DNS 后台服务已启用", false);
       await refreshAfterMacosServiceEnabled();
+    } else if (status.needsRepair) {
+      showMessage(
+        "后台服务已注册但暂未响应，可能仍在启动，将自动重试连接；若持续无响应请重启 Mac 后再试",
+        true,
+      );
     }
   } catch (error) {
     showMessage(String(error), true);
@@ -738,6 +745,14 @@ window.setInterval(() => {
   if (document.hidden) {
     return;
   }
+  // 服务待批准或暂未响应时持续复查：daemon 启动慢或用户刚在系统设置中批准，
+  // 状态恢复后自动重新加载数据，避免用户被引导去反复“修复”。
+  if (
+    currentMacosServiceStatus?.requiresApproval ||
+    currentMacosServiceStatus?.needsRepair
+  ) {
+    void loadMacosServiceStatus();
+  }
   if (activeView === "logs") {
     void refreshQueryLogs({ auto: true });
     return;
@@ -838,10 +853,14 @@ async function loadMacosServiceStatus(): Promise<void> {
   }
   macosServiceSection.classList.remove("hidden");
   try {
-    const wasEnabled = currentMacosServiceStatus?.enabled ?? false;
+    // “就绪”要求服务已启用且探测到响应；needsRepair 期间视为未就绪，
+    // 恢复响应后重新加载依赖后台服务的数据
+    const wasReady =
+      (currentMacosServiceStatus?.enabled ?? false) &&
+      !(currentMacosServiceStatus?.needsRepair ?? false);
     const status = await getMacosServiceStatus();
     renderMacosServiceStatus(status);
-    if (status.enabled && !wasEnabled) {
+    if (status.enabled && !status.needsRepair && !wasReady) {
       await refreshAfterMacosServiceEnabled();
     }
   } catch (error) {
@@ -869,7 +888,7 @@ function renderMacosServiceStatus(status: MacosServiceStatus): void {
       ? ` 当前服务版本 v${status.serviceVersion}。`
       : "";
   macosServiceStatusElement.textContent = status.needsRepair
-    ? "后台服务异常或版本不一致，请点击“安装或修复”重新安装。"
+    ? "后台服务已启用但暂未响应，可能正在启动，将自动重试连接；持续无响应时点击“安装或修复”。"
     : `${stateText}${versionText}`;
   openMacosServiceSettingsButton.classList.toggle("hidden", !status.requiresApproval);
   uninstallMacosServiceButton.disabled =
@@ -975,7 +994,12 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
     const status = await getStatus(options.auto !== true, renderDashboard);
     renderStatus(status, { renderDashboard });
   } catch (error) {
-    showMessage(String(error), true);
+    // 自动轮询会撞上后台服务重启或等待批准的窗口，瞬态错误只记录不打扰用户
+    if (options.auto) {
+      console.error("自动刷新状态失败", error);
+    } else {
+      showMessage(String(error), true);
+    }
   } finally {
     refreshInFlight = false;
     setRefreshButtonState(options.button, false);
@@ -1024,7 +1048,11 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
     queryLogTotal = page.total;
     renderQueryLogs(page);
   } catch (error) {
-    showMessage(String(error), true);
+    if (options.auto) {
+      console.error("自动刷新查询日志失败", error);
+    } else {
+      showMessage(String(error), true);
+    }
   } finally {
     queryLogRefreshInFlight = false;
     setQueryLogLoading(false, options.auto === true);

@@ -20,12 +20,16 @@ const REGISTER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// 绝不注销重装（注销会连同批准状态一起销毁，且重新注册可能被系统拒绝）；
 /// 温和修复失败时通过 needs_repair 引导用户点击“安装或修复”执行重装。
 pub fn ensure_macos_service_current() -> Result<MacosServiceStatus, String> {
+    ensure_macos_service_with(INITIAL_PROBE_ATTEMPTS)
+}
+
+fn ensure_macos_service_with(probe_attempts: usize) -> Result<MacosServiceStatus, String> {
     let raw = current_raw_status();
     if raw != SMAppServiceStatus::Enabled {
         return Ok(status_from_raw(raw));
     }
 
-    match probe_service(INITIAL_PROBE_ATTEMPTS) {
+    match probe_service(probe_attempts) {
         Ok(hello) if service_is_current(&hello) => Ok(status_with_runtime(raw, Some(hello))),
         Ok(stale) => {
             // 同协议的旧服务可自行退出，由 KeepAlive 使用更新后的 bundle 重新拉起。
@@ -41,7 +45,10 @@ pub fn ensure_macos_service_current() -> Result<MacosServiceStatus, String> {
 
 pub fn macos_service_install(force: bool) -> Result<MacosServiceStatus, String> {
     register_service(force)?;
-    ensure_macos_service_current()
+    // 刚注册的服务由 launchd 首次拉起：AMFI 校验双架构二进制、初始化数据目录与
+    // 数据库都需要时间，用重启级探测窗口等待就绪，避免把启动中的服务误判为异常、
+    // 引导用户反复点击“安装或修复”。
+    ensure_macos_service_with(RESTART_PROBE_ATTEMPTS)
 }
 
 pub fn macos_service_uninstall() -> Result<MacosServiceStatus, String> {
@@ -71,17 +78,10 @@ fn register_service(force: bool) -> Result<(), String> {
     if current == SMAppServiceStatus::Enabled && !force {
         return Ok(());
     }
-    if current == SMAppServiceStatus::Enabled {
-        unsafe { service.unregisterAndReturnError() }
-            .map_err(|error| service_error("移除旧版 macOS DNS 后台服务失败", &error))?;
-        let current = wait_for_service_stopped(&service);
-        if current == SMAppServiceStatus::Enabled {
-            return Err("移除旧版 macOS DNS 后台服务超时，服务仍处于启用状态".to_string());
-        }
-        // Apple 的 Service Management 在注销完成后仍可能短暂拒绝重新注册，
-        // 留出一次状态转换间隔再注册，避免升级 helper 时偶发 Operation not permitted。
-        thread::sleep(PROBE_INTERVAL);
-    }
+    // 即便强制修复也绝不先注销：macOS 26 的 unregister 会连同用户在系统设置中的
+    // 批准状态一起销毁，重新注册后服务回到待批准、daemon 被停掉（实机日志证实）。
+    // 对已有注册直接 register 会原地刷新 BTM 记录并保留批准；
+    // “已注册”类报错在下方按最终状态判定成功即可。
 
     let mut last_error = "注册 macOS DNS 后台服务失败".to_string();
     for attempt in 0..REGISTER_ATTEMPTS {
