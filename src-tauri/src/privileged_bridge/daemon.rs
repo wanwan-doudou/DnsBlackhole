@@ -210,8 +210,9 @@ fn perform_handshake(stream: &mut UnixStream) -> Result<bool, String> {
             service_version: env!("CARGO_PKG_VERSION").to_string(),
         },
     )?;
-    // Darwin 要求 SO_RCVTIMEO 的 timeval 为正值；用 None 清除超时会返回 EDOM，
-    // 导致服务端在握手响应后立即关闭连接，客户端随后写入业务请求时收到 EPIPE。
+    // 握手后保留有限的请求级超时，避免异常客户端的空闲连接永久占用服务线程。
+    // （此前注释称 Darwin 对 set_read_timeout(None) 返回 EDOM，经核对 xnu 源码不成立，
+    // 0.1.33 断管的真实根因未定论，勿据此排查。）
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))
         .map_err(|error| format!("设置 IPC 请求读取超时失败：{error}"))?;

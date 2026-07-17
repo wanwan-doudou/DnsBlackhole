@@ -15,13 +15,7 @@ pub(crate) struct ServiceClient;
 impl ServiceClient {
     pub(crate) fn probe() -> Result<HelloResult, String> {
         let (mut stream, hello) = connect_and_hello()?;
-        let request = RpcRequest {
-            id: 2,
-            method: "ping".to_string(),
-            params: serde_json::Value::Null,
-        };
-        write_message(&mut stream, &request)?;
-        let _: serde_json::Value = read_result(&mut stream, 2)?;
+        verify_connection_alive(&mut stream)?;
         Ok(hello)
     }
 
@@ -63,6 +57,26 @@ impl ServiceClient {
         write_message(&mut stream, &request)?;
         read_result(&mut stream, 2)
     }
+}
+
+/// 握手后的连接存活性检查：旧版服务不认识 ping 会返回错误响应，
+/// 但能收到完整响应就说明连接在握手后仍可用、服务只是版本旧；
+/// 只有写入失败、连接被关闭或超时等传输层错误才判定为断管。
+fn verify_connection_alive(stream: &mut UnixStream) -> Result<(), String> {
+    let request = RpcRequest {
+        id: 2,
+        method: "ping".to_string(),
+        params: serde_json::Value::Null,
+    };
+    write_message(stream, &request)?;
+    let response: RpcResponse = read_message(stream)?;
+    if response.id != request.id {
+        return Err(format!(
+            "后台服务响应编号不匹配：期望 {}，收到 {}",
+            request.id, response.id
+        ));
+    }
+    Ok(())
 }
 
 fn connect_and_hello() -> Result<(UnixStream, HelloResult), String> {
@@ -114,4 +128,53 @@ fn read_result<R: DeserializeOwned>(
         .result
         .ok_or_else(|| "后台服务响应缺少结果".to_string())?;
     serde_json::from_value(result).map_err(|error| format!("解析后台服务响应失败：{error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    fn stream_pair() -> (UnixStream, UnixStream) {
+        let (client, server) = UnixStream::pair().expect("应能创建 Unix socket 对");
+        client
+            .set_read_timeout(Some(RPC_TIMEOUT))
+            .expect("应能设置客户端读取超时");
+        client
+            .set_write_timeout(Some(RPC_TIMEOUT))
+            .expect("应能设置客户端写入超时");
+        (client, server)
+    }
+
+    #[test]
+    fn connection_check_tolerates_error_response_from_old_service() {
+        let (mut client, mut server) = stream_pair();
+
+        let server_thread = thread::spawn(move || -> Result<(), String> {
+            let request: RpcRequest = read_message(&mut server)?;
+            write_message(
+                &mut server,
+                &RpcResponse {
+                    id: request.id,
+                    result: None,
+                    error: Some(format!("未知的后台服务方法：{}", request.method)),
+                },
+            )
+        });
+
+        verify_connection_alive(&mut client).expect("旧服务的错误响应应视为连接存活");
+        server_thread
+            .join()
+            .expect("服务端测试线程不应 panic")
+            .expect("服务端应能读取请求并应答");
+    }
+
+    #[test]
+    fn connection_check_fails_when_peer_closed_after_handshake() {
+        let (mut client, server) = stream_pair();
+        drop(server);
+
+        assert!(verify_connection_alive(&mut client).is_err());
+    }
 }
