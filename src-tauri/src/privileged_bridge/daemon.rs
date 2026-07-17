@@ -226,8 +226,8 @@ fn perform_handshake(stream: &mut UnixStream) -> Result<bool, String> {
         },
     )?;
     // 握手后保留有限的请求级超时，避免异常客户端的空闲连接永久占用服务线程。
-    // （此前注释称 Darwin 对 set_read_timeout(None) 返回 EDOM，经核对 xnu 源码不成立，
-    // 0.1.33 断管的真实根因未定论，勿据此排查。）
+    // （0.1.33 断管的根因已定论：accept 继承了监听 socket 的非阻塞标志，
+    // 握手字节未到即被 EAGAIN 断开，见 run_daemon 的 prepare_accepted_stream。）
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))
         .map_err(|error| format!("设置 IPC 请求读取超时失败：{error}"))?;
