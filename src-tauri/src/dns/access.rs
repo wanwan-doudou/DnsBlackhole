@@ -295,7 +295,7 @@ mod tests {
         let access = ClientAccess::from_config(&AppConfig::default()).expect("access should build");
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
 
-        for _ in 0..500 {
+        for _ in 0..10_000 {
             assert!(matches!(access.check(ip, 100), ClientAccessDecision::Allow));
         }
     }

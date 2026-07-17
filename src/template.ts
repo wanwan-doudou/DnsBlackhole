@@ -409,7 +409,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               <div class="dns-security-options">
                 <label class="field">
                   <span>每客户端限速</span>
-                  <small>持续每秒允许的 DNS 查询数；可容纳约 10 秒短时突发，0 表示关闭限速。</small>
+                  <small>持续每秒允许的 DNS 查询数；默认 2000 并可容纳约 10 秒短时突发，适合路由器汇聚多台设备，0 表示关闭限速。</small>
                   <input id="rate_limit_per_second" type="number" min="0" max="100000" step="1" />
                 </label>
                 <label class="check-row">

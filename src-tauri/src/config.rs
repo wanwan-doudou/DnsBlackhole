@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(target_os = "macos"))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 8;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
 const MAX_FILTER_SIZE_MB: u32 = 256;
+const LEGACY_DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 100;
 static BOOTSTRAP_QUERY_ID: AtomicU16 = AtomicU16::new(0x1234);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,7 +492,7 @@ fn default_allowed_clients() -> String {
 }
 
 fn default_rate_limit_per_second() -> u32 {
-    100
+    2_000
 }
 
 fn default_refuse_any() -> bool {
@@ -995,6 +996,12 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
     if config.schema_version < 7 && config.listen_host.trim().parse::<Ipv6Addr>().is_ok() {
         config.listen_ipv6 = false;
     }
+    if config.schema_version < 8
+        && config.rate_limit_per_second == LEGACY_DEFAULT_RATE_LIMIT_PER_SECOND
+    {
+        // 路由器做 DNS 转发时，几十到上百台设备可能共用同一个来源 IP。
+        config.rate_limit_per_second = default_rate_limit_per_second();
+    }
     if config.schema_version < 1 {
         if config.allowed_clients.trim().is_empty() {
             config.allowed_clients = default_allowed_clients();
@@ -1361,6 +1368,7 @@ mod tests {
         assert_eq!(config.listen_host, "0.0.0.0");
         assert_eq!(config.listen_port, 53);
         assert!(config.listen_ipv6);
+        assert_eq!(config.rate_limit_per_second, 2_000);
         assert_eq!(config.filter_max_size_mb, 50);
         assert!(!config.allow_insecure_http);
         assert_eq!(
@@ -1450,6 +1458,28 @@ mod tests {
             default_runtime_watchdog_interval_seconds()
         );
         assert_eq!(config.filter_max_size_mb, default_filter_max_size_mb());
+    }
+
+    #[test]
+    fn migrates_old_default_rate_limit_but_preserves_custom_value() {
+        let mut legacy_default = AppConfig {
+            schema_version: 7,
+            rate_limit_per_second: LEGACY_DEFAULT_RATE_LIMIT_PER_SECOND,
+            ..AppConfig::default()
+        };
+        migrate_legacy_defaults(&mut legacy_default);
+        assert_eq!(
+            legacy_default.rate_limit_per_second,
+            default_rate_limit_per_second()
+        );
+
+        let mut custom = AppConfig {
+            schema_version: 7,
+            rate_limit_per_second: 500,
+            ..AppConfig::default()
+        };
+        migrate_legacy_defaults(&mut custom);
+        assert_eq!(custom.rate_limit_per_second, 500);
     }
 
     #[test]
