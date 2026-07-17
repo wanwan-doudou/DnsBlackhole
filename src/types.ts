@@ -126,6 +126,8 @@ export type DnsStats = {
   last_error: string | null;
   query_domains?: Record<string, number>;
   blocked_domains?: Record<string, number>;
+  client_requests?: Record<string, number>;
+  blocklist_hits?: Record<string, number>;
   traffic?: TrafficBucket[];
   upstream_requests?: UpstreamRequestStat[];
   upstream_avg_latency?: UpstreamLatencyStat[];

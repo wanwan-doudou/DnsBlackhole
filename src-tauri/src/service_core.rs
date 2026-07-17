@@ -247,6 +247,8 @@ impl AppState {
                     stats.failed = log_stats.failed;
                     stats.query_domains = log_stats.query_domains;
                     stats.blocked_domains = log_stats.blocked_domains;
+                    stats.client_requests = log_stats.client_requests;
+                    stats.blocklist_hits = log_stats.blocklist_hits;
                     stats.traffic = log_stats.traffic;
                     stats.upstream_requests = log_stats.upstream_requests;
                     stats.upstream_avg_latency = log_stats.upstream_avg_latency;

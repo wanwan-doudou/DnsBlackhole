@@ -96,6 +96,8 @@ let currentMacosServiceStatus: MacosServiceStatus | null = null;
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const QUERY_LOG_PAGE_SIZE = 50;
 const QUERY_LOG_SEARCH_DEBOUNCE_MS = 800;
+// 排行卡片渲染上限：超出可视高度的部分在卡片内滚动查看
+const RANK_ROW_LIMIT = 50;
 const CHECK_RETRY_DELAYS_MS = [800, 2_000, 5_000];
 const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 2_500, 5_000];
 const CHECK_TIMEOUT_MS = 20_000;
@@ -1238,6 +1240,13 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   );
   renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries);
   renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked);
+  renderRankTable(
+    "#client_rank",
+    status.stats.client_requests ?? {},
+    status.stats.queries,
+    formatClientLabel,
+  );
+  renderRankTable("#blocklist_rank", status.stats.blocklist_hits ?? {}, status.stats.blocked);
   renderUpstreamRequestRank(
     "#upstream_rank",
     status.stats.upstream_requests ?? [],
@@ -1906,6 +1915,8 @@ function renderRetentionWindow(): void {
     : "本次运行";
   query("#query_rank_window").textContent = label;
   query("#blocked_rank_window").textContent = label;
+  query("#client_rank_window").textContent = label;
+  query("#blocklist_rank_window").textContent = label;
   query("#upstream_rank_window").textContent = label;
   query("#upstream_latency_window").textContent = label;
 }
@@ -1934,12 +1945,13 @@ function renderRankTable(
   selector: string,
   counts: Record<string, number>,
   total: number,
+  formatLabel?: (key: string) => string,
 ): void {
   const container = query<HTMLDivElement>(selector);
   const rows = Object.entries(counts)
     .filter(([domain, count]) => domain.length > 0 && count > 0)
     .sort((a, b) => b[1] - a[1] || compareRankLabel(a[0], b[0]))
-    .slice(0, 8);
+    .slice(0, RANK_ROW_LIMIT);
 
   if (rows.length === 0) {
     setHtmlIfChanged(container, `<div class="empty-rank">暂无请求数据</div>`);
@@ -1948,14 +1960,15 @@ function renderRankTable(
 
   const maxCount = rows[0]?.[1] ?? 1;
   const html = rows
-    .map(([domain, count]) => {
+    .map(([key, count]) => {
       const barWidth = maxCount > 0 ? Math.max((count / maxCount) * 100, 2) : 0;
       const percent = total > 0 ? count / total : 0;
+      const label = formatLabel ? formatLabel(key) : key;
 
       return `
         <div class="rank-row">
-          <div class="rank-domain" title="${escapeHtml(domain)}">
-            <span>${escapeHtml(domain)}</span>
+          <div class="rank-domain" title="${escapeHtml(label)}">
+            <span>${escapeHtml(label)}</span>
           </div>
           <div class="rank-value">
             <span class="rank-count">${formatCount(count)}</span>
@@ -1980,7 +1993,7 @@ function renderUpstreamRequestRank(
     .sort(
       (a, b) => b.requests - a.requests || compareRankLabel(a.upstream, b.upstream),
     )
-    .slice(0, 8);
+    .slice(0, RANK_ROW_LIMIT);
 
   if (visibleRows.length === 0) {
     setHtmlIfChanged(container, `<div class="empty-rank">暂无上游请求数据</div>`);
@@ -2015,7 +2028,7 @@ function renderUpstreamLatencyRank(selector: string, rows: UpstreamLatencyStat[]
   const visibleRows = rows
     .filter((row) => row.upstream.length > 0)
     .sort((a, b) => a.avg_ms - b.avg_ms || compareRankLabel(a.upstream, b.upstream))
-    .slice(0, 8);
+    .slice(0, RANK_ROW_LIMIT);
 
   if (visibleRows.length === 0) {
     setHtmlIfChanged(container, `<div class="empty-rank">暂无上游响应时间数据</div>`);

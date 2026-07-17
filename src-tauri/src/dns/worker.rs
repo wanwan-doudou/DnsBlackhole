@@ -265,6 +265,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         record_query(
             &context.stats,
             &question.domain,
+            client_addr.ip(),
             context.detailed_runtime_stats,
         );
         let message = format!("已拒绝 ANY 查询：{}", question.domain);
@@ -316,6 +317,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         record_query(
             &context.stats,
             &question.domain,
+            client_addr.ip(),
             context.detailed_runtime_stats,
         );
         let response = build_rewrite_response(query, question, &target);
@@ -363,6 +365,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             record_query(
                 &context.stats,
                 &question.domain,
+                client_addr.ip(),
                 context.detailed_runtime_stats,
             );
             record_error(&context.stats, message.clone());
@@ -380,6 +383,8 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         record_blocked_query(
             &context.stats,
             &question.domain,
+            client_addr.ip(),
+            &rule_match.source,
             context.detailed_runtime_stats,
         );
         queue_blocked_query_log(
@@ -397,6 +402,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
     record_query(
         &context.stats,
         &question.domain,
+        client_addr.ip(),
         context.detailed_runtime_stats,
     );
 

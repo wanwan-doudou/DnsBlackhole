@@ -120,6 +120,42 @@ export function renderAppTemplate(appIconUrl: string): string {
           </section>
         </div>
 
+        <div class="dashboard-rank-grid">
+          <section class="panel rank-panel">
+            <div class="rank-title">
+              <div>
+                <h2>客户端排行</h2>
+                <span id="client_rank_window">最近 90 天</span>
+              </div>
+              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+            </div>
+            <div class="rank-table">
+              <div class="rank-head">
+                <span>客户端</span>
+                <span>请求数</span>
+              </div>
+              <div class="rank-body" id="client_rank"></div>
+            </div>
+          </section>
+
+          <section class="panel rank-panel blocked-rank">
+            <div class="rank-title">
+              <div>
+                <h2>DNS 黑名单排行</h2>
+                <span id="blocklist_rank_window">最近 90 天</span>
+              </div>
+              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+            </div>
+            <div class="rank-table">
+              <div class="rank-head">
+                <span>黑名单</span>
+                <span>拦截数</span>
+              </div>
+              <div class="rank-body" id="blocklist_rank"></div>
+            </div>
+          </section>
+        </div>
+
         <div class="dashboard-rank-grid upstream-rank-grid">
           <section class="panel rank-panel">
             <div class="rank-title">

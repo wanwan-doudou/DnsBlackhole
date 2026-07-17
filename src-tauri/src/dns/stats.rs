@@ -32,6 +32,10 @@ pub struct DnsStats {
     pub last_error: Option<String>,
     pub query_domains: HashMap<String, u64>,
     pub blocked_domains: HashMap<String, u64>,
+    #[serde(default)]
+    pub client_requests: HashMap<String, u64>,
+    #[serde(default)]
+    pub blocklist_hits: HashMap<String, u64>,
     pub traffic: Vec<TrafficBucket>,
     pub upstream_requests: Vec<UpstreamRequestStat>,
     pub upstream_avg_latency: Vec<UpstreamLatencyStat>,
@@ -134,6 +138,7 @@ pub(crate) fn reset_stats(stats: &Arc<Mutex<DnsStats>>) {
 pub(crate) fn record_query(
     stats: &Arc<Mutex<DnsStats>>,
     domain: &str,
+    client_ip: IpAddr,
     detailed_runtime_stats: bool,
 ) {
     if !detailed_runtime_stats {
@@ -144,6 +149,10 @@ pub(crate) fn record_query(
         current.queries += 1;
         current.last_query = Some(domain.to_string());
         *current.query_domains.entry(domain.to_string()).or_default() += 1;
+        *current
+            .client_requests
+            .entry(client_ip.to_string())
+            .or_default() += 1;
         record_traffic(&mut current, false);
     }
 }
@@ -151,6 +160,8 @@ pub(crate) fn record_query(
 pub(crate) fn record_blocked_query(
     stats: &Arc<Mutex<DnsStats>>,
     domain: &str,
+    client_ip: IpAddr,
+    rule_source: &str,
     detailed_runtime_stats: bool,
 ) {
     if !detailed_runtime_stats {
@@ -166,6 +177,14 @@ pub(crate) fn record_blocked_query(
         *current
             .blocked_domains
             .entry(domain.to_string())
+            .or_default() += 1;
+        *current
+            .client_requests
+            .entry(client_ip.to_string())
+            .or_default() += 1;
+        *current
+            .blocklist_hits
+            .entry(rule_source.to_string())
             .or_default() += 1;
         record_traffic(&mut current, false);
         record_traffic(&mut current, true);

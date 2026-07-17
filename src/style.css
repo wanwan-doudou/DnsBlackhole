@@ -1135,6 +1135,9 @@ button.refreshing:disabled {
 
 .rank-body {
   min-height: 260px;
+  /* 约 8 行的高度：超出后卡片内滚动，表头在滚动区外保持固定 */
+  max-height: 424px;
+  overflow-y: auto;
   background: #ffffff;
 }
 

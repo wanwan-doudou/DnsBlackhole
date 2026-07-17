@@ -400,8 +400,9 @@ mod tests {
     #[test]
     fn runtime_stats_record_domain_counts_and_traffic() {
         let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let client = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
 
-        record_query(&stats, "ads.example.org", true);
+        record_query(&stats, "ads.example.org", client, true);
         record_blocked(&stats, "ads.example.org", true);
 
         let current = stats.lock().expect("stats should lock");
@@ -409,6 +410,7 @@ mod tests {
         assert_eq!(current.blocked, 1);
         assert_eq!(current.query_domains.get("ads.example.org"), Some(&1));
         assert_eq!(current.blocked_domains.get("ads.example.org"), Some(&1));
+        assert_eq!(current.client_requests.get("192.168.1.20"), Some(&1));
         assert_eq!(current.traffic.len(), 1);
         assert_eq!(current.traffic[0].queries, 1);
         assert_eq!(current.traffic[0].blocked, 1);

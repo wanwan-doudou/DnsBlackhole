@@ -138,6 +138,8 @@ pub struct LogStats {
     pub failed: u64,
     pub query_domains: HashMap<String, u64>,
     pub blocked_domains: HashMap<String, u64>,
+    pub client_requests: HashMap<String, u64>,
+    pub blocklist_hits: HashMap<String, u64>,
     pub traffic: Vec<TrafficBucket>,
     pub upstream_requests: Vec<UpstreamRequestStat>,
     pub upstream_avg_latency: Vec<UpstreamLatencyStat>,
@@ -329,6 +331,8 @@ impl Database {
             failed,
             query_domains: grouped_domain_counts(&conn, since_minute, false)?,
             blocked_domains: grouped_domain_counts(&conn, since_minute, true)?,
+            client_requests: client_request_counts(&conn, since)?,
+            blocklist_hits: blocklist_hit_counts(&conn, since)?,
             traffic: traffic_buckets(&conn, since_minute, retention_hours)?,
             upstream_requests: upstream_request_counts(&conn, since_minute)?,
             upstream_avg_latency: upstream_avg_latency(&conn, since_minute)?,
@@ -837,6 +841,70 @@ fn grouped_domain_counts(
     Ok(counts)
 }
 
+/// 客户端与黑名单排行没有预聚合表，直接对保留窗口内的日志明细分组统计；
+/// 借助 timestamp 索引做范围扫描，且结果被日志统计缓存复用，代价可控。
+fn client_request_counts(
+    conn: &Connection,
+    since_seconds: u64,
+) -> Result<HashMap<String, u64>, String> {
+    let since = u64_to_db_i64(since_seconds, "客户端排行起始时间戳")?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT client_ip, COUNT(*)
+             FROM query_logs
+             WHERE timestamp >= ?1
+               AND client_ip IS NOT NULL
+               AND client_ip != ''
+             GROUP BY client_ip
+             ORDER BY COUNT(*) DESC, client_ip ASC
+             LIMIT 200",
+        )
+        .map_err(|e| format!("准备客户端排行查询失败：{e}"))?;
+    let rows = stmt
+        .query_map(params![since], |row| {
+            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
+        })
+        .map_err(|e| format!("读取客户端排行失败：{e}"))?;
+
+    let mut counts = HashMap::new();
+    for row in rows {
+        let (client, count) = row.map_err(|e| format!("解析客户端排行失败：{e}"))?;
+        counts.insert(client, count);
+    }
+    Ok(counts)
+}
+
+fn blocklist_hit_counts(
+    conn: &Connection,
+    since_seconds: u64,
+) -> Result<HashMap<String, u64>, String> {
+    let since = u64_to_db_i64(since_seconds, "黑名单排行起始时间戳")?;
+    // rule_source 为空的记录来自尚未记录来源的旧版本日志
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(NULLIF(rule_source, ''), '未知来源') AS source, COUNT(*)
+             FROM query_logs
+             WHERE timestamp >= ?1
+               AND blocked = 1
+             GROUP BY source
+             ORDER BY COUNT(*) DESC, source ASC
+             LIMIT 200",
+        )
+        .map_err(|e| format!("准备黑名单排行查询失败：{e}"))?;
+    let rows = stmt
+        .query_map(params![since], |row| {
+            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
+        })
+        .map_err(|e| format!("读取黑名单排行失败：{e}"))?;
+
+    let mut counts = HashMap::new();
+    for row in rows {
+        let (source, count) = row.map_err(|e| format!("解析黑名单排行失败：{e}"))?;
+        counts.insert(source, count);
+    }
+    Ok(counts)
+}
+
 // 超过该窗口的趋势按小时聚合，避免长保留期一次返回十几万分钟桶
 const TRAFFIC_HOUR_BUCKET_THRESHOLD_HOURS: u32 = 48;
 
@@ -1085,6 +1153,10 @@ mod tests {
         assert_eq!(stats.upstream_requests[0].requests, 1);
         assert_eq!(stats.upstream_avg_latency[0].upstream, "223.5.5.5:53");
         assert_eq!(stats.upstream_avg_latency[0].avg_ms, 24);
+        // 两条日志的客户端 IP 匿名化后同属 192.168.1.0
+        assert_eq!(stats.client_requests.get("192.168.1.0"), Some(&2));
+        assert_eq!(stats.blocklist_hits.get("测试清单"), Some(&1));
+        assert_eq!(stats.blocklist_hits.len(), 1);
 
         let logs = db
             .query_logs(6, "all", "", 1, 20)
