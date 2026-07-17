@@ -869,7 +869,7 @@ function renderMacosServiceStatus(status: MacosServiceStatus): void {
       ? ` 当前服务版本 v${status.serviceVersion}。`
       : "";
   macosServiceStatusElement.textContent = status.needsRepair
-    ? "后台服务版本异常，应用将在启动时自动修复。"
+    ? "后台服务异常或版本不一致，请点击“安装或修复”重新安装。"
     : `${stateText}${versionText}`;
   openMacosServiceSettingsButton.classList.toggle("hidden", !status.requiresApproval);
   uninstallMacosServiceButton.disabled =

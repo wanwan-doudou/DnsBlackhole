@@ -11,10 +11,14 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const INITIAL_PROBE_ATTEMPTS: usize = 4;
 const RESTART_PROBE_ATTEMPTS: usize = 20;
 const SERVICE_TRANSITION_ATTEMPTS: usize = 20;
-const REGISTER_ATTEMPTS: usize = 4;
+const REGISTER_ATTEMPTS: usize = 6;
+// 注销后系统的后台任务管理（BTM）传播新状态可能需要数秒，重试间隔要比探测间隔更宽。
+const REGISTER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
-/// 已获批启用的服务在应用升级后自动切换到当前 bundle 内的 helper。
-/// 尚未安装或等待系统批准时不主动注册，避免应用启动时擅自触发授权流程。
+/// 已获批启用的旧版服务在应用升级后被请求自行退出，由 KeepAlive 用当前 bundle 重新拉起。
+/// SMAppService 的注册与批准是持久状态、跨应用更新有效，本函数只做只读探测与温和重启，
+/// 绝不注销重装（注销会连同批准状态一起销毁，且重新注册可能被系统拒绝）；
+/// 温和修复失败时通过 needs_repair 引导用户点击“安装或修复”执行重装。
 pub fn ensure_macos_service_current() -> Result<MacosServiceStatus, String> {
     let raw = current_raw_status();
     if raw != SMAppServiceStatus::Enabled {
@@ -22,28 +26,17 @@ pub fn ensure_macos_service_current() -> Result<MacosServiceStatus, String> {
     }
 
     match probe_service(INITIAL_PROBE_ATTEMPTS) {
-        Ok(hello) if service_is_current(&hello) => {
-            return Ok(status_with_runtime(raw, Some(hello)));
-        }
-        Ok(_) => {
+        Ok(hello) if service_is_current(&hello) => Ok(status_with_runtime(raw, Some(hello))),
+        Ok(stale) => {
             // 同协议的旧服务可自行退出，由 KeepAlive 使用更新后的 bundle 重新拉起。
             let _ = ServiceClient::request_restart();
-            if let Ok(hello) = wait_for_current_service(RESTART_PROBE_ATTEMPTS) {
-                return Ok(status_with_runtime(current_raw_status(), Some(hello)));
+            match wait_for_current_service(RESTART_PROBE_ATTEMPTS) {
+                Ok(hello) => Ok(status_with_runtime(current_raw_status(), Some(hello))),
+                Err(_) => Ok(status_with_runtime(current_raw_status(), Some(stale))),
             }
         }
-        Err(_) => {}
+        Err(_) => Ok(status_with_runtime(raw, None)),
     }
-
-    // 协议不兼容、旧服务不支持自重启或 socket 损坏时，重新注册 LaunchDaemon。
-    register_service(true)?;
-    let raw = current_raw_status();
-    if raw != SMAppServiceStatus::Enabled {
-        return Ok(status_from_raw(raw));
-    }
-    let hello = wait_for_current_service(RESTART_PROBE_ATTEMPTS)
-        .map_err(|error| format!("自动修复 macOS DNS 后台服务后仍无法连接：{error}"))?;
-    Ok(status_with_runtime(raw, Some(hello)))
 }
 
 pub fn macos_service_install(force: bool) -> Result<MacosServiceStatus, String> {
@@ -105,10 +98,16 @@ fn register_service(force: bool) -> Result<(), String> {
             }
         }
         if attempt + 1 < REGISTER_ATTEMPTS {
-            thread::sleep(PROBE_INTERVAL);
+            thread::sleep(REGISTER_RETRY_INTERVAL);
         }
     }
-    Err(last_error)
+    // 走到这里说明注册既没成功也没进入待批准状态，即注册请求本身被系统拒绝，
+    // 常见于后台任务管理数据库状态异常，重试无法自愈，只能引导用户手动恢复。
+    Err(format!(
+        "{last_error}。注册未进入待批准状态，系统可能拒绝了本应用的注册资格：\
+        请重启 Mac 后再点击“安装或修复”；若仍失败，在终端执行 sudo sfltool resetbtm \
+        并重启后重新安装（该命令会重置所有应用的后台项批准状态）"
+    ))
 }
 
 fn wait_for_service_stopped(service: &SMAppService) -> SMAppServiceStatus {
