@@ -1,6 +1,6 @@
 [package]
 name = "dnsblackhole"
-version = "0.1.36"
+version = "0.1.37"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"

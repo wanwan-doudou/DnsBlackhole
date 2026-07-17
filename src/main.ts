@@ -1215,7 +1215,7 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   const statusErrorKey = status.error
     ? `runtime:${status.error}`
     : lastError
-      ? `dns:${status.stats.failed}:${lastError}`
+      ? `dns:${lastError}`
       : null;
   if (lastError && statusErrorKey !== lastStatusErrorKey) {
     showMessage(lastError, true);
