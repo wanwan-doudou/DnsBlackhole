@@ -855,6 +855,13 @@ fn client_request_counts(
              WHERE timestamp >= ?1
                AND client_ip IS NOT NULL
                AND client_ip != ''
+               AND client_ip NOT LIKE '127.%'
+               AND LOWER(client_ip) NOT LIKE '::ffff:127.%'
+               AND LOWER(client_ip) NOT IN (
+                   '::1',
+                   '0:0:0:0:0:0:0:1',
+                   '0:0:0:0:0:0:0:0'
+               )
              GROUP BY client_ip
              ORDER BY COUNT(*) DESC, client_ip ASC
              LIMIT 200",
@@ -1187,6 +1194,35 @@ mod tests {
     fn anonymizes_client_ip() {
         assert_eq!(anonymize_ip("192.168.1.42"), "192.168.1.0");
         assert_eq!(anonymize_ip("not-an-ip"), "not-an-ip");
+    }
+
+    #[test]
+    fn client_rank_excludes_loopback_addresses() {
+        let db = Database::open_in_memory().expect("db should open");
+        let conn = db.conn.lock().expect("database should lock");
+        let timestamp = i64::try_from(unix_now()).expect("timestamp should fit i64");
+        for (index, client_ip) in [
+            "127.0.0.1",
+            "127.0.0.0",
+            "::1",
+            "0:0:0:0:0:0:0:1",
+            "0:0:0:0:0:0:0:0",
+            "::ffff:127.0.0.1",
+            "192.168.1.20",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO query_logs (timestamp, domain, client_ip) VALUES (?1, ?2, ?3)",
+                params![timestamp, format!("client-{index}.example"), client_ip],
+            )
+            .expect("query log should insert");
+        }
+
+        let counts = client_request_counts(&conn, 0).expect("client rank should load");
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("192.168.1.20"), Some(&1));
     }
 
     #[test]

@@ -360,7 +360,7 @@ button.refreshing:disabled {
   margin-bottom: 18px;
 }
 
-.upstream-rank-grid {
+.dashboard-rank-grid + .dashboard-rank-grid {
   margin-top: 18px;
 }
 
