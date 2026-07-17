@@ -149,7 +149,10 @@ pub(crate) fn record_query(
         current.queries += 1;
         current.last_query = Some(domain.to_string());
         *current.query_domains.entry(domain.to_string()).or_default() += 1;
-        record_client_request(&mut current, client_ip);
+        *current
+            .client_requests
+            .entry(client_ip.to_string())
+            .or_default() += 1;
         record_traffic(&mut current, false);
     }
 }
@@ -175,31 +178,16 @@ pub(crate) fn record_blocked_query(
             .blocked_domains
             .entry(domain.to_string())
             .or_default() += 1;
-        record_client_request(&mut current, client_ip);
+        *current
+            .client_requests
+            .entry(client_ip.to_string())
+            .or_default() += 1;
         *current
             .blocklist_hits
             .entry(rule_source.to_string())
             .or_default() += 1;
         record_traffic(&mut current, false);
         record_traffic(&mut current, true);
-    }
-}
-
-fn record_client_request(stats: &mut DnsStats, client_ip: IpAddr) {
-    let is_loopback = match client_ip {
-        IpAddr::V4(addr) => addr.is_loopback(),
-        IpAddr::V6(addr) => {
-            addr.is_loopback()
-                || addr
-                    .to_ipv4_mapped()
-                    .is_some_and(|mapped| mapped.is_loopback())
-        }
-    };
-    if !is_loopback {
-        *stats
-            .client_requests
-            .entry(client_ip.to_string())
-            .or_default() += 1;
     }
 }
 

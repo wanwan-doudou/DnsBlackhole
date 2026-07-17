@@ -20,7 +20,7 @@ pub use stats::{
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        net::{IpAddr, Ipv4Addr},
         sync::{Arc, Mutex},
     };
 
@@ -414,28 +414,6 @@ mod tests {
         assert_eq!(current.traffic.len(), 1);
         assert_eq!(current.traffic[0].queries, 1);
         assert_eq!(current.traffic[0].blocked, 1);
-    }
-
-    #[test]
-    fn runtime_stats_exclude_loopback_clients_from_rank() {
-        let stats = Arc::new(Mutex::new(DnsStats::default()));
-
-        record_query(
-            &stats,
-            "ipv4.example.org",
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            true,
-        );
-        record_query(
-            &stats,
-            "ipv6.example.org",
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            true,
-        );
-
-        let current = stats.lock().expect("stats should lock");
-        assert_eq!(current.queries, 2);
-        assert!(current.client_requests.is_empty());
     }
 
     #[test]

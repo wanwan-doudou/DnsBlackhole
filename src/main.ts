@@ -1240,12 +1240,11 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   );
   renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries);
   renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked);
-  const clientRequests = status.stats.client_requests ?? {};
   renderRankTable(
     "#client_rank",
-    clientRequests,
-    Object.values(clientRequests).reduce((total, count) => total + count, 0),
-    formatClientLabel,
+    status.stats.client_requests ?? {},
+    status.stats.queries,
+    formatClientRankLabel,
   );
   renderRankTable("#blocklist_rank", status.stats.blocklist_hits ?? {}, status.stats.blocked);
   renderUpstreamRequestRank(
@@ -1731,6 +1730,10 @@ function formatClientLabel(ip: string | null): string {
   }
   const name = clientDisplayName(ip);
   return name ? `${name}（${ip}）` : ip;
+}
+
+function formatClientRankLabel(ip: string): string {
+  return ip === "127.0.0.1" || ip === "::1" ? ip : formatClientLabel(ip);
 }
 
 function sleep(ms: number): Promise<void> {
