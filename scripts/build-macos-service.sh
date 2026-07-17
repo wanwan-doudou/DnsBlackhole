@@ -21,6 +21,13 @@ build_service() {
     --target "${target}"
 }
 
+# 将编译出的 helper 安装为可执行 sidecar，避免覆盖占位文件时继承 0644 权限。
+install_service() {
+  local source="$1"
+  local destination="$2"
+  install -m 755 "${source}" "${destination}"
+}
+
 # daemon 由 launchd 直接拉起，macOS 26 的启动约束要求它与容器应用使用同一签名身份，
 # 且标识符必须跨版本稳定——链接器 ad-hoc 签名生成的哈希后缀名不满足要求。
 # 必须先签 helper 再由 Tauri 签外层 .app，外层资源封装才会记录最终的 helper 签名。
@@ -47,7 +54,7 @@ mkdir -p src-tauri/binaries
 case "${target}" in
   aarch64-apple-darwin|x86_64-apple-darwin)
     build_service "${target}"
-    cp \
+    install_service \
       "src-tauri/target/${target}/release/dnsblackhole-service" \
       "src-tauri/binaries/dnsblackhole-service-${target}"
     sign_service "src-tauri/binaries/dnsblackhole-service-${target}"
@@ -60,6 +67,7 @@ case "${target}" in
       src-tauri/target/aarch64-apple-darwin/release/dnsblackhole-service \
       src-tauri/target/x86_64-apple-darwin/release/dnsblackhole-service \
       -output src-tauri/binaries/dnsblackhole-service-universal-apple-darwin
+    chmod 755 src-tauri/binaries/dnsblackhole-service-universal-apple-darwin
     lipo -info src-tauri/binaries/dnsblackhole-service-universal-apple-darwin
     sign_service src-tauri/binaries/dnsblackhole-service-universal-apple-darwin
     ;;

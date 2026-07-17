@@ -15,6 +15,7 @@
     "macOS": {
       "minimumSystemVersion": "13.0",
       "hardenedRuntime": true,
+      "signingIdentity": "-",
       "files": {
         "Library/LaunchDaemons/com.dnsblackhole.app.service.plist": "./macos/com.dnsblackhole.app.service.plist"
       }
