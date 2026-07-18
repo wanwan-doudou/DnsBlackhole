@@ -456,13 +456,19 @@ fn cleanup_legacy_debug_autostart(app: &tauri::AppHandle) -> Result<(), String> 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    // Universal 安装包同时覆盖 Apple Silicon 与 Intel，使用固定目标读取同一份更新清单。
+    let updater = tauri_plugin_updater::Builder::new().target("darwin-universal");
+    #[cfg(not(target_os = "macos"))]
+    let updater = tauri_plugin_updater::Builder::new();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(updater.build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             get_config,

@@ -24,13 +24,14 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data:; font-src 'self'; connect-src 'self' ipc: https://api.github.com http://ipc.localhost http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     }
   },
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERFRkRBM0RFNjg1QzFDMUYKUldRZkhGeG8zcVA5M2dzelI5Q21qMGIwczVjUzFkaXBFYlFVUGo3OG5yRW1vTFg5SXV1WmhUeFoK",
       "endpoints": [
+        "https://github.com/wanwan-doudou/DnsBlackhole/releases/latest/download/latest-{{target}}.json",
         "https://github.com/wanwan-doudou/DnsBlackhole/releases/latest/download/latest.json"
       ]
     }

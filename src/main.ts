@@ -94,6 +94,8 @@ const isMacOS = navigator.userAgent.includes("Macintosh");
 let currentMacosServiceStatus: MacosServiceStatus | null = null;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
+const RELEASES_API_URL =
+  "https://api.github.com/repos/wanwan-doudou/DnsBlackhole/releases";
 const QUERY_LOG_PAGE_SIZE = 50;
 const QUERY_LOG_SEARCH_DEBOUNCE_MS = 800;
 // 排行卡片渲染上限：超出可视高度的部分在卡片内滚动查看
@@ -180,6 +182,12 @@ const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
 const installUpdateButton = query<HTMLButtonElement>("#install_update_btn");
 const manualDownloadButton = query<HTMLButtonElement>("#manual_download_btn");
 const updateStatusElement = query<HTMLElement>("#update_status");
+const updateDialog = query<HTMLDialogElement>("#update_dialog");
+const updateDialogCloseButton = query<HTMLButtonElement>("#update_dialog_close_btn");
+const updateDialogLaterButton = query<HTMLButtonElement>("#update_dialog_later_btn");
+const updateCurrentVersionElement = query<HTMLElement>("#update_current_version");
+const updateReleaseVersionElement = query<HTMLElement>("#update_release_version");
+const updateReleaseNotesBodyElement = query<HTMLElement>("#update_release_notes_body");
 const queryLogRefreshButton = query<HTMLButtonElement>("#query_log_refresh_btn");
 const queryLogSearchInput = query<HTMLInputElement>("#query_log_search");
 const queryLogFilterInput = query<HTMLSelectElement>("#query_log_filter");
@@ -542,39 +550,40 @@ checkUpdateButton.addEventListener("click", async () => {
   checkUpdateButton.classList.add("loading");
   checkUpdateButton.textContent = "检查中";
   setUpdateStatus("info", "正在检查更新...");
-  installUpdateButton.classList.add("hidden");
-  manualDownloadButton.classList.add("hidden");
+  closeUpdateDialog();
   pendingUpdate = null;
   manualDownloadUrl = "";
 
   try {
+    const currentVersion = await getVersion();
     pendingUpdate = await checkForUpdateWithRetry();
     if (pendingUpdate) {
+      let notes = pendingUpdate.body ?? "";
       manualDownloadUrl = resolveManualDownloadUrl(pendingUpdate);
-      const notes = pendingUpdate.body ? `\n${pendingUpdate.body}` : "";
-      setUpdateStatus("ok", `发现新版本 v${pendingUpdate.version}${notes}`);
-      installUpdateButton.classList.remove("hidden");
+      try {
+        const release = await fetchGitHubReleaseWithRetry(pendingUpdate.version);
+        notes = release.notes || notes;
+        manualDownloadUrl = release.downloadUrl;
+      } catch (error) {
+        console.warn("读取 GitHub Release 更新日志失败", error);
+      }
+
+      setUpdateStatus("ok", `发现新版本 v${pendingUpdate.version}`);
+      showUpdateDialog(currentVersion, pendingUpdate.version, notes);
       installUpdateButton.disabled = false;
-      manualDownloadButton.classList.remove("hidden");
       manualDownloadButton.disabled = false;
     } else {
-      setUpdateStatus("ok", `已是最新版本 v${await getVersion()}`, 3500);
+      setUpdateStatus("ok", `已是最新版本 v${currentVersion}`, 3500);
     }
   } catch (error) {
     console.error("检查更新失败", error);
     const message = formatUpdateError(error);
     if (/platform.+(was )?not found/i.test(message)) {
-      // 更新清单里还没有当前平台的自动更新包（例如 macOS 过渡版本）
-      setUpdateStatus(
-        "err",
-        "当前平台暂无自动更新包，可点击“浏览器下载”前往 GitHub Releases 手动下载",
-      );
+      setUpdateStatus("err", "当前平台暂无自动更新包，请前往 GitHub Releases 手动下载");
     } else {
       setUpdateStatus("err", `检查更新失败：${message}`);
     }
     manualDownloadUrl = "";
-    manualDownloadButton.classList.remove("hidden");
-    manualDownloadButton.disabled = false;
   } finally {
     checkUpdateButton.disabled = false;
     checkUpdateButton.classList.remove("loading");
@@ -587,6 +596,7 @@ installUpdateButton.addEventListener("click", async () => {
     return;
   }
 
+  closeUpdateDialog();
   installUpdateButton.disabled = true;
   manualDownloadButton.disabled = true;
 
@@ -607,6 +617,7 @@ installUpdateButton.addEventListener("click", async () => {
 
 manualDownloadButton.addEventListener("click", async () => {
   const url = manualDownloadUrl || RELEASES_URL;
+  closeUpdateDialog();
   manualDownloadButton.disabled = true;
 
   try {
@@ -616,6 +627,14 @@ manualDownloadButton.addEventListener("click", async () => {
     setUpdateStatus("err", `打开浏览器失败：${formatUpdateError(error)}\n下载地址：${url}`);
   } finally {
     manualDownloadButton.disabled = false;
+  }
+});
+
+updateDialogCloseButton.addEventListener("click", closeUpdateDialog);
+updateDialogLaterButton.addEventListener("click", closeUpdateDialog);
+updateDialog.addEventListener("click", (event) => {
+  if (event.target === updateDialog) {
+    closeUpdateDialog();
   }
 });
 
@@ -1811,6 +1830,106 @@ function setUpdateStatus(kind: "info" | "ok" | "err", message: string, autoHideM
       updateStatusElement.classList.add("hidden");
       updateStatusElement.textContent = "";
     }, autoHideMs);
+  }
+}
+
+type GitHubRelease = {
+  tag_name: string;
+  body: string | null;
+  html_url: string;
+  assets: {
+    name: string;
+    browser_download_url: string;
+  }[];
+};
+
+type GitHubReleaseAsset = {
+  name: string;
+  browser_download_url: string;
+};
+
+type GitHubReleaseInfo = {
+  version: string;
+  notes: string;
+  downloadUrl: string;
+};
+
+function normalizeVersion(version: string): string {
+  return version.trim().replace(/^v/i, "");
+}
+
+function resolveReleaseAssetUrl(assets: GitHubReleaseAsset[], pageUrl: string): string {
+  const patterns = isMacOS
+    ? [/universal.*\.dmg$/i, /\.dmg$/i]
+    : [/_x64-setup\.exe$/i, /\.exe$/i, /\.msi$/i];
+
+  for (const pattern of patterns) {
+    const asset = assets.find(({ name }) => pattern.test(name));
+    if (asset) {
+      return asset.browser_download_url;
+    }
+  }
+  return pageUrl;
+}
+
+async function fetchGitHubRelease(version: string): Promise<GitHubReleaseInfo> {
+  const endpoint = `${RELEASES_API_URL}/tags/v${encodeURIComponent(normalizeVersion(version))}`;
+  const response = await fetch(endpoint, {
+    headers: { Accept: "application/vnd.github+json" },
+    signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub Release 请求失败（HTTP ${response.status}）`);
+  }
+
+  const release = (await response.json()) as GitHubRelease;
+  const releaseVersion = normalizeVersion(release.tag_name);
+  if (!releaseVersion) {
+    throw new Error("GitHub Release 缺少版本号");
+  }
+
+  return {
+    version: releaseVersion,
+    notes: release.body?.trim() ?? "",
+    downloadUrl: resolveReleaseAssetUrl(release.assets, release.html_url || RELEASES_URL),
+  };
+}
+
+async function fetchGitHubReleaseWithRetry(version: string): Promise<GitHubReleaseInfo> {
+  return retryWithBackoff(
+    () => fetchGitHubRelease(version),
+    CHECK_RETRY_DELAYS_MS,
+    (attempt, delayMs, error) => {
+      setUpdateStatus(
+        "info",
+        `读取更新信息失败，${Math.round(delayMs / 1_000)} 秒后重试（${attempt}/${CHECK_RETRY_DELAYS_MS.length}）：${formatUpdateError(error)}`,
+      );
+    },
+  );
+}
+
+function formatReleaseNotes(notes: string): string {
+  return notes
+    .trim()
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+}
+
+function showUpdateDialog(currentVersion: string, version: string, notes: string): void {
+  const content = formatReleaseNotes(notes) || "此版本暂未提供更新说明。";
+  updateCurrentVersionElement.textContent = currentVersion;
+  updateReleaseVersionElement.textContent = `v${version}`;
+  updateReleaseNotesBodyElement.textContent = content;
+  if (!updateDialog.open) {
+    updateDialog.showModal();
+  }
+}
+
+function closeUpdateDialog(): void {
+  if (updateDialog.open) {
+    updateDialog.close();
   }
 }
 

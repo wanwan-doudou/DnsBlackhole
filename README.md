@@ -182,10 +182,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 1. 同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的版本号。
 2. 完成前端构建、Rust 测试和 Clippy 检查。
 3. 在 Windows 执行 `./scripts/release.ps1`，生成签名的 NSIS、MSI 安装包与 `latest.json`。
-4. 推送 `main` 并等待 macOS CI 完成，下载 `DnsBlackhole-macos-universal-dmg` artifact。
-5. 创建一个 `v<版本号>` GitHub Release，统一上传 NSIS、MSI、`latest.json` 和 Universal DMG。
+4. 推送 `main` 并等待 macOS CI 完成，下载 `DnsBlackhole-macos-universal-release` artifact。
+5. 创建一个 `v<版本号>` GitHub Release，统一上传 NSIS、MSI、Windows `latest.json`，以及 macOS artifact 中的 Universal DMG、`.app.tar.gz`、`.sig` 和 `latest-darwin-universal.json`。
 
-更新私钥位于维护者机器的 `%USERPROFILE%\.tauri\dnsblackhole.key`。私钥丢失后，旧版本将无法验证后续自动更新，必须妥善离线备份且不得提交到仓库。
+更新私钥位于维护者机器的 `%USERPROFILE%\.tauri\dnsblackhole.key`。macOS CI 需要把同一私钥配置为 `TAURI_SIGNING_PRIVATE_KEY` Secret；如果私钥有密码，再配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。未配置私钥时 CI 仍会生成 DMG，但不会生成自动更新产物。私钥丢失后，旧版本将无法验证后续自动更新，必须妥善离线备份且不得提交到仓库。
 
 ## License
 

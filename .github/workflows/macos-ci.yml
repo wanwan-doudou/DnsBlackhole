@@ -130,7 +130,21 @@ jobs:
       # beforeBuildCommand 会先执行 pnpm build 和 build-macos-service.sh（universal 分支），
       # 后者用同一身份先签好后台服务，Tauri 再签外层 .app 并生成 DMG
       - name: Tauri 构建（universal）
-        run: pnpm tauri build --target universal-apple-darwin --bundles app,dmg
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          updater_artifacts=false
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            updater_artifacts=true
+          else
+            echo "未配置 TAURI_SIGNING_PRIVATE_KEY，仅生成 DMG，不生成自动更新产物"
+          fi
+          pnpm tauri build \
+            --target universal-apple-darwin \
+            --bundles app,dmg \
+            --config "{\"bundle\":{\"createUpdaterArtifacts\":${updater_artifacts}}}"
+          echo "MACOS_UPDATER_ARTIFACTS=${updater_artifacts}" >> "$GITHUB_ENV"
 
       - name: 校验双架构与签名
         run: |
@@ -154,11 +168,51 @@ jobs:
               || { echo "后台服务未使用预期签名身份"; exit 1; }
           fi
 
-      - name: 上传 DMG artifact
+      - name: 生成 macOS updater 清单
+        if: env.MACOS_UPDATER_ARTIFACTS == 'true'
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bundle_dir="src-tauri/target/universal-apple-darwin/release/bundle/macos"
+          shopt -s nullglob
+          archives=("$bundle_dir"/*.app.tar.gz)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "预期找到一个 macOS updater 压缩包，实际为 ${#archives[@]} 个"
+            exit 1
+          fi
+
+          archive="${archives[0]}"
+          test -f "${archive}.sig"
+          export UPDATER_VERSION="$(node -p "require('./package.json').version")"
+          export UPDATER_ASSET_NAME="$(basename "$archive")"
+          export UPDATER_SIGNATURE_PATH="${archive}.sig"
+          export UPDATER_MANIFEST_PATH="$bundle_dir/latest-darwin-universal.json"
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const manifest = {
+            version: process.env.UPDATER_VERSION,
+            notes: "请查看 GitHub Release 中的更新日志。",
+            pub_date: new Date().toISOString(),
+            url: `https://github.com/${process.env.RELEASE_REPOSITORY}/releases/download/v${process.env.UPDATER_VERSION}/${encodeURIComponent(process.env.UPDATER_ASSET_NAME)}`,
+            signature: fs.readFileSync(process.env.UPDATER_SIGNATURE_PATH, "utf8").trim(),
+          };
+          fs.writeFileSync(
+            process.env.UPDATER_MANIFEST_PATH,
+            `${JSON.stringify(manifest, null, 2)}\n`,
+          );
+          NODE
+
+      - name: 上传 macOS Release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DnsBlackhole-macos-universal-dmg
-          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          name: DnsBlackhole-macos-universal-release
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/latest-darwin-universal.json
           if-no-files-found: error
 
       - name: 创建 Draft Release 并上传 DMG

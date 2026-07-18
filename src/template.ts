@@ -662,11 +662,36 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <span class="about-version">DnsBlackhole v<span id="app_version">-</span></span>
                 <div class="button-group update-actions">
                   <button id="check_update_btn" type="button">检查更新</button>
-                  <button class="primary hidden" id="install_update_btn" type="button">下载并安装</button>
-                  <button class="hidden" id="manual_download_btn" type="button">浏览器下载</button>
                 </div>
               </div>
               <div class="update-status hidden" id="update_status"></div>
+              <dialog class="update-dialog" id="update_dialog">
+                <div class="update-dialog-panel">
+                  <div class="update-dialog-header">
+                    <div>
+                      <span class="update-dialog-kicker">软件更新</span>
+                      <h3>发现新版本</h3>
+                    </div>
+                    <button class="update-dialog-close" id="update_dialog_close_btn" type="button" aria-label="关闭">×</button>
+                  </div>
+                  <div class="update-dialog-body">
+                    <div class="update-version-change">
+                      <span>v<span id="update_current_version">-</span></span>
+                      <span aria-hidden="true">→</span>
+                      <strong id="update_release_version">v-</strong>
+                    </div>
+                    <div class="update-release-notes">
+                      <div class="update-release-notes-title">本次更新内容</div>
+                      <div class="update-release-notes-body" id="update_release_notes_body"></div>
+                    </div>
+                  </div>
+                  <div class="update-dialog-footer">
+                    <button id="update_dialog_later_btn" type="button">稍后</button>
+                    <button id="manual_download_btn" type="button">浏览器下载</button>
+                    <button class="primary" id="install_update_btn" type="button">下载并安装</button>
+                  </div>
+                </div>
+              </dialog>
             </section>
           </div>
         </section>

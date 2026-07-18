@@ -8,7 +8,7 @@
       "app",
       "dmg"
     ],
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "externalBin": [
       "binaries/dnsblackhole-service"
     ],
