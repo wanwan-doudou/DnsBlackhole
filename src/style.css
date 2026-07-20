@@ -633,7 +633,7 @@ button.refreshing:disabled {
 }
 
 .log-time strong,
-.log-response strong,
+.log-response-summary>strong,
 .log-client strong {
   display: block;
   color: #4a5663;
@@ -644,8 +644,8 @@ button.refreshing:disabled {
 
 .log-time span,
 .log-request span,
-.log-response span,
-.log-response small,
+.log-response-summary>span,
+.log-response-summary>small,
 .log-client span {
   display: block;
   margin-top: 4px;
@@ -663,6 +663,17 @@ button.refreshing:disabled {
   gap: 14px;
 }
 
+.log-response-layout {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 14px;
+}
+
+.log-response-summary {
+  min-width: 0;
+}
+
 .log-request>div {
   min-width: 0;
 }
@@ -675,6 +686,37 @@ button.refreshing:disabled {
   height: 28px;
   align-items: center;
   justify-content: center;
+}
+
+.log-detail-anchor::after {
+  position: absolute;
+  top: 100%;
+  left: -6px;
+  z-index: 19;
+  width: 380px;
+  max-width: calc(100vw - 72px);
+  height: 8px;
+  content: "";
+  pointer-events: none;
+}
+
+.log-response-detail-anchor::after {
+  width: 440px;
+}
+
+.log-detail-anchor:hover::after,
+.log-detail-anchor:focus-within::after {
+  pointer-events: auto;
+}
+
+.log-detail-anchor.show-above::after {
+  top: auto;
+  bottom: 100%;
+}
+
+.log-detail-anchor.align-right::after {
+  right: -6px;
+  left: auto;
 }
 
 .log-detail-trigger {
@@ -717,6 +759,7 @@ button.refreshing:disabled {
   box-shadow: 0 10px 28px rgba(31, 42, 55, 0.18);
   opacity: 0;
   pointer-events: none;
+  user-select: text;
   text-align: left;
   transform: translateY(-4px);
   transition:
@@ -742,6 +785,16 @@ button.refreshing:disabled {
   top: auto;
   bottom: calc(100% + 8px);
   transform: translateY(4px);
+}
+
+.log-detail-anchor.align-right .log-detail-popover {
+  right: -6px;
+  left: auto;
+}
+
+.log-detail-anchor.align-right .log-detail-popover::before {
+  right: 13px;
+  left: auto;
 }
 
 .log-detail-anchor.show-above .log-detail-popover::before {
@@ -798,9 +851,8 @@ button.refreshing:disabled {
 .log-detail-popover dd {
   min-width: 0;
   color: #4c5967;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
   font-weight: 500;
 }
 
@@ -825,6 +877,23 @@ button.refreshing:disabled {
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 1.9;
+}
+
+.log-question-icon {
+  display: block;
+  width: 22px;
+  height: 22px;
+  fill: none;
+  color: #9ba5b0;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.log-detail-trigger:hover .log-question-icon,
+.log-detail-trigger:focus-visible .log-question-icon {
+  color: #2fae4f;
 }
 
 .log-eye-icon.blocked {
@@ -863,20 +932,83 @@ button.refreshing:disabled {
   color: #b56a00;
 }
 
-.log-response strong.processed {
+.log-response-summary>strong.processed {
   color: #4f5d6a;
 }
 
-.log-response strong.blocked {
+.log-response-summary>strong.blocked {
   color: #5a6270;
 }
 
-.log-response strong.failed {
+.log-response-summary>strong.failed {
   color: #b56a00;
 }
 
-.log-response strong.refused {
+.log-response-summary>strong.refused {
   color: #b56a00;
+}
+
+.log-response-popover {
+  width: 440px;
+}
+
+.log-response-answers {
+  margin-top: 14px;
+  border-top: 1px solid #edf0f3;
+  padding-top: 13px;
+}
+
+.log-response-answers>strong {
+  display: block;
+  margin-bottom: 8px;
+  color: #596676;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.log-response-answer-list {
+  display: grid;
+  max-height: 220px;
+  gap: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.log-response-answer {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: start;
+  border-radius: 4px;
+  padding: 7px 8px;
+  background: #f6f8fa;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.log-response-answer span {
+  color: #438456;
+  font-weight: 650;
+}
+
+.log-response-answer code {
+  min-width: 0;
+  color: #445160;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  font-family: inherit;
+}
+
+.log-response-answer small {
+  color: #8390a0;
+  white-space: nowrap;
+}
+
+.log-response-answers p {
+  margin: 7px 0 0;
+  color: #8390a0;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .log-client strong {

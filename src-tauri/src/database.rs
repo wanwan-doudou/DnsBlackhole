@@ -14,7 +14,10 @@ use tauri::AppHandle;
 
 use crate::{
     config::{self, AppConfig},
-    dns::{TrafficBucket, UpstreamLatencyStat, UpstreamRequestStat},
+    dns::{
+        DnsResponseAnswer, DnsResponseSummary, TrafficBucket, UpstreamLatencyStat,
+        UpstreamRequestStat,
+    },
 };
 
 const INSERT_QUERY_LOG_SQL: &str = "
@@ -38,9 +41,16 @@ const INSERT_QUERY_LOG_SQL: &str = "
             query_type,
             query_class,
             transport,
-            response_source
+            response_source,
+            response_code,
+            response_answer_count,
+            response_answers,
+            response_truncated
         )
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
+     VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+     )";
 
 const UPSERT_QUERY_LOG_MINUTE_STATS_SQL: &str = "
     INSERT INTO query_log_minute_stats
@@ -83,6 +93,7 @@ pub struct QueryLogEntry {
     pub query_class: u16,
     pub transport: String,
     pub response_source: String,
+    pub response: Option<DnsResponseSummary>,
     pub client_ip: Option<String>,
     pub blocked: bool,
     pub forwarded: bool,
@@ -107,6 +118,7 @@ pub struct QueryLogRecord {
     pub query_class: Option<u16>,
     pub transport: Option<String>,
     pub response_source: Option<String>,
+    pub response: Option<DnsResponseSummary>,
     pub client_ip: Option<String>,
     pub blocked: bool,
     pub forwarded: bool,
@@ -388,7 +400,11 @@ impl Database {
                 query_type,
                 query_class,
                 transport,
-                response_source
+                response_source,
+                response_code,
+                response_answer_count,
+                response_answers,
+                response_truncated
              FROM query_logs
              WHERE {where_sql}
              ORDER BY timestamp DESC, id DESC
@@ -499,6 +515,12 @@ fn execute_query_log_insert(
             ip.to_string()
         }
     });
+    let response_answers = entry
+        .response
+        .as_ref()
+        .map(|response| serde_json::to_string(&response.answers))
+        .transpose()
+        .map_err(|e| format!("序列化 DNS 响应记录失败：{e}"))?;
 
     stmt.execute(params![
         timestamp,
@@ -520,6 +542,19 @@ fn execute_query_log_insert(
         i64::from(entry.query_class),
         entry.transport.as_str(),
         entry.response_source.as_str(),
+        entry
+            .response
+            .as_ref()
+            .map(|response| i64::from(response.code)),
+        entry
+            .response
+            .as_ref()
+            .map(|response| i64::from(response.answer_count)),
+        response_answers.as_deref(),
+        entry
+            .response
+            .as_ref()
+            .map(|response| bool_to_i64(response.truncated)),
     ])
     .map_err(|e| format!("写入查询日志失败：{e}"))?;
     Ok(())
@@ -573,6 +608,20 @@ fn upsert_query_log_stats(
 }
 
 fn read_query_log_record(row: &Row<'_>) -> rusqlite::Result<QueryLogRecord> {
+    let response_code = row.get::<_, Option<u8>>(20)?;
+    let response_answer_count = row.get::<_, Option<u16>>(21)?.unwrap_or_default();
+    let response_answers = row
+        .get::<_, Option<String>>(22)?
+        .and_then(|value| serde_json::from_str::<Vec<DnsResponseAnswer>>(&value).ok())
+        .unwrap_or_default();
+    let response_truncated = row.get::<_, Option<i64>>(23)?.unwrap_or_default() != 0;
+    let response = response_code.map(|code| DnsResponseSummary {
+        code,
+        answer_count: response_answer_count,
+        answers: response_answers,
+        truncated: response_truncated,
+    });
+
     Ok(QueryLogRecord {
         id: row.get(0)?,
         timestamp: read_u64(row, 1)?,
@@ -594,6 +643,7 @@ fn read_query_log_record(row: &Row<'_>) -> rusqlite::Result<QueryLogRecord> {
         query_class: row.get(17)?,
         transport: row.get(18)?,
         response_source: row.get(19)?,
+        response,
     })
 }
 
@@ -629,7 +679,11 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             query_type INTEGER,
             query_class INTEGER,
             transport TEXT,
-            response_source TEXT
+            response_source TEXT,
+            response_code INTEGER,
+            response_answer_count INTEGER,
+            response_answers TEXT,
+            response_truncated INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS query_log_minute_stats (
@@ -676,6 +730,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     add_column_if_missing(conn, "query_logs", "query_class", "INTEGER")?;
     add_column_if_missing(conn, "query_logs", "transport", "TEXT")?;
     add_column_if_missing(conn, "query_logs", "response_source", "TEXT")?;
+    add_column_if_missing(conn, "query_logs", "response_code", "INTEGER")?;
+    add_column_if_missing(conn, "query_logs", "response_answer_count", "INTEGER")?;
+    add_column_if_missing(conn, "query_logs", "response_answers", "TEXT")?;
+    add_column_if_missing(conn, "query_logs", "response_truncated", "INTEGER")?;
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_query_logs_timestamp
@@ -1101,6 +1159,16 @@ mod tests {
                     query_class: 1,
                     transport: "udp".into(),
                     response_source: "blocked".into(),
+                    response: Some(DnsResponseSummary {
+                        code: 0,
+                        answer_count: 1,
+                        answers: vec![DnsResponseAnswer {
+                            record_type: 1,
+                            value: "0.0.0.0".into(),
+                            ttl: 60,
+                        }],
+                        truncated: false,
+                    }),
                     client_ip: Some("192.168.1.42".into()),
                     blocked: true,
                     forwarded: false,
@@ -1124,6 +1192,16 @@ mod tests {
                     query_class: 1,
                     transport: "tcp".into(),
                     response_source: "upstream".into(),
+                    response: Some(DnsResponseSummary {
+                        code: 0,
+                        answer_count: 1,
+                        answers: vec![DnsResponseAnswer {
+                            record_type: 28,
+                            value: "2001:db8::1".into(),
+                            ttl: 300,
+                        }],
+                        truncated: false,
+                    }),
                     client_ip: Some("192.168.1.43".into()),
                     blocked: false,
                     forwarded: true,
@@ -1168,6 +1246,21 @@ mod tests {
         assert_eq!(logs.records[0].query_class, Some(1));
         assert_eq!(logs.records[0].transport.as_deref(), Some("tcp"));
         assert_eq!(logs.records[0].response_source.as_deref(), Some("upstream"));
+        assert_eq!(
+            logs.records[0]
+                .response
+                .as_ref()
+                .map(|response| response.code),
+            Some(0)
+        );
+        assert_eq!(
+            logs.records[0]
+                .response
+                .as_ref()
+                .and_then(|response| response.answers.first())
+                .map(|answer| answer.value.as_str()),
+            Some("2001:db8::1")
+        );
         assert_eq!(logs.records[0].processing_duration_ms, Some(24.75));
         assert_eq!(logs.records[0].client_ip.as_deref(), Some("192.168.1.0"));
 
@@ -1245,12 +1338,20 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("processing_duration_ms column should exist");
+        let response_answers: String = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('query_logs') WHERE name = 'response_answers'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("response_answers column should exist");
 
         assert_eq!(upstream_server, "upstream_server");
         assert_eq!(upstream_index, "idx_query_logs_upstream_server");
         assert_eq!(query_type, "query_type");
         assert_eq!(response_source, "response_source");
         assert_eq!(processing_duration_ms, "processing_duration_ms");
+        assert_eq!(response_answers, "response_answers");
     }
 
     #[test]

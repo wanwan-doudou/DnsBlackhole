@@ -1,12 +1,18 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::{
+    fmt::Write as _,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 use crate::config::{AppConfig, BlockingMode};
+use serde::{Deserialize, Serialize};
 
 use super::rewrites::RewriteTarget;
 
 pub(crate) const DNS_HEADER_LEN: usize = 12;
 pub(crate) const MAX_DNS_PACKET_SIZE: usize = u16::MAX as usize;
 const MAX_UDP_DNS_PAYLOAD: usize = 65_507;
+const MAX_LOGGED_RESPONSE_ANSWERS: usize = 8;
+const MAX_LOGGED_RESPONSE_VALUE_CHARS: usize = 320;
 const BLOCK_RESPONSE_TTL: u32 = 60;
 const REWRITE_RESPONSE_TTL: u32 = 300;
 pub(crate) const TYPE_A: u16 = 1;
@@ -18,6 +24,21 @@ pub(crate) const TYPE_ANY: u16 = 255;
 pub(crate) const RCODE_NOERROR: u8 = 0;
 pub(crate) const RCODE_REFUSED: u8 = 5;
 pub(crate) const RCODE_NXDOMAIN: u8 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DnsResponseAnswer {
+    pub(crate) record_type: u16,
+    pub(crate) value: String,
+    pub(crate) ttl: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DnsResponseSummary {
+    pub(crate) code: u8,
+    pub(crate) answer_count: u16,
+    pub(crate) answers: Vec<DnsResponseAnswer>,
+    pub(crate) truncated: bool,
+}
 
 pub(crate) struct Question {
     pub(crate) domain: String,
@@ -321,6 +342,191 @@ pub(crate) fn response_is_truncated(packet: &[u8]) -> bool {
     packet.get(2).is_some_and(|flags| flags & 0b0000_0010 != 0)
 }
 
+pub(crate) fn summarize_response(packet: &[u8]) -> Option<DnsResponseSummary> {
+    if packet.len() < DNS_HEADER_LEN || packet[2] & 0x80 == 0 {
+        return None;
+    }
+
+    let question_count = read_u16(packet, 4)?;
+    let answer_count = read_u16(packet, 6)?;
+    let mut offset = DNS_HEADER_LEN;
+    for _ in 0..question_count {
+        offset = skip_dns_name(packet, offset)?.checked_add(4)?;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+
+    let mut answers =
+        Vec::with_capacity(usize::from(answer_count).min(MAX_LOGGED_RESPONSE_ANSWERS));
+    for _ in 0..answer_count.min(MAX_LOGGED_RESPONSE_ANSWERS as u16) {
+        let record = read_dns_record(packet, offset)?;
+        answers.push(DnsResponseAnswer {
+            record_type: record.record_type,
+            value: limit_response_value(format_response_record_value(packet, &record)),
+            ttl: record.ttl,
+        });
+        offset = record.next_offset;
+    }
+
+    Some(DnsResponseSummary {
+        code: packet[3] & 0x0f,
+        answer_count,
+        answers,
+        truncated: response_is_truncated(packet),
+    })
+}
+
+fn format_response_record_value(packet: &[u8], record: &DnsRecordHeader) -> String {
+    let data = &packet[record.data_offset..record.next_offset];
+    match (record.record_type, data.len()) {
+        (TYPE_A, 4) => Ipv4Addr::new(data[0], data[1], data[2], data[3]).to_string(),
+        (TYPE_AAAA, 16) => {
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(data);
+            Ipv6Addr::from(octets).to_string()
+        }
+        (2 | 5 | 12, _) => decode_dns_name(packet, record.data_offset)
+            .map(|(name, _)| display_dns_name(name))
+            .unwrap_or_else(|| format_hex_value(data)),
+        (15, _) if data.len() >= 3 => {
+            let preference = read_u16(packet, record.data_offset).unwrap_or_default();
+            let exchange = decode_dns_name(packet, record.data_offset + 2)
+                .map(|(name, _)| display_dns_name(name))
+                .unwrap_or_else(|| format_hex_value(&data[2..]));
+            format!("{preference} {exchange}")
+        }
+        (16, _) => format_txt_value(data),
+        (33, _) if data.len() >= 7 => {
+            let priority = read_u16(packet, record.data_offset).unwrap_or_default();
+            let weight = read_u16(packet, record.data_offset + 2).unwrap_or_default();
+            let port = read_u16(packet, record.data_offset + 4).unwrap_or_default();
+            let target = decode_dns_name(packet, record.data_offset + 6)
+                .map(|(name, _)| display_dns_name(name))
+                .unwrap_or_else(|| format_hex_value(&data[6..]));
+            format!("{priority} {weight} {port} {target}")
+        }
+        (TYPE_SOA, _) => format_soa_value(packet, record).unwrap_or_else(|| format_hex_value(data)),
+        (257, _) if data.len() >= 2 => format_caa_value(data),
+        _ => format_hex_value(data),
+    }
+}
+
+fn format_soa_value(packet: &[u8], record: &DnsRecordHeader) -> Option<String> {
+    let (primary, after_primary) = decode_dns_name(packet, record.data_offset)?;
+    let (responsible, after_responsible) = decode_dns_name(packet, after_primary)?;
+    if after_responsible.checked_add(20)? > record.next_offset {
+        return None;
+    }
+
+    let serial = read_u32(packet, after_responsible)?;
+    let refresh = read_u32(packet, after_responsible + 4)?;
+    let retry = read_u32(packet, after_responsible + 8)?;
+    let expire = read_u32(packet, after_responsible + 12)?;
+    let minimum = read_u32(packet, after_responsible + 16)?;
+    Some(format!(
+        "{} {} {serial} {refresh} {retry} {expire} {minimum}",
+        display_dns_name(primary),
+        display_dns_name(responsible)
+    ))
+}
+
+fn format_txt_value(data: &[u8]) -> String {
+    let mut offset = 0;
+    let mut values = Vec::new();
+    while offset < data.len() {
+        let length = usize::from(data[offset]);
+        offset += 1;
+        let Some(end) = offset.checked_add(length) else {
+            return format_hex_value(data);
+        };
+        let Some(value) = data.get(offset..end) else {
+            return format_hex_value(data);
+        };
+        values.push(format!("{:?}", String::from_utf8_lossy(value)));
+        offset = end;
+    }
+    values.join(" ")
+}
+
+fn format_caa_value(data: &[u8]) -> String {
+    let tag_length = usize::from(data[1]);
+    let Some(tag_end) = 2_usize.checked_add(tag_length) else {
+        return format_hex_value(data);
+    };
+    let Some(tag) = data.get(2..tag_end) else {
+        return format_hex_value(data);
+    };
+    let value = data.get(tag_end..).unwrap_or_default();
+    format!(
+        "{} {} {:?}",
+        data[0],
+        String::from_utf8_lossy(tag),
+        String::from_utf8_lossy(value)
+    )
+}
+
+fn decode_dns_name(packet: &[u8], offset: usize) -> Option<(String, usize)> {
+    let mut cursor = offset;
+    let mut next_offset = None;
+    let mut labels = Vec::new();
+
+    for _ in 0..=packet.len() {
+        let length = usize::from(*packet.get(cursor)?);
+        if length == 0 {
+            return Some((labels.join("."), next_offset.unwrap_or(cursor + 1)));
+        }
+        if length & 0b1100_0000 == 0b1100_0000 {
+            let next = usize::from(*packet.get(cursor + 1)?);
+            let pointer = ((length & 0b0011_1111) << 8) | next;
+            next_offset.get_or_insert(cursor + 2);
+            cursor = pointer;
+            continue;
+        }
+        if length & 0b1100_0000 != 0 {
+            return None;
+        }
+
+        let label_start = cursor.checked_add(1)?;
+        let label_end = label_start.checked_add(length)?;
+        let label = packet.get(label_start..label_end)?;
+        labels.push(String::from_utf8_lossy(label).into_owned());
+        cursor = label_end;
+    }
+
+    None
+}
+
+fn display_dns_name(name: String) -> String {
+    if name.is_empty() { ".".into() } else { name }
+}
+
+fn format_hex_value(data: &[u8]) -> String {
+    const MAX_HEX_BYTES: usize = 48;
+
+    let mut value = String::with_capacity(data.len().min(MAX_HEX_BYTES) * 2);
+    for byte in data.iter().take(MAX_HEX_BYTES) {
+        let _ = write!(value, "{byte:02X}");
+    }
+    if data.len() > MAX_HEX_BYTES {
+        let _ = write!(value, "…（另有 {} 字节）", data.len() - MAX_HEX_BYTES);
+    }
+    value
+}
+
+fn limit_response_value(value: String) -> String {
+    if value.chars().count() <= MAX_LOGGED_RESPONSE_VALUE_CHARS {
+        return value;
+    }
+
+    let mut limited = value
+        .chars()
+        .take(MAX_LOGGED_RESPONSE_VALUE_CHARS - 1)
+        .collect::<String>();
+    limited.push('…');
+    limited
+}
+
 pub(crate) fn extract_response_ips(packet: &[u8]) -> Vec<IpAddr> {
     if packet.len() < DNS_HEADER_LEN {
         return Vec::new();
@@ -469,6 +675,7 @@ struct DnsRecordHeader {
     record_type: u16,
     record_class: u16,
     ttl: u32,
+    data_offset: usize,
     data_len: usize,
     next_offset: usize,
 }
@@ -492,6 +699,7 @@ fn read_dns_record(packet: &[u8], offset: usize) -> Option<DnsRecordHeader> {
         record_type,
         record_class,
         ttl,
+        data_offset: header_offset + 10,
         data_len,
         next_offset,
     })

@@ -152,6 +152,19 @@ export type RuntimeStatus = {
   error: string | null;
 };
 
+export type QueryLogResponseAnswer = {
+  record_type: number;
+  value: string;
+  ttl: number;
+};
+
+export type QueryLogResponseSummary = {
+  code: number;
+  answer_count: number;
+  answers: QueryLogResponseAnswer[];
+  truncated: boolean;
+};
+
 export type QueryLogRecord = {
   id: number;
   timestamp: number;
@@ -160,6 +173,7 @@ export type QueryLogRecord = {
   query_class: number | null;
   transport: "udp" | "tcp" | null;
   response_source: "upstream" | "cache" | "rewrite" | "blocked" | "refused" | null;
+  response: QueryLogResponseSummary | null;
   client_ip: string | null;
   blocked: boolean;
   forwarded: boolean;

@@ -11,6 +11,7 @@ mod upstream;
 mod worker;
 
 pub(crate) use filter_runtime::{build_filter_runtime, replace_filter_runtime};
+pub(crate) use protocol::{DnsResponseAnswer, DnsResponseSummary};
 pub use rules::{RuleSummary, summarize_rules};
 pub use server::DnsServer;
 pub use stats::{
@@ -34,8 +35,8 @@ mod tests {
             BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_SOA,
             build_block_response, build_error_response, build_rewrite_response,
             extract_response_ips, parse_query, parse_question, prepare_cached_response, read_u16,
-            response_is_truncated, response_min_record_ttl, truncate_response_for_udp,
-            udp_payload_size, validate_response_for_query,
+            response_is_truncated, response_min_record_ttl, summarize_response,
+            truncate_response_for_udp, udp_payload_size, validate_response_for_query,
         },
         rewrites::compile_rewrites,
         rules::{compile_domain_set, compile_rules, summarize_rules},
@@ -424,6 +425,26 @@ mod tests {
             extract_response_ips(&response),
             vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]
         );
+    }
+
+    #[test]
+    fn summarizes_dns_response_for_query_log() {
+        let response = a_response("example.org", [1, 2, 3, 4]);
+        let summary = summarize_response(&response).expect("response should summarize");
+
+        assert_eq!(summary.code, 0);
+        assert_eq!(summary.answer_count, 1);
+        assert!(!summary.truncated);
+        assert_eq!(summary.answers.len(), 1);
+        assert_eq!(summary.answers[0].record_type, TYPE_A);
+        assert_eq!(summary.answers[0].value, "1.2.3.4");
+        assert_eq!(summary.answers[0].ttl, 60);
+
+        let nxdomain = nxdomain_response("missing.example.org", 300);
+        let summary = summarize_response(&nxdomain).expect("nxdomain should summarize");
+        assert_eq!(summary.code, RCODE_NXDOMAIN);
+        assert_eq!(summary.answer_count, 0);
+        assert!(summary.answers.is_empty());
     }
 
     #[test]

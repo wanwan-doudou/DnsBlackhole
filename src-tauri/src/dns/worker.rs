@@ -21,8 +21,8 @@ use super::{
     filter_runtime::{FilterRuntime, SharedFilterRuntime, current_filter_runtime},
     protocol::{
         Question, RCODE_REFUSED, TYPE_ANY, build_block_response, build_error_response,
-        build_rewrite_response, parse_query, prepare_response_for_query, truncate_response_for_udp,
-        udp_payload_size,
+        build_rewrite_response, parse_query, prepare_response_for_query, summarize_response,
+        truncate_response_for_udp, udp_payload_size,
     },
     stats::{
         DnsStats, DnsTransport, current_second, record_access_denied, record_blocked_query,
@@ -270,9 +270,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         );
         let message = format!("已拒绝 ANY 查询：{}", question.domain);
         let response = build_error_response(query, RCODE_REFUSED);
-        match response {
+        match response.as_deref() {
             Some(response) => {
-                if let Err(error) = send_dns_response(response_target, query, &response) {
+                if let Err(error) = send_dns_response(response_target, query, response) {
                     let message = format!("返回 ANY 拒绝响应失败：{error}");
                     record_error(&context.stats, message.clone());
                     queue_query_log(
@@ -294,7 +294,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             None => send_no_response(response_target),
         }
         record_refused_any(&context.stats);
-        queue_query_log(
+        queue_query_log_with_response(
             context,
             &filter,
             &log_metadata,
@@ -306,6 +306,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             None,
             None,
             Some(message),
+            response.as_deref(),
         );
         return;
     }
@@ -338,7 +339,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 Some(message),
             );
         } else {
-            queue_query_log(
+            queue_query_log_with_response(
                 context,
                 &filter,
                 &log_metadata,
@@ -350,6 +351,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 None,
                 None,
                 None,
+                Some(&response),
             );
         }
         return;
@@ -387,13 +389,14 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             &rule_match.source,
             context.detailed_runtime_stats,
         );
-        queue_blocked_query_log(
+        queue_blocked_query_log_with_response(
             context,
             &filter,
             &log_metadata,
             client_addr,
             false,
             None,
+            Some(&response),
             &rule_match,
         );
         return;
@@ -428,7 +431,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 Some(message),
             );
         } else {
-            queue_query_log(
+            queue_query_log_with_response(
                 context,
                 &filter,
                 &log_metadata,
@@ -440,6 +443,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 None,
                 None,
                 None,
+                Some(&cache_hit.response),
             );
             if cache_hit.refresh {
                 refresh_expired_cache_async(
@@ -480,7 +484,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                                 Some(message),
                             );
                         } else {
-                            queue_query_log(
+                            queue_query_log_with_response(
                                 context,
                                 &filter,
                                 &log_metadata,
@@ -492,6 +496,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                                 Some(&forwarded.upstream),
                                 Some(forwarded.duration_ms),
                                 None,
+                                Some(&response),
                             );
                         }
                     }
@@ -561,7 +566,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 );
             } else {
                 record_forwarded(&context.stats, context.detailed_runtime_stats);
-                queue_query_log(
+                queue_query_log_with_response(
                     context,
                     &filter,
                     &log_metadata,
@@ -573,6 +578,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     Some(&forwarded.upstream),
                     Some(forwarded.duration_ms),
                     None,
+                    Some(&forwarded.response),
                 );
             }
         }
@@ -805,7 +811,7 @@ fn queue_query_log(
     upstream_duration_ms: Option<u64>,
     error: Option<String>,
 ) {
-    queue_query_log_with_match(
+    queue_query_log_with_response(
         context,
         filter,
         metadata,
@@ -821,6 +827,38 @@ fn queue_query_log(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn queue_query_log_with_response(
+    context: &DnsWorkerContext,
+    filter: &FilterRuntime,
+    metadata: &QueryLogMetadata<'_>,
+    client_addr: SocketAddr,
+    response_source: QueryResponseSource,
+    blocked: bool,
+    forwarded: bool,
+    failed: bool,
+    upstream_server: Option<&str>,
+    upstream_duration_ms: Option<u64>,
+    error: Option<String>,
+    response: Option<&[u8]>,
+) {
+    queue_query_log_with_match(
+        context,
+        filter,
+        metadata,
+        client_addr,
+        response_source,
+        blocked,
+        forwarded,
+        failed,
+        upstream_server,
+        upstream_duration_ms,
+        error,
+        response,
+        None,
+    );
+}
+
 fn queue_blocked_query_log(
     context: &DnsWorkerContext,
     filter: &FilterRuntime,
@@ -828,6 +866,29 @@ fn queue_blocked_query_log(
     client_addr: SocketAddr,
     failed: bool,
     error: Option<String>,
+    rule_match: &super::rules::BlockMatch,
+) {
+    queue_blocked_query_log_with_response(
+        context,
+        filter,
+        metadata,
+        client_addr,
+        failed,
+        error,
+        None,
+        rule_match,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_blocked_query_log_with_response(
+    context: &DnsWorkerContext,
+    filter: &FilterRuntime,
+    metadata: &QueryLogMetadata<'_>,
+    client_addr: SocketAddr,
+    failed: bool,
+    error: Option<String>,
+    response: Option<&[u8]>,
     rule_match: &super::rules::BlockMatch,
 ) {
     queue_query_log_with_match(
@@ -842,6 +903,7 @@ fn queue_blocked_query_log(
         None,
         None,
         error,
+        response,
         Some(rule_match),
     );
 }
@@ -859,6 +921,7 @@ fn queue_query_log_with_match(
     upstream_server: Option<&str>,
     upstream_duration_ms: Option<u64>,
     error: Option<String>,
+    response: Option<&[u8]>,
     rule_match: Option<&super::rules::BlockMatch>,
 ) {
     if filter.log_ignore.contains(metadata.domain) {
@@ -874,6 +937,7 @@ fn queue_query_log_with_match(
         query_class: metadata.query_class,
         transport: metadata.transport.to_string(),
         response_source: response_source.as_str().to_string(),
+        response: response.and_then(summarize_response),
         client_ip: Some(client_addr.ip().to_string()),
         blocked,
         forwarded,

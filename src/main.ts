@@ -1371,7 +1371,8 @@ function renderQueryLogRow(record: QueryLogRecord): string {
   if (record.query_class !== null && record.query_class !== 1) {
     requestMeta.push(dnsQueryClassLabel(record.query_class));
   }
-  const detailPopover = renderQueryLogDetail(record, status.label, duration);
+  const requestDetailPopover = renderQueryLogRequestDetail(record);
+  const responseDetailPopover = renderQueryLogResponseDetail(record, status.label);
 
   return `
     <div class="query-log-row${rowClass}">
@@ -1384,7 +1385,7 @@ function renderQueryLogRow(record: QueryLogRecord): string {
           <button class="log-detail-trigger" type="button" aria-label="查看请求详情">
             ${renderLogEyeIcon(status.className)}
           </button>
-          ${detailPopover}
+          ${requestDetailPopover}
         </div>
         <div>
           <strong title="${escapeHtml(record.domain)}">${escapeHtml(record.domain)}</strong>
@@ -1392,9 +1393,19 @@ function renderQueryLogRow(record: QueryLogRecord): string {
         </div>
       </div>
       <div class="log-response">
-        <strong class="${status.className}">${status.label}</strong>
-        <span title="${detail}">${detail}</span>
-        ${duration ? `<small>${duration}</small>` : ""}
+        <div class="log-response-layout">
+          <div class="log-detail-anchor log-response-detail-anchor">
+            <button class="log-detail-trigger" type="button" aria-label="查看响应详情">
+              ${renderLogQuestionIcon()}
+            </button>
+            ${responseDetailPopover}
+          </div>
+          <div class="log-response-summary">
+            <strong class="${status.className}">${status.label}</strong>
+            <span title="${detail}">${detail}</span>
+            ${duration ? `<small>${duration}</small>` : ""}
+          </div>
+        </div>
       </div>
       <div class="log-client">
         <strong>${escapeHtml(clientDisplayName(record.client_ip) ?? record.client_ip ?? "-")}</strong>
@@ -1414,11 +1425,17 @@ function renderLogEyeIcon(className: string): string {
   `;
 }
 
-function renderQueryLogDetail(
-  record: QueryLogRecord,
-  statusLabel: string,
-  duration: string,
-): string {
+function renderLogQuestionIcon(): string {
+  return `
+    <svg class="log-question-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <circle cx="12" cy="12" r="8.75"></circle>
+      <path d="M9.7 9.35a2.45 2.45 0 0 1 4.7.95c0 1.9-2.4 2.1-2.4 3.65"></path>
+      <path d="M12 17.25h.01"></path>
+    </svg>
+  `;
+}
+
+function renderQueryLogRequestDetail(record: QueryLogRecord): string {
   const rows = [
     ["时间", formatLogTime(record.timestamp)],
     ["日期", formatLogDate(record.timestamp)],
@@ -1426,17 +1443,42 @@ function renderQueryLogDetail(
     ["查询类型", dnsQueryTypeDetail(record.query_type)],
     ["查询类别", dnsQueryClassLabel(record.query_class)],
     ["传输协议", record.transport?.toUpperCase() ?? "旧日志未记录"],
-    ["响应状态", statusLabel],
-    ["响应来源", queryLogResponseSourceLabel(record)],
     ["客户端", formatClientLabel(record.client_ip)],
   ];
+
+  return renderLogDetailPopover("请求详情", rows);
+}
+
+function renderQueryLogResponseDetail(record: QueryLogRecord, statusLabel: string): string {
+  const rows = [
+    ["状态", statusLabel],
+    ["响应来源", queryLogResponseSourceLabel(record)],
+  ];
+  const response = record.response;
+
+  if (response) {
+    rows.push(
+      ["响应代码", dnsResponseCodeLabel(response.code)],
+      ["响应记录", `${formatCount(response.answer_count)} 条`],
+    );
+  } else {
+    rows.push(["响应代码", record.failed ? "无响应" : "旧日志未记录"]);
+  }
 
   if (record.upstream_server) {
     rows.push(["上游服务器", record.upstream_server]);
   }
 
-  if (duration) {
-    rows.push(["处理耗时", duration]);
+  if (record.upstream_duration_ms !== null) {
+    rows.push(["上游耗时", formatElapsedMs(record.upstream_duration_ms)]);
+  }
+
+  if (record.processing_duration_ms !== null) {
+    rows.push(["总处理耗时", formatElapsedMs(record.processing_duration_ms)]);
+  }
+
+  if (response?.truncated) {
+    rows.push(["截断响应", "是（TC 标志）"]);
   }
 
   if (record.error) {
@@ -1453,9 +1495,17 @@ function renderQueryLogDetail(
     );
   }
 
+  return renderLogDetailPopover("响应详情", rows, renderQueryLogResponseAnswers(record));
+}
+
+function renderLogDetailPopover(
+  title: string,
+  rows: string[][],
+  extraContent = "",
+): string {
   return `
-    <div class="log-detail-popover" role="tooltip">
-      <strong>请求详情</strong>
+    <div class="log-detail-popover${extraContent ? " log-response-popover" : ""}" role="tooltip">
+      <strong>${escapeHtml(title)}</strong>
       <dl>
         ${rows
           .map(
@@ -1468,8 +1518,56 @@ function renderQueryLogDetail(
           )
           .join("")}
       </dl>
+      ${extraContent}
     </div>
   `;
+}
+
+function renderQueryLogResponseAnswers(record: QueryLogRecord): string {
+  const response = record.response;
+  if (!response || response.answer_count === 0) {
+    return "";
+  }
+
+  const omitted = Math.max(0, response.answer_count - response.answers.length);
+  const records = response.answers
+    .map(
+      (answer) => `
+        <div class="log-response-answer">
+          <span>${escapeHtml(dnsQueryTypeLabel(answer.record_type))}</span>
+          <code title="${escapeHtml(answer.value)}">${escapeHtml(answer.value)}</code>
+          <small>TTL ${formatCount(answer.ttl)} 秒</small>
+        </div>
+      `,
+    )
+    .join("");
+
+  return `
+    <section class="log-response-answers">
+      <strong>响应记录</strong>
+      <div class="log-response-answer-list">
+        ${records || `<p>响应记录内容无法解析</p>`}
+      </div>
+      ${omitted > 0 ? `<p>另有 ${formatCount(omitted)} 条记录未写入日志摘要</p>` : ""}
+    </section>
+  `;
+}
+
+function dnsResponseCodeLabel(code: number): string {
+  const labels: Record<number, string> = {
+    0: "NOERROR",
+    1: "FORMERR",
+    2: "SERVFAIL",
+    3: "NXDOMAIN",
+    4: "NOTIMP",
+    5: "REFUSED",
+    6: "YXDOMAIN",
+    7: "YXRRSET",
+    8: "NXRRSET",
+    9: "NOTAUTH",
+    10: "NOTZONE",
+  };
+  return `${labels[code] ?? "RCODE"}（${code}）`;
 }
 
 function renderQueryLogPagination(page: QueryLogPage): void {
@@ -1636,16 +1734,19 @@ function placeLogDetailPopover(anchor: HTMLElement): void {
     return;
   }
 
-  anchor.classList.remove("show-above");
+  anchor.classList.remove("show-above", "align-right");
   const contentRect = contentElement.getBoundingClientRect();
   const anchorRect = anchor.getBoundingClientRect();
   const bottomLimit = Math.min(window.innerHeight, contentRect.bottom) - 12;
   const topLimit = Math.max(0, contentRect.top) + 12;
+  const rightLimit = Math.min(window.innerWidth, contentRect.right) - 12;
   const spaceBelow = bottomLimit - anchorRect.bottom;
   const spaceAbove = anchorRect.top - topLimit;
   const shouldShowAbove = spaceBelow < popover.offsetHeight + 16 && spaceAbove > spaceBelow;
+  const shouldAlignRight = anchorRect.left - 6 + popover.offsetWidth > rightLimit;
 
   anchor.classList.toggle("show-above", shouldShowAbove);
+  anchor.classList.toggle("align-right", shouldAlignRight);
 }
 
 function setRadioValue(inputs: HTMLInputElement[], value: string): void {
