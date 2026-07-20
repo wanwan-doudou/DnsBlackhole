@@ -1243,7 +1243,9 @@ button.refreshing:disabled {
 .rank-head,
 .rank-row {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) 192px;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) 192px;
 }
 
 .rank-head {
@@ -1269,7 +1271,9 @@ button.refreshing:disabled {
   min-height: 260px;
   /* 约 8 行的高度：超出后卡片内滚动，表头在滚动区外保持固定 */
   max-height: 424px;
+  overflow-x: hidden;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   background: #ffffff;
 }
 

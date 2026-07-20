@@ -49,30 +49,44 @@ impl GuiState {
 }
 
 #[tauri::command]
-fn get_config(state: tauri::State<'_, Arc<GuiState>>) -> Result<AppConfig, String> {
+async fn get_config(state: tauri::State<'_, Arc<GuiState>>) -> Result<AppConfig, String> {
     #[cfg(any(target_os = "macos", windows))]
-    {
-        let _ = state;
-        privileged_bridge::ServiceClient::call("get_config", &serde_json::json!({}))
-    }
+    let _ = state;
     #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        state.local()?.current_config()
-    }
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            privileged_bridge::ServiceClient::call("get_config", &serde_json::json!({}))
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            state.local()?.current_config()
+        }
+    })
+    .await
+    .map_err(|error| format!("读取配置任务异常：{error}"))?
 }
 
 #[tauri::command]
-fn get_storage_info(state: tauri::State<'_, Arc<GuiState>>) -> Result<StorageInfo, String> {
+async fn get_storage_info(state: tauri::State<'_, Arc<GuiState>>) -> Result<StorageInfo, String> {
     #[cfg(any(target_os = "macos", windows))]
-    {
-        let _ = state;
-        privileged_bridge::ServiceClient::call("get_storage_info", &serde_json::json!({}))
-    }
+    let _ = state;
     #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        let state = state.local()?;
-        storage::storage_info(&state.default_data_dir, &state.data_dir)
-    }
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            privileged_bridge::ServiceClient::call("get_storage_info", &serde_json::json!({}))
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            let state = state.local()?;
+            storage::storage_info(&state.default_data_dir, &state.data_dir)
+        }
+    })
+    .await
+    .map_err(|error| format!("读取存储信息任务异常：{error}"))?
 }
 
 #[tauri::command]
@@ -161,40 +175,52 @@ fn serialize_windows_service_status(
 
 #[cfg(windows)]
 #[tauri::command]
-fn get_windows_service_status() -> Result<serde_json::Value, String> {
-    serialize_windows_service_status(privileged_bridge::windows_service_status()?)
+async fn get_windows_service_status() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        serialize_windows_service_status(privileged_bridge::windows_service_status()?)
+    })
+    .await
+    .map_err(|error| format!("读取 Windows 后台服务状态任务异常：{error}"))?
 }
 
 #[cfg(not(windows))]
 #[tauri::command]
-fn get_windows_service_status() -> Result<serde_json::Value, String> {
+async fn get_windows_service_status() -> Result<serde_json::Value, String> {
     Err("当前平台不支持 Windows DNS 后台服务".to_string())
 }
 
 #[cfg(windows)]
 #[tauri::command]
-fn install_windows_service(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+async fn install_windows_service(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let legacy_default_dir = app.path().app_config_dir().ok();
-    serialize_windows_service_status(privileged_bridge::install_windows_service(
-        legacy_default_dir.as_deref(),
-    )?)
+    tauri::async_runtime::spawn_blocking(move || {
+        serialize_windows_service_status(privileged_bridge::install_windows_service(
+            legacy_default_dir.as_deref(),
+        )?)
+    })
+    .await
+    .map_err(|error| format!("安装 Windows 后台服务任务异常：{error}"))?
 }
 
 #[cfg(not(windows))]
 #[tauri::command]
-fn install_windows_service(_app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+async fn install_windows_service(_app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     Err("当前平台不支持 Windows DNS 后台服务".to_string())
 }
 
 #[cfg(windows)]
 #[tauri::command]
-fn uninstall_windows_service() -> Result<serde_json::Value, String> {
-    serialize_windows_service_status(privileged_bridge::uninstall_windows_service()?)
+async fn uninstall_windows_service() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        serialize_windows_service_status(privileged_bridge::uninstall_windows_service()?)
+    })
+    .await
+    .map_err(|error| format!("卸载 Windows 后台服务任务异常：{error}"))?
 }
 
 #[cfg(not(windows))]
 #[tauri::command]
-fn uninstall_windows_service() -> Result<serde_json::Value, String> {
+async fn uninstall_windows_service() -> Result<serde_json::Value, String> {
     Err("当前平台不支持 Windows DNS 后台服务".to_string())
 }
 

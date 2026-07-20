@@ -35,6 +35,15 @@ use super::{
 
 const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
 const PENDING_QUERY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+// Windows 刚连上 Wi-Fi 时，路由表通常会晚几秒可用。此时 UDP connect 会立即返回
+// WSAENETUNREACH/WSAEHOSTUNREACH；短暂等待后重试，避免首个 NCSI 探测直接收到失败。
+const NETWORK_UNAVAILABLE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+    Duration::from_millis(1_200),
+    Duration::from_millis(1_600),
+];
 #[cfg(windows)]
 const WINDOWS_UDP_NO_BUFFER_SPACE: i32 = 10055;
 #[cfg(windows)]
@@ -759,6 +768,42 @@ fn forward_query_with_fallback(
     next_upstream: &AtomicUsize,
     fallback_next_upstream: &AtomicUsize,
 ) -> Result<UpstreamForwardResponse, String> {
+    let mut result = forward_query_once_with_fallback(
+        query,
+        upstream_servers,
+        fallback_upstream_servers,
+        upstream_mode,
+        next_upstream,
+        fallback_next_upstream,
+    );
+    for delay in NETWORK_UNAVAILABLE_RETRY_DELAYS {
+        if !result
+            .as_ref()
+            .is_err_and(|error| is_network_temporarily_unavailable(error))
+        {
+            break;
+        }
+        std::thread::sleep(delay);
+        result = forward_query_once_with_fallback(
+            query,
+            upstream_servers,
+            fallback_upstream_servers,
+            upstream_mode,
+            next_upstream,
+            fallback_next_upstream,
+        );
+    }
+    result
+}
+
+fn forward_query_once_with_fallback(
+    query: &[u8],
+    upstream_servers: &[RuntimeUpstream],
+    fallback_upstream_servers: &[RuntimeUpstream],
+    upstream_mode: &UpstreamMode,
+    next_upstream: &AtomicUsize,
+    fallback_next_upstream: &AtomicUsize,
+) -> Result<UpstreamForwardResponse, String> {
     match forward_query(query, upstream_servers, upstream_mode, next_upstream) {
         Ok(response) => Ok(response),
         Err(primary_error) => {
@@ -777,6 +822,11 @@ fn forward_query_with_fallback(
             })
         }
     }
+}
+
+fn is_network_temporarily_unavailable(error: &str) -> bool {
+    // io::Error 的展示文本会本地化，但 Windows raw OS error 始终保留在末尾。
+    error.contains("(os error 10051)") || error.contains("(os error 10065)")
 }
 
 pub(crate) fn prepare_forwarded_response(response: &[u8], query: &[u8]) -> Vec<u8> {
@@ -1016,7 +1066,20 @@ fn duration_ms(duration: Duration) -> f64 {
 mod tests {
     use std::io;
 
-    use super::{WINDOWS_UDP_NO_BUFFER_SPACE, retry_windows_udp_send};
+    use super::{
+        WINDOWS_UDP_NO_BUFFER_SPACE, is_network_temporarily_unavailable, retry_windows_udp_send,
+    };
+
+    #[test]
+    fn identifies_windows_network_transition_errors() {
+        assert!(is_network_temporarily_unavailable(
+            "连接上游 DNS 失败：套接字操作尝试一个无法连接的主机。 (os error 10065)"
+        ));
+        assert!(is_network_temporarily_unavailable(
+            "连接上游 DNS 失败：网络不可达。 (os error 10051)"
+        ));
+        assert!(!is_network_temporarily_unavailable("读取上游 DNS 响应超时"));
+    }
 
     #[test]
     fn retries_transient_windows_udp_buffer_pressure() {

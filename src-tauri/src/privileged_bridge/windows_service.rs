@@ -8,7 +8,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use windows_service::{
@@ -45,6 +45,7 @@ fn service_main(_arguments: Vec<OsString>) {
 }
 
 fn run_service() -> Result<(), String> {
+    write_service_log("服务进程开始初始化");
     let stop_requested = Arc::new(AtomicBool::new(false));
     let handler_stop = Arc::clone(&stop_requested);
     let event_handler = move |control| match control {
@@ -79,6 +80,7 @@ fn run_service_body(
     stop_requested: &Arc<AtomicBool>,
     status_handle: &service_control_handler::ServiceStatusHandle,
 ) -> Result<(), String> {
+    let startup_started = Instant::now();
     status_handle
         .set_service_status(service_status(
             ServiceState::StartPending,
@@ -88,9 +90,24 @@ fn run_service_body(
         ))
         .map_err(|error| format!("报告 Windows 服务启动状态失败：{error}"))?;
 
+    let storage_started = Instant::now();
     let service_default_dir = storage::prepare_windows_service_storage(None)?;
+    write_service_log(&format!(
+        "存储定位完成，耗时 {} ms",
+        storage_started.elapsed().as_millis()
+    ));
+    let state_started = Instant::now();
     let state = initialize_state(service_default_dir)?;
+    write_service_log(&format!(
+        "数据库与配置初始化完成，耗时 {} ms",
+        state_started.elapsed().as_millis()
+    ));
+    let runtime_started = Instant::now();
     initialize_dns_runtime(&state, stop_requested, status_handle)?;
+    write_service_log(&format!(
+        "规则编译与 DNS 监听初始化完成，耗时 {} ms",
+        runtime_started.elapsed().as_millis()
+    ));
     if stop_requested.load(Ordering::Acquire) {
         state.shutdown();
         return Ok(());
@@ -104,6 +121,10 @@ fn run_service_body(
             Duration::default(),
         ))
         .map_err(|error| format!("报告 Windows 服务运行状态失败：{error}"))?;
+    write_service_log(&format!(
+        "服务已进入运行状态，总耗时 {} ms",
+        startup_started.elapsed().as_millis()
+    ));
 
     run_service_loop(stop_requested, state)
 }
@@ -123,7 +144,16 @@ fn initialize_dns_runtime(
     let mut checkpoint = 1_u32;
     loop {
         match finished_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                let config = state.current_config()?;
+                let status = state.status_with_log_stats(false, false);
+                if config.enabled && !status.running {
+                    return Err(status
+                        .error
+                        .unwrap_or_else(|| "DNS 初始化完成但监听线程未运行".to_string()));
+                }
+                return Ok(());
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if stop_requested.load(Ordering::Acquire) {
                     return Ok(());
@@ -205,6 +235,10 @@ fn write_service_log(message: &str) {
         .append(true)
         .open(data_dir.join("service.log"))
     {
-        let _ = writeln!(file, "{message}");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let _ = writeln!(file, "[{timestamp}] {message}");
     }
 }

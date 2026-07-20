@@ -211,12 +211,12 @@ pub(crate) fn record_blocked(
 }
 
 pub(crate) fn record_forwarded(stats: &Arc<Mutex<DnsStats>>, detailed_runtime_stats: bool) {
-    if !detailed_runtime_stats {
-        return;
-    }
-
     if let Ok(mut current) = stats.lock() {
-        current.forwarded += 1;
+        // 成功转发说明上游链路已经恢复，不能继续把开机阶段的瞬态错误展示为当前故障。
+        current.last_error = None;
+        if detailed_runtime_stats {
+            current.forwarded += 1;
+        }
     }
 }
 
@@ -405,5 +405,16 @@ mod tests {
             current.rate_limited_total,
             (SECURITY_EVENT_CAPACITY + 1) as u64
         );
+    }
+
+    #[test]
+    fn successful_forward_clears_stale_runtime_error() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        record_error(&stats, "网络暂不可用".to_string());
+        record_forwarded(&stats, false);
+
+        let current = stats.lock().unwrap();
+        assert_eq!(current.failed, 1);
+        assert!(current.last_error.is_none());
     }
 }

@@ -100,6 +100,8 @@ const isMacOS = navigator.userAgent.includes("Macintosh");
 const isWindows = navigator.userAgent.includes("Windows");
 let currentMacosServiceStatus: MacosServiceStatus | null = null;
 let currentWindowsServiceStatus: WindowsServiceStatus | null = null;
+let initialBootstrapComplete = false;
+let backgroundServiceRefreshInFlight = false;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
@@ -813,14 +815,15 @@ void getVersion().then((version) => {
   appVersionElement.textContent = version;
 });
 
-const initialWindowsServiceStatus = await loadWindowsServiceStatus();
-await loadMacosServiceStatus();
+const [initialWindowsServiceStatus] = await Promise.all([
+  loadWindowsServiceStatus(),
+  loadMacosServiceStatus(),
+]);
 const windowsCoreReady =
   !isWindows ||
   ((initialWindowsServiceStatus?.running ?? false) &&
     !(initialWindowsServiceStatus?.needsRepair ?? false));
-const configReady = await loadConfig();
-await loadStorageInfo();
+const [configReady] = await Promise.all([loadConfig(), loadStorageInfo()]);
 if (!windowsCoreReady && !configReady) {
   activeView = "settings";
 }
@@ -833,6 +836,7 @@ if (configReady) {
   await refreshStatus();
 }
 setActiveView(activeView);
+initialBootstrapComplete = true;
 window.setInterval(() => {
   // 窗口不可见（最小化 / 切到托盘）时跳过轮询，避免无谓的 IPC 与重渲染
   if (document.hidden) {
@@ -975,7 +979,12 @@ async function loadMacosServiceStatus(): Promise<void> {
       !(currentMacosServiceStatus?.needsRepair ?? false);
     const status = await getMacosServiceStatus();
     renderMacosServiceStatus(status);
-    if (status.enabled && !status.needsRepair && !wasReady) {
+    if (
+      initialBootstrapComplete &&
+      status.enabled &&
+      !status.needsRepair &&
+      !wasReady
+    ) {
       await refreshAfterBackgroundServiceEnabled();
     }
   } catch (error) {
@@ -985,11 +994,20 @@ async function loadMacosServiceStatus(): Promise<void> {
 }
 
 async function refreshAfterBackgroundServiceEnabled(): Promise<void> {
+  if (backgroundServiceRefreshInFlight) {
+    return;
+  }
+  backgroundServiceRefreshInFlight = true;
   // 系统服务启动后 IPC 可能稍晚创建，短暂等待再同步完整状态。
-  await new Promise((resolve) => window.setTimeout(resolve, 400));
-  await loadConfig();
-  await loadStorageInfo();
-  await refreshStatus();
+  try {
+    await new Promise((resolve) => window.setTimeout(resolve, 400));
+    const [configReady] = await Promise.all([loadConfig(), loadStorageInfo()]);
+    if (configReady) {
+      await refreshStatus();
+    }
+  } finally {
+    backgroundServiceRefreshInFlight = false;
+  }
 }
 
 function renderMacosServiceStatus(status: MacosServiceStatus): void {
@@ -1032,7 +1050,12 @@ async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> 
       !(currentWindowsServiceStatus?.needsRepair ?? false);
     const status = requireWindowsServiceStatus(await getWindowsServiceStatus());
     renderWindowsServiceStatus(status);
-    if (status.running && !status.needsRepair && !wasReady) {
+    if (
+      initialBootstrapComplete &&
+      status.running &&
+      !status.needsRepair &&
+      !wasReady
+    ) {
       await refreshAfterBackgroundServiceEnabled();
     }
     return status;

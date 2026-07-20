@@ -79,11 +79,32 @@ const UPSERT_QUERY_LOG_UPSTREAM_STATS_SQL: &str = "
         latency_total_ms = latency_total_ms + excluded.latency_total_ms,
         latency_samples = latency_samples + excluded.latency_samples";
 
+const UPSERT_QUERY_LOG_CLIENT_STATS_SQL: &str = "
+    INSERT INTO query_log_client_stats (minute, client_ip, queries)
+    VALUES (?1, ?2, 1)
+    ON CONFLICT(minute, client_ip) DO UPDATE SET
+        queries = queries + 1";
+
+const UPSERT_QUERY_LOG_BLOCKLIST_STATS_SQL: &str = "
+    INSERT INTO query_log_blocklist_stats (minute, rule_source, hits)
+    VALUES (?1, ?2, 1)
+    ON CONFLICT(minute, rule_source) DO UPDATE SET
+        hits = hits + 1";
+const READ_CONNECTION_POOL_SIZE: usize = 4;
+
+struct QueryLogStatsStatements<'connection> {
+    minute: rusqlite::Statement<'connection>,
+    domain: rusqlite::Statement<'connection>,
+    upstream: rusqlite::Statement<'connection>,
+    client: rusqlite::Statement<'connection>,
+    blocklist: rusqlite::Statement<'connection>,
+}
+
 pub struct Database {
     conn: Mutex<Connection>,
     // WAL 模式下读写可并行；仪表盘/日志查询走独立只读连接，
     // 避免和批量日志写入互相阻塞。内存库（测试）没有独立连接，回退主连接。
-    read_conn: Option<Mutex<Connection>>,
+    read_conns: Vec<Mutex<Connection>>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,7 +187,9 @@ impl Database {
         let conn = Connection::open(&path).map_err(|e| format!("打开数据库失败：{e}"))?;
         let mut database = Self::from_connection(conn)?;
         // 主连接完成建表和 WAL 设置后再打开只读连接
-        database.read_conn = open_read_connection(&path);
+        database.read_conns = (0..READ_CONNECTION_POOL_SIZE)
+            .filter_map(|_| open_read_connection(&path))
+            .collect();
         Ok(database)
     }
 
@@ -183,7 +206,7 @@ impl Database {
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            read_conn: None,
+            read_conns: Vec::new(),
         })
     }
 
@@ -255,23 +278,30 @@ impl Database {
             let mut insert_stmt = tx
                 .prepare(INSERT_QUERY_LOG_SQL)
                 .map_err(|e| format!("准备批量写入查询日志失败：{e}"))?;
-            let mut minute_stats_stmt = tx
-                .prepare(UPSERT_QUERY_LOG_MINUTE_STATS_SQL)
-                .map_err(|e| format!("准备写入分钟统计失败：{e}"))?;
-            let mut domain_stats_stmt = tx
-                .prepare(UPSERT_QUERY_LOG_DOMAIN_STATS_SQL)
-                .map_err(|e| format!("准备写入域名统计失败：{e}"))?;
-            let mut upstream_stats_stmt = tx
-                .prepare(UPSERT_QUERY_LOG_UPSTREAM_STATS_SQL)
-                .map_err(|e| format!("准备写入上游统计失败：{e}"))?;
+            let mut stats_statements = QueryLogStatsStatements {
+                minute: tx
+                    .prepare(UPSERT_QUERY_LOG_MINUTE_STATS_SQL)
+                    .map_err(|e| format!("准备写入分钟统计失败：{e}"))?,
+                domain: tx
+                    .prepare(UPSERT_QUERY_LOG_DOMAIN_STATS_SQL)
+                    .map_err(|e| format!("准备写入域名统计失败：{e}"))?,
+                upstream: tx
+                    .prepare(UPSERT_QUERY_LOG_UPSTREAM_STATS_SQL)
+                    .map_err(|e| format!("准备写入上游统计失败：{e}"))?,
+                client: tx
+                    .prepare(UPSERT_QUERY_LOG_CLIENT_STATS_SQL)
+                    .map_err(|e| format!("准备写入客户端统计失败：{e}"))?,
+                blocklist: tx
+                    .prepare(UPSERT_QUERY_LOG_BLOCKLIST_STATS_SQL)
+                    .map_err(|e| format!("准备写入黑名单统计失败：{e}"))?,
+            };
             for (entry, anonymize_client_ip) in entries {
                 let timestamp = unix_now();
                 execute_query_log_insert(&mut insert_stmt, entry, *anonymize_client_ip, timestamp)?;
                 upsert_query_log_stats(
-                    &mut minute_stats_stmt,
-                    &mut domain_stats_stmt,
-                    &mut upstream_stats_stmt,
+                    &mut stats_statements,
                     entry,
+                    *anonymize_client_ip,
                     timestamp,
                 )?;
             }
@@ -306,48 +336,27 @@ impl Database {
             params![since_minute],
         )
         .map_err(|e| format!("清理上游统计失败：{e}"))?;
+        conn.execute(
+            "DELETE FROM query_log_client_stats WHERE minute < ?1",
+            params![since_minute],
+        )
+        .map_err(|e| format!("清理客户端统计失败：{e}"))?;
+        conn.execute(
+            "DELETE FROM query_log_blocklist_stats WHERE minute < ?1",
+            params![since_minute],
+        )
+        .map_err(|e| format!("清理黑名单统计失败：{e}"))?;
         Ok(())
     }
 
     pub fn log_stats(&self, retention_hours: u32) -> Result<LogStats, String> {
         let since = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
         let since_minute = since / 60;
-        let since_param = u64_to_db_i64(since_minute, "日志统计起始分钟")?;
+        if self.read_conns.len() >= READ_CONNECTION_POOL_SIZE {
+            return parallel_log_stats(&self.read_conns, since, since_minute, retention_hours);
+        }
         let conn = self.lock_read()?;
-        let (queries, blocked, forwarded, failed) = conn
-            .query_row(
-                "SELECT
-                    COALESCE(SUM(queries), 0),
-                    COALESCE(SUM(blocked), 0),
-                    COALESCE(SUM(forwarded), 0),
-                    COALESCE(SUM(failed), 0)
-                 FROM query_log_minute_stats
-                 WHERE minute >= ?1",
-                params![since_param],
-                |row| {
-                    Ok((
-                        read_u64(row, 0)?,
-                        read_u64(row, 1)?,
-                        read_u64(row, 2)?,
-                        read_u64(row, 3)?,
-                    ))
-                },
-            )
-            .map_err(|e| format!("读取查询日志统计失败：{e}"))?;
-
-        Ok(LogStats {
-            queries,
-            blocked,
-            forwarded,
-            failed,
-            query_domains: grouped_domain_counts(&conn, since_minute, false)?,
-            blocked_domains: grouped_domain_counts(&conn, since_minute, true)?,
-            client_requests: client_request_counts(&conn, since)?,
-            blocklist_hits: blocklist_hit_counts(&conn, since)?,
-            traffic: traffic_buckets(&conn, since_minute, retention_hours)?,
-            upstream_requests: upstream_request_counts(&conn, since_minute)?,
-            upstream_avg_latency: upstream_avg_latency(&conn, since_minute)?,
-        })
+        log_stats_with_connection(&conn, since, since_minute, retention_hours)
     }
 
     pub fn query_logs(
@@ -474,11 +483,134 @@ impl Database {
     }
 
     fn lock_read(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
-        if let Some(read_conn) = &self.read_conn {
+        if let Some(read_conn) = self.read_conns.first() {
             return read_conn.lock().map_err(|_| "数据库只读连接已损坏".into());
         }
         self.lock()
     }
+}
+
+fn log_stats_with_connection(
+    conn: &Connection,
+    since: u64,
+    since_minute: u64,
+    retention_hours: u32,
+) -> Result<LogStats, String> {
+    let (queries, blocked, forwarded, failed) = total_log_counts(conn, since_minute)?;
+    Ok(LogStats {
+        queries,
+        blocked,
+        forwarded,
+        failed,
+        query_domains: grouped_domain_counts(conn, since_minute, false)?,
+        blocked_domains: grouped_domain_counts(conn, since_minute, true)?,
+        client_requests: client_request_counts(conn, since)?,
+        blocklist_hits: blocklist_hit_counts(conn, since)?,
+        traffic: traffic_buckets(conn, since_minute, retention_hours)?,
+        upstream_requests: upstream_request_counts(conn, since_minute)?,
+        upstream_avg_latency: upstream_avg_latency(conn, since_minute)?,
+    })
+}
+
+fn parallel_log_stats(
+    read_conns: &[Mutex<Connection>],
+    since: u64,
+    since_minute: u64,
+    retention_hours: u32,
+) -> Result<LogStats, String> {
+    std::thread::scope(|scope| {
+        let totals_conn = &read_conns[0];
+        let domains_conn = &read_conns[1];
+        let clients_conn = &read_conns[2];
+        let upstreams_conn = &read_conns[3];
+
+        let totals = scope.spawn(move || {
+            let conn = totals_conn
+                .lock()
+                .map_err(|_| "数据库统计连接已损坏".to_string())?;
+            Ok::<_, String>((
+                total_log_counts(&conn, since_minute)?,
+                traffic_buckets(&conn, since_minute, retention_hours)?,
+            ))
+        });
+        let domains = scope.spawn(move || {
+            let conn = domains_conn
+                .lock()
+                .map_err(|_| "数据库域名排行连接已损坏".to_string())?;
+            Ok::<_, String>((
+                grouped_domain_counts(&conn, since_minute, false)?,
+                grouped_domain_counts(&conn, since_minute, true)?,
+            ))
+        });
+        let clients = scope.spawn(move || {
+            let conn = clients_conn
+                .lock()
+                .map_err(|_| "数据库客户端排行连接已损坏".to_string())?;
+            Ok::<_, String>((
+                client_request_counts(&conn, since)?,
+                blocklist_hit_counts(&conn, since)?,
+            ))
+        });
+        let upstreams = scope.spawn(move || {
+            let conn = upstreams_conn
+                .lock()
+                .map_err(|_| "数据库上游排行连接已损坏".to_string())?;
+            Ok::<_, String>((
+                upstream_request_counts(&conn, since_minute)?,
+                upstream_avg_latency(&conn, since_minute)?,
+            ))
+        });
+
+        let ((queries, blocked, forwarded, failed), traffic) = totals
+            .join()
+            .map_err(|_| "数据库统计线程异常".to_string())??;
+        let (query_domains, blocked_domains) = domains
+            .join()
+            .map_err(|_| "数据库域名排行线程异常".to_string())??;
+        let (client_requests, blocklist_hits) = clients
+            .join()
+            .map_err(|_| "数据库客户端排行线程异常".to_string())??;
+        let (upstream_requests, upstream_avg_latency) = upstreams
+            .join()
+            .map_err(|_| "数据库上游排行线程异常".to_string())??;
+
+        Ok(LogStats {
+            queries,
+            blocked,
+            forwarded,
+            failed,
+            query_domains,
+            blocked_domains,
+            client_requests,
+            blocklist_hits,
+            traffic,
+            upstream_requests,
+            upstream_avg_latency,
+        })
+    })
+}
+
+fn total_log_counts(conn: &Connection, since_minute: u64) -> Result<(u64, u64, u64, u64), String> {
+    let since = u64_to_db_i64(since_minute, "日志统计起始分钟")?;
+    conn.query_row(
+        "SELECT
+            COALESCE(SUM(queries), 0),
+            COALESCE(SUM(blocked), 0),
+            COALESCE(SUM(forwarded), 0),
+            COALESCE(SUM(failed), 0)
+         FROM query_log_minute_stats
+         WHERE minute >= ?1",
+        params![since],
+        |row| {
+            Ok((
+                read_u64(row, 0)?,
+                read_u64(row, 1)?,
+                read_u64(row, 2)?,
+                read_u64(row, 3)?,
+            ))
+        },
+    )
+    .map_err(|e| format!("读取查询日志统计失败：{e}"))
 }
 
 fn open_read_connection(path: &std::path::Path) -> Option<Mutex<Connection>> {
@@ -507,13 +639,7 @@ fn execute_query_log_insert(
 ) -> Result<(), String> {
     let timestamp = u64_to_db_i64(timestamp, "查询日志时间戳")?;
     let upstream_duration_ms = optional_u64_to_db_i64(entry.upstream_duration_ms, "上游响应时间")?;
-    let client_ip = entry.client_ip.as_deref().map(|ip| {
-        if anonymize_client_ip {
-            anonymize_ip(ip)
-        } else {
-            ip.to_string()
-        }
-    });
+    let client_ip = stored_client_ip(entry, anonymize_client_ip);
     let response_answers = entry
         .response
         .as_ref()
@@ -560,14 +686,14 @@ fn execute_query_log_insert(
 }
 
 fn upsert_query_log_stats(
-    minute_stmt: &mut rusqlite::Statement<'_>,
-    domain_stmt: &mut rusqlite::Statement<'_>,
-    upstream_stmt: &mut rusqlite::Statement<'_>,
+    statements: &mut QueryLogStatsStatements<'_>,
     entry: &QueryLogEntry,
+    anonymize_client_ip: bool,
     timestamp: u64,
 ) -> Result<(), String> {
     let minute = u64_to_db_i64(timestamp / 60, "查询日志统计分钟")?;
-    minute_stmt
+    statements
+        .minute
         .execute(params![
             minute,
             bool_to_i64(entry.blocked),
@@ -575,7 +701,8 @@ fn upsert_query_log_stats(
             bool_to_i64(entry.failed),
         ])
         .map_err(|e| format!("写入分钟统计失败：{e}"))?;
-    domain_stmt
+    statements
+        .domain
         .execute(params![
             minute,
             entry.domain.as_str(),
@@ -593,7 +720,8 @@ fn upsert_query_log_stats(
         } else {
             0_i64
         };
-        upstream_stmt
+        statements
+            .upstream
             .execute(params![
                 minute,
                 upstream_server,
@@ -603,7 +731,38 @@ fn upsert_query_log_stats(
             .map_err(|e| format!("写入上游统计失败：{e}"))?;
     }
 
+    if let Some(client_ip) = stored_client_ip(entry, anonymize_client_ip)
+        && !client_ip.is_empty()
+    {
+        statements
+            .client
+            .execute(params![minute, client_ip])
+            .map_err(|e| format!("写入客户端统计失败：{e}"))?;
+    }
+
+    if entry.blocked {
+        let rule_source = entry
+            .rule_source
+            .as_deref()
+            .filter(|source| !source.is_empty())
+            .unwrap_or("未知来源");
+        statements
+            .blocklist
+            .execute(params![minute, rule_source])
+            .map_err(|e| format!("写入黑名单统计失败：{e}"))?;
+    }
+
     Ok(())
+}
+
+fn stored_client_ip(entry: &QueryLogEntry, anonymize_client_ip: bool) -> Option<String> {
+    entry.client_ip.as_deref().map(|ip| {
+        if anonymize_client_ip {
+            anonymize_ip(ip)
+        } else {
+            ip.to_string()
+        }
+    })
 }
 
 fn read_query_log_record(row: &Row<'_>) -> rusqlite::Result<QueryLogRecord> {
@@ -709,6 +868,20 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             latency_samples INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (minute, upstream_server)
         );
+
+        CREATE TABLE IF NOT EXISTS query_log_client_stats (
+            minute INTEGER NOT NULL,
+            client_ip TEXT NOT NULL,
+            queries INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (minute, client_ip)
+        );
+
+        CREATE TABLE IF NOT EXISTS query_log_blocklist_stats (
+            minute INTEGER NOT NULL,
+            rule_source TEXT NOT NULL,
+            hits INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (minute, rule_source)
+        );
         ",
     )
     .map_err(|e| format!("初始化数据库失败：{e}"))?;
@@ -747,6 +920,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             ON query_log_domain_stats(domain);
         CREATE INDEX IF NOT EXISTS idx_query_log_upstream_stats_upstream
             ON query_log_upstream_stats(upstream_server);
+        CREATE INDEX IF NOT EXISTS idx_query_log_client_stats_client
+            ON query_log_client_stats(client_ip);
+        CREATE INDEX IF NOT EXISTS idx_query_log_blocklist_stats_source
+            ON query_log_blocklist_stats(rule_source);
         ",
     )
     .map_err(|e| format!("初始化数据库索引失败：{e}"))?;
@@ -769,15 +946,6 @@ fn configure_connection(conn: &Connection) -> Result<(), String> {
 }
 
 fn backfill_query_log_stats_if_empty(conn: &Connection) -> Result<(), String> {
-    let existing_stats = conn
-        .query_row("SELECT COUNT(*) FROM query_log_minute_stats", [], |row| {
-            read_u64(row, 0)
-        })
-        .map_err(|e| format!("检查查询日志统计失败：{e}"))?;
-    if existing_stats > 0 {
-        return Ok(());
-    }
-
     let existing_logs = conn
         .query_row("SELECT COUNT(*) FROM query_logs", [], |row| {
             read_u64(row, 0)
@@ -787,7 +955,9 @@ fn backfill_query_log_stats_if_empty(conn: &Connection) -> Result<(), String> {
         return Ok(());
     }
 
-    conn.execute_batch(
+    backfill_stats_table_if_empty(
+        conn,
+        "query_log_minute_stats",
         "
         INSERT INTO query_log_minute_stats (minute, queries, blocked, forwarded, failed)
         SELECT
@@ -798,7 +968,12 @@ fn backfill_query_log_stats_if_empty(conn: &Connection) -> Result<(), String> {
             COALESCE(SUM(failed), 0)
         FROM query_logs
         GROUP BY timestamp / 60;
-
+        ",
+    )?;
+    backfill_stats_table_if_empty(
+        conn,
+        "query_log_domain_stats",
+        "
         INSERT INTO query_log_domain_stats (minute, domain, queries, blocked)
         SELECT
             timestamp / 60,
@@ -807,7 +982,12 @@ fn backfill_query_log_stats_if_empty(conn: &Connection) -> Result<(), String> {
             COALESCE(SUM(blocked), 0)
         FROM query_logs
         GROUP BY timestamp / 60, domain;
-
+        ",
+    )?;
+    backfill_stats_table_if_empty(
+        conn,
+        "query_log_upstream_stats",
+        "
         INSERT INTO query_log_upstream_stats (
             minute,
             upstream_server,
@@ -825,9 +1005,50 @@ fn backfill_query_log_stats_if_empty(conn: &Connection) -> Result<(), String> {
         WHERE forwarded = 1 AND upstream_server IS NOT NULL
         GROUP BY timestamp / 60, upstream_server;
         ",
-    )
-    .map_err(|e| format!("回填查询日志统计失败：{e}"))?;
+    )?;
+    backfill_stats_table_if_empty(
+        conn,
+        "query_log_client_stats",
+        "
+        INSERT INTO query_log_client_stats (minute, client_ip, queries)
+        SELECT timestamp / 60, client_ip, COUNT(*)
+        FROM query_logs
+        WHERE client_ip IS NOT NULL AND client_ip != ''
+        GROUP BY timestamp / 60, client_ip;
+        ",
+    )?;
+    backfill_stats_table_if_empty(
+        conn,
+        "query_log_blocklist_stats",
+        "
+        INSERT INTO query_log_blocklist_stats (minute, rule_source, hits)
+        SELECT
+            timestamp / 60,
+            COALESCE(NULLIF(rule_source, ''), '未知来源'),
+            COUNT(*)
+        FROM query_logs
+        WHERE blocked = 1
+        GROUP BY timestamp / 60, COALESCE(NULLIF(rule_source, ''), '未知来源');
+        ",
+    )?;
     Ok(())
+}
+
+fn backfill_stats_table_if_empty(
+    conn: &Connection,
+    table: &str,
+    backfill_sql: &str,
+) -> Result<(), String> {
+    let existing = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            read_u64(row, 0)
+        })
+        .map_err(|e| format!("检查 {table} 统计失败：{e}"))?;
+    if existing > 0 {
+        return Ok(());
+    }
+    conn.execute_batch(backfill_sql)
+        .map_err(|e| format!("回填 {table} 统计失败：{e}"))
 }
 
 fn add_column_if_missing(
@@ -898,22 +1119,19 @@ fn grouped_domain_counts(
     Ok(counts)
 }
 
-/// 客户端与黑名单排行没有预聚合表，直接对保留窗口内的日志明细分组统计；
-/// 借助 timestamp 索引做范围扫描，且结果被日志统计缓存复用，代价可控。
 fn client_request_counts(
     conn: &Connection,
     since_seconds: u64,
 ) -> Result<HashMap<String, u64>, String> {
-    let since = u64_to_db_i64(since_seconds, "客户端排行起始时间戳")?;
+    let since = u64_to_db_i64(since_seconds / 60, "客户端排行起始分钟")?;
     let mut stmt = conn
         .prepare(
-            "SELECT client_ip, COUNT(*)
-             FROM query_logs
-             WHERE timestamp >= ?1
-               AND client_ip IS NOT NULL
-               AND client_ip != ''
+            "SELECT client_ip, COALESCE(SUM(queries), 0)
+             FROM query_log_client_stats
+             WHERE minute >= ?1
              GROUP BY client_ip
-             ORDER BY COUNT(*) DESC, client_ip ASC
+             HAVING COALESCE(SUM(queries), 0) > 0
+             ORDER BY COALESCE(SUM(queries), 0) DESC, client_ip ASC
              LIMIT 200",
         )
         .map_err(|e| format!("准备客户端排行查询失败：{e}"))?;
@@ -935,16 +1153,15 @@ fn blocklist_hit_counts(
     conn: &Connection,
     since_seconds: u64,
 ) -> Result<HashMap<String, u64>, String> {
-    let since = u64_to_db_i64(since_seconds, "黑名单排行起始时间戳")?;
-    // rule_source 为空的记录来自尚未记录来源的旧版本日志
+    let since = u64_to_db_i64(since_seconds / 60, "黑名单排行起始分钟")?;
     let mut stmt = conn
         .prepare(
-            "SELECT COALESCE(NULLIF(rule_source, ''), '未知来源') AS source, COUNT(*)
-             FROM query_logs
-             WHERE timestamp >= ?1
-               AND blocked = 1
-             GROUP BY source
-             ORDER BY COUNT(*) DESC, source ASC
+            "SELECT rule_source, COALESCE(SUM(hits), 0)
+             FROM query_log_blocklist_stats
+             WHERE minute >= ?1
+             GROUP BY rule_source
+             HAVING COALESCE(SUM(hits), 0) > 0
+             ORDER BY COALESCE(SUM(hits), 0) DESC, rule_source ASC
              LIMIT 200",
         )
         .map_err(|e| format!("准备黑名单排行查询失败：{e}"))?;
@@ -1344,6 +1561,20 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("response_answers column should exist");
+        let client_stats_table: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'query_log_client_stats'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("client stats table should exist");
+        let blocklist_stats_table: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'query_log_blocklist_stats'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("blocklist stats table should exist");
 
         assert_eq!(upstream_server, "upstream_server");
         assert_eq!(upstream_index, "idx_query_logs_upstream_server");
@@ -1351,6 +1582,8 @@ mod tests {
         assert_eq!(response_source, "response_source");
         assert_eq!(processing_duration_ms, "processing_duration_ms");
         assert_eq!(response_answers, "response_answers");
+        assert_eq!(client_stats_table, "query_log_client_stats");
+        assert_eq!(blocklist_stats_table, "query_log_blocklist_stats");
     }
 
     #[test]
@@ -1417,11 +1650,56 @@ mod tests {
                 |row| read_u64(row, 0),
             )
             .expect("upstream stats should backfill");
+        let client_queries = conn
+            .query_row(
+                "SELECT SUM(queries)
+                 FROM query_log_client_stats
+                 WHERE client_ip IN ('192.168.1.2', '192.168.1.3')",
+                [],
+                |row| read_u64(row, 0),
+            )
+            .expect("client stats should backfill");
+        let unknown_blocklist_hits = conn
+            .query_row(
+                "SELECT hits
+                 FROM query_log_blocklist_stats
+                 WHERE minute = 2 AND rule_source = '未知来源'",
+                [],
+                |row| read_u64(row, 0),
+            )
+            .expect("blocklist stats should backfill");
 
         assert_eq!(queries, 2);
         assert_eq!(blocked, 1);
         assert_eq!(forwarded, 1);
         assert_eq!(ads_blocked, 1);
         assert_eq!(latency_total, 24);
+        assert_eq!(client_queries, 2);
+        assert_eq!(unknown_blocklist_hits, 1);
+    }
+
+    #[test]
+    fn file_database_reads_log_stats_with_connection_pool() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let storage_dir = std::env::temp_dir().join(format!(
+            "dnsblackhole-database-test-{}-{unique}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&storage_dir).expect("test storage directory should create");
+        let database = Database::open(&storage_dir).expect("file database should open");
+
+        assert_eq!(database.read_conns.len(), READ_CONNECTION_POOL_SIZE);
+        let stats = database
+            .log_stats(6)
+            .expect("parallel log stats should load");
+        assert_eq!(stats.queries, 0);
+        assert_eq!(stats.blocked, 0);
+
+        drop(database);
+        fs::remove_dir_all(storage_dir).expect("test storage directory should remove");
     }
 }
