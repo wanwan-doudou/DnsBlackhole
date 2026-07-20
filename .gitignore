@@ -35,3 +35,5 @@ MACOS_PORTING_PLAN.md
 
 # 本地代码签名证书（私钥不入库，CI 从 GitHub Secrets 读取）
 .signing/
+
+.claude/

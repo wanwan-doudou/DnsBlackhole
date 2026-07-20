@@ -95,6 +95,7 @@ let currentConfigSchemaVersion = 2;
 let clientNameMap = new Map<string, string>();
 let currentStorageInfo: StorageInfo | null = null;
 let selectedDataStoragePath = "";
+let configLoaded = false;
 const isMacOS = navigator.userAgent.includes("Macintosh");
 const isWindows = navigator.userAgent.includes("Windows");
 let currentMacosServiceStatus: MacosServiceStatus | null = null;
@@ -162,6 +163,15 @@ const saveButton = query<HTMLButtonElement>("#save_btn");
 const saveSettingsButton = query<HTMLButtonElement>("#save_settings_btn");
 const saveSecurityButton = query<HTMLButtonElement>("#save_security_btn");
 const saveCustomButton = query<HTMLButtonElement>("#save_custom_btn");
+const configSaveButtons = [
+  saveButton,
+  saveSettingsButton,
+  saveSecurityButton,
+  saveCustomButton,
+];
+configSaveButtons.forEach((button) => {
+  button.disabled = true;
+});
 const startButton = query<HTMLButtonElement>("#start_btn");
 const stopButton = query<HTMLButtonElement>("#stop_btn");
 const addFilterButton = query<HTMLButtonElement>("#add_filter_btn");
@@ -711,7 +721,7 @@ installWindowsServiceButton.addEventListener("click", async () => {
   installWindowsServiceButton.disabled = true;
   installWindowsServiceButton.classList.add("loading");
   try {
-    const status = await installWindowsService();
+    const status = requireWindowsServiceStatus(await installWindowsService());
     renderWindowsServiceStatus(status);
     if (status.running && !status.needsRepair) {
       showMessage("Windows DNS 系统服务已安装并启动", false);
@@ -737,7 +747,7 @@ uninstallWindowsServiceButton.addEventListener("click", async () => {
   uninstallWindowsServiceButton.disabled = true;
   uninstallWindowsServiceButton.classList.add("loading");
   try {
-    const status = await uninstallWindowsService();
+    const status = requireWindowsServiceStatus(await uninstallWindowsService());
     renderWindowsServiceStatus(status);
     showMessage("Windows DNS 系统服务已卸载，数据和配置未删除", false);
   } catch (error) {
@@ -809,10 +819,9 @@ const windowsCoreReady =
   !isWindows ||
   ((initialWindowsServiceStatus?.running ?? false) &&
     !(initialWindowsServiceStatus?.needsRepair ?? false));
-if (windowsCoreReady) {
-  await loadConfig();
-  await loadStorageInfo();
-} else {
+const configReady = await loadConfig();
+await loadStorageInfo();
+if (!windowsCoreReady && !configReady) {
   activeView = "settings";
 }
 void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
@@ -820,7 +829,7 @@ void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
 }).catch((error) => {
   console.error("监听过滤器更新失败", error);
 });
-if (windowsCoreReady) {
+if (configReady) {
   await refreshStatus();
 }
 setActiveView(activeView);
@@ -834,7 +843,8 @@ window.setInterval(() => {
   if (
     currentMacosServiceStatus?.requiresApproval ||
     currentMacosServiceStatus?.needsRepair ||
-    currentWindowsServiceStatus?.needsRepair
+    (isWindows &&
+      (!currentWindowsServiceStatus || currentWindowsServiceStatus.needsRepair))
   ) {
     void loadMacosServiceStatus();
     void loadWindowsServiceStatus();
@@ -858,15 +868,21 @@ document.addEventListener("visibilitychange", () => {
     if (currentMacosServiceStatus?.requiresApproval) {
       void loadMacosServiceStatus();
     }
-    if (currentWindowsServiceStatus?.needsRepair) {
+    if (
+      isWindows &&
+      (!currentWindowsServiceStatus || currentWindowsServiceStatus.needsRepair)
+    ) {
       void loadWindowsServiceStatus();
     }
   }
 });
 
-async function loadConfig(): Promise<void> {
+async function loadConfig(): Promise<boolean> {
   try {
     const config = await getConfig();
+    if (!config || typeof config.schema_version !== "number") {
+      throw new Error("DNS 服务返回了空配置或配置格式无效");
+    }
     currentConfigSchemaVersion = config.schema_version;
     enabledInput.checked = config.enabled;
     launchAtStartupInput.checked = config.launch_at_startup;
@@ -912,8 +928,18 @@ async function loadConfig(): Promise<void> {
     blacklistInput.value = config.blacklist;
     filtersState = config.filters;
     renderFilters();
+    configLoaded = true;
+    configSaveButtons.forEach((button) => {
+      button.disabled = false;
+    });
+    return true;
   } catch (error) {
+    configLoaded = false;
+    configSaveButtons.forEach((button) => {
+      button.disabled = true;
+    });
     showMessage(String(error), true);
+    return false;
   }
 }
 
@@ -1004,7 +1030,7 @@ async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> 
     const wasReady =
       (currentWindowsServiceStatus?.running ?? false) &&
       !(currentWindowsServiceStatus?.needsRepair ?? false);
-    const status = await getWindowsServiceStatus();
+    const status = requireWindowsServiceStatus(await getWindowsServiceStatus());
     renderWindowsServiceStatus(status);
     if (status.running && !status.needsRepair && !wasReady) {
       await refreshAfterBackgroundServiceEnabled();
@@ -1029,6 +1055,24 @@ function renderWindowsServiceStatus(status: WindowsServiceStatus): void {
       ? "系统服务已启动但 IPC 无响应或版本不一致，请点击“安装或修复”。"
       : `${stateText}${versionText}`;
   uninstallWindowsServiceButton.disabled = !status.installed;
+}
+
+function requireWindowsServiceStatus(value: unknown): WindowsServiceStatus {
+  if (!value || typeof value !== "object") {
+    throw new Error("Windows 系统服务状态接口返回了空结果");
+  }
+  const status = value as Partial<WindowsServiceStatus>;
+  if (
+    typeof status.state !== "string" ||
+    !(status.state in WINDOWS_SERVICE_STATE_TEXT) ||
+    typeof status.installed !== "boolean" ||
+    typeof status.running !== "boolean" ||
+    typeof status.expectedVersion !== "string" ||
+    typeof status.needsRepair !== "boolean"
+  ) {
+    throw new Error("Windows 系统服务状态接口返回格式无效");
+  }
+  return status as WindowsServiceStatus;
 }
 
 function renderStorageInfo(info: StorageInfo): void {
@@ -1062,6 +1106,10 @@ function normalizePath(value: string): string {
 }
 
 async function saveConfig(): Promise<void> {
+  if (!configLoaded) {
+    showMessage("配置尚未从 DNS 服务加载，已阻止保存以保护原配置", true);
+    return;
+  }
   await runStatusAction(() => saveConfigOnly(), "配置已保存");
 }
 

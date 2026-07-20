@@ -152,9 +152,17 @@ fn open_macos_service_settings() -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn serialize_windows_service_status(
+    status: privileged_bridge::WindowsServiceStatus,
+) -> Result<serde_json::Value, String> {
+    serde_json::to_value(status)
+        .map_err(|error| format!("序列化 Windows DNS 服务状态失败：{error}"))
+}
+
+#[cfg(windows)]
 #[tauri::command]
-fn get_windows_service_status() -> Result<privileged_bridge::WindowsServiceStatus, String> {
-    privileged_bridge::windows_service_status()
+fn get_windows_service_status() -> Result<serde_json::Value, String> {
+    serialize_windows_service_status(privileged_bridge::windows_service_status()?)
 }
 
 #[cfg(not(windows))]
@@ -165,11 +173,11 @@ fn get_windows_service_status() -> Result<serde_json::Value, String> {
 
 #[cfg(windows)]
 #[tauri::command]
-fn install_windows_service(
-    app: tauri::AppHandle,
-) -> Result<privileged_bridge::WindowsServiceStatus, String> {
+fn install_windows_service(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let legacy_default_dir = app.path().app_config_dir().ok();
-    privileged_bridge::install_windows_service(legacy_default_dir.as_deref())
+    serialize_windows_service_status(privileged_bridge::install_windows_service(
+        legacy_default_dir.as_deref(),
+    )?)
 }
 
 #[cfg(not(windows))]
@@ -180,8 +188,8 @@ fn install_windows_service(_app: tauri::AppHandle) -> Result<serde_json::Value, 
 
 #[cfg(windows)]
 #[tauri::command]
-fn uninstall_windows_service() -> Result<privileged_bridge::WindowsServiceStatus, String> {
-    privileged_bridge::uninstall_windows_service()
+fn uninstall_windows_service() -> Result<serde_json::Value, String> {
+    serialize_windows_service_status(privileged_bridge::uninstall_windows_service()?)
 }
 
 #[cfg(not(windows))]
