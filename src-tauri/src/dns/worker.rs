@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
+    io,
     net::{SocketAddr, UdpSocket},
     sync::{
         Arc, Condvar, Mutex,
@@ -34,6 +35,11 @@ use super::{
 
 const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
 const PENDING_QUERY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const WINDOWS_UDP_NO_BUFFER_SPACE: i32 = 10055;
+#[cfg(windows)]
+const WINDOWS_UDP_SEND_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(1), Duration::from_millis(2)];
 pub(crate) const PENDING_QUERY_SHARDS: usize = 64;
 
 pub(crate) struct DnsWorkItem {
@@ -644,15 +650,13 @@ fn send_dns_response(
         } => {
             let max_size = udp_payload_size(query);
             if response.len() <= max_size {
-                return socket
-                    .send_to(response, *client_addr)
+                return send_udp_response(socket, response, *client_addr)
                     .map(|_| ())
                     .map_err(|error| error.to_string());
             }
             let response = truncate_response_for_udp(query, response, max_size)
                 .ok_or_else(|| "无法构造符合客户端 UDP 大小限制的 DNS 响应".to_string())?;
-            socket
-                .send_to(&response, *client_addr)
+            send_udp_response(socket, &response, *client_addr)
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
@@ -660,6 +664,42 @@ fn send_dns_response(
             .try_send(Some(response.to_vec()))
             .map_err(|error| error.to_string()),
     }
+}
+
+#[cfg(windows)]
+fn send_udp_response(
+    socket: &UdpSocket,
+    response: &[u8],
+    client_addr: SocketAddr,
+) -> io::Result<usize> {
+    retry_windows_udp_send(|| socket.send_to(response, client_addr))
+}
+
+#[cfg(windows)]
+fn retry_windows_udp_send<T>(mut send: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut retry_index = 0;
+    loop {
+        match send() {
+            // WSAENOBUFS 通常是短暂的系统发送队列背压，只在该错误上做有限重试。
+            Err(error)
+                if error.raw_os_error() == Some(WINDOWS_UDP_NO_BUFFER_SPACE)
+                    && retry_index < WINDOWS_UDP_SEND_RETRY_DELAYS.len() =>
+            {
+                std::thread::sleep(WINDOWS_UDP_SEND_RETRY_DELAYS[retry_index]);
+                retry_index += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn send_udp_response(
+    socket: &UdpSocket,
+    response: &[u8],
+    client_addr: SocketAddr,
+) -> io::Result<usize> {
+    socket.send_to(response, client_addr)
 }
 
 fn send_no_response(response_target: &DnsResponseTarget) {
@@ -970,4 +1010,54 @@ fn queue_query_log_with_match(
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::io;
+
+    use super::{WINDOWS_UDP_NO_BUFFER_SPACE, retry_windows_udp_send};
+
+    #[test]
+    fn retries_transient_windows_udp_buffer_pressure() {
+        let mut attempts = 0;
+        let sent = retry_windows_udp_send(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(io::Error::from_raw_os_error(WINDOWS_UDP_NO_BUFFER_SPACE))
+            } else {
+                Ok(42)
+            }
+        })
+        .expect("短暂缓冲区压力恢复后应发送成功");
+
+        assert_eq!(sent, 42);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn stops_after_windows_udp_buffer_retries_are_exhausted() {
+        let mut attempts = 0;
+        let error = retry_windows_udp_send(|| {
+            attempts += 1;
+            Err::<usize, _>(io::Error::from_raw_os_error(WINDOWS_UDP_NO_BUFFER_SPACE))
+        })
+        .expect_err("持续缓冲区压力应在有限重试后返回错误");
+
+        assert_eq!(attempts, 3);
+        assert_eq!(error.raw_os_error(), Some(WINDOWS_UDP_NO_BUFFER_SPACE));
+    }
+
+    #[test]
+    fn does_not_retry_other_windows_udp_errors() {
+        let mut attempts = 0;
+        let error = retry_windows_udp_send(|| {
+            attempts += 1;
+            Err::<usize, _>(io::Error::from_raw_os_error(10054))
+        })
+        .expect_err("非缓冲区错误应直接返回");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(error.raw_os_error(), Some(10054));
+    }
 }

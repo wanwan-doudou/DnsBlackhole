@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 use crate::{config::AppConfig, database::Database};
 
@@ -34,6 +34,8 @@ const TCP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TCP_MAX_CONNECTIONS: usize = 256;
+// 路由器会把多台设备的查询汇聚到同一监听套接字，放大缓冲区以承接瞬时突发。
+const UDP_SOCKET_BUFFER_SIZE: usize = 1024 * 1024;
 const DNS_WORK_QUEUE_CAPACITY: usize = 8192;
 const QUERY_LOG_QUEUE_CAPACITY: usize = 16384;
 const QUERY_LOG_BATCH_SIZE: usize = 128;
@@ -241,8 +243,19 @@ fn bind_tcp_listener(addr: SocketAddr, ipv6_only: bool) -> std::io::Result<TcpLi
     Ok(socket.into())
 }
 
-#[cfg(windows)]
 fn configure_udp_listener_socket(socket: &UdpSocket) -> Result<(), String> {
+    let socket_ref = SockRef::from(socket);
+    socket_ref
+        .set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE)
+        .map_err(|error| format!("设置 UDP DNS 接收缓冲区失败：{error}"))?;
+    socket_ref
+        .set_send_buffer_size(UDP_SOCKET_BUFFER_SIZE)
+        .map_err(|error| format!("设置 UDP DNS 发送缓冲区失败：{error}"))?;
+    configure_windows_udp_listener_socket(socket)
+}
+
+#[cfg(windows)]
+fn configure_windows_udp_listener_socket(socket: &UdpSocket) -> Result<(), String> {
     use std::{ffi::c_void, io, os::windows::io::AsRawSocket, ptr};
 
     const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
@@ -291,7 +304,7 @@ fn configure_udp_listener_socket(socket: &UdpSocket) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn configure_udp_listener_socket(_socket: &UdpSocket) -> Result<(), String> {
+fn configure_windows_udp_listener_socket(_socket: &UdpSocket) -> Result<(), String> {
     Ok(())
 }
 
