@@ -1460,24 +1460,24 @@ button.refreshing:disabled {
   flex: 0 0 auto;
 }
 
-.macos-service-section {
+.background-service-section {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 18px;
 }
 
-.macos-service-section h3 {
+.background-service-section h3 {
   margin-bottom: 6px;
 }
 
-.macos-service-section p {
+.background-service-section p {
   margin: 0 0 5px;
   color: #3b4e62;
   font-size: 13px;
 }
 
-.macos-service-section small {
+.background-service-section small {
   display: block;
   max-width: 650px;
   color: #7a8999;
@@ -1485,16 +1485,17 @@ button.refreshing:disabled {
   line-height: 1.5;
 }
 
-.macos-service-section .macos-service-actions {
+.background-service-section .background-service-actions {
   flex: 0 0 auto;
   flex-wrap: nowrap;
 }
 
-.macos-service-section.is-ready p {
+.background-service-section.is-ready p {
   color: #448155;
 }
 
-.macos-service-section.needs-approval p {
+.background-service-section.needs-approval p,
+.background-service-section.needs-repair p {
   color: #a5622d;
 }
 

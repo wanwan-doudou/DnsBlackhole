@@ -7,16 +7,16 @@ mod service_core;
 mod storage;
 mod tray;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 use std::path::Path;
 use std::{io, sync::Arc};
 
 use config::AppConfig;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 use database::Database;
 use database::QueryLogPage;
 use dns::RuntimeStatus;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 use service_core::{
     AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, query_logs_blocking,
     save_config_blocking, spawn_filter_auto_update, spawn_initial_runtime, spawn_runtime_watchdog,
@@ -34,11 +34,11 @@ use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_autostart::ManagerExt;
 
 struct GuiState {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     local: Option<Arc<AppState>>,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 impl GuiState {
     fn local(&self) -> Result<Arc<AppState>, String> {
         self.local
@@ -50,12 +50,12 @@ impl GuiState {
 
 #[tauri::command]
 fn get_config(state: tauri::State<'_, Arc<GuiState>>) -> Result<AppConfig, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let _ = state;
         privileged_bridge::ServiceClient::call("get_config", &serde_json::json!({}))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         state.local()?.current_config()
     }
@@ -63,12 +63,12 @@ fn get_config(state: tauri::State<'_, Arc<GuiState>>) -> Result<AppConfig, Strin
 
 #[tauri::command]
 fn get_storage_info(state: tauri::State<'_, Arc<GuiState>>) -> Result<StorageInfo, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let _ = state;
         privileged_bridge::ServiceClient::call("get_storage_info", &serde_json::json!({}))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let state = state.local()?;
         storage::storage_info(&state.default_data_dir, &state.data_dir)
@@ -80,7 +80,7 @@ fn request_data_migration(
     state: tauri::State<'_, Arc<GuiState>>,
     target_path: String,
 ) -> Result<StorageInfo, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let _ = state;
         privileged_bridge::ServiceClient::call(
@@ -88,7 +88,7 @@ fn request_data_migration(
             &serde_json::json!({ "target_path": target_path }),
         )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let state = state.local()?;
         let target_path = Path::new(target_path.trim());
@@ -151,28 +151,67 @@ fn open_macos_service_settings() -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
+#[tauri::command]
+fn get_windows_service_status() -> Result<privileged_bridge::WindowsServiceStatus, String> {
+    privileged_bridge::windows_service_status()
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn get_windows_service_status() -> Result<serde_json::Value, String> {
+    Err("当前平台不支持 Windows DNS 后台服务".to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn install_windows_service(
+    app: tauri::AppHandle,
+) -> Result<privileged_bridge::WindowsServiceStatus, String> {
+    let legacy_default_dir = app.path().app_config_dir().ok();
+    privileged_bridge::install_windows_service(legacy_default_dir.as_deref())
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn install_windows_service(_app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    Err("当前平台不支持 Windows DNS 后台服务".to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn uninstall_windows_service() -> Result<privileged_bridge::WindowsServiceStatus, String> {
+    privileged_bridge::uninstall_windows_service()
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn uninstall_windows_service() -> Result<serde_json::Value, String> {
+    Err("当前平台不支持 Windows DNS 后台服务".to_string())
+}
+
 #[tauri::command]
 async fn save_config(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<GuiState>>,
     mut config: AppConfig,
 ) -> Result<RuntimeStatus, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let _ = state;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         config::migrate_legacy_defaults(&mut config);
         config.validate()?;
         apply_autostart_config(&app, config.launch_at_startup)?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call(
                 "save_config",
                 &serde_json::json!({ "config": config }),
             )
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             save_config_blocking(state.local()?, config)
         }
@@ -187,12 +226,12 @@ async fn get_status(
     force: Option<bool>,
     include_log_stats: Option<bool>,
 ) -> Result<RuntimeStatus, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let _ = state;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call(
                 "get_status",
@@ -202,7 +241,7 @@ async fn get_status(
                 }),
             )
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             Ok(state
                 .local()?
@@ -221,12 +260,12 @@ async fn get_query_logs(
     page: Option<u32>,
     page_size: Option<u32>,
 ) -> Result<QueryLogPage, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let _ = state;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call(
                 "get_query_logs",
@@ -238,7 +277,7 @@ async fn get_query_logs(
                 }),
             )
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             query_logs_blocking(state.local()?, filter, search, page, page_size)
         }
@@ -253,28 +292,28 @@ async fn update_filters(
     state: tauri::State<'_, Arc<GuiState>>,
     config: AppConfig,
 ) -> Result<FilterUpdateResult, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let _ = state;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let result = privileged_bridge::ServiceClient::call(
             "update_filters",
             &serde_json::json!({ "config": config }),
         )?;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let result = update_filters_blocking(state.local()?, config)?;
 
         let latest = {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             {
                 privileged_bridge::ServiceClient::call::<_, AppConfig>(
                     "get_config",
                     &serde_json::json!({}),
                 )?
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", windows)))]
             {
                 state.local()?.current_config()?
             }
@@ -288,16 +327,16 @@ async fn update_filters(
 
 #[tauri::command]
 async fn start_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let _ = state;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call("start_dns", &serde_json::json!({}))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             start_dns_blocking(state.local()?)
         }
@@ -308,16 +347,16 @@ async fn start_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStat
 
 #[tauri::command]
 async fn stop_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let _ = state;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call("stop_dns", &serde_json::json!({}))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             stop_dns_blocking(state.local()?)
         }
@@ -328,12 +367,12 @@ async fn stop_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatu
 
 #[tauri::command]
 fn clear_dns_cache(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let _ = state;
         privileged_bridge::ServiceClient::call("clear_dns_cache", &serde_json::json!({}))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let state = state.local()?;
         clear_dns_cache_blocking(&state)
@@ -344,16 +383,16 @@ fn clear_dns_cache(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStat
 async fn clear_filter_cache(
     state: tauri::State<'_, Arc<GuiState>>,
 ) -> Result<FilterCacheClearResult, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let _ = state;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call("clear_filter_cache", &serde_json::json!({}))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             clear_filter_cache_blocking(state.local()?)
         }
@@ -478,6 +517,9 @@ pub fn run() {
             install_macos_service,
             uninstall_macos_service,
             open_macos_service_settings,
+            get_windows_service_status,
+            install_windows_service,
+            uninstall_windows_service,
             save_config,
             get_status,
             get_query_logs,
@@ -518,7 +560,26 @@ pub fn run() {
                 }
             }
 
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(windows)]
+            {
+                app.manage(Arc::new(GuiState {}));
+                match privileged_bridge::ensure_windows_service_current() {
+                    Ok(status) if status.running => {
+                        if let Ok(config) = privileged_bridge::ServiceClient::call::<_, AppConfig>(
+                            "get_config",
+                            &serde_json::json!({}),
+                        ) && let Err(error) =
+                            apply_autostart_config(app.handle(), config.launch_at_startup)
+                        {
+                            eprintln!("{error}");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("读取 Windows DNS 后台服务状态失败：{error}"),
+                }
+            }
+
+            #[cfg(not(any(target_os = "macos", windows)))]
             {
                 let storage = storage::initialize(app.handle())
                     .map_err(|error| io::Error::other(format!("数据目录初始化失败：{error}")))?;

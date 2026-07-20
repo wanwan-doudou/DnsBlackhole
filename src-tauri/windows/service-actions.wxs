@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="DnsBlackholeWindowsServiceInstaller" Guid="8C655B5A-E710-4B67-8C56-10C59B155725">
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\DnsBlackhole"
+          Name="WindowsServiceInstaller"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <CustomAction
+      Id="InstallDnsBlackholeWindowsService"
+      FileKey="Path"
+      ExeCommand="--windows-service-install --legacy-data-dir &quot;[AppDataFolder]com.dnsblackhole.app&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+    <CustomAction
+      Id="UninstallDnsBlackholeWindowsService"
+      FileKey="Path"
+      ExeCommand="--windows-service-uninstall"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom
+        Action="InstallDnsBlackholeWindowsService"
+        After="InstallFiles">NOT Installed OR REINSTALL</Custom>
+      <Custom
+        Action="UninstallDnsBlackholeWindowsService"
+        Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

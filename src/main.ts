@@ -9,16 +9,19 @@ import {
   clearFilterCache as clearFilterCacheCommand,
   getConfig,
   getMacosServiceStatus,
+  getWindowsServiceStatus,
   getStorageInfo,
   getQueryLogs,
   getStatus,
   saveConfig as saveConfigCommand,
   requestDataMigration,
   installMacosService,
+  installWindowsService,
   openMacosServiceSettings,
   startDns,
   stopDns,
   uninstallMacosService,
+  uninstallWindowsService,
   updateFilters as updateFiltersCommand,
 } from "./api";
 import appIconUrl from "./app-icon.png";
@@ -55,6 +58,8 @@ import type {
   UpstreamMode,
   UpstreamRequestStat,
   ViewName,
+  WindowsServiceState,
+  WindowsServiceStatus,
 } from "./types";
 import "./style.css";
 
@@ -91,7 +96,9 @@ let clientNameMap = new Map<string, string>();
 let currentStorageInfo: StorageInfo | null = null;
 let selectedDataStoragePath = "";
 const isMacOS = navigator.userAgent.includes("Macintosh");
+const isWindows = navigator.userAgent.includes("Windows");
 let currentMacosServiceStatus: MacosServiceStatus | null = null;
+let currentWindowsServiceStatus: WindowsServiceStatus | null = null;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
@@ -177,6 +184,10 @@ const uninstallMacosServiceButton = query<HTMLButtonElement>("#uninstall_macos_s
 const openMacosServiceSettingsButton = query<HTMLButtonElement>(
   "#open_macos_service_settings_btn",
 );
+const windowsServiceSection = query<HTMLElement>("#windows_service_section");
+const windowsServiceStatusElement = query<HTMLElement>("#windows_service_status");
+const installWindowsServiceButton = query<HTMLButtonElement>("#install_windows_service_btn");
+const uninstallWindowsServiceButton = query<HTMLButtonElement>("#uninstall_windows_service_btn");
 const appVersionElement = query<HTMLElement>("#app_version");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
 const installUpdateButton = query<HTMLButtonElement>("#install_update_btn");
@@ -652,7 +663,7 @@ installMacosServiceButton.addEventListener("click", async () => {
       await openMacosServiceSettings();
     } else if (status.enabled && !status.needsRepair) {
       showMessage("macOS DNS 后台服务已启用", false);
-      await refreshAfterMacosServiceEnabled();
+      await refreshAfterBackgroundServiceEnabled();
     } else if (status.needsRepair) {
       showMessage(
         "后台服务已注册但暂未响应，可能仍在启动，将自动重试连接；若持续无响应请重启 Mac 后再试",
@@ -693,6 +704,47 @@ openMacosServiceSettingsButton.addEventListener("click", async () => {
     await openMacosServiceSettings();
   } catch (error) {
     showMessage(String(error), true);
+  }
+});
+
+installWindowsServiceButton.addEventListener("click", async () => {
+  installWindowsServiceButton.disabled = true;
+  installWindowsServiceButton.classList.add("loading");
+  try {
+    const status = await installWindowsService();
+    renderWindowsServiceStatus(status);
+    if (status.running && !status.needsRepair) {
+      showMessage("Windows DNS 系统服务已安装并启动", false);
+      await refreshAfterBackgroundServiceEnabled();
+    } else {
+      showMessage("系统服务已注册但暂未就绪，请稍候重试；详情可查看服务日志", true);
+    }
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    installWindowsServiceButton.disabled = false;
+    installWindowsServiceButton.classList.remove("loading");
+  }
+});
+
+uninstallWindowsServiceButton.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "卸载 Windows DNS 系统服务后，127.0.0.1/::1 将不再提供 DNS；若网卡仍指向本机 DNS，解析可能立即失败。是否继续？",
+  );
+  if (!confirmed) {
+    return;
+  }
+  uninstallWindowsServiceButton.disabled = true;
+  uninstallWindowsServiceButton.classList.add("loading");
+  try {
+    const status = await uninstallWindowsService();
+    renderWindowsServiceStatus(status);
+    showMessage("Windows DNS 系统服务已卸载，数据和配置未删除", false);
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    uninstallWindowsServiceButton.disabled = false;
+    uninstallWindowsServiceButton.classList.remove("loading");
   }
 });
 
@@ -751,15 +803,26 @@ void getVersion().then((version) => {
   appVersionElement.textContent = version;
 });
 
-await loadConfig();
-await loadStorageInfo();
+const initialWindowsServiceStatus = await loadWindowsServiceStatus();
 await loadMacosServiceStatus();
+const windowsCoreReady =
+  !isWindows ||
+  ((initialWindowsServiceStatus?.running ?? false) &&
+    !(initialWindowsServiceStatus?.needsRepair ?? false));
+if (windowsCoreReady) {
+  await loadConfig();
+  await loadStorageInfo();
+} else {
+  activeView = "settings";
+}
 void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
   syncFilterUpdateMetadata(payload);
 }).catch((error) => {
   console.error("监听过滤器更新失败", error);
 });
-await refreshStatus();
+if (windowsCoreReady) {
+  await refreshStatus();
+}
 setActiveView(activeView);
 window.setInterval(() => {
   // 窗口不可见（最小化 / 切到托盘）时跳过轮询，避免无谓的 IPC 与重渲染
@@ -770,9 +833,11 @@ window.setInterval(() => {
   // 状态恢复后自动重新加载数据，避免用户被引导去反复“修复”。
   if (
     currentMacosServiceStatus?.requiresApproval ||
-    currentMacosServiceStatus?.needsRepair
+    currentMacosServiceStatus?.needsRepair ||
+    currentWindowsServiceStatus?.needsRepair
   ) {
     void loadMacosServiceStatus();
+    void loadWindowsServiceStatus();
   }
   if (activeView === "logs") {
     void refreshQueryLogs({ auto: true });
@@ -792,6 +857,9 @@ document.addEventListener("visibilitychange", () => {
     // 用户可能刚从系统设置批准完服务回来，切回窗口时同步最新授权状态
     if (currentMacosServiceStatus?.requiresApproval) {
       void loadMacosServiceStatus();
+    }
+    if (currentWindowsServiceStatus?.needsRepair) {
+      void loadWindowsServiceStatus();
     }
   }
 });
@@ -882,7 +950,7 @@ async function loadMacosServiceStatus(): Promise<void> {
     const status = await getMacosServiceStatus();
     renderMacosServiceStatus(status);
     if (status.enabled && !status.needsRepair && !wasReady) {
-      await refreshAfterMacosServiceEnabled();
+      await refreshAfterBackgroundServiceEnabled();
     }
   } catch (error) {
     currentMacosServiceStatus = null;
@@ -890,8 +958,8 @@ async function loadMacosServiceStatus(): Promise<void> {
   }
 }
 
-async function refreshAfterMacosServiceEnabled(): Promise<void> {
-  // LaunchDaemon 注册成功后 socket 可能稍晚创建，短暂等待再同步完整状态。
+async function refreshAfterBackgroundServiceEnabled(): Promise<void> {
+  // 系统服务启动后 IPC 可能稍晚创建，短暂等待再同步完整状态。
   await new Promise((resolve) => window.setTimeout(resolve, 400));
   await loadConfig();
   await loadStorageInfo();
@@ -914,6 +982,53 @@ function renderMacosServiceStatus(status: MacosServiceStatus): void {
   openMacosServiceSettingsButton.classList.toggle("hidden", !status.requiresApproval);
   uninstallMacosServiceButton.disabled =
     status.state === "not_registered" || status.state === "not_found";
+}
+
+const WINDOWS_SERVICE_STATE_TEXT: Record<WindowsServiceState, string> = {
+  not_installed: "系统服务尚未安装，DNS 核心无法在开机阶段自动启动。",
+  stopped: "系统服务已停止，可点击“安装或修复”恢复。",
+  start_pending: "系统服务正在启动，请稍候…",
+  stop_pending: "系统服务正在停止，请稍候…",
+  running: "系统服务正在运行，DNS 核心不依赖 GUI。",
+  continue_pending: "系统服务正在恢复运行，请稍候…",
+  pause_pending: "系统服务正在暂停，请稍候…",
+  paused: "系统服务已暂停，可点击“安装或修复”恢复。",
+};
+
+async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> {
+  if (!isWindows) {
+    return null;
+  }
+  windowsServiceSection.classList.remove("hidden");
+  try {
+    const wasReady =
+      (currentWindowsServiceStatus?.running ?? false) &&
+      !(currentWindowsServiceStatus?.needsRepair ?? false);
+    const status = await getWindowsServiceStatus();
+    renderWindowsServiceStatus(status);
+    if (status.running && !status.needsRepair && !wasReady) {
+      await refreshAfterBackgroundServiceEnabled();
+    }
+    return status;
+  } catch (error) {
+    currentWindowsServiceStatus = null;
+    windowsServiceStatusElement.textContent = `读取 Windows 系统服务状态失败：${String(error)}`;
+    return null;
+  }
+}
+
+function renderWindowsServiceStatus(status: WindowsServiceStatus): void {
+  currentWindowsServiceStatus = status;
+  const ready = status.running && !status.needsRepair;
+  windowsServiceSection.classList.toggle("is-ready", ready);
+  windowsServiceSection.classList.toggle("needs-repair", status.needsRepair);
+  const stateText = WINDOWS_SERVICE_STATE_TEXT[status.state];
+  const versionText = status.serviceVersion ? ` 当前服务版本 v${status.serviceVersion}。` : "";
+  windowsServiceStatusElement.textContent =
+    status.running && status.needsRepair
+      ? "系统服务已启动但 IPC 无响应或版本不一致，请点击“安装或修复”。"
+      : `${stateText}${versionText}`;
+  uninstallWindowsServiceButton.disabled = !status.installed;
 }
 
 function renderStorageInfo(info: StorageInfo): void {

@@ -16,23 +16,11 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
-
-use crate::{
-    config::AppConfig,
-    database::Database,
-    service_core::{
-        AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, query_logs_blocking,
-        save_config_blocking, spawn_filter_auto_update, spawn_initial_runtime,
-        spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking, update_filters_blocking,
-    },
-    storage,
-};
-
 use super::{
-    BRIDGE_PROTOCOL_VERSION, BRIDGE_SOCKET_PATH, HelloParams, HelloResult, RpcRequest, RpcResponse,
-    read_message, write_message,
+    BRIDGE_SOCKET_PATH,
+    rpc_server::{
+        handle_requests, initialize_state, perform_handshake, start_background_tasks, write_result,
+    },
 };
 
 const SYSTEM_DATA_DIR: &str = "/Library/Application Support/DnsBlackhole";
@@ -40,41 +28,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Deserialize)]
-struct StatusParams {
-    #[serde(default)]
-    force_log_stats: bool,
-    #[serde(default = "default_true")]
-    include_log_stats: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct QueryLogsParams {
-    filter: Option<String>,
-    search: Option<String>,
-    page: Option<u32>,
-    page_size: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConfigParams {
-    config: AppConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct MigrationParams {
-    target_path: String,
-}
-
 pub fn run_daemon() -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("macOS DNS 后台服务必须以 root 身份运行".to_string());
     }
 
-    let state = initialize_state()?;
-    spawn_initial_runtime(Arc::clone(&state));
-    spawn_runtime_watchdog(Arc::clone(&state));
-    spawn_filter_auto_update(Arc::clone(&state), |_| {});
+    let state = initialize_state(PathBuf::from(SYSTEM_DATA_DIR))?;
+    start_background_tasks(&state);
 
     let socket_path = Path::new(BRIDGE_SOCKET_PATH);
     let socket_dir = socket_path
@@ -109,10 +69,10 @@ pub fn run_daemon() -> Result<(), String> {
                 };
                 let state = Arc::clone(&state);
                 let restart_requested = Arc::clone(&restart_requested);
-                thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, state, restart_requested) {
-                        eprintln!("{error}");
-                    }
+                thread::spawn(move || match handle_macos_client(stream, state) {
+                    Ok(true) => restart_requested.store(true, Ordering::Release),
+                    Ok(false) => {}
+                    Err(error) => eprintln!("{error}"),
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -127,169 +87,35 @@ pub fn run_daemon() -> Result<(), String> {
     Ok(())
 }
 
-fn initialize_state() -> Result<Arc<AppState>, String> {
-    let bootstrap = storage::initialize_at(PathBuf::from(SYSTEM_DATA_DIR))?;
-    let database = Arc::new(Database::open(&bootstrap.data_dir)?);
-    let config = database.load_or_default_config()?;
-    storage::finish_pending_cleanup(&bootstrap.default_dir, &bootstrap.data_dir)?;
-    let state = Arc::new(AppState::new(
-        config,
-        database,
-        bootstrap.default_dir,
-        bootstrap.data_dir,
-    ));
-    if let Some(error) = bootstrap.migration_error {
-        state.set_error(Some(error));
-    }
-    Ok(state)
-}
-
 /// 将从非阻塞 listener 接收的客户端连接恢复为阻塞模式，保证帧读取等待客户端写入。
 fn prepare_accepted_stream(stream: UnixStream) -> Result<UnixStream, String> {
     stream
         .set_nonblocking(false)
         .map_err(|error| format!("设置后台服务 IPC 客户端阻塞模式失败：{error}"))?;
+    stream
+        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|error| format!("设置后台服务握手读取超时失败：{error}"))?;
+    stream
+        .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|error| format!("设置后台服务握手写入超时失败：{error}"))?;
     Ok(stream)
 }
 
-fn handle_client(
+fn handle_macos_client(
     mut stream: UnixStream,
-    state: Arc<AppState>,
-    restart_requested: Arc<AtomicBool>,
-) -> Result<(), String> {
+    state: Arc<crate::service_core::AppState>,
+) -> Result<bool, String> {
     verify_peer(&stream)?;
     if !perform_handshake(&mut stream)? {
-        return Ok(());
-    }
-
-    loop {
-        let request: RpcRequest = match read_message(&mut stream) {
-            Ok(request) => request,
-            Err(error)
-                if error.contains("UnexpectedEof")
-                    || error.contains("failed to fill whole buffer") =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        match dispatch_request(&state, &request.method, request.params) {
-            Ok((result, should_restart)) => {
-                write_response(
-                    &mut stream,
-                    RpcResponse {
-                        id: request.id,
-                        result: Some(result),
-                        error: None,
-                    },
-                )?;
-                if should_restart {
-                    restart_requested.store(true, Ordering::Release);
-                    return Ok(());
-                }
-            }
-            Err(error) => write_error(&mut stream, request.id, error)?,
-        }
-    }
-}
-
-fn perform_handshake(stream: &mut UnixStream) -> Result<bool, String> {
-    stream
-        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
-        .map_err(|error| format!("设置 IPC 读取超时失败：{error}"))?;
-    stream
-        .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
-        .map_err(|error| format!("设置 IPC 写入超时失败：{error}"))?;
-
-    let request: RpcRequest = read_message(stream)?;
-    if request.method != "hello" {
-        return Err("客户端未执行 IPC 握手".to_string());
-    }
-    let hello: HelloParams = parse_params(request.params)?;
-    if hello.protocol_version != BRIDGE_PROTOCOL_VERSION {
-        write_error(
-            stream,
-            request.id,
-            format!(
-                "客户端 IPC 协议版本不兼容：服务 {}，客户端 {}",
-                BRIDGE_PROTOCOL_VERSION, hello.protocol_version
-            ),
-        )?;
         return Ok(false);
     }
-    write_result(
-        stream,
-        request.id,
-        &HelloResult {
-            protocol_version: BRIDGE_PROTOCOL_VERSION,
-            service_version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-    )?;
-    // 握手后保留有限的请求级超时，避免异常客户端的空闲连接永久占用服务线程。
-    // （0.1.33 断管的根因已定论：accept 继承了监听 socket 的非阻塞标志，
-    // 握手字节未到即被 EAGAIN 断开，见 run_daemon 的 prepare_accepted_stream。）
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))
-        .map_err(|error| format!("设置 IPC 请求读取超时失败：{error}"))?;
+        .map_err(|error| format!("设置后台服务请求读取超时失败：{error}"))?;
     stream
         .set_write_timeout(Some(RPC_TIMEOUT))
-        .map_err(|error| format!("设置 IPC 请求写入超时失败：{error}"))?;
-    Ok(true)
-}
-
-fn dispatch_request(
-    state: &Arc<AppState>,
-    method: &str,
-    params: Value,
-) -> Result<(Value, bool), String> {
-    let result = match method {
-        "ping" => Value::Null,
-        "get_config" => to_value(state.current_config()?)?,
-        "get_storage_info" => to_value(storage::storage_info(
-            &state.default_data_dir,
-            &state.data_dir,
-        )?)?,
-        "request_data_migration" => {
-            let params: MigrationParams = parse_params(params)?;
-            let target_path = Path::new(params.target_path.trim());
-            if target_path.as_os_str().is_empty() {
-                return Err("请选择新的数据存储目录".to_string());
-            }
-            let info =
-                storage::request_migration(&state.default_data_dir, &state.data_dir, target_path)?;
-            let should_restart = info.pending_path.is_some();
-            return Ok((to_value(info)?, should_restart));
-        }
-        "save_config" => {
-            let params: ConfigParams = parse_params(params)?;
-            to_value(save_config_blocking(Arc::clone(state), params.config)?)?
-        }
-        "get_status" => {
-            let params: StatusParams = parse_params(params)?;
-            to_value(state.status_with_log_stats(params.force_log_stats, params.include_log_stats))?
-        }
-        "get_query_logs" => {
-            let params: QueryLogsParams = parse_params(params)?;
-            to_value(query_logs_blocking(
-                Arc::clone(state),
-                params.filter,
-                params.search,
-                params.page,
-                params.page_size,
-            )?)?
-        }
-        "update_filters" => {
-            let params: ConfigParams = parse_params(params)?;
-            to_value(update_filters_blocking(Arc::clone(state), params.config)?)?
-        }
-        "start_dns" => to_value(start_dns_blocking(Arc::clone(state))?)?,
-        "stop_dns" => to_value(stop_dns_blocking(Arc::clone(state))?)?,
-        "clear_dns_cache" => to_value(clear_dns_cache_blocking(state)?)?,
-        "clear_filter_cache" => to_value(clear_filter_cache_blocking(Arc::clone(state))?)?,
-        "restart_service" => return Ok((Value::Null, true)),
-        _ => return Err(format!("未知的后台服务方法：{method}")),
-    };
-    Ok((result, false))
+        .map_err(|error| format!("设置后台服务请求写入超时失败：{error}"))?;
+    handle_requests(stream, state)
 }
 
 fn verify_peer(stream: &UnixStream) -> Result<(), String> {
@@ -312,48 +138,14 @@ fn verify_peer(stream: &UnixStream) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, String> {
-    serde_json::from_value(params).map_err(|error| format!("后台服务请求参数无效：{error}"))
-}
-
-fn to_value<T: Serialize>(result: T) -> Result<Value, String> {
-    serde_json::to_value(result).map_err(|error| format!("序列化后台服务响应失败：{error}"))
-}
-
-fn write_result<T: Serialize>(stream: &mut UnixStream, id: u64, result: &T) -> Result<(), String> {
-    write_response(
-        stream,
-        RpcResponse {
-            id,
-            result: Some(to_value(result)?),
-            error: None,
-        },
-    )
-}
-
-fn write_error(stream: &mut UnixStream, id: u64, error: String) -> Result<(), String> {
-    write_response(
-        stream,
-        RpcResponse {
-            id,
-            result: None,
-            error: Some(error),
-        },
-    )
-}
-
-fn write_response(stream: &mut UnixStream, response: RpcResponse) -> Result<(), String> {
-    write_message(stream, &response)
-}
-
-fn default_true() -> bool {
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::privileged_bridge::{
+        BRIDGE_PROTOCOL_VERSION, HelloParams, RpcRequest, RpcResponse, read_message, write_message,
+    };
 
     #[test]
     fn handshake_keeps_connection_open_for_rpc_request() {

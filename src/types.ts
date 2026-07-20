@@ -24,6 +24,25 @@ export type MacosServiceStatus = {
   needsRepair: boolean;
 };
 
+export type WindowsServiceState =
+  | "not_installed"
+  | "stopped"
+  | "start_pending"
+  | "stop_pending"
+  | "running"
+  | "continue_pending"
+  | "pause_pending"
+  | "paused";
+
+export type WindowsServiceStatus = {
+  state: WindowsServiceState;
+  installed: boolean;
+  running: boolean;
+  expectedVersion: string;
+  serviceVersion: string | null;
+  needsRepair: boolean;
+};
+
 export type FilterSubscription = {
   id: string;
   name: string;

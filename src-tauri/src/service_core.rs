@@ -1,5 +1,5 @@
 //! DNS 服务核心：配置、运行状态、日志统计与后台任务。
-//! 不依赖任何 Tauri 窗口能力，Windows GUI 进程内运行，macOS 由 root 后台服务承载。
+//! 不依赖任何 Tauri 窗口能力；Windows 和 macOS 由系统后台服务承载。
 
 use std::{
     path::PathBuf,
@@ -326,7 +326,6 @@ impl AppState {
         }
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn shutdown(&self) {
         let _ = self.stop_current();
     }
@@ -622,7 +621,7 @@ fn apply_update_report_error(state: &AppState, report: &FilterUpdateReport) {
 
 /// 后台按 filter_update_interval_hours 自动更新启用的远程清单。
 /// 成功后靠 last_updated 推进下一轮；失败时指数退避，避免网络故障期间频繁请求远端。
-/// 更新成功后通过 on_updated 通知调用方（Windows GUI 借此向前端推送事件）。
+/// 更新成功后通过 on_updated 通知调用方（进程内运行的平台借此向前端推送事件）。
 pub(crate) fn spawn_filter_auto_update<F>(state: Arc<AppState>, on_updated: F)
 where
     F: Fn(&AppConfig) + Send + 'static,
@@ -718,32 +717,37 @@ pub(crate) fn spawn_runtime_watchdog(state: Arc<AppState>) {
     });
 }
 
+#[cfg(not(windows))]
 pub(crate) fn spawn_initial_runtime(state: Arc<AppState>) {
     thread::spawn(move || {
-        let _runtime_guard = match state.runtime_update_lock.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                state.set_error(Some("DNS 初始化任务状态异常".to_string()));
-                return;
-            }
-        };
-        let config = match state.current_config() {
-            Ok(config) => config,
-            Err(error) => {
-                state.set_error(Some(error));
-                return;
-            }
-        };
-        if !config.enabled {
+        initialize_runtime_blocking(&state);
+    });
+}
+
+pub(crate) fn initialize_runtime_blocking(state: &AppState) {
+    let _runtime_guard = match state.runtime_update_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            state.set_error(Some("DNS 初始化任务状态异常".to_string()));
             return;
         }
-
-        let rules_text = config::build_effective_rules(&state.data_dir, &config);
-        if let Err(error) = state.start_current(&rules_text) {
-            eprintln!("DNS 服务启动失败：{error}");
+    };
+    let config = match state.current_config() {
+        Ok(config) => config,
+        Err(error) => {
             state.set_error(Some(error));
+            return;
         }
-    });
+    };
+    if !config.enabled {
+        return;
+    }
+
+    let rules_text = config::build_effective_rules(&state.data_dir, &config);
+    if let Err(error) = state.start_current(&rules_text) {
+        eprintln!("DNS 服务启动失败：{error}");
+        state.set_error(Some(error));
+    }
 }
 
 fn unix_now() -> u64 {

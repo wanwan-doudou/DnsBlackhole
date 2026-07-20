@@ -9,6 +9,7 @@ import type {
   QueryLogPage,
   RuntimeStatus,
   StorageInfo,
+  WindowsServiceStatus,
 } from "./types";
 
 type QueryLogRequest = {
@@ -76,4 +77,16 @@ export function uninstallMacosService(): Promise<MacosServiceStatus> {
 
 export function openMacosServiceSettings(): Promise<void> {
   return invoke<void>("open_macos_service_settings");
+}
+
+export function getWindowsServiceStatus(): Promise<WindowsServiceStatus> {
+  return invoke<WindowsServiceStatus>("get_windows_service_status");
+}
+
+export function installWindowsService(): Promise<WindowsServiceStatus> {
+  return invoke<WindowsServiceStatus>("install_windows_service");
+}
+
+export function uninstallWindowsService(): Promise<WindowsServiceStatus> {
+  return invoke<WindowsServiceStatus>("uninstall_windows_service");
 }

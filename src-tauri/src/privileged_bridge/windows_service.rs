@@ -1,0 +1,210 @@
+use std::{
+    ffi::OsString,
+    fs::OpenOptions,
+    io::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
+
+use windows_service::{
+    define_windows_service,
+    service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    },
+    service_control_handler::{self, ServiceControlHandlerResult},
+    service_dispatcher,
+};
+
+use crate::{service_core::initialize_runtime_blocking, storage};
+
+use super::{
+    rpc_server::{handle_client, initialize_state, start_maintenance_tasks},
+    windows_pipe::WindowsPipeStream,
+    windows_service_management::WINDOWS_SERVICE_NAME,
+};
+
+const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+define_windows_service!(ffi_service_main, service_main);
+
+pub fn run_service_dispatcher() -> Result<(), String> {
+    service_dispatcher::start(WINDOWS_SERVICE_NAME, ffi_service_main)
+        .map_err(|error| format!("启动 Windows 服务调度器失败：{error}"))
+}
+
+fn service_main(_arguments: Vec<OsString>) {
+    if let Err(error) = run_service() {
+        write_service_log(&error);
+    }
+}
+
+fn run_service() -> Result<(), String> {
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let handler_stop = Arc::clone(&stop_requested);
+    let event_handler = move |control| match control {
+        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        ServiceControl::Stop | ServiceControl::Shutdown => {
+            handler_stop.store(true, Ordering::Release);
+            thread::spawn(WindowsPipeStream::wake_server);
+            ServiceControlHandlerResult::NoError
+        }
+        _ => ServiceControlHandlerResult::NotImplemented,
+    };
+    let status_handle = service_control_handler::register(WINDOWS_SERVICE_NAME, event_handler)
+        .map_err(|error| format!("注册 Windows 服务控制处理器失败：{error}"))?;
+
+    let result = run_service_body(&stop_requested, &status_handle);
+    let exit_code = if result.is_ok() {
+        ServiceExitCode::Win32(0)
+    } else {
+        ServiceExitCode::Win32(1)
+    };
+    let status_result = status_handle.set_service_status(service_status(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        exit_code,
+        Duration::default(),
+    ));
+    result?;
+    status_result.map_err(|error| format!("报告 Windows 服务停止状态失败：{error}"))
+}
+
+fn run_service_body(
+    stop_requested: &Arc<AtomicBool>,
+    status_handle: &service_control_handler::ServiceStatusHandle,
+) -> Result<(), String> {
+    status_handle
+        .set_service_status(service_status(
+            ServiceState::StartPending,
+            ServiceControlAccept::empty(),
+            ServiceExitCode::Win32(0),
+            Duration::from_secs(10),
+        ))
+        .map_err(|error| format!("报告 Windows 服务启动状态失败：{error}"))?;
+
+    let service_default_dir = storage::prepare_windows_service_storage(None)?;
+    let state = initialize_state(service_default_dir)?;
+    initialize_dns_runtime(&state, stop_requested, status_handle)?;
+    if stop_requested.load(Ordering::Acquire) {
+        state.shutdown();
+        return Ok(());
+    }
+    start_maintenance_tasks(&state);
+    status_handle
+        .set_service_status(service_status(
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            ServiceExitCode::Win32(0),
+            Duration::default(),
+        ))
+        .map_err(|error| format!("报告 Windows 服务运行状态失败：{error}"))?;
+
+    run_service_loop(stop_requested, state)
+}
+
+fn initialize_dns_runtime(
+    state: &Arc<crate::service_core::AppState>,
+    stop_requested: &Arc<AtomicBool>,
+    status_handle: &service_control_handler::ServiceStatusHandle,
+) -> Result<(), String> {
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let initial_state = Arc::clone(state);
+    thread::spawn(move || {
+        initialize_runtime_blocking(&initial_state);
+        let _ = finished_tx.send(());
+    });
+
+    let mut checkpoint = 1_u32;
+    loop {
+        match finished_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if stop_requested.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                checkpoint = checkpoint.saturating_add(1);
+                let mut status = service_status(
+                    ServiceState::StartPending,
+                    ServiceControlAccept::empty(),
+                    ServiceExitCode::Win32(0),
+                    Duration::from_secs(10),
+                );
+                status.checkpoint = checkpoint;
+                status_handle
+                    .set_service_status(status)
+                    .map_err(|error| format!("更新 Windows 服务启动进度失败：{error}"))?;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Windows DNS 初始化线程异常退出".to_string());
+            }
+        }
+    }
+}
+
+fn run_service_loop(
+    stop_requested: &Arc<AtomicBool>,
+    state: Arc<crate::service_core::AppState>,
+) -> Result<(), String> {
+    let restart_requested = Arc::new(AtomicBool::new(false));
+
+    while !stop_requested.load(Ordering::Acquire) && !restart_requested.load(Ordering::Acquire) {
+        let stream = WindowsPipeStream::accept()?;
+        if stop_requested.load(Ordering::Acquire) || restart_requested.load(Ordering::Acquire) {
+            break;
+        }
+
+        let state = Arc::clone(&state);
+        let restart_requested = Arc::clone(&restart_requested);
+        thread::spawn(move || match handle_client(stream, state) {
+            Ok(true) => {
+                restart_requested.store(true, Ordering::Release);
+                WindowsPipeStream::wake_server();
+            }
+            Ok(false) => {}
+            Err(error) => write_service_log(&error),
+        });
+    }
+    state.shutdown();
+    if restart_requested.load(Ordering::Acquire) {
+        Err("Windows DNS 服务收到重新加载请求，将由服务控制管理器重新启动".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn service_status(
+    state: ServiceState,
+    controls_accepted: ServiceControlAccept,
+    exit_code: ServiceExitCode,
+    wait_hint: Duration,
+) -> ServiceStatus {
+    ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: state,
+        controls_accepted,
+        exit_code,
+        checkpoint: 0,
+        wait_hint,
+        process_id: None,
+    }
+}
+
+fn write_service_log(message: &str) {
+    let Ok(data_dir) = storage::windows_service_default_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&data_dir);
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("service.log"))
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}

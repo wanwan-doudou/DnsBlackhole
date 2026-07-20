@@ -1,14 +1,25 @@
+#[cfg(target_os = "macos")]
 use std::{os::unix::net::UnixStream, time::Duration};
 
 use serde::{Serialize, de::DeserializeOwned};
 
+#[cfg(target_os = "macos")]
+use super::BRIDGE_SOCKET_PATH;
+#[cfg(windows)]
+use super::windows_pipe::WindowsPipeStream;
 use super::{
-    BRIDGE_PROTOCOL_VERSION, BRIDGE_SOCKET_PATH, HelloParams, HelloResult, RpcRequest, RpcResponse,
-    read_message, write_message,
+    BRIDGE_PROTOCOL_VERSION, HelloParams, HelloResult, RpcRequest, RpcResponse, read_message,
+    write_message,
 };
 
+#[cfg(target_os = "macos")]
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPECTED_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(target_os = "macos")]
+type ServiceStream = UnixStream;
+#[cfg(windows)]
+type ServiceStream = WindowsPipeStream;
 
 pub(crate) struct ServiceClient;
 
@@ -27,6 +38,7 @@ impl ServiceClient {
         Self::call_with_version_policy(method, params, true)
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn request_restart() -> Result<(), String> {
         Self::call_with_version_policy("restart_service", &serde_json::json!({}), false)
     }
@@ -43,7 +55,7 @@ impl ServiceClient {
         let (mut stream, hello) = connect_and_hello()?;
         if require_current_version && hello.service_version != EXPECTED_SERVICE_VERSION {
             return Err(format!(
-                "macOS 后台服务版本不一致：应用 {}，服务 {}。应用将自动修复后台服务",
+                "DNS 后台服务版本不一致：应用 {}，服务 {}。请安装或修复后台服务",
                 EXPECTED_SERVICE_VERSION, hello.service_version
             ));
         }
@@ -62,7 +74,7 @@ impl ServiceClient {
 /// 握手后的连接存活性检查：旧版服务不认识 ping 会返回错误响应，
 /// 但能收到完整响应就说明连接在握手后仍可用、服务只是版本旧；
 /// 只有写入失败、连接被关闭或超时等传输层错误才判定为断管。
-fn verify_connection_alive(stream: &mut UnixStream) -> Result<(), String> {
+fn verify_connection_alive(stream: &mut ServiceStream) -> Result<(), String> {
     let request = RpcRequest {
         id: 2,
         method: "ping".to_string(),
@@ -79,7 +91,8 @@ fn verify_connection_alive(stream: &mut UnixStream) -> Result<(), String> {
     Ok(())
 }
 
-fn connect_and_hello() -> Result<(UnixStream, HelloResult), String> {
+fn connect_and_hello() -> Result<(ServiceStream, HelloResult), String> {
+    #[cfg(target_os = "macos")]
     let mut stream = UnixStream::connect(BRIDGE_SOCKET_PATH).map_err(|error| {
         // 区分“服务根本没在运行”（socket 不存在或无人监听）与其他连接故障，
         // 前者最常见的原因是服务尚未安装、等待系统设置批准或正在启动。
@@ -92,9 +105,13 @@ fn connect_and_hello() -> Result<(UnixStream, HelloResult), String> {
         };
         format!("无法连接 macOS DNS 后台服务，{hint}：{error}")
     })?;
+    #[cfg(windows)]
+    let mut stream = WindowsPipeStream::connect()?;
+    #[cfg(target_os = "macos")]
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))
         .map_err(|error| format!("设置后台服务读取超时失败：{error}"))?;
+    #[cfg(target_os = "macos")]
     stream
         .set_write_timeout(Some(RPC_TIMEOUT))
         .map_err(|error| format!("设置后台服务写入超时失败：{error}"))?;
@@ -112,7 +129,7 @@ fn connect_and_hello() -> Result<(UnixStream, HelloResult), String> {
     let hello: HelloResult = read_result(&mut stream, 1)?;
     if hello.protocol_version != BRIDGE_PROTOCOL_VERSION {
         return Err(format!(
-            "macOS 后台服务协议版本不兼容：应用 {}，服务 {}。应用将自动修复后台服务",
+            "DNS 后台服务协议版本不兼容：应用 {}，服务 {}。请安装或修复后台服务",
             BRIDGE_PROTOCOL_VERSION, hello.protocol_version
         ));
     }
@@ -120,7 +137,7 @@ fn connect_and_hello() -> Result<(UnixStream, HelloResult), String> {
 }
 
 fn read_result<R: DeserializeOwned>(
-    stream: &mut UnixStream,
+    stream: &mut ServiceStream,
     expected_id: u64,
 ) -> Result<R, String> {
     let response: RpcResponse = read_message(stream)?;
@@ -139,7 +156,7 @@ fn read_result<R: DeserializeOwned>(
     serde_json::from_value(result).map_err(|error| format!("解析后台服务响应失败：{error}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::thread;
 

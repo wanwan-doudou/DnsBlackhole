@@ -574,13 +574,25 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
-            <section class="settings-section macos-service-section hidden" id="macos_service_section">
+            <section class="settings-section background-service-section hidden" id="windows_service_section">
+              <div>
+                <h3>Windows DNS 系统服务</h3>
+                <p id="windows_service_status">正在读取系统服务状态…</p>
+                <small>DNS 核心由 Windows 服务控制管理器在开机阶段自动启动；关闭 GUI、尚未登录或 Clash 稍后启动都不会中断本机 DNS。</small>
+              </div>
+              <div class="button-group background-service-actions">
+                <button class="primary" id="install_windows_service_btn" type="button">安装或修复</button>
+                <button id="uninstall_windows_service_btn" type="button">卸载服务</button>
+              </div>
+            </section>
+
+            <section class="settings-section background-service-section hidden" id="macos_service_section">
               <div>
                 <h3>macOS DNS 后台服务</h3>
                 <p id="macos_service_status">正在读取后台服务状态…</p>
                 <small>正式版通过系统后台服务监听 UDP/TCP 53。首次安装需要管理员在“系统设置 → 通用 → 登录项与扩展”中批准。</small>
               </div>
-              <div class="button-group macos-service-actions">
+              <div class="button-group background-service-actions">
                 <button class="primary" id="install_macos_service_btn" type="button">安装或修复</button>
                 <button class="hidden" id="open_macos_service_settings_btn" type="button">打开系统设置</button>
                 <button id="uninstall_macos_service_btn" type="button">卸载服务</button>

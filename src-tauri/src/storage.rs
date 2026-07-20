@@ -7,7 +7,7 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use serde::{Deserialize, Serialize};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
 const DATABASE_FILE: &str = "dnsblackhole.sqlite3";
@@ -45,7 +45,7 @@ struct StorageLocator {
     last_migration_error: Option<String>,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn initialize(app: &AppHandle) -> Result<StorageBootstrap, String> {
     let default_dir = default_data_dir(app)?;
     initialize_at(default_dir)
@@ -154,11 +154,78 @@ pub fn filters_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(FILTERS_DIR)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn default_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map_err(|_| "无法获取默认数据目录".to_string())
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_service_default_dir() -> Result<PathBuf, String> {
+    let program_data = std::env::var_os("ProgramData")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "无法获取 Windows ProgramData 目录".to_string())?;
+    Ok(PathBuf::from(program_data).join("DnsBlackhole"))
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_windows_service_storage(
+    legacy_default_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let service_default_dir = windows_service_default_dir()?;
+    fs::create_dir_all(&service_default_dir).map_err(|error| {
+        format!(
+            "创建 Windows 服务数据目录失败（{}）：{error}",
+            service_default_dir.display()
+        )
+    })?;
+
+    let mut locator = read_locator(&service_default_dir)?;
+    if locator.data_dir.is_none() && !database_path(&service_default_dir).exists() {
+        let legacy_default_dir = legacy_default_dir
+            .map(Path::to_path_buf)
+            .or_else(discover_windows_legacy_default_dir);
+        if let Some(legacy_default_dir) = legacy_default_dir
+            && let Some((legacy_locator, legacy_data_dir)) =
+                read_existing_legacy_storage(&legacy_default_dir)?
+            && !same_directory(&service_default_dir, &legacy_data_dir)
+        {
+            locator.data_dir = Some(legacy_data_dir);
+            locator.pending_data_dir = legacy_locator.pending_data_dir;
+            locator.cleanup_data_dir = legacy_locator.cleanup_data_dir;
+            locator.last_migration_error = legacy_locator.last_migration_error;
+            write_locator(&service_default_dir, &locator)?;
+        }
+    }
+    Ok(service_default_dir)
+}
+
+#[cfg(windows)]
+fn discover_windows_legacy_default_dir() -> Option<PathBuf> {
+    let app_data = std::env::var_os("APPDATA")?;
+    let app_data = PathBuf::from(app_data);
+    ["com.dnsblackhole.app", "DnsBlackhole"]
+        .into_iter()
+        .map(|name| app_data.join(name))
+        .find(|path| path.exists())
+}
+
+#[cfg(windows)]
+fn read_existing_legacy_storage(
+    default_dir: &Path,
+) -> Result<Option<(StorageLocator, PathBuf)>, String> {
+    if !default_dir.exists() {
+        return Ok(None);
+    }
+    let locator = read_locator(default_dir)?;
+    let data_dir = locator
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| default_dir.to_path_buf());
+    Ok(database_path(&data_dir)
+        .exists()
+        .then_some((locator, data_dir)))
 }
 
 fn locator_path(default_dir: &Path) -> PathBuf {
@@ -646,5 +713,39 @@ mod tests {
             path_for_display(Path::new(r"D:\DnsBlackhole\data")),
             r"D:\DnsBlackhole\data"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_legacy_custom_storage_without_losing_pending_migration() {
+        let root = temporary_directory("legacy-locator");
+        let legacy_default = root.join("legacy");
+        let custom_data = root.join("custom");
+        let pending_data = root.join("pending");
+        fs::create_dir_all(&legacy_default).expect("legacy default should create");
+        fs::create_dir_all(&custom_data).expect("custom data should create");
+        fs::write(database_path(&custom_data), "database").expect("database should write");
+        write_locator(
+            &legacy_default,
+            &StorageLocator {
+                data_dir: Some(custom_data.clone()),
+                pending_data_dir: Some(pending_data.clone()),
+                cleanup_data_dir: None,
+                last_migration_error: Some("previous error".to_string()),
+            },
+        )
+        .expect("legacy locator should write");
+
+        let (locator, data_dir) = read_existing_legacy_storage(&legacy_default)
+            .expect("legacy storage should read")
+            .expect("legacy storage should exist");
+
+        assert_eq!(data_dir, custom_data);
+        assert_eq!(locator.pending_data_dir, Some(pending_data));
+        assert_eq!(
+            locator.last_migration_error.as_deref(),
+            Some("previous error")
+        );
+        fs::remove_dir_all(root).expect("temporary directory should remove");
     }
 }

@@ -2,14 +2,22 @@ use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod client;
 #[cfg(target_os = "macos")]
 mod daemon;
+#[cfg(any(target_os = "macos", windows))]
+mod rpc_server;
 #[cfg(target_os = "macos")]
 mod service_management;
+#[cfg(windows)]
+mod windows_pipe;
+#[cfg(windows)]
+mod windows_service;
+#[cfg(windows)]
+mod windows_service_management;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) use client::ServiceClient;
 #[cfg(target_os = "macos")]
 pub use daemon::run_daemon;
@@ -18,6 +26,58 @@ pub(crate) use service_management::{
     ensure_macos_service_current, macos_service_install, macos_service_open_settings,
     macos_service_uninstall,
 };
+#[cfg(windows)]
+pub use windows_service::run_service_dispatcher as run_windows_service;
+#[cfg(windows)]
+pub(crate) use windows_service_management::{
+    WindowsServiceStatus, ensure_windows_service_current, install_windows_service,
+    uninstall_windows_service, windows_service_status,
+};
+#[cfg(windows)]
+pub fn handle_windows_service_command() -> Option<Result<(), String>> {
+    use std::path::PathBuf;
+
+    let mut arguments = std::env::args_os().skip(1);
+    let command = arguments.next()?;
+    if command == "--windows-service" {
+        return Some(run_windows_service());
+    }
+    if command == "--windows-service-uninstall" {
+        return Some(windows_service_management::uninstall_windows_service_elevated());
+    }
+    if command == "--windows-service-uninstall-request" {
+        return Some(windows_service_management::uninstall_windows_service().map(|_| ()));
+    }
+    if command != "--windows-service-install" && command != "--windows-service-install-request" {
+        return None;
+    }
+
+    let mut legacy_data_dir: Option<PathBuf> = None;
+    while let Some(argument) = arguments.next() {
+        if argument == "--legacy-data-dir" {
+            let Some(path) = arguments.next() else {
+                return Some(Err("--legacy-data-dir 缺少路径参数".to_string()));
+            };
+            legacy_data_dir = Some(PathBuf::from(path));
+        }
+    }
+    let source_executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return Some(Err(format!("读取当前程序路径失败：{error}"))),
+    };
+    if command == "--windows-service-install-request" {
+        return Some(
+            windows_service_management::install_windows_service(legacy_data_dir.as_deref())
+                .map(|_| ()),
+        );
+    }
+    Some(
+        windows_service_management::install_windows_service_elevated(
+            &source_executable,
+            legacy_data_dir.as_deref(),
+        ),
+    )
+}
 
 // 协议 2：控制面 RPC。DNS 引擎完整运行在 root 后台服务内，
 // GUI 只通过本协议做配置、状态查询和日志读取，不再转发 DNS 查询。

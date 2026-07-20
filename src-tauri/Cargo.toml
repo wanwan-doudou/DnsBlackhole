@@ -1,6 +1,6 @@
 [package]
 name = "dnsblackhole"
-version = "0.1.41"
+version = "0.1.42"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"
@@ -40,7 +40,20 @@ objc2-foundation = { version = "0.3.2", features = ["NSError", "NSString"] }
 objc2-service-management = { version = "0.3.2", features = ["objc2", "objc2-foundation", "SMAppService"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-service = "0.8"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 winreg = "0.56"
 
 [[bin]]

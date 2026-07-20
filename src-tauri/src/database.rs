@@ -9,7 +9,7 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params, params};
 use serde::{Deserialize, Serialize};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 use tauri::AppHandle;
 
 use crate::{
@@ -187,7 +187,7 @@ impl Database {
         })
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     pub fn load_or_migrate_config(&self, app: &AppHandle) -> Result<AppConfig, String> {
         if let Some(config) = self.load_config()? {
             return Ok(config);
@@ -198,7 +198,6 @@ impl Database {
         Ok(config)
     }
 
-    #[cfg(target_os = "macos")]
     pub fn load_or_default_config(&self) -> Result<AppConfig, String> {
         if let Some(config) = self.load_config()? {
             return Ok(config);
