@@ -18,9 +18,7 @@ use std::{
 
 use super::{
     BRIDGE_SOCKET_PATH,
-    rpc_server::{
-        handle_requests, initialize_state, perform_handshake, start_background_tasks, write_result,
-    },
+    rpc_server::{handle_requests, initialize_state, perform_handshake, start_background_tasks},
 };
 
 const SYSTEM_DATA_DIR: &str = "/Library/Application Support/DnsBlackhole";
@@ -143,6 +141,7 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::privileged_bridge::rpc_server::write_result;
     use crate::privileged_bridge::{
         BRIDGE_PROTOCOL_VERSION, HelloParams, RpcRequest, RpcResponse, read_message, write_message,
     };

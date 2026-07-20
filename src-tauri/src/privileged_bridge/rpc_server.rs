@@ -79,6 +79,7 @@ pub(crate) fn start_maintenance_tasks(state: &Arc<AppState>) {
     spawn_filter_auto_update(Arc::clone(state), |_| {});
 }
 
+#[cfg(windows)]
 pub(crate) fn handle_client<S>(mut stream: S, state: Arc<AppState>) -> Result<bool, String>
 where
     S: Read + Write,
