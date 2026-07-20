@@ -35,12 +35,20 @@ pub(crate) struct WindowsPipeStream {
     server_end: bool,
 }
 
+pub(crate) struct WindowsPipeListener {
+    handle: HANDLE,
+}
+
 unsafe impl Send for WindowsPipeStream {}
 
 impl WindowsPipeStream {
     pub(crate) fn connect() -> Result<Self, String> {
+        Self::connect_with_timeout(PIPE_CONNECT_TIMEOUT_MS)
+    }
+
+    pub(crate) fn connect_with_timeout(timeout_ms: u32) -> Result<Self, String> {
         let pipe_name = wide(WINDOWS_PIPE_PATH);
-        if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), PIPE_CONNECT_TIMEOUT_MS) } == 0 {
+        if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), timeout_ms) } == 0 {
             return Err(format!(
                 "Windows DNS 后台服务尚未就绪：{}",
                 io::Error::last_os_error()
@@ -69,7 +77,15 @@ impl WindowsPipeStream {
         })
     }
 
-    pub(crate) fn accept() -> Result<Self, String> {
+    pub(crate) fn wake_server() {
+        let _ = Self::connect();
+    }
+}
+
+impl WindowsPipeListener {
+    /// 先创建可连接的管道实例，再由 Windows 服务报告 Running。
+    /// 这样 GUI 看到 Running 时，IPC 端点已经真实存在。
+    pub(crate) fn bind() -> Result<Self, String> {
         let pipe_name = wide(WINDOWS_PIPE_PATH);
         let security_descriptor = SecurityDescriptor::new(PIPE_SECURITY_SDDL)?;
         let security_attributes = SECURITY_ATTRIBUTES {
@@ -96,24 +112,22 @@ impl WindowsPipeStream {
             ));
         }
 
-        let connected = unsafe { ConnectNamedPipe(handle, ptr::null_mut()) };
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn accept(mut self) -> Result<WindowsPipeStream, String> {
+        let connected = unsafe { ConnectNamedPipe(self.handle, ptr::null_mut()) };
         if connected == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-                unsafe {
-                    CloseHandle(handle);
-                }
                 return Err(format!("等待 Windows 后台服务客户端失败：{error}"));
             }
         }
-        Ok(Self {
+        let handle = std::mem::replace(&mut self.handle, INVALID_HANDLE_VALUE);
+        Ok(WindowsPipeStream {
             handle,
             server_end: true,
         })
-    }
-
-    pub(crate) fn wake_server() {
-        let _ = Self::connect();
     }
 }
 
@@ -178,6 +192,16 @@ impl Drop for WindowsPipeStream {
                 DisconnectNamedPipe(self.handle);
             }
             CloseHandle(self.handle);
+        }
+    }
+}
+
+impl Drop for WindowsPipeListener {
+    fn drop(&mut self) {
+        if self.handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(self.handle);
+            }
         }
     }
 }

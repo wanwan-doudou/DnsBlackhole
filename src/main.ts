@@ -102,6 +102,8 @@ let currentMacosServiceStatus: MacosServiceStatus | null = null;
 let currentWindowsServiceStatus: WindowsServiceStatus | null = null;
 let initialBootstrapComplete = false;
 let backgroundServiceRefreshInFlight = false;
+let windowsServiceStatusInFlight: Promise<WindowsServiceStatus | null> | null = null;
+let windowsServiceUnavailableSince: number | null = null;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
@@ -114,6 +116,8 @@ const CHECK_RETRY_DELAYS_MS = [800, 2_000, 5_000];
 const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 2_500, 5_000];
 const CHECK_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
+const WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS = [150, 250, 400, 700, 1_100, 1_800, 2_500, 3_000];
+const WINDOWS_SERVICE_ERROR_GRACE_MS = 10_000;
 
 const contentElement = query<HTMLDivElement>(".content");
 const enabledInput = query<HTMLInputElement>("#enabled");
@@ -725,7 +729,7 @@ installWindowsServiceButton.addEventListener("click", async () => {
   try {
     const status = requireWindowsServiceStatus(await installWindowsService());
     renderWindowsServiceStatus(status);
-    if (status.running && !status.needsRepair) {
+    if (status.ready) {
       showMessage("Windows DNS 系统服务已安装并启动", false);
       await refreshAfterBackgroundServiceEnabled();
     } else {
@@ -815,15 +819,18 @@ void getVersion().then((version) => {
   appVersionElement.textContent = version;
 });
 
-const [initialWindowsServiceStatus] = await Promise.all([
+let [initialWindowsServiceStatus] = await Promise.all([
   loadWindowsServiceStatus(),
   loadMacosServiceStatus(),
 ]);
+if (isWindows && shouldWaitForWindowsService(initialWindowsServiceStatus)) {
+  initialWindowsServiceStatus = await waitForWindowsServiceReady(initialWindowsServiceStatus);
+}
 const windowsCoreReady =
-  !isWindows ||
-  ((initialWindowsServiceStatus?.running ?? false) &&
-    !(initialWindowsServiceStatus?.needsRepair ?? false));
-const [configReady] = await Promise.all([loadConfig(), loadStorageInfo()]);
+  !isWindows || (initialWindowsServiceStatus?.ready ?? false);
+const [configReady] = windowsCoreReady
+  ? await Promise.all([loadConfig(), loadStorageInfo()])
+  : [false];
 if (!windowsCoreReady && !configReady) {
   activeView = "settings";
 }
@@ -848,7 +855,7 @@ window.setInterval(() => {
     currentMacosServiceStatus?.requiresApproval ||
     currentMacosServiceStatus?.needsRepair ||
     (isWindows &&
-      (!currentWindowsServiceStatus || currentWindowsServiceStatus.needsRepair))
+      (!currentWindowsServiceStatus || !currentWindowsServiceStatus.ready))
   ) {
     void loadMacosServiceStatus();
     void loadWindowsServiceStatus();
@@ -874,7 +881,7 @@ document.addEventListener("visibilitychange", () => {
     }
     if (
       isWindows &&
-      (!currentWindowsServiceStatus || currentWindowsServiceStatus.needsRepair)
+      (!currentWindowsServiceStatus || !currentWindowsServiceStatus.ready)
     ) {
       void loadWindowsServiceStatus();
     }
@@ -998,9 +1005,7 @@ async function refreshAfterBackgroundServiceEnabled(): Promise<void> {
     return;
   }
   backgroundServiceRefreshInFlight = true;
-  // 系统服务启动后 IPC 可能稍晚创建，短暂等待再同步完整状态。
   try {
-    await new Promise((resolve) => window.setTimeout(resolve, 400));
     const [configReady] = await Promise.all([loadConfig(), loadStorageInfo()]);
     if (configReady) {
       await refreshStatus();
@@ -1043,41 +1048,96 @@ async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> 
   if (!isWindows) {
     return null;
   }
+  if (windowsServiceStatusInFlight) {
+    return windowsServiceStatusInFlight;
+  }
   windowsServiceSection.classList.remove("hidden");
-  try {
-    const wasReady =
-      (currentWindowsServiceStatus?.running ?? false) &&
-      !(currentWindowsServiceStatus?.needsRepair ?? false);
-    const status = requireWindowsServiceStatus(await getWindowsServiceStatus());
-    renderWindowsServiceStatus(status);
-    if (
-      initialBootstrapComplete &&
-      status.running &&
-      !status.needsRepair &&
-      !wasReady
-    ) {
-      await refreshAfterBackgroundServiceEnabled();
+  const request = (async (): Promise<WindowsServiceStatus | null> => {
+    try {
+      const wasReady = currentWindowsServiceStatus?.ready ?? false;
+      const status = requireWindowsServiceStatus(await getWindowsServiceStatus());
+      renderWindowsServiceStatus(status);
+      if (initialBootstrapComplete && status.ready && !wasReady) {
+        await refreshAfterBackgroundServiceEnabled();
+      }
+      return status;
+    } catch (error) {
+      const now = Date.now();
+      windowsServiceUnavailableSince ??= now;
+      windowsServiceSection.classList.remove("is-ready");
+      const persistent = now - windowsServiceUnavailableSince >= WINDOWS_SERVICE_ERROR_GRACE_MS;
+      windowsServiceSection.classList.toggle("needs-repair", persistent);
+      windowsServiceStatusElement.textContent = persistent
+        ? `连续读取 Windows 系统服务状态失败：${String(error)}`
+        : "正在等待 Windows 系统服务响应…";
+      return null;
     }
-    return status;
-  } catch (error) {
-    currentWindowsServiceStatus = null;
-    windowsServiceStatusElement.textContent = `读取 Windows 系统服务状态失败：${String(error)}`;
-    return null;
+  })();
+  windowsServiceStatusInFlight = request;
+  try {
+    return await request;
+  } finally {
+    windowsServiceStatusInFlight = null;
   }
 }
 
 function renderWindowsServiceStatus(status: WindowsServiceStatus): void {
   currentWindowsServiceStatus = status;
-  const ready = status.running && !status.needsRepair;
-  windowsServiceSection.classList.toggle("is-ready", ready);
-  windowsServiceSection.classList.toggle("needs-repair", status.needsRepair);
+  const now = Date.now();
+  if (status.ready || !status.running || status.ipcReady) {
+    windowsServiceUnavailableSince = null;
+  } else {
+    windowsServiceUnavailableSince ??= now;
+  }
+  const ipcFailurePersistent =
+    status.running &&
+    !status.ipcReady &&
+    windowsServiceUnavailableSince !== null &&
+    now - windowsServiceUnavailableSince >= WINDOWS_SERVICE_ERROR_GRACE_MS;
+  const showRepair = status.needsRepair || ipcFailurePersistent;
+  windowsServiceSection.classList.toggle("is-ready", status.ready);
+  windowsServiceSection.classList.toggle("needs-repair", showRepair);
   const stateText = WINDOWS_SERVICE_STATE_TEXT[status.state];
   const versionText = status.serviceVersion ? ` 当前服务版本 v${status.serviceVersion}。` : "";
-  windowsServiceStatusElement.textContent =
-    status.running && status.needsRepair
-      ? "系统服务已启动但 IPC 无响应或版本不一致，请点击“安装或修复”。"
-      : `${stateText}${versionText}`;
+  if (status.ready) {
+    windowsServiceStatusElement.textContent = `${stateText}${versionText}`;
+  } else if (status.running && status.ipcReady && status.needsRepair) {
+    windowsServiceStatusElement.textContent = `系统服务版本不一致（当前 ${status.serviceVersion ?? "未知"}，需要 ${status.expectedVersion}），请点击“安装或修复”。`;
+  } else if (status.running && ipcFailurePersistent) {
+    windowsServiceStatusElement.textContent = "系统服务已运行，但 IPC 连续无响应，请点击“安装或修复”。";
+  } else if (status.running && !status.ipcReady) {
+    windowsServiceStatusElement.textContent = "系统服务正在完成启动并建立通信，请稍候…";
+  } else {
+    windowsServiceStatusElement.textContent = `${stateText}${versionText}`;
+  }
   uninstallWindowsServiceButton.disabled = !status.installed;
+}
+
+function shouldWaitForWindowsService(status: WindowsServiceStatus | null): boolean {
+  if (!status) {
+    return true;
+  }
+  if (status.ready || status.needsRepair || !status.installed) {
+    return false;
+  }
+  return status.running || status.state === "start_pending" || status.state === "continue_pending";
+}
+
+async function waitForWindowsServiceReady(
+  initialStatus: WindowsServiceStatus | null,
+): Promise<WindowsServiceStatus | null> {
+  let status = initialStatus;
+  for (const delay of WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS) {
+    if (!shouldWaitForWindowsService(status)) {
+      break;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, delay));
+    const next = await loadWindowsServiceStatus();
+    if (next) {
+      status = next;
+    }
+  }
+  return status;
 }
 
 function requireWindowsServiceStatus(value: unknown): WindowsServiceStatus {
@@ -1090,8 +1150,12 @@ function requireWindowsServiceStatus(value: unknown): WindowsServiceStatus {
     !(status.state in WINDOWS_SERVICE_STATE_TEXT) ||
     typeof status.installed !== "boolean" ||
     typeof status.running !== "boolean" ||
+    typeof status.ready !== "boolean" ||
+    typeof status.ipcReady !== "boolean" ||
     typeof status.expectedVersion !== "string" ||
-    typeof status.needsRepair !== "boolean"
+    typeof status.needsRepair !== "boolean" ||
+    (status.serviceVersion !== null && typeof status.serviceVersion !== "string") ||
+    (status.diagnostic !== null && typeof status.diagnostic !== "string")
   ) {
     throw new Error("Windows 系统服务状态接口返回格式无效");
   }

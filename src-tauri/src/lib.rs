@@ -598,7 +598,7 @@ pub fn run() {
             {
                 app.manage(Arc::new(GuiState {}));
                 match privileged_bridge::ensure_windows_service_current() {
-                    Ok(status) if status.running => {
+                    Ok(status) if status.ready => {
                         if let Ok(config) = privileged_bridge::ServiceClient::call::<_, AppConfig>(
                             "get_config",
                             &serde_json::json!({}),
@@ -683,7 +683,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::{
+        fs,
+        net::{Ipv4Addr, TcpListener},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
     use crate::{config::FilterSubscription, database::Database, service_core::AppState};
@@ -746,20 +750,25 @@ mod tests {
             ..AppConfig::default()
         };
         let database = Arc::new(Database::open_in_memory().unwrap());
-        let data_dir = std::env::temp_dir();
+        let data_dir = std::env::temp_dir().join(format!(
+            "dnsblackhole-hot-swap-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&data_dir).unwrap();
         let state = AppState::new(previous.clone(), database, data_dir.clone(), data_dir);
-        state.start_current("").unwrap();
+        state.start_current().unwrap();
 
         let mut next = previous.clone();
         next.blacklist = "||example.org^".into();
-        assert!(
-            state
-                .try_hot_swap(&previous, &next, &next.blacklist)
-                .unwrap()
-        );
+        assert!(state.try_hot_swap(&previous, &next).unwrap());
         assert_eq!(state.status(false).summary.block_rules, 1);
         assert!(!state.server_needs_start().unwrap());
 
         state.stop_current().unwrap();
+        fs::remove_dir_all(&state.data_dir).unwrap();
     }
 }

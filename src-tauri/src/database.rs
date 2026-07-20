@@ -946,12 +946,8 @@ fn configure_connection(conn: &Connection) -> Result<(), String> {
 }
 
 fn backfill_query_log_stats_if_empty(conn: &Connection) -> Result<(), String> {
-    let existing_logs = conn
-        .query_row("SELECT COUNT(*) FROM query_logs", [], |row| {
-            read_u64(row, 0)
-        })
-        .map_err(|e| format!("检查查询日志回填数据失败：{e}"))?;
-    if existing_logs == 0 {
+    if !table_has_rows(conn, "query_logs").map_err(|e| format!("检查查询日志回填数据失败：{e}"))?
+    {
         return Ok(());
     }
 
@@ -1039,16 +1035,19 @@ fn backfill_stats_table_if_empty(
     table: &str,
     backfill_sql: &str,
 ) -> Result<(), String> {
-    let existing = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-            read_u64(row, 0)
-        })
-        .map_err(|e| format!("检查 {table} 统计失败：{e}"))?;
-    if existing > 0 {
+    if table_has_rows(conn, table).map_err(|e| format!("检查 {table} 统计失败：{e}"))? {
         return Ok(());
     }
     conn.execute_batch(backfill_sql)
         .map_err(|e| format!("回填 {table} 统计失败：{e}"))
+}
+
+fn table_has_rows(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+        [],
+        |row| row.get(0),
+    )
 }
 
 fn add_column_if_missing(

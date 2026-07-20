@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -35,6 +36,7 @@ const PARALLEL_RESULT_WAIT: Duration = Duration::from_secs(6);
 const UDP_SOCKET_POOL_CAPACITY: usize = 8;
 const PROBE_CACHE_TTL_SECONDS: u64 = 600;
 const PROBE_CACHE_MAX_ENTRIES: usize = 4096;
+const UPSTREAM_INIT_MAX_WORKERS: usize = 8;
 const DNSBLACKHOLE_USER_AGENT: &str = concat!("DnsBlackhole/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone)]
@@ -72,10 +74,29 @@ pub(crate) fn build_runtime_upstreams(
     upstream_servers: Vec<UpstreamServer>,
     bootstrap_servers: &[SocketAddr],
 ) -> Vec<RuntimeUpstream> {
-    upstream_servers
-        .into_iter()
-        .map(|server| RuntimeUpstream::new(server, bootstrap_servers))
-        .collect()
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, UPSTREAM_INIT_MAX_WORKERS);
+    let mut servers = upstream_servers.into_iter();
+    let mut initialized = Vec::new();
+    loop {
+        let batch = servers.by_ref().take(worker_count).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let mut batch = thread::scope(|scope| {
+            batch
+                .into_iter()
+                .map(|server| scope.spawn(move || RuntimeUpstream::new(server, bootstrap_servers)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| worker.join().expect("上游初始化线程不应异常退出"))
+                .collect::<Vec<_>>()
+        });
+        initialized.append(&mut batch);
+    }
+    initialized
 }
 
 impl RuntimeUpstream {

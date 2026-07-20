@@ -1,5 +1,6 @@
 #[cfg(target_os = "macos")]
-use std::{os::unix::net::UnixStream, time::Duration};
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -24,8 +25,17 @@ type ServiceStream = WindowsPipeStream;
 pub(crate) struct ServiceClient;
 
 impl ServiceClient {
+    #[cfg(target_os = "macos")]
     pub(crate) fn probe() -> Result<HelloResult, String> {
         let (mut stream, hello) = connect_and_hello()?;
+        verify_connection_alive(&mut stream)?;
+        Ok(hello)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn probe_with_timeout(timeout: Duration) -> Result<HelloResult, String> {
+        let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        let (mut stream, hello) = connect_and_hello_with_timeout(timeout_ms)?;
         verify_connection_alive(&mut stream)?;
         Ok(hello)
     }
@@ -93,7 +103,7 @@ fn verify_connection_alive(stream: &mut ServiceStream) -> Result<(), String> {
 
 fn connect_and_hello() -> Result<(ServiceStream, HelloResult), String> {
     #[cfg(target_os = "macos")]
-    let mut stream = UnixStream::connect(BRIDGE_SOCKET_PATH).map_err(|error| {
+    let stream = UnixStream::connect(BRIDGE_SOCKET_PATH).map_err(|error| {
         // 区分“服务根本没在运行”（socket 不存在或无人监听）与其他连接故障，
         // 前者最常见的原因是服务尚未安装、等待系统设置批准或正在启动。
         let hint = match error.kind() {
@@ -106,7 +116,17 @@ fn connect_and_hello() -> Result<(ServiceStream, HelloResult), String> {
         format!("无法连接 macOS DNS 后台服务，{hint}：{error}")
     })?;
     #[cfg(windows)]
-    let mut stream = WindowsPipeStream::connect()?;
+    let stream = WindowsPipeStream::connect()?;
+    finish_hello(stream)
+}
+
+#[cfg(windows)]
+fn connect_and_hello_with_timeout(timeout_ms: u32) -> Result<(ServiceStream, HelloResult), String> {
+    let stream = WindowsPipeStream::connect_with_timeout(timeout_ms)?;
+    finish_hello(stream)
+}
+
+fn finish_hello(mut stream: ServiceStream) -> Result<(ServiceStream, HelloResult), String> {
     #[cfg(target_os = "macos")]
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))

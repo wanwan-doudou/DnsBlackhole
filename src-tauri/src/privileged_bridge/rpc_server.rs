@@ -84,7 +84,12 @@ pub(crate) fn handle_client<S>(mut stream: S, state: Arc<AppState>) -> Result<bo
 where
     S: Read + Write,
 {
-    if !perform_handshake(&mut stream)? {
+    let handshake_complete = match perform_handshake(&mut stream) {
+        Ok(complete) => complete,
+        Err(error) if connection_closed(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !handshake_complete {
         return Ok(false);
     }
     handle_requests(stream, state)

@@ -17,7 +17,7 @@ use crate::{config::AppConfig, database::Database};
 use super::{
     access::ClientAccess,
     cache::{DnsCacheConfig, DnsCacheStore},
-    filter_runtime::{SharedFilterRuntime, build_filter_runtime, share_filter_runtime},
+    filter_runtime::{FilterRuntime, SharedFilterRuntime, share_filter_runtime},
     protocol::MAX_DNS_PACKET_SIZE,
     stats::{DnsStats, record_error, reset_stats},
     upstream::build_runtime_upstreams,
@@ -26,6 +26,9 @@ use super::{
         QueryLogMessage, dns_worker_loop,
     },
 };
+
+#[cfg(test)]
+use super::filter_runtime::build_filter_runtime;
 
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(500);
 const TCP_ACCEPT_SLEEP: Duration = Duration::from_millis(100);
@@ -52,9 +55,20 @@ pub struct DnsServer {
 }
 
 impl DnsServer {
+    #[cfg(test)]
     pub fn start(
         config: AppConfig,
         rules_text: &str,
+        stats: Arc<Mutex<DnsStats>>,
+        database: Arc<Database>,
+    ) -> Result<Self, String> {
+        let filter_runtime = build_filter_runtime(&config, rules_text);
+        Self::start_with_filter_runtime(config, filter_runtime, stats, database)
+    }
+
+    pub(crate) fn start_with_filter_runtime(
+        config: AppConfig,
+        filter_runtime: FilterRuntime,
         stats: Arc<Mutex<DnsStats>>,
         database: Arc<Database>,
     ) -> Result<Self, String> {
@@ -79,7 +93,7 @@ impl DnsServer {
         let dns_cache =
             DnsCacheStore::from_config(dns_cache_config.clone(), DNS_CACHE_SHARDS).map(Arc::new);
         let dns_cache_config = dns_cache.as_ref().map(|_| dns_cache_config);
-        let filter_runtime = share_filter_runtime(build_filter_runtime(&config, rules_text));
+        let filter_runtime = share_filter_runtime(filter_runtime);
         let listeners = listen_addrs
             .iter()
             .copied()

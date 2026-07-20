@@ -16,8 +16,8 @@ pub struct RuleSummary {
     pub ignored_invalid_rules: usize,
 }
 
-#[derive(Clone)]
-pub struct CompiledRules {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CompiledRules {
     blocks: RuleSet,
     allows: RuleSet,
     /// 清单名称表：规则条目里只存索引，避免几百万条规则各克隆一份清单名
@@ -25,7 +25,7 @@ pub struct CompiledRules {
     summary: RuleSummary,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct RuleSet {
     exact: HashMap<Box<str>, RuleEntry>,
     suffix: HashMap<Box<str>, RuleEntry>,
@@ -33,20 +33,20 @@ struct RuleSet {
 
 /// 绝大多数规则是无修饰符的规范写法（如 `||domain^`），原文可以在命中时由域名重建，
 /// 压缩成 4 字节的 Simple；带修饰符、非规范写法或同域名多条规则时才升级为完整形态。
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 enum RuleEntry {
     Simple(SimpleRule),
     Complex(Box<[ComplexRule]>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct SimpleRule {
     source_id: u16,
     kind: SimpleKind,
 }
 
 /// 能够由域名逐字节重建规则原文的规范形态
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum SimpleKind {
     /// `||domain^`（允许规则为 `@@||domain^`）
     Suffix,
@@ -62,7 +62,7 @@ enum SimpleKind {
     HostsLocal6,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ComplexRule {
     raw: Box<str>,
     source_id: u16,
@@ -72,7 +72,7 @@ struct ComplexRule {
     denyallow: Box<[Box<str>]>,
 }
 
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 enum QueryTypes {
     #[default]
     Any,
@@ -80,7 +80,7 @@ enum QueryTypes {
     Exclude(Box<[u16]>),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum RuleType {
     Exact,
     Suffix,
@@ -187,8 +187,9 @@ pub fn summarize_rules(raw: &str) -> RuleSummary {
 }
 
 pub fn compile_rules(raw: &str) -> CompiledRules {
-    let mut blocks = RuleSet::default();
-    let mut allows = RuleSet::default();
+    let capacities = estimate_rule_capacities(raw);
+    let mut blocks = RuleSet::with_capacities(capacities.block_exact, capacities.block_suffix);
+    let mut allows = RuleSet::with_capacities(capacities.allow_exact, capacities.allow_suffix);
     let mut summary = RuleSummary::default();
     let mut sources: Vec<Box<str>> = vec![DEFAULT_SOURCE.into()];
     let mut source_id: u16 = 0;
@@ -211,6 +212,54 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
         sources,
         summary,
     }
+}
+
+#[derive(Default)]
+struct RuleCapacities {
+    block_exact: usize,
+    block_suffix: usize,
+    allow_exact: usize,
+    allow_suffix: usize,
+}
+
+/// 预估四个索引的容量，避免数百万条规则启动时反复扩容和搬迁哈希表。
+fn estimate_rule_capacities(raw: &str) -> RuleCapacities {
+    let mut capacities = RuleCapacities::default();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('!')
+            || trimmed.contains("$badfilter")
+        {
+            continue;
+        }
+        let (is_allow, rule) = trimmed
+            .strip_prefix("@@")
+            .map_or((false, trimmed), |rule| (true, rule));
+        let pattern = rule.split_once('$').map_or(rule, |(pattern, _)| pattern);
+        let mut parts = pattern.split_whitespace();
+        let host_prefix = parts
+            .next()
+            .is_some_and(|value| matches!(value, "0.0.0.0" | "127.0.0.1" | "::" | "::1"));
+        let exact_count = if host_prefix {
+            parts
+                .take_while(|token| !token.starts_with('#') && !token.starts_with('!'))
+                .count()
+                .max(1)
+        } else {
+            1
+        };
+        let suffix = pattern.starts_with("||") || pattern.starts_with("*.");
+        let capacity = match (is_allow, suffix) {
+            (false, false) => &mut capacities.block_exact,
+            (false, true) => &mut capacities.block_suffix,
+            (true, false) => &mut capacities.allow_exact,
+            (true, true) => &mut capacities.allow_suffix,
+        };
+        *capacity = capacity.saturating_add(exact_count);
+    }
+    capacities
 }
 
 fn count_rule(summary: &mut RuleSummary, parsed: &ParsedRule<'_>) {
@@ -296,6 +345,13 @@ impl CompiledRules {
 }
 
 impl RuleSet {
+    fn with_capacities(exact: usize, suffix: usize) -> Self {
+        Self {
+            exact: HashMap::with_capacity(exact),
+            suffix: HashMap::with_capacity(suffix),
+        }
+    }
+
     fn insert(&mut self, rule: RuleData<'_>, source_id: u16, is_allow: bool) {
         let RuleData {
             domain,

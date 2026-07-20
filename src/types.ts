@@ -38,9 +38,12 @@ export type WindowsServiceStatus = {
   state: WindowsServiceState;
   installed: boolean;
   running: boolean;
+  ready: boolean;
+  ipcReady: boolean;
   expectedVersion: string;
   serviceVersion: string | null;
   needsRepair: boolean;
+  diagnostic: string | null;
 };
 
 export type FilterSubscription = {

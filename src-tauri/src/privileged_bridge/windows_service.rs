@@ -25,7 +25,7 @@ use crate::{service_core::initialize_runtime_blocking, storage};
 
 use super::{
     rpc_server::{handle_client, initialize_state, start_maintenance_tasks},
-    windows_pipe::WindowsPipeStream,
+    windows_pipe::{WindowsPipeListener, WindowsPipeStream},
     windows_service_management::WINDOWS_SERVICE_NAME,
 };
 
@@ -103,16 +103,23 @@ fn run_service_body(
         state_started.elapsed().as_millis()
     ));
     let runtime_started = Instant::now();
-    initialize_dns_runtime(&state, stop_requested, status_handle)?;
+    let rule_source = initialize_dns_runtime(&state, stop_requested, status_handle)?;
     write_service_log(&format!(
-        "规则编译与 DNS 监听初始化完成，耗时 {} ms",
-        runtime_started.elapsed().as_millis()
+        "规则加载与 DNS 监听初始化完成，耗时 {} ms，规则来源：{}",
+        runtime_started.elapsed().as_millis(),
+        match rule_source {
+            Some(crate::dns::RuleLoadSource::Cache) => "编译缓存",
+            Some(crate::dns::RuleLoadSource::Compiled) => "重新编译",
+            None => "未启用",
+        }
     ));
     if stop_requested.load(Ordering::Acquire) {
         state.shutdown();
         return Ok(());
     }
     start_maintenance_tasks(&state);
+    // IPC 监听器必须先于 Running 状态就绪，避免 GUI 在两步之间误判服务损坏。
+    let listener = WindowsPipeListener::bind()?;
     status_handle
         .set_service_status(service_status(
             ServiceState::Running,
@@ -126,25 +133,25 @@ fn run_service_body(
         startup_started.elapsed().as_millis()
     ));
 
-    run_service_loop(stop_requested, state)
+    run_service_loop(stop_requested, state, listener)
 }
 
 fn initialize_dns_runtime(
     state: &Arc<crate::service_core::AppState>,
     stop_requested: &Arc<AtomicBool>,
     status_handle: &service_control_handler::ServiceStatusHandle,
-) -> Result<(), String> {
+) -> Result<Option<crate::dns::RuleLoadSource>, String> {
     let (finished_tx, finished_rx) = mpsc::channel();
     let initial_state = Arc::clone(state);
     thread::spawn(move || {
-        initialize_runtime_blocking(&initial_state);
-        let _ = finished_tx.send(());
+        let source = initialize_runtime_blocking(&initial_state);
+        let _ = finished_tx.send(source);
     });
 
     let mut checkpoint = 1_u32;
     loop {
         match finished_rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(()) => {
+            Ok(source) => {
                 let config = state.current_config()?;
                 let status = state.status_with_log_stats(false, false);
                 if config.enabled && !status.running {
@@ -152,11 +159,11 @@ fn initialize_dns_runtime(
                         .error
                         .unwrap_or_else(|| "DNS 初始化完成但监听线程未运行".to_string()));
                 }
-                return Ok(());
+                return Ok(source);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if stop_requested.load(Ordering::Acquire) {
-                    return Ok(());
+                    return Ok(None);
                 }
                 checkpoint = checkpoint.saturating_add(1);
                 let mut status = service_status(
@@ -180,14 +187,18 @@ fn initialize_dns_runtime(
 fn run_service_loop(
     stop_requested: &Arc<AtomicBool>,
     state: Arc<crate::service_core::AppState>,
+    mut listener: WindowsPipeListener,
 ) -> Result<(), String> {
     let restart_requested = Arc::new(AtomicBool::new(false));
 
     while !stop_requested.load(Ordering::Acquire) && !restart_requested.load(Ordering::Acquire) {
-        let stream = WindowsPipeStream::accept()?;
+        let stream = listener.accept()?;
         if stop_requested.load(Ordering::Acquire) || restart_requested.load(Ordering::Acquire) {
             break;
         }
+
+        // 在处理当前连接前创建下一实例，缩短并发客户端等待新管道的窗口。
+        listener = WindowsPipeListener::bind()?;
 
         let state = Arc::clone(&state);
         let restart_requested = Arc::clone(&restart_requested);

@@ -35,9 +35,10 @@ const WINDOWS_SERVICE_DISPLAY_NAME: &str = "DnsBlackhole DNS Service";
 const SERVICE_BINARY_NAME: &str = "dnsblackhole-service.exe";
 const SERVICE_TRANSITION_ATTEMPTS: usize = 240;
 const SERVICE_TRANSITION_INTERVAL: Duration = Duration::from_millis(250);
+const SERVICE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowsServiceState {
     NotInstalled,
@@ -56,9 +57,12 @@ pub struct WindowsServiceStatus {
     pub state: WindowsServiceState,
     pub installed: bool,
     pub running: bool,
+    pub ready: bool,
+    pub ipc_ready: bool,
     pub expected_version: String,
     pub service_version: Option<String>,
     pub needs_repair: bool,
+    pub diagnostic: Option<String>,
 }
 
 pub(crate) fn ensure_windows_service_current() -> Result<WindowsServiceStatus, String> {
@@ -78,22 +82,9 @@ pub(crate) fn windows_service_status() -> Result<WindowsServiceStatus, String> {
         .map_err(|error| service_error("读取 Windows DNS 服务状态失败", error))?;
     let state = map_service_state(status.current_state);
     let running = status.current_state == ServiceState::Running;
-    let service_version = running
-        .then(ServiceClient::probe)
-        .transpose()
-        .ok()
-        .flatten()
-        .map(|hello| hello.service_version);
     let expected_version = env!("CARGO_PKG_VERSION").to_string();
-    let needs_repair = !running || service_version.as_deref() != Some(expected_version.as_str());
-    Ok(WindowsServiceStatus {
-        state,
-        installed: true,
-        running,
-        expected_version,
-        service_version,
-        needs_repair,
-    })
+    let probe = running.then(|| ServiceClient::probe_with_timeout(SERVICE_STATUS_PROBE_TIMEOUT));
+    Ok(status_from_probe(state, expected_version, probe))
 }
 
 pub(crate) fn install_windows_service(
@@ -288,7 +279,7 @@ fn wait_for_state(
 fn wait_for_service_ready() -> Result<WindowsServiceStatus, String> {
     let mut last = windows_service_status()?;
     for attempt in 0..SERVICE_TRANSITION_ATTEMPTS {
-        if last.running && last.service_version.as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+        if last.ready {
             return Ok(last);
         }
         if attempt + 1 < SERVICE_TRANSITION_ATTEMPTS {
@@ -412,9 +403,51 @@ fn not_installed_status() -> WindowsServiceStatus {
         state: WindowsServiceState::NotInstalled,
         installed: false,
         running: false,
+        ready: false,
+        ipc_ready: false,
         expected_version: env!("CARGO_PKG_VERSION").to_string(),
         service_version: None,
         needs_repair: true,
+        diagnostic: None,
+    }
+}
+
+fn status_from_probe(
+    state: WindowsServiceState,
+    expected_version: String,
+    probe: Option<Result<super::HelloResult, String>>,
+) -> WindowsServiceStatus {
+    let running = state == WindowsServiceState::Running;
+    let (service_version, diagnostic) = match probe {
+        Some(Ok(hello)) => (Some(hello.service_version), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
+    let ipc_ready = running && service_version.is_some();
+    let ready = ipc_ready && service_version.as_deref() == Some(expected_version.as_str());
+    let confirmed_incompatible = diagnostic
+        .as_deref()
+        .is_some_and(|error| error.contains("协议版本不兼容"));
+    let needs_repair = match state {
+        WindowsServiceState::NotInstalled
+        | WindowsServiceState::Stopped
+        | WindowsServiceState::Paused => true,
+        WindowsServiceState::Running => (ipc_ready && !ready) || confirmed_incompatible,
+        WindowsServiceState::StartPending
+        | WindowsServiceState::StopPending
+        | WindowsServiceState::ContinuePending
+        | WindowsServiceState::PausePending => false,
+    };
+    WindowsServiceStatus {
+        state,
+        installed: state != WindowsServiceState::NotInstalled,
+        running,
+        ready,
+        ipc_ready,
+        expected_version,
+        service_version,
+        needs_repair,
+        diagnostic,
     }
 }
 
@@ -434,7 +467,8 @@ fn service_error(context: &str, error: Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::quote_windows_argument;
+    use super::{WindowsServiceState, quote_windows_argument, status_from_probe};
+    use crate::privileged_bridge::{BRIDGE_PROTOCOL_VERSION, HelloResult};
     use std::ffi::OsStr;
 
     #[test]
@@ -447,5 +481,35 @@ mod tests {
             quote_windows_argument(OsStr::new(r"C:\DnsBlackhole\")),
             r#""C:\DnsBlackhole\\""#
         );
+    }
+
+    #[test]
+    fn running_service_without_ipc_is_starting_not_broken() {
+        let status = status_from_probe(
+            WindowsServiceState::Running,
+            "1.2.3".to_string(),
+            Some(Err("管道尚未就绪".to_string())),
+        );
+
+        assert!(status.running);
+        assert!(!status.ready);
+        assert!(!status.ipc_ready);
+        assert!(!status.needs_repair);
+    }
+
+    #[test]
+    fn running_service_with_old_version_requires_repair() {
+        let status = status_from_probe(
+            WindowsServiceState::Running,
+            "1.2.3".to_string(),
+            Some(Ok(HelloResult {
+                protocol_version: BRIDGE_PROTOCOL_VERSION,
+                service_version: "1.2.2".to_string(),
+            })),
+        );
+
+        assert!(status.ipc_ready);
+        assert!(!status.ready);
+        assert!(status.needs_repair);
     }
 }

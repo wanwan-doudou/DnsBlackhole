@@ -3,6 +3,7 @@ mod cache;
 mod filter_runtime;
 mod protocol;
 mod rewrites;
+mod rule_cache;
 mod rules;
 mod server;
 mod stats;
@@ -10,8 +11,9 @@ mod task_pool;
 mod upstream;
 mod worker;
 
-pub(crate) use filter_runtime::{build_filter_runtime, replace_filter_runtime};
+pub(crate) use filter_runtime::{build_filter_runtime_with_rules, replace_filter_runtime};
 pub(crate) use protocol::{DnsResponseAnswer, DnsResponseSummary};
+pub(crate) use rule_cache::{RuleLoadSource, load_or_compile_rules};
 pub use rules::{RuleSummary, summarize_rules};
 pub use server::DnsServer;
 pub use stats::{

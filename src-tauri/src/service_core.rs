@@ -14,8 +14,8 @@ use crate::{
     config::{self, AppConfig},
     database::{Database, LogStats, QueryLogPage},
     dns::{
-        self, DnsServer, DnsStats, RuleSummary, RuntimeStatus, build_filter_runtime,
-        replace_filter_runtime,
+        self, DnsServer, DnsStats, RuleLoadSource, RuleSummary, RuntimeStatus,
+        build_filter_runtime_with_rules, load_or_compile_rules, replace_filter_runtime,
     },
     filters::{self, FilterUpdateReport},
 };
@@ -112,13 +112,16 @@ impl AppState {
         Ok(())
     }
 
-    pub(crate) fn start_current(&self, rules_text: &str) -> Result<(), String> {
+    pub(crate) fn start_current(&self) -> Result<RuleLoadSource, String> {
         self.stop_current()?;
 
         let config = self.current_config()?;
-        let server = DnsServer::start(
+        let loaded_rules = load_or_compile_rules(&self.data_dir, &config);
+        let source = loaded_rules.source;
+        let filter_runtime = build_filter_runtime_with_rules(&config, loaded_rules.rules);
+        let server = DnsServer::start_with_filter_runtime(
             config,
-            rules_text,
+            filter_runtime,
             Arc::clone(&self.stats),
             Arc::clone(&self.database),
         )?;
@@ -136,7 +139,7 @@ impl AppState {
         };
         *current = Some(server);
         self.set_error(None);
-        Ok(())
+        Ok(source)
     }
 
     pub(crate) fn stop_current(&self) -> Result<(), String> {
@@ -165,7 +168,6 @@ impl AppState {
         &self,
         previous: &AppConfig,
         config: &AppConfig,
-        rules_text: &str,
     ) -> Result<bool, String> {
         if needs_dns_restart(previous, config) {
             return Ok(false);
@@ -183,7 +185,8 @@ impl AppState {
             server.filter_runtime_handle()
         };
         // 规则编译可能较耗时，不占用 server 状态锁，避免状态查询和停止操作被长时间阻塞。
-        let runtime = build_filter_runtime(config, rules_text);
+        let loaded_rules = load_or_compile_rules(&self.data_dir, config);
+        let runtime = build_filter_runtime_with_rules(config, loaded_rules.rules);
         let summary = runtime.summary();
         replace_filter_runtime(&filter_runtime, runtime);
         self.set_effective_summary(summary)?;
@@ -192,24 +195,19 @@ impl AppState {
 
     /// 应用新配置：能热替换就热替换，否则重启 DNS 服务。
     /// 调用前需要先完成 replace_config。
-    fn apply_config_change(
-        &self,
-        previous: &AppConfig,
-        config: &AppConfig,
-        rules_text: &str,
-    ) -> Result<(), String> {
+    fn apply_config_change(&self, previous: &AppConfig, config: &AppConfig) -> Result<(), String> {
         if !config.enabled {
             self.stop_current()?;
             self.set_error(None);
             return Ok(());
         }
 
-        if self.try_hot_swap(previous, config, rules_text)? {
+        if self.try_hot_swap(previous, config)? {
             self.set_error(None);
             return Ok(());
         }
 
-        self.start_current(rules_text)
+        self.start_current().map(|_| ())
     }
 
     pub(crate) fn set_error(&self, error: Option<String>) {
@@ -428,8 +426,7 @@ pub(crate) fn save_config_blocking(
         }
         state.set_error(None);
     } else if filter_changed || start_required {
-        let rules_text = config::build_effective_rules(&state.data_dir, &config);
-        if let Err(error) = state.apply_config_change(&previous, &config, &rules_text) {
+        if let Err(error) = state.apply_config_change(&previous, &config) {
             state.set_error(Some(error.clone()));
             return Err(error);
         }
@@ -489,9 +486,8 @@ pub(crate) fn update_filters_blocking(
     state.replace_config(config.clone())?;
 
     if config.enabled {
-        let rules_text = config::build_effective_rules(&state.data_dir, &config);
         state
-            .apply_config_change(&previous, &config, &rules_text)
+            .apply_config_change(&previous, &config)
             .inspect_err(|error| {
                 state.set_error(Some(error.clone()));
             })?;
@@ -520,8 +516,7 @@ pub(crate) fn start_dns_blocking(state: Arc<AppState>) -> Result<RuntimeStatus, 
     config.validate()?;
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
-    let rules_text = config::build_effective_rules(&state.data_dir, &config);
-    state.start_current(&rules_text).inspect_err(|error| {
+    state.start_current().inspect_err(|error| {
         state.set_error(Some(error.clone()));
     })?;
     state.invalidate_log_stats_cache();
@@ -569,9 +564,8 @@ pub(crate) fn clear_filter_cache_blocking(
     state.replace_config(config.clone())?;
 
     if config.enabled {
-        let rules_text = config::build_effective_rules(&state.data_dir, &config);
         state
-            .apply_config_change(&previous, &config, &rules_text)
+            .apply_config_change(&previous, &config)
             .inspect_err(|error| {
                 state.set_error(Some(error.clone()));
             })?;
@@ -706,12 +700,8 @@ pub(crate) fn spawn_runtime_watchdog(state: Arc<AppState>) {
                 }
             };
 
-            if should_restart {
-                // 规则文本不常驻内存，自恢复时从磁盘清单缓存重建
-                let rules_text = config::build_effective_rules(&state.data_dir, &config);
-                if let Err(error) = state.start_current(&rules_text) {
-                    state.set_error(Some(format!("DNS 自恢复重启失败：{error}")));
-                }
+            if should_restart && let Err(error) = state.start_current() {
+                state.set_error(Some(format!("DNS 自恢复重启失败：{error}")));
             }
         }
     });
@@ -724,29 +714,32 @@ pub(crate) fn spawn_initial_runtime(state: Arc<AppState>) {
     });
 }
 
-pub(crate) fn initialize_runtime_blocking(state: &AppState) {
+pub(crate) fn initialize_runtime_blocking(state: &AppState) -> Option<RuleLoadSource> {
     let _runtime_guard = match state.runtime_update_lock.lock() {
         Ok(guard) => guard,
         Err(_) => {
             state.set_error(Some("DNS 初始化任务状态异常".to_string()));
-            return;
+            return None;
         }
     };
     let config = match state.current_config() {
         Ok(config) => config,
         Err(error) => {
             state.set_error(Some(error));
-            return;
+            return None;
         }
     };
     if !config.enabled {
-        return;
+        return None;
     }
 
-    let rules_text = config::build_effective_rules(&state.data_dir, &config);
-    if let Err(error) = state.start_current(&rules_text) {
-        eprintln!("DNS 服务启动失败：{error}");
-        state.set_error(Some(error));
+    match state.start_current() {
+        Ok(source) => Some(source),
+        Err(error) => {
+            eprintln!("DNS 服务启动失败：{error}");
+            state.set_error(Some(error));
+            None
+        }
     }
 }
 
