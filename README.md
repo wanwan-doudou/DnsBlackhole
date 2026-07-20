@@ -8,6 +8,33 @@ DnsBlackhole 可以运行在 Windows 或 macOS 主机上，通过远程黑名单
 
 > 当前 GitHub Release 同时提供 Windows x64 的 NSIS/MSI 安装包和 macOS Universal DMG。
 
+## 界面预览
+
+DnsBlackhole 提供完整的图形界面，可直接查看 DNS 请求趋势、拦截统计、热门域名和客户端活动。
+
+[![DnsBlackhole 仪表盘](image/dashboard.png)](image/dashboard.png)
+
+查询日志会展示请求类型、处理结果、命中过滤器、响应时间和客户端信息，便于定位异常请求与验证规则。
+
+[![DnsBlackhole 查询日志](image/query-log.png)](image/query-log.png)
+
+<details>
+<summary>查看更多界面截图</summary>
+
+| DNS 设置 | 安全防护 |
+| --- | --- |
+| [![DNS 上游与监听设置](image/dns-settings.png)](image/dns-settings.png) | [![客户端访问与查询防护](image/security-protection.png)](image/security-protection.png) |
+
+| DNS 黑名单 | 自定义规则与 DNS 重写 |
+| --- | --- |
+| [![远程 DNS 黑名单](image/blocklists.png)](image/blocklists.png) | [![自定义过滤规则与 DNS 重写](image/custom-rules.png)](image/custom-rules.png) |
+
+### 应用与运行设置
+
+[![DnsBlackhole 应用与运行设置](image/app-settings.png)](image/app-settings.png)
+
+</details>
+
 ## 安装
 
 1. 打开 [最新 Release](https://github.com/wanwan-doudou/DnsBlackhole/releases/latest)。
