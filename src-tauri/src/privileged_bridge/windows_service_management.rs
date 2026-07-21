@@ -4,7 +4,7 @@ use std::{
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr, thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -70,11 +70,17 @@ pub(crate) fn ensure_windows_service_current() -> Result<WindowsServiceStatus, S
 }
 
 pub(crate) fn windows_service_status() -> Result<WindowsServiceStatus, String> {
+    let total_started = Instant::now();
+    let scm_started = Instant::now();
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|error| service_error("连接 Windows 服务管理器失败", error))?;
     let service = match manager.open_service(WINDOWS_SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         Ok(service) => service,
-        Err(error) if is_missing_service(&error) => return Ok(not_installed_status()),
+        Err(error) if is_missing_service(&error) => {
+            crate::performance::log("Windows 服务状态", "SCM 查询", scm_started);
+            crate::performance::log("Windows 服务状态", "总计（未安装）", total_started);
+            return Ok(not_installed_status());
+        }
         Err(error) => return Err(service_error("读取 Windows DNS 服务失败", error)),
     };
     let status = service
@@ -82,9 +88,25 @@ pub(crate) fn windows_service_status() -> Result<WindowsServiceStatus, String> {
         .map_err(|error| service_error("读取 Windows DNS 服务状态失败", error))?;
     let state = map_service_state(status.current_state);
     let running = status.current_state == ServiceState::Running;
+    crate::performance::log("Windows 服务状态", "SCM 查询", scm_started);
     let expected_version = env!("CARGO_PKG_VERSION").to_string();
-    let probe = running.then(|| ServiceClient::probe_with_timeout(SERVICE_STATUS_PROBE_TIMEOUT));
-    Ok(status_from_probe(state, expected_version, probe))
+    let probe = running.then(|| {
+        let started = Instant::now();
+        let result = ServiceClient::probe_with_timeout(SERVICE_STATUS_PROBE_TIMEOUT);
+        crate::performance::log("Windows 服务状态", "IPC 就绪探测", started);
+        result
+    });
+    let result = status_from_probe(state, expected_version, probe);
+    eprintln!(
+        "[Windows 服务状态] state={:?}, ready={}, ipc_ready={}, needs_repair={}, diagnostic={}",
+        result.state,
+        result.ready,
+        result.ipc_ready,
+        result.needs_repair,
+        result.diagnostic.as_deref().unwrap_or("无")
+    );
+    crate::performance::log("Windows 服务状态", "总计", total_started);
+    Ok(result)
 }
 
 pub(crate) fn install_windows_service(

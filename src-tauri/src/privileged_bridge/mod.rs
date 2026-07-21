@@ -28,6 +28,13 @@ pub(crate) use service_management::{
 };
 #[cfg(windows)]
 pub use windows_service::run_service_dispatcher as run_windows_service;
+
+#[cfg(windows)]
+pub(crate) fn write_windows_service_performance_log(message: &str) {
+    if std::env::args_os().any(|argument| argument == "--windows-service") {
+        windows_service::write_service_log(message);
+    }
+}
 #[cfg(windows)]
 pub(crate) use windows_service_management::{
     WindowsServiceStatus, ensure_windows_service_current, install_windows_service,

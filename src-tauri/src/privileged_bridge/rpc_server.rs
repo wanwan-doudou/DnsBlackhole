@@ -2,6 +2,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -52,10 +53,19 @@ struct MigrationParams {
 }
 
 pub(crate) fn initialize_state(default_dir: PathBuf) -> Result<Arc<AppState>, String> {
+    let total_started = Instant::now();
+    let storage_started = Instant::now();
     let bootstrap = storage::initialize_at(default_dir)?;
+    crate::performance::log_service("服务启动", "存储目录初始化", storage_started);
+    let database_started = Instant::now();
     let database = Arc::new(Database::open(&bootstrap.data_dir)?);
+    crate::performance::log_service("服务启动", "数据库打开与结构检查", database_started);
+    let config_started = Instant::now();
     let config = database.load_or_default_config()?;
+    crate::performance::log_service("服务启动", "配置读取", config_started);
+    let cleanup_started = Instant::now();
     storage::finish_pending_cleanup(&bootstrap.default_dir, &bootstrap.data_dir)?;
+    crate::performance::log_service("服务启动", "迁移残留清理", cleanup_started);
     let state = Arc::new(AppState::new(
         config,
         database,
@@ -65,6 +75,7 @@ pub(crate) fn initialize_state(default_dir: PathBuf) -> Result<Arc<AppState>, St
     if let Some(error) = bootstrap.migration_error {
         state.set_error(Some(error));
     }
+    crate::performance::log_service("服务启动", "状态初始化总计", total_started);
     Ok(state)
 }
 

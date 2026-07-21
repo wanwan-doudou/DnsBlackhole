@@ -72,18 +72,24 @@ impl DnsServer {
         stats: Arc<Mutex<DnsStats>>,
         database: Arc<Database>,
     ) -> Result<Self, String> {
+        let total_started = Instant::now();
+        let config_started = Instant::now();
         config.validate()?;
 
         let listen_addrs = config.listen_socket_addrs()?;
         let bootstrap_servers = config.bootstrap_servers()?;
-        let upstream_servers = Arc::new(build_runtime_upstreams(
-            config.upstream_servers()?,
-            &bootstrap_servers,
-        ));
-        let fallback_upstream_servers = Arc::new(build_runtime_upstreams(
-            config.fallback_servers()?,
-            &bootstrap_servers,
-        ));
+        let upstream_config = config.upstream_servers()?;
+        let fallback_config = config.fallback_servers()?;
+        crate::performance::log_service("DNS 服务实例", "配置解析与校验", config_started);
+        let upstream_started = Instant::now();
+        let upstream_servers =
+            Arc::new(build_runtime_upstreams(upstream_config, &bootstrap_servers));
+        crate::performance::log_service("DNS 服务实例", "主上游初始化", upstream_started);
+        let fallback_started = Instant::now();
+        let fallback_upstream_servers =
+            Arc::new(build_runtime_upstreams(fallback_config, &bootstrap_servers));
+        crate::performance::log_service("DNS 服务实例", "备用上游初始化", fallback_started);
+        let runtime_state_started = Instant::now();
         let upstream_mode = config.upstream_mode.clone();
         let query_log_enabled = config.query_log_enabled;
         let anonymize_client_ip = config.anonymize_client_ip;
@@ -94,12 +100,20 @@ impl DnsServer {
             DnsCacheStore::from_config(dns_cache_config.clone(), DNS_CACHE_SHARDS).map(Arc::new);
         let dns_cache_config = dns_cache.as_ref().map(|_| dns_cache_config);
         let filter_runtime = share_filter_runtime(filter_runtime);
+        crate::performance::log_service(
+            "DNS 服务实例",
+            "访问控制与缓存初始化",
+            runtime_state_started,
+        );
+        let listener_started = Instant::now();
         let listeners = listen_addrs
             .iter()
             .copied()
             .map(|addr| bind_listener_pair(addr, addr.is_ipv6() && config.listen_ipv6))
             .collect::<Result<Vec<_>, _>>()?;
+        crate::performance::log_service("DNS 服务实例", "监听端口绑定", listener_started);
 
+        let threads_started = Instant::now();
         reset_stats(&stats);
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
@@ -176,12 +190,15 @@ impl DnsServer {
             threads.push(thread);
         }
 
-        Ok(Self {
+        let server = Self {
             stop,
             threads,
             cache: dns_cache,
             filter_runtime,
-        })
+        };
+        crate::performance::log_service("DNS 服务实例", "工作线程启动", threads_started);
+        crate::performance::log_service("DNS 服务实例", "总计", total_started);
+        Ok(server)
     }
 
     pub fn clear_cache(&self) -> Result<(), String> {

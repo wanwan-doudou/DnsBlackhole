@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,12 @@ pub(crate) struct FilterCacheClearResult {
     pub(crate) message: String,
 }
 
+#[derive(Clone, Copy)]
+enum FilterUpdateScope {
+    ManualAll,
+    AutomaticDueAt(u64),
+}
+
 impl AppState {
     pub(crate) fn new(
         config: AppConfig,
@@ -113,18 +119,27 @@ impl AppState {
     }
 
     pub(crate) fn start_current(&self) -> Result<RuleLoadSource, String> {
+        let total_started = Instant::now();
+        let stop_started = Instant::now();
         self.stop_current()?;
+        crate::performance::log_service("DNS 核心启动", "停止旧运行实例", stop_started);
 
         let config = self.current_config()?;
+        let rules_started = Instant::now();
         let loaded_rules = load_or_compile_rules(&self.data_dir, &config);
+        crate::performance::log_service("DNS 核心启动", "规则加载", rules_started);
         let source = loaded_rules.source;
+        let filter_runtime_started = Instant::now();
         let filter_runtime = build_filter_runtime_with_rules(&config, loaded_rules.rules);
+        crate::performance::log_service("DNS 核心启动", "过滤运行时构建", filter_runtime_started);
+        let server_started = Instant::now();
         let server = DnsServer::start_with_filter_runtime(
             config,
             filter_runtime,
             Arc::clone(&self.stats),
             Arc::clone(&self.database),
         )?;
+        crate::performance::log_service("DNS 核心启动", "DNS 服务实例", server_started);
         let summary = server.rule_summary();
         if let Err(error) = self.set_effective_summary(summary) {
             server.stop();
@@ -139,6 +154,7 @@ impl AppState {
         };
         *current = Some(server);
         self.set_error(None);
+        crate::performance::log_service("DNS 核心启动", "总计", total_started);
         Ok(source)
     }
 
@@ -225,6 +241,7 @@ impl AppState {
         force_log_stats: bool,
         include_log_stats: bool,
     ) -> RuntimeStatus {
+        let total_started = Instant::now();
         let config = self.current_config().unwrap_or_default();
         let summary = self
             .effective_summary
@@ -237,6 +254,7 @@ impl AppState {
             .map(|stats| stats.clone())
             .unwrap_or_default();
         if config.query_log_enabled && include_log_stats {
+            let log_stats_started = Instant::now();
             match self.cached_log_stats(config.query_log_retention_hours, force_log_stats) {
                 Ok(log_stats) => {
                     stats.queries = log_stats.queries;
@@ -253,6 +271,9 @@ impl AppState {
                 }
                 Err(error) => self.set_error(Some(error)),
             }
+            if force_log_stats {
+                crate::performance::log_service("首页数据", "查询日志统计", log_stats_started);
+            }
         }
         let error = self.last_error.lock().ok().and_then(|error| error.clone());
         let running = self
@@ -262,7 +283,11 @@ impl AppState {
             .and_then(|server| server.as_ref().map(|server| !server.has_finished_threads()))
             .unwrap_or(false);
 
-        dns::empty_status(&config, running, summary, stats, error)
+        let status = dns::empty_status(&config, running, summary, stats, error);
+        if force_log_stats {
+            crate::performance::log_service("首页数据", "状态快照总计", total_started);
+        }
+        status
     }
 
     fn cached_log_stats(
@@ -468,7 +493,23 @@ pub(crate) fn query_logs_blocking(
 /// 更新启用的远程清单并应用。前端事件通知由调用方处理。
 pub(crate) fn update_filters_blocking(
     state: Arc<AppState>,
+    config: AppConfig,
+) -> Result<FilterUpdateResult, String> {
+    update_filters_blocking_with_scope(state, config, FilterUpdateScope::ManualAll)
+}
+
+fn update_due_filters_blocking(
+    state: Arc<AppState>,
+    config: AppConfig,
+    now: u64,
+) -> Result<FilterUpdateResult, String> {
+    update_filters_blocking_with_scope(state, config, FilterUpdateScope::AutomaticDueAt(now))
+}
+
+fn update_filters_blocking_with_scope(
+    state: Arc<AppState>,
     mut config: AppConfig,
+    scope: FilterUpdateScope,
 ) -> Result<FilterUpdateResult, String> {
     let _update_guard = state
         .filter_update_lock
@@ -476,7 +517,14 @@ pub(crate) fn update_filters_blocking(
         .map_err(|_| "清单更新任务状态异常".to_string())?;
     config::migrate_legacy_defaults(&mut config);
     config.validate()?;
-    let report = filters::update_enabled_filters(&state.data_dir, &mut config)?;
+    let report = match scope {
+        FilterUpdateScope::ManualAll => {
+            filters::update_enabled_filters(&state.data_dir, &mut config)?
+        }
+        FilterUpdateScope::AutomaticDueAt(now) => {
+            filters::update_due_filters(&state.data_dir, &mut config, now)?
+        }
+    };
     let _runtime_guard = state
         .runtime_update_lock
         .lock()
@@ -485,20 +533,26 @@ pub(crate) fn update_filters_blocking(
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
 
-    if config.enabled {
+    let rules_may_have_changed =
+        matches!(scope, FilterUpdateScope::ManualAll) || report.updated > 0;
+    if config.enabled && rules_may_have_changed {
         state
             .apply_config_change(&previous, &config)
             .inspect_err(|error| {
                 state.set_error(Some(error.clone()));
             })?;
-    } else {
+    } else if !config.enabled {
         state.set_effective_summary(configured_rule_summary(&config))?;
     }
 
     apply_update_report_error(&state, &report);
 
+    let status = match scope {
+        FilterUpdateScope::ManualAll => state.status(true),
+        FilterUpdateScope::AutomaticDueAt(_) => state.status_with_log_stats(false, false),
+    };
     Ok(FilterUpdateResult {
-        status: state.status(true),
+        status,
         updated: report.updated,
         failed: report.failed,
         message: report.message,
@@ -613,7 +667,7 @@ fn apply_update_report_error(state: &AppState, report: &FilterUpdateReport) {
     }
 }
 
-/// 后台按 filter_update_interval_hours 自动更新启用的远程清单。
+/// 后台按 filter_update_interval_hours 仅更新已到期或从未成功更新的远程清单。
 /// 成功后靠 last_updated 推进下一轮；失败时指数退避，避免网络故障期间频繁请求远端。
 /// 更新成功后通过 on_updated 通知调用方（进程内运行的平台借此向前端推送事件）。
 pub(crate) fn spawn_filter_auto_update<F>(state: Arc<AppState>, on_updated: F)
@@ -637,32 +691,29 @@ where
             if !config.use_filters {
                 continue;
             }
-            let interval_seconds = u64::from(config.filter_update_interval_hours) * 3600;
-            let due = config.filters.iter().any(|filter| {
-                filter.enabled
-                    && filter
-                        .last_updated
-                        .is_none_or(|updated| now.saturating_sub(updated) >= interval_seconds)
-            });
-            if !due {
+            if !filters::has_due_filters(&config, now) {
                 continue;
             }
 
-            match update_filters_blocking(Arc::clone(&state), config) {
-                Ok(result) if result.failed == 0 => {
-                    backoff_seconds = 0;
-                    backoff_until = 0;
+            let update_complete = match update_due_filters_blocking(Arc::clone(&state), config, now)
+            {
+                Ok(result) => {
                     if let Ok(latest) = state.current_config() {
                         on_updated(&latest);
                     }
+                    result.failed == 0
                 }
-                _ => {
-                    backoff_seconds = (backoff_seconds * 2).clamp(
-                        FILTER_AUTO_UPDATE_MIN_BACKOFF_SECONDS,
-                        FILTER_AUTO_UPDATE_MAX_BACKOFF_SECONDS,
-                    );
-                    backoff_until = now.saturating_add(backoff_seconds);
-                }
+                Err(_) => false,
+            };
+            if update_complete {
+                backoff_seconds = 0;
+                backoff_until = 0;
+            } else {
+                backoff_seconds = (backoff_seconds * 2).clamp(
+                    FILTER_AUTO_UPDATE_MIN_BACKOFF_SECONDS,
+                    FILTER_AUTO_UPDATE_MAX_BACKOFF_SECONDS,
+                );
+                backoff_until = now.saturating_add(backoff_seconds);
             }
         }
     });
@@ -715,6 +766,8 @@ pub(crate) fn spawn_initial_runtime(state: Arc<AppState>) {
 }
 
 pub(crate) fn initialize_runtime_blocking(state: &AppState) -> Option<RuleLoadSource> {
+    let total_started = Instant::now();
+    let lock_started = Instant::now();
     let _runtime_guard = match state.runtime_update_lock.lock() {
         Ok(guard) => guard,
         Err(_) => {
@@ -722,6 +775,7 @@ pub(crate) fn initialize_runtime_blocking(state: &AppState) -> Option<RuleLoadSo
             return None;
         }
     };
+    crate::performance::log_service("服务启动", "DNS 初始化锁等待", lock_started);
     let config = match state.current_config() {
         Ok(config) => config,
         Err(error) => {
@@ -733,14 +787,16 @@ pub(crate) fn initialize_runtime_blocking(state: &AppState) -> Option<RuleLoadSo
         return None;
     }
 
-    match state.start_current() {
+    let result = match state.start_current() {
         Ok(source) => Some(source),
         Err(error) => {
             eprintln!("DNS 服务启动失败：{error}");
             state.set_error(Some(error));
             None
         }
-    }
+    };
+    crate::performance::log_service("服务启动", "DNS 运行时初始化总计", total_started);
+    result
 }
 
 fn unix_now() -> u64 {

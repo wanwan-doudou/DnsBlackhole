@@ -6,7 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(not(test))]
@@ -50,19 +50,31 @@ struct RuleCacheOwned {
 }
 
 pub(crate) fn load_or_compile_rules(data_dir: &Path, app_config: &AppConfig) -> LoadedRules {
+    let total_started = Instant::now();
+    let fingerprint_started = Instant::now();
     let fingerprint = effective_rules_fingerprint(data_dir, app_config);
+    crate::performance::log_service("规则加载", "规则指纹计算", fingerprint_started);
     LATEST_CACHE_FINGERPRINT.store(fingerprint, Ordering::Release);
     let cache_path = rule_cache_path(data_dir);
+    let cache_started = Instant::now();
     if let Ok(rules) = load_rule_cache(&cache_path, fingerprint) {
+        crate::performance::log_service("规则加载", "编译缓存反序列化", cache_started);
+        crate::performance::log_service("规则加载", "总计（命中缓存）", total_started);
         return LoadedRules {
             rules: Arc::new(rules),
             source: RuleLoadSource::Cache,
         };
     }
+    crate::performance::log_service("规则加载", "缓存检查（未命中）", cache_started);
 
+    let rules_text_started = Instant::now();
     let rules_text = config::build_effective_rules(data_dir, app_config);
+    crate::performance::log_service("规则加载", "规则文本合并", rules_text_started);
+    let compile_started = Instant::now();
     let rules = Arc::new(compile_rules(&rules_text));
+    crate::performance::log_service("规则加载", "规则编译", compile_started);
     persist_rule_cache(cache_path, fingerprint, Arc::clone(&rules));
+    crate::performance::log_service("规则加载", "总计（重新编译）", total_started);
     LoadedRules {
         rules,
         source: RuleLoadSource::Compiled,

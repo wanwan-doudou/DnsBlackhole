@@ -1,6 +1,6 @@
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -34,10 +34,15 @@ impl ServiceClient {
 
     #[cfg(windows)]
     pub(crate) fn probe_with_timeout(timeout: Duration) -> Result<HelloResult, String> {
+        let started = Instant::now();
         let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-        let (mut stream, hello) = connect_and_hello_with_timeout(timeout_ms)?;
-        verify_connection_alive(&mut stream)?;
-        Ok(hello)
+        let result = (|| {
+            let (mut stream, hello) = connect_and_hello_with_timeout(timeout_ms)?;
+            verify_connection_alive(&mut stream)?;
+            Ok(hello)
+        })();
+        crate::performance::log("IPC 客户端", "服务就绪探测", started);
+        result
     }
 
     pub(crate) fn call<P, R>(method: &str, params: &P) -> Result<R, String>
@@ -62,8 +67,17 @@ impl ServiceClient {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let (mut stream, hello) = connect_and_hello()?;
+        let total_started = Instant::now();
+        let connect_started = Instant::now();
+        let connection = connect_and_hello();
+        crate::performance::log(
+            "IPC 客户端",
+            &format!("{method} 连接与握手"),
+            connect_started,
+        );
+        let (mut stream, hello) = connection?;
         if require_current_version && hello.service_version != EXPECTED_SERVICE_VERSION {
+            crate::performance::log("IPC 客户端", &format!("{method} 总计"), total_started);
             return Err(format!(
                 "DNS 后台服务版本不一致：应用 {}，服务 {}。请安装或修复后台服务",
                 EXPECTED_SERVICE_VERSION, hello.service_version
@@ -76,8 +90,15 @@ impl ServiceClient {
             params: serde_json::to_value(params)
                 .map_err(|error| format!("构造后台服务请求失败：{error}"))?,
         };
-        write_message(&mut stream, &request)?;
-        read_result(&mut stream, 2)
+        let request_started = Instant::now();
+        let result = write_message(&mut stream, &request).and_then(|_| read_result(&mut stream, 2));
+        crate::performance::log(
+            "IPC 客户端",
+            &format!("{method} 请求与响应"),
+            request_started,
+        );
+        crate::performance::log("IPC 客户端", &format!("{method} 总计"), total_started);
+        result
     }
 }
 

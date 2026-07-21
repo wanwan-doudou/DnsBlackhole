@@ -13,11 +13,19 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 9;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
 const MAX_FILTER_SIZE_MB: u32 = 256;
 const LEGACY_DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 100;
+const LEGACY_ADGUARD_DNS_FILTER_URL: &str =
+    "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
+const LEGACY_ADAWAY_FILTER_URL: &str =
+    "https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt";
+const DEFAULT_ADGUARD_DNS_FILTER_URL: &str =
+    "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/assets/filter_1.txt";
+const DEFAULT_ADAWAY_FILTER_URL: &str =
+    "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/assets/filter_2.txt";
 static BOOTSTRAP_QUERY_ID: AtomicU16 = AtomicU16::new(0x1234);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,13 +520,13 @@ pub fn default_filters() -> Vec<FilterSubscription> {
         FilterSubscription {
             id: "adguard-dns-filter".into(),
             name: "AdGuard DNS filter".into(),
-            url: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt".into(),
+            url: DEFAULT_ADGUARD_DNS_FILTER_URL.into(),
             ..FilterSubscription::default()
         },
         FilterSubscription {
             id: "adaway-default-blocklist".into(),
             name: "AdAway Default Blocklist".into(),
-            url: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt".into(),
+            url: DEFAULT_ADAWAY_FILTER_URL.into(),
             ..FilterSubscription::default()
         },
         FilterSubscription {
@@ -1002,6 +1010,9 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
         // 路由器做 DNS 转发时，几十到上百台设备可能共用同一个来源 IP。
         config.rate_limit_per_second = default_rate_limit_per_second();
     }
+    if config.schema_version < 9 {
+        migrate_legacy_filter_urls(config);
+    }
     if config.schema_version < 1 {
         if config.allowed_clients.trim().is_empty() {
             config.allowed_clients = default_allowed_clients();
@@ -1035,6 +1046,21 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
         config.fallback_dns = default_fallback_dns();
     }
     config.schema_version = CURRENT_CONFIG_SCHEMA_VERSION;
+}
+
+fn migrate_legacy_filter_urls(config: &mut AppConfig) {
+    for filter in &mut config.filters {
+        let replacement = match filter.url.trim() {
+            LEGACY_ADGUARD_DNS_FILTER_URL => Some(DEFAULT_ADGUARD_DNS_FILTER_URL),
+            LEGACY_ADAWAY_FILTER_URL => Some(DEFAULT_ADAWAY_FILTER_URL),
+            _ => None,
+        };
+        if let Some(url) = replacement {
+            filter.url = url.into();
+            // 旧地址的网络错误不应继续污染迁移后的订阅状态。
+            filter.last_error = None;
+        }
+    }
 }
 
 fn is_legacy_default_fallback_dns(fallback_dns: &str) -> bool {
@@ -1383,15 +1409,9 @@ mod tests {
         );
         assert_eq!(config.filters.len(), 3);
         assert_eq!(config.filters[0].name, "AdGuard DNS filter");
-        assert_eq!(
-            config.filters[0].url,
-            "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"
-        );
+        assert_eq!(config.filters[0].url, DEFAULT_ADGUARD_DNS_FILTER_URL);
         assert_eq!(config.filters[1].name, "AdAway Default Blocklist");
-        assert_eq!(
-            config.filters[1].url,
-            "https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt"
-        );
+        assert_eq!(config.filters[1].url, DEFAULT_ADAWAY_FILTER_URL);
         assert_eq!(config.filters[2].name, "AdBlock DNS Filters");
         assert_eq!(
             config.filters[2].url,
@@ -1480,6 +1500,40 @@ mod tests {
         };
         migrate_legacy_defaults(&mut custom);
         assert_eq!(custom.rate_limit_per_second, 500);
+    }
+
+    #[test]
+    fn migrates_legacy_filter_urls_but_preserves_custom_sources() {
+        let mut config = AppConfig {
+            schema_version: 8,
+            filters: vec![
+                FilterSubscription {
+                    id: "adguard-dns-filter".into(),
+                    url: LEGACY_ADGUARD_DNS_FILTER_URL.into(),
+                    last_error: Some("旧地址下载失败".into()),
+                    ..FilterSubscription::default()
+                },
+                FilterSubscription {
+                    id: "adaway-default-blocklist".into(),
+                    url: LEGACY_ADAWAY_FILTER_URL.into(),
+                    ..FilterSubscription::default()
+                },
+                FilterSubscription {
+                    id: "custom".into(),
+                    url: "https://example.com/custom.txt".into(),
+                    ..FilterSubscription::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+
+        migrate_legacy_defaults(&mut config);
+
+        assert_eq!(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.filters[0].url, DEFAULT_ADGUARD_DNS_FILTER_URL);
+        assert!(config.filters[0].last_error.is_none());
+        assert_eq!(config.filters[1].url, DEFAULT_ADAWAY_FILTER_URL);
+        assert_eq!(config.filters[2].url, "https://example.com/custom.txt");
     }
 
     #[test]

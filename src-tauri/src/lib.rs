@@ -2,6 +2,7 @@ mod config;
 mod database;
 mod dns;
 mod filters;
+mod performance;
 pub mod privileged_bridge;
 mod service_core;
 mod storage;
@@ -9,7 +10,7 @@ mod tray;
 
 #[cfg(not(any(target_os = "macos", windows)))]
 use std::path::Path;
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Instant};
 
 use config::AppConfig;
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -38,6 +39,20 @@ struct GuiState {
     local: Option<Arc<AppState>>,
 }
 
+#[tauri::command]
+fn record_frontend_timing(
+    module: String,
+    duration_ms: f64,
+    since_start_ms: f64,
+    detail: Option<String>,
+) {
+    let detail = detail
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("，{value}"))
+        .unwrap_or_default();
+    eprintln!("[加载耗时][前端 +{since_start_ms:.1} ms] {module}：{duration_ms:.1} ms{detail}");
+}
+
 #[cfg(not(any(target_os = "macos", windows)))]
 impl GuiState {
     fn local(&self) -> Result<Arc<AppState>, String> {
@@ -50,11 +65,12 @@ impl GuiState {
 
 #[tauri::command]
 async fn get_config(state: tauri::State<'_, Arc<GuiState>>) -> Result<AppConfig, String> {
+    let started = Instant::now();
     #[cfg(any(target_os = "macos", windows))]
     let _ = state;
     #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call("get_config", &serde_json::json!({}))
@@ -65,16 +81,19 @@ async fn get_config(state: tauri::State<'_, Arc<GuiState>>) -> Result<AppConfig,
         }
     })
     .await
-    .map_err(|error| format!("读取配置任务异常：{error}"))?
+    .map_err(|error| format!("读取配置任务异常：{error}"))?;
+    performance::log("GUI 命令", "get_config", started);
+    result
 }
 
 #[tauri::command]
 async fn get_storage_info(state: tauri::State<'_, Arc<GuiState>>) -> Result<StorageInfo, String> {
+    let started = Instant::now();
     #[cfg(any(target_os = "macos", windows))]
     let _ = state;
     #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call("get_storage_info", &serde_json::json!({}))
@@ -86,7 +105,9 @@ async fn get_storage_info(state: tauri::State<'_, Arc<GuiState>>) -> Result<Stor
         }
     })
     .await
-    .map_err(|error| format!("读取存储信息任务异常：{error}"))?
+    .map_err(|error| format!("读取存储信息任务异常：{error}"))?;
+    performance::log("GUI 命令", "get_storage_info", started);
+    result
 }
 
 #[tauri::command]
@@ -176,11 +197,14 @@ fn serialize_windows_service_status(
 #[cfg(windows)]
 #[tauri::command]
 async fn get_windows_service_status() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    let started = Instant::now();
+    let result = tauri::async_runtime::spawn_blocking(|| {
         serialize_windows_service_status(privileged_bridge::windows_service_status()?)
     })
     .await
-    .map_err(|error| format!("读取 Windows 后台服务状态任务异常：{error}"))?
+    .map_err(|error| format!("读取 Windows 后台服务状态任务异常：{error}"))?;
+    performance::log("GUI 命令", "get_windows_service_status", started);
+    result
 }
 
 #[cfg(not(windows))]
@@ -260,11 +284,12 @@ async fn get_status(
     force: Option<bool>,
     include_log_stats: Option<bool>,
 ) -> Result<RuntimeStatus, String> {
+    let started = Instant::now();
     #[cfg(any(target_os = "macos", windows))]
     let _ = state;
     #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call(
@@ -283,7 +308,9 @@ async fn get_status(
         }
     })
     .await
-    .map_err(|error| format!("获取状态失败：{error}"))?
+    .map_err(|error| format!("获取状态失败：{error}"))?;
+    performance::log("GUI 命令", "get_status", started);
+    result
 }
 
 #[tauri::command]
@@ -529,6 +556,7 @@ fn cleanup_legacy_debug_autostart(app: &tauri::AppHandle) -> Result<(), String> 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let application_started = Instant::now();
     #[cfg(target_os = "macos")]
     // Universal 安装包同时覆盖 Apple Silicon 与 Intel，使用固定目标读取同一份更新清单。
     let updater = tauri_plugin_updater::Builder::new().target("darwin-universal");
@@ -544,6 +572,7 @@ pub fn run() {
         .plugin(updater.build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
+            record_frontend_timing,
             get_config,
             get_storage_info,
             request_data_migration,
@@ -563,21 +592,30 @@ pub fn run() {
             clear_dns_cache,
             clear_filter_cache
         ])
-        .setup(|app| {
+        .setup(move |app| {
+            let setup_started = Instant::now();
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-            app.handle()
-                .plugin(tauri_plugin_autostart::init(
-                    MacosLauncher::LaunchAgent,
-                    None,
-                ))
-                .map_err(|error| io::Error::other(format!("开机自启插件初始化失败：{error}")))?;
+            {
+                let started = Instant::now();
+                app.handle()
+                    .plugin(tauri_plugin_autostart::init(
+                        MacosLauncher::LaunchAgent,
+                        None,
+                    ))
+                    .map_err(|error| {
+                        io::Error::other(format!("开机自启插件初始化失败：{error}"))
+                    })?;
+                performance::log("GUI 启动", "开机自启插件", started);
+            }
 
             #[cfg(all(windows, debug_assertions))]
             if let Err(error) = cleanup_legacy_debug_autostart(app.handle()) {
                 eprintln!("{error}");
             }
 
+            let tray_started = Instant::now();
             tray::create(app.handle())?;
+            performance::log("GUI 启动", "托盘菜单", tray_started);
             #[cfg(target_os = "macos")]
             {
                 app.manage(Arc::new(GuiState {}));
@@ -597,6 +635,7 @@ pub fn run() {
             #[cfg(windows)]
             {
                 app.manage(Arc::new(GuiState {}));
+                let service_status_started = Instant::now();
                 match privileged_bridge::ensure_windows_service_current() {
                     Ok(status) if status.ready => {
                         if let Ok(config) = privileged_bridge::ServiceClient::call::<_, AppConfig>(
@@ -611,6 +650,11 @@ pub fn run() {
                     Ok(_) => {}
                     Err(error) => eprintln!("读取 Windows DNS 后台服务状态失败：{error}"),
                 }
+                performance::log(
+                    "GUI 启动",
+                    "Windows 服务状态与配置同步",
+                    service_status_started,
+                );
             }
 
             #[cfg(not(any(target_os = "macos", windows)))]
@@ -662,6 +706,8 @@ pub fn run() {
                     let _ = app_handle.emit("filters-updated", &config.filters);
                 });
             }
+            performance::log("GUI 启动", "setup 总计", setup_started);
+            performance::log("GUI 启动", "进程启动至 setup 完成", application_started);
             Ok(())
         })
         .on_window_event(|window, event| {

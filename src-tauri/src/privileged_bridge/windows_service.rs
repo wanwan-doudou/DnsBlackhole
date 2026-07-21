@@ -236,7 +236,7 @@ fn service_status(
     }
 }
 
-fn write_service_log(message: &str) {
+pub(super) fn write_service_log(message: &str) {
     let Ok(data_dir) = storage::windows_service_default_dir() else {
         return;
     };

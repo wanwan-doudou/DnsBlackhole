@@ -4,7 +4,7 @@ use std::{
     net::IpAddr,
     path::Path,
     sync::Mutex,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, named_params, params};
@@ -91,6 +91,7 @@ const UPSERT_QUERY_LOG_BLOCKLIST_STATS_SQL: &str = "
     ON CONFLICT(minute, rule_source) DO UPDATE SET
         hits = hits + 1";
 const READ_CONNECTION_POOL_SIZE: usize = 4;
+type DomainRankings = (HashMap<String, u64>, HashMap<String, u64>);
 
 struct QueryLogStatsStatements<'connection> {
     minute: rusqlite::Statement<'connection>,
@@ -180,16 +181,24 @@ pub struct LogStats {
 
 impl Database {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
+        let total_started = Instant::now();
         let path = crate::storage::database_path(data_dir);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("创建数据库目录失败：{e}"))?;
         }
+        let connection_started = Instant::now();
         let conn = Connection::open(&path).map_err(|e| format!("打开数据库失败：{e}"))?;
+        crate::performance::log_service("数据库启动", "主连接打开", connection_started);
+        let schema_started = Instant::now();
         let mut database = Self::from_connection(conn)?;
+        crate::performance::log_service("数据库启动", "连接配置与结构检查", schema_started);
         // 主连接完成建表和 WAL 设置后再打开只读连接
+        let read_pool_started = Instant::now();
         database.read_conns = (0..READ_CONNECTION_POOL_SIZE)
             .filter_map(|_| open_read_connection(&path))
             .collect();
+        crate::performance::log_service("数据库启动", "只读连接池", read_pool_started);
+        crate::performance::log_service("数据库启动", "总计", total_started);
         Ok(database)
     }
 
@@ -497,13 +506,14 @@ fn log_stats_with_connection(
     retention_hours: u32,
 ) -> Result<LogStats, String> {
     let (queries, blocked, forwarded, failed) = total_log_counts(conn, since_minute)?;
+    let (query_domains, blocked_domains) = grouped_domain_counts(conn, since_minute)?;
     Ok(LogStats {
         queries,
         blocked,
         forwarded,
         failed,
-        query_domains: grouped_domain_counts(conn, since_minute, false)?,
-        blocked_domains: grouped_domain_counts(conn, since_minute, true)?,
+        query_domains,
+        blocked_domains,
         client_requests: client_request_counts(conn, since)?,
         blocklist_hits: blocklist_hit_counts(conn, since)?,
         traffic: traffic_buckets(conn, since_minute, retention_hours)?,
@@ -537,10 +547,7 @@ fn parallel_log_stats(
             let conn = domains_conn
                 .lock()
                 .map_err(|_| "数据库域名排行连接已损坏".to_string())?;
-            Ok::<_, String>((
-                grouped_domain_counts(&conn, since_minute, false)?,
-                grouped_domain_counts(&conn, since_minute, true)?,
-            ))
+            grouped_domain_counts(&conn, since_minute)
         });
         let clients = scope.spawn(move || {
             let conn = clients_conn
@@ -1077,45 +1084,63 @@ fn add_column_if_missing(
     Ok(())
 }
 
-fn grouped_domain_counts(
-    conn: &Connection,
-    since_minute: u64,
-    blocked_only: bool,
-) -> Result<HashMap<String, u64>, String> {
+fn grouped_domain_counts(conn: &Connection, since_minute: u64) -> Result<DomainRankings, String> {
     let since = u64_to_db_i64(since_minute, "域名排行起始分钟")?;
-    let sql = if blocked_only {
-        "SELECT domain, COALESCE(SUM(blocked), 0)
-         FROM query_log_domain_stats
-         WHERE minute >= ?1
-         GROUP BY domain
-         HAVING COALESCE(SUM(blocked), 0) > 0
-         ORDER BY COALESCE(SUM(blocked), 0) DESC, domain ASC
-         LIMIT 200"
-    } else {
-        "SELECT domain, COALESCE(SUM(queries), 0)
-         FROM query_log_domain_stats
-         WHERE minute >= ?1
-         GROUP BY domain
-         HAVING COALESCE(SUM(queries), 0) > 0
-         ORDER BY COALESCE(SUM(queries), 0) DESC, domain ASC
-         LIMIT 200"
-    };
-
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(
+            "WITH domain_totals AS MATERIALIZED (
+                 SELECT
+                     domain,
+                     COALESCE(SUM(queries), 0) AS queries,
+                     COALESCE(SUM(blocked), 0) AS blocked
+                 FROM query_log_domain_stats
+                 WHERE minute >= ?1
+                 GROUP BY domain
+             ),
+             query_top AS (
+                 SELECT domain, queries AS count
+                 FROM domain_totals
+                 WHERE queries > 0
+                 ORDER BY queries DESC, domain ASC
+                 LIMIT 200
+             ),
+             blocked_top AS (
+                 SELECT domain, blocked AS count
+                 FROM domain_totals
+                 WHERE blocked > 0
+                 ORDER BY blocked DESC, domain ASC
+                 LIMIT 200
+             )
+             SELECT 0 AS ranking, domain, count FROM query_top
+             UNION ALL
+             SELECT 1 AS ranking, domain, count FROM blocked_top",
+        )
         .map_err(|e| format!("准备域名排行查询失败：{e}"))?;
     let rows = stmt
         .query_map(params![since], |row| {
-            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                read_u64(row, 2)?,
+            ))
         })
         .map_err(|e| format!("读取域名排行失败：{e}"))?;
 
-    let mut counts = HashMap::new();
+    let mut query_counts = HashMap::new();
+    let mut blocked_counts = HashMap::new();
     for row in rows {
-        let (domain, count) = row.map_err(|e| format!("解析域名排行失败：{e}"))?;
-        counts.insert(domain, count);
+        let (ranking, domain, count) = row.map_err(|e| format!("解析域名排行失败：{e}"))?;
+        match ranking {
+            0 => {
+                query_counts.insert(domain, count);
+            }
+            1 => {
+                blocked_counts.insert(domain, count);
+            }
+            _ => return Err("域名排行类型无效".into()),
+        }
     }
-    Ok(counts)
+    Ok((query_counts, blocked_counts))
 }
 
 fn client_request_counts(

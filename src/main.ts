@@ -18,6 +18,7 @@ import {
   installMacosService,
   installWindowsService,
   openMacosServiceSettings,
+  recordFrontendTiming,
   startDns,
   stopDns,
   uninstallMacosService,
@@ -63,6 +64,25 @@ import type {
 } from "./types";
 import "./style.css";
 
+const frontendStartedAt = performance.now();
+
+function logLoadTime(
+  module: string,
+  started: number,
+  detail?: string,
+  forwardToBackend = true,
+): void {
+  const finished = performance.now();
+  const durationMs = finished - started;
+  const detailText = detail ? `，${detail}` : "";
+  console.info(`[加载耗时][前端] ${module}：${durationMs.toFixed(1)} ms${detailText}`);
+  if (forwardToBackend) {
+    void recordFrontendTiming(module, durationMs, finished - frontendStartedAt, detail).catch(
+      (error) => console.error("记录前端加载耗时失败", error),
+    );
+  }
+}
+
 let messageTimer = 0;
 let updateStatusTimer = 0;
 let lastStatusErrorKey: string | null = null;
@@ -72,7 +92,9 @@ if (!app) {
   throw new Error("缺少应用挂载节点");
 }
 
+const templateStarted = performance.now();
 app.innerHTML = renderAppTemplate(appIconUrl);
+logLoadTime("页面模板渲染", templateStarted);
 
 let activeView: ViewName = "dashboard";
 let filtersState: FilterSubscription[] = [];
@@ -815,80 +837,96 @@ filtersBody.addEventListener("click", (event) => {
   }
 });
 
-void getVersion().then((version) => {
-  appVersionElement.textContent = version;
-});
+async function bootstrapApplication(): Promise<void> {
+  void getVersion().then((version) => {
+    appVersionElement.textContent = version;
+  });
 
-let [initialWindowsServiceStatus] = await Promise.all([
-  loadWindowsServiceStatus(),
-  loadMacosServiceStatus(),
-]);
-if (isWindows && shouldWaitForWindowsService(initialWindowsServiceStatus)) {
-  initialWindowsServiceStatus = await waitForWindowsServiceReady(initialWindowsServiceStatus);
-}
-const windowsCoreReady =
-  !isWindows || (initialWindowsServiceStatus?.ready ?? false);
-const [configReady] = windowsCoreReady
-  ? await Promise.all([loadConfig(), loadStorageInfo()])
-  : [false];
-if (!windowsCoreReady && !configReady) {
-  activeView = "settings";
-}
-void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
-  syncFilterUpdateMetadata(payload);
-}).catch((error) => {
-  console.error("监听过滤器更新失败", error);
-});
-if (configReady) {
-  await refreshStatus();
-}
-setActiveView(activeView);
-initialBootstrapComplete = true;
-window.setInterval(() => {
-  // 窗口不可见（最小化 / 切到托盘）时跳过轮询，避免无谓的 IPC 与重渲染
-  if (document.hidden) {
-    return;
+  const serviceStatusStarted = performance.now();
+  let [initialWindowsServiceStatus] = await Promise.all([
+    loadWindowsServiceStatus(),
+    loadMacosServiceStatus(),
+  ]);
+  if (isWindows && shouldWaitForWindowsService(initialWindowsServiceStatus)) {
+    initialWindowsServiceStatus = await waitForWindowsServiceReady(initialWindowsServiceStatus);
   }
-  // 服务待批准或暂未响应时持续复查：daemon 启动慢或用户刚在系统设置中批准，
-  // 状态恢复后自动重新加载数据，避免用户被引导去反复“修复”。
-  if (
-    currentMacosServiceStatus?.requiresApproval ||
-    currentMacosServiceStatus?.needsRepair ||
-    (isWindows &&
-      (!currentWindowsServiceStatus || !currentWindowsServiceStatus.ready))
-  ) {
-    void loadMacosServiceStatus();
-    void loadWindowsServiceStatus();
+  logLoadTime(
+    "后台服务就绪检查",
+    serviceStatusStarted,
+    isWindows ? `ready=${initialWindowsServiceStatus?.ready ?? false}` : "非 Windows 平台",
+  );
+  const windowsCoreReady = !isWindows || (initialWindowsServiceStatus?.ready ?? false);
+  const initialDataStarted = performance.now();
+  const [configReady] = windowsCoreReady
+    ? await Promise.all([loadConfig(), loadStorageInfo()])
+    : [false];
+  logLoadTime("初始配置与存储信息", initialDataStarted, `configReady=${configReady}`);
+  if (!windowsCoreReady && !configReady) {
+    activeView = "settings";
   }
+  void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
+    syncFilterUpdateMetadata(payload);
+  }).catch((error) => {
+    console.error("监听过滤器更新失败", error);
+  });
+  if (configReady) {
+    await refreshStatus();
+  }
+  const initialViewStarted = performance.now();
+  setActiveView(activeView);
+  logLoadTime("初始页面切换与渲染", initialViewStarted, `view=${activeView}`);
+  initialBootstrapComplete = true;
+  logLoadTime("前端启动总计", frontendStartedAt);
+
+  startBackgroundRefresh();
+}
+
+function startBackgroundRefresh(): void {
+  window.setInterval(() => {
+    // 窗口不可见（最小化 / 切到托盘）时跳过轮询，避免无谓的 IPC 与重渲染
+    if (document.hidden) {
+      return;
+    }
+    refreshBackgroundServiceStatusIfNeeded();
+    refreshActiveView();
+  }, 5000);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      return;
+    }
+    refreshActiveView();
+    // 用户可能刚从系统设置批准完服务回来，切回窗口时同步最新授权状态
+    refreshBackgroundServiceStatusIfNeeded();
+  });
+}
+
+function refreshActiveView(): void {
   if (activeView === "logs") {
     void refreshQueryLogs({ auto: true });
-    return;
-  }
-  if (activeView === "dashboard" || activeView === "security") {
+  } else if (activeView === "dashboard" || activeView === "security") {
     void refreshStatus({ auto: true });
+  } else if (activeView === "filters") {
+    void refreshFilterUpdateMetadata();
   }
-}, 5000);
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) {
-    if (activeView === "logs") {
-      void refreshQueryLogs({ auto: true });
-    } else if (activeView === "dashboard" || activeView === "security") {
-      void refreshStatus({ auto: true });
-    }
-    // 用户可能刚从系统设置批准完服务回来，切回窗口时同步最新授权状态
-    if (currentMacosServiceStatus?.requiresApproval) {
-      void loadMacosServiceStatus();
-    }
-    if (
-      isWindows &&
-      (!currentWindowsServiceStatus || !currentWindowsServiceStatus.ready)
-    ) {
-      void loadWindowsServiceStatus();
-    }
+}
+
+function refreshBackgroundServiceStatusIfNeeded(): void {
+  // 服务待批准或暂未响应时持续复查：daemon 启动慢或用户刚在系统设置中批准，
+  // 状态恢复后自动重新加载数据，避免用户被引导去反复“修复”。
+  if (currentMacosServiceStatus?.requiresApproval || currentMacosServiceStatus?.needsRepair) {
+    void loadMacosServiceStatus();
   }
-});
+  if (isWindows && (!currentWindowsServiceStatus || !currentWindowsServiceStatus.ready)) {
+    void loadWindowsServiceStatus().catch((error) => {
+      console.error("刷新 Windows 系统服务状态失败", error);
+    });
+  }
+}
 
 async function loadConfig(): Promise<boolean> {
+  const started = performance.now();
+  let succeeded = false;
   try {
     const config = await getConfig();
     if (!config || typeof config.schema_version !== "number") {
@@ -943,6 +981,7 @@ async function loadConfig(): Promise<boolean> {
     configSaveButtons.forEach((button) => {
       button.disabled = false;
     });
+    succeeded = true;
     return true;
   } catch (error) {
     configLoaded = false;
@@ -951,17 +990,24 @@ async function loadConfig(): Promise<boolean> {
     });
     showMessage(String(error), true);
     return false;
+  } finally {
+    logLoadTime("设置配置加载与渲染", started, `success=${succeeded}`);
   }
 }
 
 async function loadStorageInfo(): Promise<void> {
+  const started = performance.now();
+  let succeeded = false;
   try {
     currentStorageInfo = await getStorageInfo();
     selectedDataStoragePath = currentStorageInfo.pending_path ?? currentStorageInfo.current_path;
     renderStorageInfo(currentStorageInfo);
+    succeeded = true;
   } catch (error) {
     dataStorageError.textContent = String(error);
     dataStorageError.classList.remove("hidden");
+  } finally {
+    logLoadTime("存储信息加载与渲染", started, `success=${succeeded}`);
   }
 }
 
@@ -1051,17 +1097,15 @@ async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> 
   if (windowsServiceStatusInFlight) {
     return windowsServiceStatusInFlight;
   }
+  const started = performance.now();
+  let loadDetail = "无有效状态";
   windowsServiceSection.classList.remove("hidden");
   const request = (async (): Promise<WindowsServiceStatus | null> => {
+    let rawStatus: WindowsServiceStatus;
     try {
-      const wasReady = currentWindowsServiceStatus?.ready ?? false;
-      const status = requireWindowsServiceStatus(await getWindowsServiceStatus());
-      renderWindowsServiceStatus(status);
-      if (initialBootstrapComplete && status.ready && !wasReady) {
-        await refreshAfterBackgroundServiceEnabled();
-      }
-      return status;
+      rawStatus = await getWindowsServiceStatus();
     } catch (error) {
+      loadDetail = `IPC error=${String(error)}`;
       const now = Date.now();
       windowsServiceUnavailableSince ??= now;
       windowsServiceSection.classList.remove("is-ready");
@@ -1072,12 +1116,27 @@ async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> 
         : "正在等待 Windows 系统服务响应…";
       return null;
     }
+
+    const wasReady = currentWindowsServiceStatus?.ready ?? false;
+    loadDetail = `rawState=${rawStatus.state}, rawReady=${rawStatus.ready}, rawIpcReady=${rawStatus.ipcReady}`;
+    const status = requireWindowsServiceStatus(rawStatus);
+    renderWindowsServiceStatus(status);
+    loadDetail = `state=${status.state}, ready=${status.ready}, ipcReady=${status.ipcReady}, needsRepair=${status.needsRepair}, diagnostic=${status.diagnostic ?? "无"}`;
+    if (initialBootstrapComplete && status.ready && !wasReady) {
+      await refreshAfterBackgroundServiceEnabled();
+    }
+    return status;
   })();
   windowsServiceStatusInFlight = request;
   try {
     return await request;
   } finally {
     windowsServiceStatusInFlight = null;
+    logLoadTime(
+      "Windows 服务状态加载",
+      started,
+      loadDetail,
+    );
   }
 }
 
@@ -1126,17 +1185,25 @@ function shouldWaitForWindowsService(status: WindowsServiceStatus | null): boole
 async function waitForWindowsServiceReady(
   initialStatus: WindowsServiceStatus | null,
 ): Promise<WindowsServiceStatus | null> {
+  const started = performance.now();
   let status = initialStatus;
-  for (const delay of WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS) {
+  for (const [index, delay] of WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS.entries()) {
     if (!shouldWaitForWindowsService(status)) {
       break;
     }
+    const attemptStarted = performance.now();
     await new Promise((resolve) => window.setTimeout(resolve, delay));
     const next = await loadWindowsServiceStatus();
     if (next) {
       status = next;
     }
+    logLoadTime(
+      `Windows 服务启动重试 #${index + 1}`,
+      attemptStarted,
+      `计划等待=${delay}ms, ready=${status?.ready ?? false}`,
+    );
   }
+  logLoadTime("Windows 服务启动等待总计", started, `ready=${status?.ready ?? false}`);
   return status;
 }
 
@@ -1146,8 +1213,7 @@ function requireWindowsServiceStatus(value: unknown): WindowsServiceStatus {
   }
   const status = value as Partial<WindowsServiceStatus>;
   if (
-    typeof status.state !== "string" ||
-    !(status.state in WINDOWS_SERVICE_STATE_TEXT) ||
+    !isWindowsServiceState(status.state) ||
     typeof status.installed !== "boolean" ||
     typeof status.running !== "boolean" ||
     typeof status.ready !== "boolean" ||
@@ -1160,6 +1226,22 @@ function requireWindowsServiceStatus(value: unknown): WindowsServiceStatus {
     throw new Error("Windows 系统服务状态接口返回格式无效");
   }
   return status as WindowsServiceStatus;
+}
+
+function isWindowsServiceState(value: unknown): value is WindowsServiceState {
+  switch (value) {
+    case "not_installed":
+    case "stopped":
+    case "start_pending":
+    case "stop_pending":
+    case "running":
+    case "continue_pending":
+    case "pause_pending":
+    case "paused":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function renderStorageInfo(info: StorageInfo): void {
@@ -1258,12 +1340,15 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
     return;
   }
 
+  const started = performance.now();
+  let succeeded = false;
   refreshInFlight = true;
   setRefreshButtonState(options.button, true);
   try {
     const renderDashboard = activeView === "dashboard";
     const status = await getStatus(options.auto !== true, renderDashboard);
     renderStatus(status, { renderDashboard });
+    succeeded = true;
   } catch (error) {
     // 自动轮询会撞上后台服务重启或等待批准的窗口，瞬态错误只记录不打扰用户
     if (options.auto) {
@@ -1272,6 +1357,12 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
       showMessage(String(error), true);
     }
   } finally {
+    logLoadTime(
+      "首页状态加载与渲染",
+      started,
+      `success=${succeeded}, auto=${options.auto === true}`,
+      options.auto !== true,
+    );
     refreshInFlight = false;
     setRefreshButtonState(options.button, false);
   }
@@ -1377,6 +1468,9 @@ function setActiveView(view: ViewName): void {
   if (view === "logs") {
     void refreshQueryLogs();
   }
+  if (view === "filters" && viewChanged) {
+    void refreshFilterUpdateMetadata();
+  }
   if (view === "security") {
     void refreshStatus({ auto: true });
   }
@@ -1396,12 +1490,13 @@ function renderFilters(): void {
 
 function syncFilterUpdateMetadata(updatedFilters: FilterSubscription[]): void {
   const updatedById = new Map(updatedFilters.map((filter) => [filter.id, filter]));
+  let changed = false;
   filtersState = filtersState.map((filter) => {
     const updated = updatedById.get(filter.id);
     if (!updated) {
       return filter;
     }
-    return {
+    const next = {
       ...filter,
       rule_count: updated.rule_count,
       block_rule_count: updated.block_rule_count,
@@ -1414,8 +1509,39 @@ function syncFilterUpdateMetadata(updatedFilters: FilterSubscription[]): void {
       last_updated: updated.last_updated,
       last_error: updated.last_error,
     };
+    changed ||= filterUpdateMetadataKey(filter) !== filterUpdateMetadataKey(next);
+    return next;
   });
-  renderFilters();
+  if (changed) {
+    renderFilters();
+  }
+}
+
+function filterUpdateMetadataKey(filter: FilterSubscription): string {
+  return JSON.stringify([
+    filter.rule_count,
+    filter.block_rule_count,
+    filter.allow_rule_count,
+    filter.ignored_rule_count,
+    filter.ignored_comment_count,
+    filter.ignored_regex_count,
+    filter.ignored_unsupported_count,
+    filter.ignored_invalid_count,
+    filter.last_updated,
+    filter.last_error,
+  ]);
+}
+
+async function refreshFilterUpdateMetadata(): Promise<void> {
+  if (editingFilterIds.size > 0) {
+    return;
+  }
+  try {
+    const config = await getConfig();
+    syncFilterUpdateMetadata(config.filters);
+  } catch (error) {
+    console.warn("刷新过滤器更新状态失败", error);
+  }
 }
 
 function renderFilter(filter: FilterSubscription): string {
@@ -2642,3 +2768,9 @@ function showMessage(value: string, isError: boolean): void {
     messageTimer = window.setTimeout(dismiss, 8000);
   }
 }
+
+void bootstrapApplication().catch((error) => {
+  console.error("应用启动失败", error);
+  showMessage(`应用启动失败：${String(error)}`, true);
+  logLoadTime("前端启动失败", frontendStartedAt, String(error));
+});

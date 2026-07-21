@@ -1,14 +1,14 @@
 use std::{
     io::Read,
     path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use serde::Serialize;
 
 use crate::{
-    config::{self, AppConfig},
+    config::{self, AppConfig, FilterSubscription},
     dns,
 };
 
@@ -26,6 +26,43 @@ pub fn update_enabled_filters(
     data_dir: &Path,
     config: &mut AppConfig,
 ) -> Result<FilterUpdateReport, String> {
+    update_matching_filters(data_dir, config, "没有启用的远程清单", |_| true)
+}
+
+pub fn update_due_filters(
+    data_dir: &Path,
+    config: &mut AppConfig,
+    now: u64,
+) -> Result<FilterUpdateReport, String> {
+    let interval_seconds = u64::from(config.filter_update_interval_hours) * 3600;
+    update_matching_filters(data_dir, config, "没有到期的远程清单", |filter| {
+        is_filter_due(filter, now, interval_seconds)
+    })
+}
+
+pub fn has_due_filters(config: &AppConfig, now: u64) -> bool {
+    let interval_seconds = u64::from(config.filter_update_interval_hours) * 3600;
+    config
+        .filters
+        .iter()
+        .any(|filter| filter.enabled && is_filter_due(filter, now, interval_seconds))
+}
+
+fn is_filter_due(filter: &FilterSubscription, now: u64, interval_seconds: u64) -> bool {
+    filter
+        .last_updated
+        .is_none_or(|updated| now.saturating_sub(updated) >= interval_seconds)
+}
+
+fn update_matching_filters<F>(
+    data_dir: &Path,
+    config: &mut AppConfig,
+    empty_message: &str,
+    should_update: F,
+) -> Result<FilterUpdateReport, String>
+where
+    F: Fn(&FilterSubscription) -> bool,
+{
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent(concat!("DnsBlackhole/", env!("CARGO_PKG_VERSION")))
@@ -35,13 +72,23 @@ pub fn update_enabled_filters(
     let mut updated = 0;
     let mut failed = 0;
     let mut messages = Vec::new();
+    let max_size_mb = config.filter_max_size_mb;
 
     for filter in &mut config.filters {
-        if !filter.enabled {
+        if !filter.enabled || !should_update(filter) {
             continue;
         }
 
-        match download_filter(&client, &filter.url, config.filter_max_size_mb) {
+        let download_started = Instant::now();
+        let download = download_filter(&client, &filter.url, max_size_mb);
+        let outcome = if download.is_ok() { "成功" } else { "失败" };
+        crate::performance::log_service(
+            "远程清单更新",
+            &format!("{}（{outcome}）", filter.name),
+            download_started,
+        );
+
+        match download {
             Ok(content) => {
                 let summary = dns::summarize_rules(&content);
                 if let Err(error) = config::write_filter_cache(data_dir, &filter.id, &content) {
@@ -71,7 +118,7 @@ pub fn update_enabled_filters(
     }
 
     let message = if updated == 0 && failed == 0 {
-        "没有启用的远程清单".to_string()
+        empty_message.to_string()
     } else if failed == 0 {
         format!("已更新 {updated} 个远程清单")
     } else {
@@ -188,7 +235,8 @@ fn unix_now() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bytes_to_mb_ceil, is_allowed_filter_content_type};
+    use super::{bytes_to_mb_ceil, has_due_filters, is_allowed_filter_content_type, is_filter_due};
+    use crate::config::{AppConfig, FilterSubscription};
 
     #[test]
     fn allows_plain_filter_content_types() {
@@ -208,5 +256,46 @@ mod tests {
         assert_eq!(bytes_to_mb_ceil(1), 1);
         assert_eq!(bytes_to_mb_ceil(1024 * 1024), 1);
         assert_eq!(bytes_to_mb_ceil(1024 * 1024 + 1), 2);
+    }
+
+    #[test]
+    fn determines_filter_due_time_from_last_successful_update() {
+        let now = 100_000;
+        let interval = 6 * 3600;
+        let mut filter = FilterSubscription::default();
+
+        assert!(is_filter_due(&filter, now, interval));
+
+        filter.last_updated = Some(now - interval + 1);
+        assert!(!is_filter_due(&filter, now, interval));
+
+        filter.last_updated = Some(now - interval);
+        assert!(is_filter_due(&filter, now, interval));
+
+        filter.last_updated = Some(now + 60);
+        assert!(!is_filter_due(&filter, now, interval));
+    }
+
+    #[test]
+    fn automatic_update_ignores_disabled_and_not_due_filters() {
+        let now = 100_000;
+        let mut config = AppConfig {
+            filter_update_interval_hours: 6,
+            filters: vec![FilterSubscription {
+                enabled: false,
+                last_updated: None,
+                ..FilterSubscription::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        assert!(!has_due_filters(&config, now));
+
+        config.filters[0].enabled = true;
+        config.filters[0].last_updated = Some(now - 5 * 3600);
+        assert!(!has_due_filters(&config, now));
+
+        config.filters[0].last_updated = Some(now - 6 * 3600);
+        assert!(has_due_filters(&config, now));
     }
 }
