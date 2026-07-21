@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "dnsblackhole"
-version = "0.1.46"
+version = "0.1.47"
 dependencies = [
  "libc",
  "objc2",

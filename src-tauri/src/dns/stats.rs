@@ -18,6 +18,10 @@ const SECURITY_EVENT_AGGREGATE_SECONDS: u64 = 10;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DnsStats {
     pub started_at: Option<u64>,
+    #[serde(default)]
+    pub dashboard_started_at: Option<u64>,
+    #[serde(default)]
+    pub dashboard_ended_at: Option<u64>,
     pub queries: u64,
     pub blocked: u64,
     pub forwarded: u64,

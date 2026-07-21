@@ -67,6 +67,8 @@ export type UpstreamMode = "load_balance" | "parallel_requests" | "fastest_addr"
 
 export type BlockingMode = "null_ip" | "nxdomain" | "refused" | "custom_ip";
 
+export type FilterProxyMode = "system" | "direct" | "custom";
+
 export type AppConfig = {
   schema_version: number;
   enabled: boolean;
@@ -84,6 +86,9 @@ export type AppConfig = {
   refuse_any: boolean;
   filter_update_interval_hours: number;
   filter_max_size_mb: number;
+  filter_proxy_mode: FilterProxyMode;
+  filter_proxy_url: string;
+  filter_system_proxy_url: string;
   allow_insecure_http: boolean;
   query_log_enabled: boolean;
   anonymize_client_ip: boolean;
@@ -134,6 +139,8 @@ export type UpstreamLatencyStat = {
 
 export type DnsStats = {
   started_at: number | null;
+  dashboard_started_at?: number | null;
+  dashboard_ended_at?: number | null;
   queries: number;
   blocked: number;
   forwarded: number;
@@ -222,7 +229,17 @@ export type FilterUpdateResult = {
   status: RuntimeStatus;
   updated: number;
   failed: number;
+  cancelled: number;
   message: string;
+};
+
+export type FilterUpdateProgress = {
+  running: boolean;
+  total: number;
+  completed: number;
+  updated: number;
+  failed: number;
+  cancel_requested: boolean;
 };
 
 export type FilterCacheClearResult = {

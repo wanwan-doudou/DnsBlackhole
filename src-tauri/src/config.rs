@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 10;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
 const MAX_FILTER_SIZE_MB: u32 = 256;
@@ -59,6 +59,12 @@ pub struct AppConfig {
     pub filter_update_interval_hours: u32,
     #[serde(default = "default_filter_max_size_mb")]
     pub filter_max_size_mb: u32,
+    #[serde(default)]
+    pub filter_proxy_mode: FilterProxyMode,
+    #[serde(default)]
+    pub filter_proxy_url: String,
+    #[serde(default)]
+    pub filter_system_proxy_url: String,
     #[serde(default)]
     pub allow_insecure_http: bool,
     #[serde(default = "default_query_log_enabled")]
@@ -118,6 +124,15 @@ pub enum UpstreamMode {
     LoadBalance,
     ParallelRequests,
     FastestAddr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterProxyMode {
+    #[default]
+    System,
+    Direct,
+    Custom,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +214,9 @@ impl Default for AppConfig {
             refuse_any: default_refuse_any(),
             filter_update_interval_hours: default_filter_update_interval_hours(),
             filter_max_size_mb: default_filter_max_size_mb(),
+            filter_proxy_mode: FilterProxyMode::default(),
+            filter_proxy_url: String::new(),
+            filter_system_proxy_url: String::new(),
             allow_insecure_http: false,
             query_log_enabled: default_query_log_enabled(),
             anonymize_client_ip: false,
@@ -288,6 +306,7 @@ impl AppConfig {
                 "单个过滤器最大下载大小必须在 1 到 {MAX_FILTER_SIZE_MB} MB 之间"
             ));
         }
+        validate_filter_proxy(self)?;
         validate_client_list(&self.allowed_clients, "允许客户端")?;
         validate_client_list(&self.blocked_clients, "拒绝客户端")?;
         if self.rate_limit_per_second > 100_000 {
@@ -315,6 +334,27 @@ impl AppConfig {
         validate_ignored_domains(&self.query_log_ignored_domains)?;
         Ok(())
     }
+}
+
+fn validate_filter_proxy(config: &AppConfig) -> Result<(), String> {
+    let proxy_url = match config.filter_proxy_mode {
+        FilterProxyMode::Direct => return Ok(()),
+        FilterProxyMode::System => config.filter_system_proxy_url.trim(),
+        FilterProxyMode::Custom => config.filter_proxy_url.trim(),
+    };
+    if proxy_url.is_empty() {
+        if config.filter_proxy_mode == FilterProxyMode::Custom {
+            return Err("自定义过滤器下载代理不能为空".into());
+        }
+        return Ok(());
+    }
+
+    let parsed = reqwest::Url::parse(proxy_url)
+        .map_err(|error| format!("过滤器下载代理地址无效：{error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("过滤器下载代理必须是有效的 HTTP 或 HTTPS 地址".into());
+    }
+    Ok(())
 }
 
 fn validate_blocking_config(config: &AppConfig) -> Result<(), String> {

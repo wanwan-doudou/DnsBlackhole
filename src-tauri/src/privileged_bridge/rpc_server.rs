@@ -211,6 +211,8 @@ fn dispatch_request(
             let params: ConfigParams = parse_params(params)?;
             to_value(update_filters_blocking(Arc::clone(state), params.config)?)?
         }
+        "get_filter_update_progress" => to_value(state.filter_update_progress()?)?,
+        "cancel_filter_update" => to_value(state.request_filter_update_cancel()?)?,
         "start_dns" => to_value(start_dns_blocking(Arc::clone(state))?)?,
         "stop_dns" => to_value(stop_dns_blocking(Arc::clone(state))?)?,
         "clear_dns_cache" => to_value(clear_dns_cache_blocking(state)?)?,

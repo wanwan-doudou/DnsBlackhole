@@ -3,7 +3,10 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,7 +20,7 @@ use crate::{
         self, DnsServer, DnsStats, RuleLoadSource, RuleSummary, RuntimeStatus,
         build_filter_runtime_with_rules, load_or_compile_rules, replace_filter_runtime,
     },
-    filters::{self, FilterUpdateReport},
+    filters,
 };
 
 const LOG_STATS_CACHE_SECONDS: u64 = 15;
@@ -39,6 +42,8 @@ pub(crate) struct AppState {
     last_error: Mutex<Option<String>>,
     // 手动更新与自动更新共用，避免并发下载清单互相踩踏
     filter_update_lock: Mutex<()>,
+    filter_update_progress: Mutex<FilterUpdateProgressState>,
+    filter_update_cancel: AtomicBool,
     // 启停、配置保存和规则热替换串行执行，避免后台初始化与用户操作互相覆盖
     pub(crate) runtime_update_lock: Mutex<()>,
 }
@@ -55,7 +60,18 @@ pub(crate) struct FilterUpdateResult {
     pub(crate) status: RuntimeStatus,
     pub(crate) updated: usize,
     pub(crate) failed: usize,
+    pub(crate) cancelled: usize,
     pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct FilterUpdateProgressState {
+    pub(crate) running: bool,
+    pub(crate) total: usize,
+    pub(crate) completed: usize,
+    pub(crate) updated: usize,
+    pub(crate) failed: usize,
+    pub(crate) cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +108,8 @@ impl AppState {
             last_prune_at: Mutex::new(0),
             last_error: Mutex::new(None),
             filter_update_lock: Mutex::new(()),
+            filter_update_progress: Mutex::new(FilterUpdateProgressState::default()),
+            filter_update_cancel: AtomicBool::new(false),
             runtime_update_lock: Mutex::new(()),
         }
     }
@@ -101,6 +119,52 @@ impl AppState {
             .lock()
             .map(|config| config.clone())
             .map_err(|_| "读取配置失败".into())
+    }
+
+    pub(crate) fn filter_update_progress(&self) -> Result<FilterUpdateProgressState, String> {
+        self.filter_update_progress
+            .lock()
+            .map(|progress| progress.clone())
+            .map_err(|_| "读取过滤器更新进度失败".into())
+    }
+
+    pub(crate) fn request_filter_update_cancel(&self) -> Result<FilterUpdateProgressState, String> {
+        self.filter_update_cancel.store(true, Ordering::Release);
+        let mut progress = self
+            .filter_update_progress
+            .lock()
+            .map_err(|_| "写入过滤器取消状态失败".to_string())?;
+        if progress.running {
+            progress.cancel_requested = true;
+        }
+        Ok(progress.clone())
+    }
+
+    fn begin_filter_update(&self) {
+        self.filter_update_cancel.store(false, Ordering::Release);
+        if let Ok(mut progress) = self.filter_update_progress.lock() {
+            *progress = FilterUpdateProgressState {
+                running: true,
+                ..FilterUpdateProgressState::default()
+            };
+        }
+    }
+
+    fn record_filter_update_progress(&self, update: filters::FilterUpdateProgress) {
+        if let Ok(mut progress) = self.filter_update_progress.lock() {
+            progress.total = update.total;
+            progress.completed = update.completed;
+            progress.updated = update.updated;
+            progress.failed = update.failed;
+            progress.cancel_requested = self.filter_update_cancel.load(Ordering::Acquire);
+        }
+    }
+
+    fn finish_filter_update(&self) {
+        if let Ok(mut progress) = self.filter_update_progress.lock() {
+            progress.running = false;
+            progress.cancel_requested = self.filter_update_cancel.load(Ordering::Acquire);
+        }
     }
 
     fn replace_config(&self, config: AppConfig) -> Result<(), String> {
@@ -268,6 +332,8 @@ impl AppState {
                     stats.traffic = log_stats.traffic;
                     stats.upstream_requests = log_stats.upstream_requests;
                     stats.upstream_avg_latency = log_stats.upstream_avg_latency;
+                    stats.dashboard_started_at = log_stats.dashboard_started_at;
+                    stats.dashboard_ended_at = log_stats.dashboard_ended_at;
                 }
                 Err(error) => self.set_error(Some(error)),
             }
@@ -354,6 +420,14 @@ impl AppState {
     }
 }
 
+struct FilterUpdateProgressGuard<'a>(&'a AppState);
+
+impl Drop for FilterUpdateProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.finish_filter_update();
+    }
+}
+
 pub(crate) fn configured_rule_summary(config: &AppConfig) -> RuleSummary {
     if !config.use_filters {
         return RuleSummary::default();
@@ -392,7 +466,16 @@ pub(crate) fn configured_rule_summary(config: &AppConfig) -> RuleSummary {
 
 pub(crate) fn filter_runtime_changed(previous: &AppConfig, next: &AppConfig) -> bool {
     previous.use_filters != next.use_filters
-        || previous.filters != next.filters
+        || previous.filters.len() != next.filters.len()
+        || previous
+            .filters
+            .iter()
+            .zip(&next.filters)
+            .any(|(previous, next)| {
+                previous.id != next.id
+                    || previous.name != next.name
+                    || previous.enabled != next.enabled
+            })
         || previous.blacklist != next.blacklist
         || previous.blocking_mode != next.blocking_mode
         || previous.blocking_custom_ipv4 != next.blocking_custom_ipv4
@@ -517,13 +600,22 @@ fn update_filters_blocking_with_scope(
         .map_err(|_| "清单更新任务状态异常".to_string())?;
     config::migrate_legacy_defaults(&mut config);
     config.validate()?;
+    state.begin_filter_update();
+    let _progress_guard = FilterUpdateProgressGuard(&state);
     let report = match scope {
-        FilterUpdateScope::ManualAll => {
-            filters::update_enabled_filters(&state.data_dir, &mut config)?
-        }
-        FilterUpdateScope::AutomaticDueAt(now) => {
-            filters::update_due_filters(&state.data_dir, &mut config, now)?
-        }
+        FilterUpdateScope::ManualAll => filters::update_enabled_filters(
+            &state.data_dir,
+            &mut config,
+            &state.filter_update_cancel,
+            |progress| state.record_filter_update_progress(progress),
+        )?,
+        FilterUpdateScope::AutomaticDueAt(now) => filters::update_due_filters(
+            &state.data_dir,
+            &mut config,
+            now,
+            &state.filter_update_cancel,
+            |progress| state.record_filter_update_progress(progress),
+        )?,
     };
     let _runtime_guard = state
         .runtime_update_lock
@@ -533,8 +625,7 @@ fn update_filters_blocking_with_scope(
     state.database.save_config(&config)?;
     state.replace_config(config.clone())?;
 
-    let rules_may_have_changed =
-        matches!(scope, FilterUpdateScope::ManualAll) || report.updated > 0;
+    let rules_may_have_changed = report.updated > 0 || filter_runtime_changed(&previous, &config);
     if config.enabled && rules_may_have_changed {
         state
             .apply_config_change(&previous, &config)
@@ -545,8 +636,6 @@ fn update_filters_blocking_with_scope(
         state.set_effective_summary(configured_rule_summary(&config))?;
     }
 
-    apply_update_report_error(&state, &report);
-
     let status = match scope {
         FilterUpdateScope::ManualAll => state.status(true),
         FilterUpdateScope::AutomaticDueAt(_) => state.status_with_log_stats(false, false),
@@ -555,6 +644,7 @@ fn update_filters_blocking_with_scope(
         status,
         updated: report.updated,
         failed: report.failed,
+        cancelled: report.cancelled,
         message: report.message,
     })
 }
@@ -656,14 +746,6 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KIB)
     } else {
         format!("{:.1} MB", bytes as f64 / MIB)
-    }
-}
-
-fn apply_update_report_error(state: &AppState, report: &FilterUpdateReport) {
-    if report.failed > 0 {
-        state.set_error(Some(report.message.clone()));
-    } else {
-        state.set_error(None);
     }
 }
 

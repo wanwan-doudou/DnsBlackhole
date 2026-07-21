@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppConfig,
   FilterCacheClearResult,
+  FilterUpdateProgress,
   FilterUpdateResult,
   MacosServiceStatus,
   QueryLogFilter,
@@ -54,6 +55,18 @@ export function getQueryLogs(request: QueryLogRequest): Promise<QueryLogPage> {
 
 export function updateFilters(config: AppConfig): Promise<FilterUpdateResult> {
   return timedInvoke<FilterUpdateResult>("update_filters", { config });
+}
+
+export function getFilterUpdateProgress(): Promise<FilterUpdateProgress> {
+  return timedInvoke<FilterUpdateProgress>("get_filter_update_progress");
+}
+
+export function cancelFilterUpdate(): Promise<FilterUpdateProgress> {
+  return timedInvoke<FilterUpdateProgress>("cancel_filter_update");
+}
+
+export function detectSystemProxy(): Promise<string | null> {
+  return timedInvoke<string | null>("detect_system_proxy");
 }
 
 export function startDns(): Promise<RuntimeStatus> {

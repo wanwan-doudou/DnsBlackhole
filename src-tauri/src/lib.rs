@@ -23,7 +23,7 @@ use service_core::{
     save_config_blocking, spawn_filter_auto_update, spawn_initial_runtime, spawn_runtime_watchdog,
     start_dns_blocking, stop_dns_blocking, update_filters_blocking,
 };
-use service_core::{FilterCacheClearResult, FilterUpdateResult};
+use service_core::{FilterCacheClearResult, FilterUpdateProgressState, FilterUpdateResult};
 use storage::StorageInfo;
 use tauri::{Emitter, Manager, WindowEvent};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -51,6 +51,70 @@ fn record_frontend_timing(
         .map(|value| format!("，{value}"))
         .unwrap_or_default();
     eprintln!("[加载耗时][前端 +{since_start_ms:.1} ms] {module}：{duration_ms:.1} ms{detail}");
+}
+
+#[tauri::command]
+fn detect_system_proxy() -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        use winreg::{RegKey, enums::HKEY_CURRENT_USER};
+
+        let internet_settings = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+            .map_err(|error| format!("读取当前用户系统代理失败：{error}"))?;
+        let enabled = internet_settings
+            .get_value::<u32, _>("ProxyEnable")
+            .unwrap_or_default()
+            != 0;
+        if !enabled {
+            return Ok(None);
+        }
+        let setting = internet_settings
+            .get_value::<String, _>("ProxyServer")
+            .unwrap_or_default();
+        Ok(proxy_url_from_setting(&setting))
+    }
+
+    #[cfg(not(windows))]
+    {
+        for name in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+            if let Some(value) = std::env::var_os(name)
+                && let Some(proxy) = proxy_url_from_setting(&value.to_string_lossy())
+            {
+                return Ok(Some(proxy));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn proxy_url_from_setting(setting: &str) -> Option<String> {
+    let trimmed = setting.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = if trimmed.contains('=') {
+        let entries = trimmed
+            .split(';')
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(scheme, value)| (scheme.trim().to_ascii_lowercase(), value.trim()))
+            .collect::<Vec<_>>();
+        entries
+            .iter()
+            .find(|(scheme, _)| scheme == "https")
+            .or_else(|| entries.iter().find(|(scheme, _)| scheme == "http"))
+            .map(|(_, value)| *value)?
+    } else {
+        trimmed
+    };
+    if candidate.is_empty() {
+        return None;
+    }
+    Some(if candidate.contains("://") {
+        candidate.to_string()
+    } else {
+        format!("http://{candidate}")
+    })
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -387,6 +451,53 @@ async fn update_filters(
 }
 
 #[tauri::command]
+async fn get_filter_update_progress(
+    state: tauri::State<'_, Arc<GuiState>>,
+) -> Result<FilterUpdateProgressState, String> {
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = state;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            privileged_bridge::ServiceClient::call(
+                "get_filter_update_progress",
+                &serde_json::json!({}),
+            )
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            state.local()?.filter_update_progress()
+        }
+    })
+    .await
+    .map_err(|error| format!("读取过滤器更新进度任务异常：{error}"))?
+}
+
+#[tauri::command]
+async fn cancel_filter_update(
+    state: tauri::State<'_, Arc<GuiState>>,
+) -> Result<FilterUpdateProgressState, String> {
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = state;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            privileged_bridge::ServiceClient::call("cancel_filter_update", &serde_json::json!({}))
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            state.local()?.request_filter_update_cancel()
+        }
+    })
+    .await
+    .map_err(|error| format!("取消过滤器更新任务异常：{error}"))?
+}
+
+#[tauri::command]
 async fn start_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
     #[cfg(any(target_os = "macos", windows))]
     let _ = state;
@@ -573,6 +684,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             record_frontend_timing,
+            detect_system_proxy,
             get_config,
             get_storage_info,
             request_data_migration,
@@ -587,6 +699,8 @@ pub fn run() {
             get_status,
             get_query_logs,
             update_filters,
+            get_filter_update_progress,
+            cancel_filter_update,
             start_dns,
             stop_dns,
             clear_dns_cache,
@@ -737,6 +851,19 @@ mod tests {
 
     use super::*;
     use crate::{config::FilterSubscription, database::Database, service_core::AppState};
+
+    #[test]
+    fn parses_windows_system_proxy_settings() {
+        assert_eq!(
+            proxy_url_from_setting("http=127.0.0.1:7897;https=127.0.0.1:7898"),
+            Some("http://127.0.0.1:7898".into())
+        );
+        assert_eq!(
+            proxy_url_from_setting("127.0.0.1:7897"),
+            Some("http://127.0.0.1:7897".into())
+        );
+        assert_eq!(proxy_url_from_setting("  "), None);
+    }
 
     #[test]
     fn unrelated_config_change_does_not_rebuild_filter_runtime() {

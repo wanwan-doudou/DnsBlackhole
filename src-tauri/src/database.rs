@@ -52,53 +52,62 @@ const INSERT_QUERY_LOG_SQL: &str = "
         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
      )";
 
-const UPSERT_QUERY_LOG_MINUTE_STATS_SQL: &str = "
-    INSERT INTO query_log_minute_stats
-        (minute, queries, blocked, forwarded, failed)
-    VALUES (?1, 1, ?2, ?3, ?4)
-    ON CONFLICT(minute) DO UPDATE SET
+const UPSERT_DASHBOARD_DAILY_STATS_SQL: &str = "
+    INSERT INTO dashboard_summary_stats
+        (scope, dimension, value, queries, blocked, forwarded, failed, first_seen_at, last_seen_at)
+    VALUES (
+        strftime('%Y-%m-%d', ?1, 'unixepoch', 'localtime'),
+        'total',
+        '',
+        1,
+        ?2,
+        ?3,
+        ?4,
+        ?1,
+        ?1
+    )
+    ON CONFLICT(scope, dimension, value) DO UPDATE SET
         queries = queries + 1,
         blocked = blocked + excluded.blocked,
         forwarded = forwarded + excluded.forwarded,
-        failed = failed + excluded.failed";
+        failed = failed + excluded.failed,
+        first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+        last_seen_at = MAX(last_seen_at, excluded.last_seen_at)";
 
-const UPSERT_QUERY_LOG_DOMAIN_STATS_SQL: &str = "
-    INSERT INTO query_log_domain_stats
-        (minute, domain, queries, blocked)
-    VALUES (?1, ?2, 1, ?3)
-    ON CONFLICT(minute, domain) DO UPDATE SET
-        queries = queries + 1,
-        blocked = blocked + excluded.blocked";
-
-const UPSERT_QUERY_LOG_UPSTREAM_STATS_SQL: &str = "
-    INSERT INTO query_log_upstream_stats
-        (minute, upstream_server, requests, latency_total_ms, latency_samples)
-    VALUES (?1, ?2, 1, ?3, ?4)
-    ON CONFLICT(minute, upstream_server) DO UPDATE SET
-        requests = requests + 1,
+const UPSERT_DASHBOARD_LIFETIME_STATS_SQL: &str = "
+    INSERT INTO dashboard_summary_stats
+        (
+            scope,
+            dimension,
+            value,
+            queries,
+            blocked,
+            forwarded,
+            failed,
+            requests,
+            latency_total_ms,
+            latency_samples,
+            first_seen_at,
+            last_seen_at
+        )
+    VALUES ('all', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+    ON CONFLICT(scope, dimension, value) DO UPDATE SET
+        queries = queries + excluded.queries,
+        blocked = blocked + excluded.blocked,
+        forwarded = forwarded + excluded.forwarded,
+        failed = failed + excluded.failed,
+        requests = requests + excluded.requests,
         latency_total_ms = latency_total_ms + excluded.latency_total_ms,
-        latency_samples = latency_samples + excluded.latency_samples";
-
-const UPSERT_QUERY_LOG_CLIENT_STATS_SQL: &str = "
-    INSERT INTO query_log_client_stats (minute, client_ip, queries)
-    VALUES (?1, ?2, 1)
-    ON CONFLICT(minute, client_ip) DO UPDATE SET
-        queries = queries + 1";
-
-const UPSERT_QUERY_LOG_BLOCKLIST_STATS_SQL: &str = "
-    INSERT INTO query_log_blocklist_stats (minute, rule_source, hits)
-    VALUES (?1, ?2, 1)
-    ON CONFLICT(minute, rule_source) DO UPDATE SET
-        hits = hits + 1";
+        latency_samples = latency_samples + excluded.latency_samples,
+        first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+        last_seen_at = MAX(last_seen_at, excluded.last_seen_at)";
 const READ_CONNECTION_POOL_SIZE: usize = 4;
 type DomainRankings = (HashMap<String, u64>, HashMap<String, u64>);
+type DashboardTotals = (u64, u64, u64, u64, Option<u64>, Option<u64>);
 
-struct QueryLogStatsStatements<'connection> {
-    minute: rusqlite::Statement<'connection>,
-    domain: rusqlite::Statement<'connection>,
-    upstream: rusqlite::Statement<'connection>,
-    client: rusqlite::Statement<'connection>,
-    blocklist: rusqlite::Statement<'connection>,
+struct DashboardStatsStatements<'connection> {
+    dashboard_daily: rusqlite::Statement<'connection>,
+    dashboard_lifetime: rusqlite::Statement<'connection>,
 }
 
 pub struct Database {
@@ -177,6 +186,8 @@ pub struct LogStats {
     pub traffic: Vec<TrafficBucket>,
     pub upstream_requests: Vec<UpstreamRequestStat>,
     pub upstream_avg_latency: Vec<UpstreamLatencyStat>,
+    pub dashboard_started_at: Option<u64>,
+    pub dashboard_ended_at: Option<u64>,
 }
 
 impl Database {
@@ -287,27 +298,18 @@ impl Database {
             let mut insert_stmt = tx
                 .prepare(INSERT_QUERY_LOG_SQL)
                 .map_err(|e| format!("准备批量写入查询日志失败：{e}"))?;
-            let mut stats_statements = QueryLogStatsStatements {
-                minute: tx
-                    .prepare(UPSERT_QUERY_LOG_MINUTE_STATS_SQL)
-                    .map_err(|e| format!("准备写入分钟统计失败：{e}"))?,
-                domain: tx
-                    .prepare(UPSERT_QUERY_LOG_DOMAIN_STATS_SQL)
-                    .map_err(|e| format!("准备写入域名统计失败：{e}"))?,
-                upstream: tx
-                    .prepare(UPSERT_QUERY_LOG_UPSTREAM_STATS_SQL)
-                    .map_err(|e| format!("准备写入上游统计失败：{e}"))?,
-                client: tx
-                    .prepare(UPSERT_QUERY_LOG_CLIENT_STATS_SQL)
-                    .map_err(|e| format!("准备写入客户端统计失败：{e}"))?,
-                blocklist: tx
-                    .prepare(UPSERT_QUERY_LOG_BLOCKLIST_STATS_SQL)
-                    .map_err(|e| format!("准备写入黑名单统计失败：{e}"))?,
+            let mut stats_statements = DashboardStatsStatements {
+                dashboard_daily: tx
+                    .prepare(UPSERT_DASHBOARD_DAILY_STATS_SQL)
+                    .map_err(|e| format!("准备写入仪表盘每日统计失败：{e}"))?,
+                dashboard_lifetime: tx
+                    .prepare(UPSERT_DASHBOARD_LIFETIME_STATS_SQL)
+                    .map_err(|e| format!("准备写入仪表盘累计统计失败：{e}"))?,
             };
             for (entry, anonymize_client_ip) in entries {
                 let timestamp = unix_now();
                 execute_query_log_insert(&mut insert_stmt, entry, *anonymize_client_ip, timestamp)?;
-                upsert_query_log_stats(
+                upsert_dashboard_stats(
                     &mut stats_statements,
                     entry,
                     *anonymize_client_ip,
@@ -358,14 +360,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn log_stats(&self, retention_hours: u32) -> Result<LogStats, String> {
-        let since = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
-        let since_minute = since / 60;
+    pub fn log_stats(&self, _retention_hours: u32) -> Result<LogStats, String> {
         if self.read_conns.len() >= READ_CONNECTION_POOL_SIZE {
-            return parallel_log_stats(&self.read_conns, since, since_minute, retention_hours);
+            return parallel_log_stats(&self.read_conns);
         }
         let conn = self.lock_read()?;
-        log_stats_with_connection(&conn, since, since_minute, retention_hours)
+        log_stats_with_connection(&conn)
     }
 
     pub fn query_logs(
@@ -499,14 +499,10 @@ impl Database {
     }
 }
 
-fn log_stats_with_connection(
-    conn: &Connection,
-    since: u64,
-    since_minute: u64,
-    retention_hours: u32,
-) -> Result<LogStats, String> {
-    let (queries, blocked, forwarded, failed) = total_log_counts(conn, since_minute)?;
-    let (query_domains, blocked_domains) = grouped_domain_counts(conn, since_minute)?;
+fn log_stats_with_connection(conn: &Connection) -> Result<LogStats, String> {
+    let (queries, blocked, forwarded, failed, dashboard_started_at, dashboard_ended_at) =
+        total_log_counts(conn)?;
+    let (query_domains, blocked_domains) = grouped_domain_counts(conn)?;
     Ok(LogStats {
         queries,
         blocked,
@@ -514,20 +510,17 @@ fn log_stats_with_connection(
         failed,
         query_domains,
         blocked_domains,
-        client_requests: client_request_counts(conn, since)?,
-        blocklist_hits: blocklist_hit_counts(conn, since)?,
-        traffic: traffic_buckets(conn, since_minute, retention_hours)?,
-        upstream_requests: upstream_request_counts(conn, since_minute)?,
-        upstream_avg_latency: upstream_avg_latency(conn, since_minute)?,
+        client_requests: client_request_counts(conn)?,
+        blocklist_hits: blocklist_hit_counts(conn)?,
+        traffic: traffic_buckets(conn)?,
+        upstream_requests: upstream_request_counts(conn)?,
+        upstream_avg_latency: upstream_avg_latency(conn)?,
+        dashboard_started_at,
+        dashboard_ended_at,
     })
 }
 
-fn parallel_log_stats(
-    read_conns: &[Mutex<Connection>],
-    since: u64,
-    since_minute: u64,
-    retention_hours: u32,
-) -> Result<LogStats, String> {
+fn parallel_log_stats(read_conns: &[Mutex<Connection>]) -> Result<LogStats, String> {
     std::thread::scope(|scope| {
         let totals_conn = &read_conns[0];
         let domains_conn = &read_conns[1];
@@ -538,37 +531,34 @@ fn parallel_log_stats(
             let conn = totals_conn
                 .lock()
                 .map_err(|_| "数据库统计连接已损坏".to_string())?;
-            Ok::<_, String>((
-                total_log_counts(&conn, since_minute)?,
-                traffic_buckets(&conn, since_minute, retention_hours)?,
-            ))
+            Ok::<_, String>((total_log_counts(&conn)?, traffic_buckets(&conn)?))
         });
         let domains = scope.spawn(move || {
             let conn = domains_conn
                 .lock()
                 .map_err(|_| "数据库域名排行连接已损坏".to_string())?;
-            grouped_domain_counts(&conn, since_minute)
+            grouped_domain_counts(&conn)
         });
         let clients = scope.spawn(move || {
             let conn = clients_conn
                 .lock()
                 .map_err(|_| "数据库客户端排行连接已损坏".to_string())?;
-            Ok::<_, String>((
-                client_request_counts(&conn, since)?,
-                blocklist_hit_counts(&conn, since)?,
-            ))
+            Ok::<_, String>((client_request_counts(&conn)?, blocklist_hit_counts(&conn)?))
         });
         let upstreams = scope.spawn(move || {
             let conn = upstreams_conn
                 .lock()
                 .map_err(|_| "数据库上游排行连接已损坏".to_string())?;
             Ok::<_, String>((
-                upstream_request_counts(&conn, since_minute)?,
-                upstream_avg_latency(&conn, since_minute)?,
+                upstream_request_counts(&conn)?,
+                upstream_avg_latency(&conn)?,
             ))
         });
 
-        let ((queries, blocked, forwarded, failed), traffic) = totals
+        let (
+            (queries, blocked, forwarded, failed, dashboard_started_at, dashboard_ended_at),
+            traffic,
+        ) = totals
             .join()
             .map_err(|_| "数据库统计线程异常".to_string())??;
         let (query_domains, blocked_domains) = domains
@@ -593,31 +583,38 @@ fn parallel_log_stats(
             traffic,
             upstream_requests,
             upstream_avg_latency,
+            dashboard_started_at,
+            dashboard_ended_at,
         })
     })
 }
 
-fn total_log_counts(conn: &Connection, since_minute: u64) -> Result<(u64, u64, u64, u64), String> {
-    let since = u64_to_db_i64(since_minute, "日志统计起始分钟")?;
+fn total_log_counts(conn: &Connection) -> Result<DashboardTotals, String> {
     conn.query_row(
         "SELECT
-            COALESCE(SUM(queries), 0),
-            COALESCE(SUM(blocked), 0),
-            COALESCE(SUM(forwarded), 0),
-            COALESCE(SUM(failed), 0)
-         FROM query_log_minute_stats
-         WHERE minute >= ?1",
-        params![since],
+            queries,
+            blocked,
+            forwarded,
+            failed,
+            first_seen_at,
+            last_seen_at
+         FROM dashboard_summary_stats
+         WHERE scope = 'all' AND dimension = 'total' AND value = ''",
+        [],
         |row| {
             Ok((
                 read_u64(row, 0)?,
                 read_u64(row, 1)?,
                 read_u64(row, 2)?,
                 read_u64(row, 3)?,
+                Some(read_u64(row, 4)?),
+                Some(read_u64(row, 5)?),
             ))
         },
     )
-    .map_err(|e| format!("读取查询日志统计失败：{e}"))
+    .optional()
+    .map(|row| row.unwrap_or_default())
+    .map_err(|e| format!("读取仪表盘累计统计失败：{e}"))
 }
 
 fn open_read_connection(path: &std::path::Path) -> Option<Mutex<Connection>> {
@@ -692,31 +689,46 @@ fn execute_query_log_insert(
     Ok(())
 }
 
-fn upsert_query_log_stats(
-    statements: &mut QueryLogStatsStatements<'_>,
+fn upsert_dashboard_stats(
+    statements: &mut DashboardStatsStatements<'_>,
     entry: &QueryLogEntry,
     anonymize_client_ip: bool,
     timestamp: u64,
 ) -> Result<(), String> {
-    let minute = u64_to_db_i64(timestamp / 60, "查询日志统计分钟")?;
+    let dashboard_timestamp = u64_to_db_i64(timestamp, "仪表盘统计时间戳")?;
+    let blocked = bool_to_i64(entry.blocked);
+    let forwarded = bool_to_i64(entry.forwarded);
+    let failed = bool_to_i64(entry.failed);
     statements
-        .minute
-        .execute(params![
-            minute,
-            bool_to_i64(entry.blocked),
-            bool_to_i64(entry.forwarded),
-            bool_to_i64(entry.failed),
-        ])
-        .map_err(|e| format!("写入分钟统计失败：{e}"))?;
-    statements
-        .domain
-        .execute(params![
-            minute,
-            entry.domain.as_str(),
-            bool_to_i64(entry.blocked),
-        ])
-        .map_err(|e| format!("写入域名统计失败：{e}"))?;
-
+        .dashboard_daily
+        .execute(params![dashboard_timestamp, blocked, forwarded, failed])
+        .map_err(|e| format!("写入仪表盘每日统计失败：{e}"))?;
+    upsert_dashboard_lifetime(
+        &mut statements.dashboard_lifetime,
+        "total",
+        "",
+        1,
+        blocked,
+        forwarded,
+        failed,
+        0,
+        0,
+        0,
+        dashboard_timestamp,
+    )?;
+    upsert_dashboard_lifetime(
+        &mut statements.dashboard_lifetime,
+        "domain",
+        entry.domain.as_str(),
+        1,
+        blocked,
+        0,
+        0,
+        0,
+        0,
+        0,
+        dashboard_timestamp,
+    )?;
     if entry.forwarded
         && let Some(upstream_server) = entry.upstream_server.as_deref()
     {
@@ -727,24 +739,37 @@ fn upsert_query_log_stats(
         } else {
             0_i64
         };
-        statements
-            .upstream
-            .execute(params![
-                minute,
-                upstream_server,
-                latency_total,
-                latency_samples
-            ])
-            .map_err(|e| format!("写入上游统计失败：{e}"))?;
+        upsert_dashboard_lifetime(
+            &mut statements.dashboard_lifetime,
+            "upstream",
+            upstream_server,
+            0,
+            0,
+            0,
+            0,
+            1,
+            latency_total,
+            latency_samples,
+            dashboard_timestamp,
+        )?;
     }
 
     if let Some(client_ip) = stored_client_ip(entry, anonymize_client_ip)
         && !client_ip.is_empty()
     {
-        statements
-            .client
-            .execute(params![minute, client_ip])
-            .map_err(|e| format!("写入客户端统计失败：{e}"))?;
+        upsert_dashboard_lifetime(
+            &mut statements.dashboard_lifetime,
+            "client",
+            &client_ip,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            dashboard_timestamp,
+        )?;
     }
 
     if entry.blocked {
@@ -753,12 +778,52 @@ fn upsert_query_log_stats(
             .as_deref()
             .filter(|source| !source.is_empty())
             .unwrap_or("未知来源");
-        statements
-            .blocklist
-            .execute(params![minute, rule_source])
-            .map_err(|e| format!("写入黑名单统计失败：{e}"))?;
+        upsert_dashboard_lifetime(
+            &mut statements.dashboard_lifetime,
+            "blocklist",
+            rule_source,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            dashboard_timestamp,
+        )?;
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_dashboard_lifetime(
+    statement: &mut rusqlite::Statement<'_>,
+    dimension: &str,
+    value: &str,
+    queries: i64,
+    blocked: i64,
+    forwarded: i64,
+    failed: i64,
+    requests: i64,
+    latency_total_ms: i64,
+    latency_samples: i64,
+    timestamp: i64,
+) -> Result<(), String> {
+    statement
+        .execute(params![
+            dimension,
+            value,
+            queries,
+            blocked,
+            forwarded,
+            failed,
+            requests,
+            latency_total_ms,
+            latency_samples,
+            timestamp,
+        ])
+        .map_err(|e| format!("写入仪表盘累计统计失败：{e}"))?;
     Ok(())
 }
 
@@ -889,6 +954,22 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             hits INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (minute, rule_source)
         );
+
+        CREATE TABLE IF NOT EXISTS dashboard_summary_stats (
+            scope TEXT NOT NULL,
+            dimension TEXT NOT NULL,
+            value TEXT NOT NULL,
+            queries INTEGER NOT NULL DEFAULT 0,
+            blocked INTEGER NOT NULL DEFAULT 0,
+            forwarded INTEGER NOT NULL DEFAULT 0,
+            failed INTEGER NOT NULL DEFAULT 0,
+            requests INTEGER NOT NULL DEFAULT 0,
+            latency_total_ms INTEGER NOT NULL DEFAULT 0,
+            latency_samples INTEGER NOT NULL DEFAULT 0,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            PRIMARY KEY (scope, dimension, value)
+        ) WITHOUT ROWID;
         ",
     )
     .map_err(|e| format!("初始化数据库失败：{e}"))?;
@@ -931,10 +1012,21 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             ON query_log_client_stats(client_ip);
         CREATE INDEX IF NOT EXISTS idx_query_log_blocklist_stats_source
             ON query_log_blocklist_stats(rule_source);
+        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_queries
+            ON dashboard_summary_stats(scope, dimension, queries DESC, value);
+        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_blocked
+            ON dashboard_summary_stats(scope, dimension, blocked DESC, value);
+        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_requests
+            ON dashboard_summary_stats(scope, dimension, requests DESC, value);
         ",
     )
     .map_err(|e| format!("初始化数据库索引失败：{e}"))?;
-    backfill_query_log_stats_if_empty(conn)?;
+    if !table_has_rows(conn, "dashboard_summary_stats")
+        .map_err(|e| format!("检查仪表盘汇总数据失败：{e}"))?
+    {
+        backfill_query_log_stats_if_empty(conn)?;
+        backfill_dashboard_summary_if_empty(conn)?;
+    }
     Ok(())
 }
 
@@ -1037,6 +1129,93 @@ fn backfill_query_log_stats_if_empty(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn backfill_dashboard_summary_if_empty(conn: &Connection) -> Result<(), String> {
+    if table_has_rows(conn, "dashboard_summary_stats")
+        .map_err(|e| format!("检查仪表盘汇总数据失败：{e}"))?
+    {
+        return Ok(());
+    }
+    if !table_has_rows(conn, "query_log_minute_stats")
+        .map_err(|e| format!("检查旧统计数据失败：{e}"))?
+    {
+        return Ok(());
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("创建仪表盘汇总回填事务失败：{e}"))?;
+    tx.execute_batch(
+        "
+        INSERT INTO dashboard_summary_stats (
+            scope, dimension, value, queries, blocked, forwarded, failed,
+            first_seen_at, last_seen_at
+        )
+        SELECT
+            strftime('%Y-%m-%d', minute * 60, 'unixepoch', 'localtime'),
+            'total',
+            '',
+            SUM(queries),
+            SUM(blocked),
+            SUM(forwarded),
+            SUM(failed),
+            MIN(minute) * 60,
+            MAX(minute) * 60
+        FROM query_log_minute_stats
+        GROUP BY strftime('%Y-%m-%d', minute * 60, 'unixepoch', 'localtime');
+
+        INSERT INTO dashboard_summary_stats (
+            scope, dimension, value, queries, blocked, forwarded, failed,
+            first_seen_at, last_seen_at
+        )
+        SELECT
+            'all', 'total', '', SUM(queries), SUM(blocked), SUM(forwarded), SUM(failed),
+            MIN(minute) * 60, MAX(minute) * 60
+        FROM query_log_minute_stats;
+
+        INSERT INTO dashboard_summary_stats (
+            scope, dimension, value, queries, blocked, first_seen_at, last_seen_at
+        )
+        SELECT
+            'all', 'domain', domain, SUM(queries), SUM(blocked),
+            MIN(minute) * 60, MAX(minute) * 60
+        FROM query_log_domain_stats
+        GROUP BY domain;
+
+        INSERT INTO dashboard_summary_stats (
+            scope, dimension, value, queries, first_seen_at, last_seen_at
+        )
+        SELECT
+            'all', 'client', client_ip, SUM(queries),
+            MIN(minute) * 60, MAX(minute) * 60
+        FROM query_log_client_stats
+        GROUP BY client_ip;
+
+        INSERT INTO dashboard_summary_stats (
+            scope, dimension, value, blocked, first_seen_at, last_seen_at
+        )
+        SELECT
+            'all', 'blocklist', rule_source, SUM(hits),
+            MIN(minute) * 60, MAX(minute) * 60
+        FROM query_log_blocklist_stats
+        GROUP BY rule_source;
+
+        INSERT INTO dashboard_summary_stats (
+            scope, dimension, value, requests, latency_total_ms, latency_samples,
+            first_seen_at, last_seen_at
+        )
+        SELECT
+            'all', 'upstream', upstream_server, SUM(requests),
+            SUM(latency_total_ms), SUM(latency_samples),
+            MIN(minute) * 60, MAX(minute) * 60
+        FROM query_log_upstream_stats
+        GROUP BY upstream_server;
+        ",
+    )
+    .map_err(|e| format!("回填仪表盘汇总数据失败：{e}"))?;
+    tx.commit()
+        .map_err(|e| format!("提交仪表盘汇总回填失败：{e}"))
+}
+
 fn backfill_stats_table_if_empty(
     conn: &Connection,
     table: &str,
@@ -1084,40 +1263,31 @@ fn add_column_if_missing(
     Ok(())
 }
 
-fn grouped_domain_counts(conn: &Connection, since_minute: u64) -> Result<DomainRankings, String> {
-    let since = u64_to_db_i64(since_minute, "域名排行起始分钟")?;
+fn grouped_domain_counts(conn: &Connection) -> Result<DomainRankings, String> {
     let mut stmt = conn
         .prepare(
-            "WITH domain_totals AS MATERIALIZED (
-                 SELECT
-                     domain,
-                     COALESCE(SUM(queries), 0) AS queries,
-                     COALESCE(SUM(blocked), 0) AS blocked
-                 FROM query_log_domain_stats
-                 WHERE minute >= ?1
-                 GROUP BY domain
-             ),
-             query_top AS (
-                 SELECT domain, queries AS count
-                 FROM domain_totals
-                 WHERE queries > 0
-                 ORDER BY queries DESC, domain ASC
-                 LIMIT 200
-             ),
-             blocked_top AS (
-                 SELECT domain, blocked AS count
-                 FROM domain_totals
-                 WHERE blocked > 0
-                 ORDER BY blocked DESC, domain ASC
+            "SELECT 0 AS ranking, value, queries AS count
+             FROM (
+                 SELECT value, queries
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'domain' AND queries > 0
+                 ORDER BY queries DESC, value ASC
                  LIMIT 200
              )
-             SELECT 0 AS ranking, domain, count FROM query_top
              UNION ALL
-             SELECT 1 AS ranking, domain, count FROM blocked_top",
+             SELECT 1 AS ranking, value, blocked AS count
+             FROM (
+                 SELECT value, blocked
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'domain' AND blocked > 0
+                 ORDER BY blocked DESC, value ASC
+                 LIMIT 200
+             )
+             ",
         )
         .map_err(|e| format!("准备域名排行查询失败：{e}"))?;
     let rows = stmt
-        .query_map(params![since], |row| {
+        .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -1143,26 +1313,18 @@ fn grouped_domain_counts(conn: &Connection, since_minute: u64) -> Result<DomainR
     Ok((query_counts, blocked_counts))
 }
 
-fn client_request_counts(
-    conn: &Connection,
-    since_seconds: u64,
-) -> Result<HashMap<String, u64>, String> {
-    let since = u64_to_db_i64(since_seconds / 60, "客户端排行起始分钟")?;
+fn client_request_counts(conn: &Connection) -> Result<HashMap<String, u64>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT client_ip, COALESCE(SUM(queries), 0)
-             FROM query_log_client_stats
-             WHERE minute >= ?1
-             GROUP BY client_ip
-             HAVING COALESCE(SUM(queries), 0) > 0
-             ORDER BY COALESCE(SUM(queries), 0) DESC, client_ip ASC
+            "SELECT value, queries
+             FROM dashboard_summary_stats
+             WHERE scope = 'all' AND dimension = 'client' AND queries > 0
+             ORDER BY queries DESC, value ASC
              LIMIT 200",
         )
         .map_err(|e| format!("准备客户端排行查询失败：{e}"))?;
     let rows = stmt
-        .query_map(params![since], |row| {
-            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
-        })
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, read_u64(row, 1)?)))
         .map_err(|e| format!("读取客户端排行失败：{e}"))?;
 
     let mut counts = HashMap::new();
@@ -1173,26 +1335,18 @@ fn client_request_counts(
     Ok(counts)
 }
 
-fn blocklist_hit_counts(
-    conn: &Connection,
-    since_seconds: u64,
-) -> Result<HashMap<String, u64>, String> {
-    let since = u64_to_db_i64(since_seconds / 60, "黑名单排行起始分钟")?;
+fn blocklist_hit_counts(conn: &Connection) -> Result<HashMap<String, u64>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT rule_source, COALESCE(SUM(hits), 0)
-             FROM query_log_blocklist_stats
-             WHERE minute >= ?1
-             GROUP BY rule_source
-             HAVING COALESCE(SUM(hits), 0) > 0
-             ORDER BY COALESCE(SUM(hits), 0) DESC, rule_source ASC
+            "SELECT value, blocked
+             FROM dashboard_summary_stats
+             WHERE scope = 'all' AND dimension = 'blocklist' AND blocked > 0
+             ORDER BY blocked DESC, value ASC
              LIMIT 200",
         )
         .map_err(|e| format!("准备黑名单排行查询失败：{e}"))?;
     let rows = stmt
-        .query_map(params![since], |row| {
-            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
-        })
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, read_u64(row, 1)?)))
         .map_err(|e| format!("读取黑名单排行失败：{e}"))?;
 
     let mut counts = HashMap::new();
@@ -1203,34 +1357,23 @@ fn blocklist_hit_counts(
     Ok(counts)
 }
 
-// 超过该窗口的趋势按小时聚合，避免长保留期一次返回十几万分钟桶
-const TRAFFIC_HOUR_BUCKET_THRESHOLD_HOURS: u32 = 48;
-
-fn traffic_buckets(
-    conn: &Connection,
-    since_minute: u64,
-    retention_hours: u32,
-) -> Result<Vec<TrafficBucket>, String> {
-    let since = u64_to_db_i64(since_minute, "趋势起始分钟")?;
-    let sql = if retention_hours > TRAFFIC_HOUR_BUCKET_THRESHOLD_HOURS {
-        "SELECT (minute / 60) * 60 AS bucket_minute,
-                COALESCE(SUM(queries), 0),
-                COALESCE(SUM(blocked), 0)
-         FROM query_log_minute_stats
-         WHERE minute >= ?1
-         GROUP BY minute / 60
-         ORDER BY bucket_minute"
-    } else {
-        "SELECT minute, queries, blocked
-         FROM query_log_minute_stats
-         WHERE minute >= ?1
-         ORDER BY minute"
-    };
+fn traffic_buckets(conn: &Connection) -> Result<Vec<TrafficBucket>, String> {
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(
+            "SELECT
+                CAST(strftime('%s', scope || ' 00:00:00', 'utc') AS INTEGER) / 60,
+                queries,
+                blocked
+             FROM dashboard_summary_stats
+             WHERE dimension = 'total'
+               AND value = ''
+               AND scope >= date('now', 'localtime', '-29 days')
+               AND scope <= date('now', 'localtime')
+             ORDER BY scope",
+        )
         .map_err(|e| format!("准备趋势查询失败：{e}"))?;
     let rows = stmt
-        .query_map(params![since], |row| {
+        .query_map([], |row| {
             Ok(TrafficBucket {
                 minute: read_u64(row, 0)?,
                 queries: read_u64(row, 1)?,
@@ -1246,24 +1389,18 @@ fn traffic_buckets(
     Ok(buckets)
 }
 
-fn upstream_request_counts(
-    conn: &Connection,
-    since_minute: u64,
-) -> Result<Vec<UpstreamRequestStat>, String> {
-    let since = u64_to_db_i64(since_minute, "上游请求排行起始分钟")?;
+fn upstream_request_counts(conn: &Connection) -> Result<Vec<UpstreamRequestStat>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT upstream_server, COALESCE(SUM(requests), 0)
-             FROM query_log_upstream_stats
-             WHERE minute >= ?1
-             GROUP BY upstream_server
-             HAVING COALESCE(SUM(requests), 0) > 0
-             ORDER BY COALESCE(SUM(requests), 0) DESC, upstream_server ASC
+            "SELECT value, requests
+             FROM dashboard_summary_stats
+             WHERE scope = 'all' AND dimension = 'upstream' AND requests > 0
+             ORDER BY requests DESC, value ASC
              LIMIT 200",
         )
         .map_err(|e| format!("准备上游请求排行失败：{e}"))?;
     let rows = stmt
-        .query_map(params![since], |row| {
+        .query_map([], |row| {
             Ok(UpstreamRequestStat {
                 upstream: row.get(0)?,
                 requests: read_u64(row, 1)?,
@@ -1278,30 +1415,24 @@ fn upstream_request_counts(
     Ok(stats)
 }
 
-fn upstream_avg_latency(
-    conn: &Connection,
-    since_minute: u64,
-) -> Result<Vec<UpstreamLatencyStat>, String> {
-    let since = u64_to_db_i64(since_minute, "上游响应时间排行起始分钟")?;
+fn upstream_avg_latency(conn: &Connection) -> Result<Vec<UpstreamLatencyStat>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT
-                upstream_server,
+                value,
                 CAST(ROUND(
-                    CAST(SUM(latency_total_ms) AS REAL) / SUM(latency_samples)
+                    CAST(latency_total_ms AS REAL) / latency_samples
                 ) AS INTEGER)
-             FROM query_log_upstream_stats
-             WHERE minute >= ?1
+             FROM dashboard_summary_stats
+             WHERE scope = 'all'
+               AND dimension = 'upstream'
                AND latency_samples > 0
-             GROUP BY upstream_server
-             HAVING SUM(latency_samples) > 0
-             ORDER BY CAST(SUM(latency_total_ms) AS REAL) / SUM(latency_samples) ASC,
-                upstream_server ASC
+             ORDER BY CAST(latency_total_ms AS REAL) / latency_samples ASC, value ASC
              LIMIT 200",
         )
         .map_err(|e| format!("准备上游响应时间排行失败：{e}"))?;
     let rows = stmt
-        .query_map(params![since], |row| {
+        .query_map([], |row| {
             Ok(UpstreamLatencyStat {
                 upstream: row.get(0)?,
                 avg_ms: read_u64(row, 1)?,
@@ -1514,6 +1645,29 @@ mod tests {
             blocked_logs.records[0].matched_rule.as_deref(),
             Some("||example.org^")
         );
+
+        {
+            let conn = db.lock().expect("database should lock");
+            conn.execute("UPDATE query_logs SET timestamp = 0", [])
+                .expect("raw logs should become expired");
+            conn.execute("UPDATE query_log_minute_stats SET minute = 0", [])
+                .expect("minute stats should become expired");
+            conn.execute("UPDATE query_log_domain_stats SET minute = 0", [])
+                .expect("domain stats should become expired");
+            conn.execute("UPDATE query_log_upstream_stats SET minute = 0", [])
+                .expect("upstream stats should become expired");
+            conn.execute("UPDATE query_log_client_stats SET minute = 0", [])
+                .expect("client stats should become expired");
+            conn.execute("UPDATE query_log_blocklist_stats SET minute = 0", [])
+                .expect("blocklist stats should become expired");
+        }
+        db.prune_query_logs(1).expect("expired logs should prune");
+        let preserved = db
+            .log_stats(1)
+            .expect("dashboard summary should survive pruning");
+        assert_eq!(preserved.queries, 2);
+        assert_eq!(preserved.blocked, 1);
+        assert_eq!(preserved.query_domains.get("ads.example.org"), Some(&1));
     }
 
     #[test]
@@ -1692,6 +1846,24 @@ mod tests {
                 |row| read_u64(row, 0),
             )
             .expect("blocklist stats should backfill");
+        let dashboard_total = conn
+            .query_row(
+                "SELECT queries, blocked, forwarded
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'total' AND value = ''",
+                [],
+                |row| Ok((read_u64(row, 0)?, read_u64(row, 1)?, read_u64(row, 2)?)),
+            )
+            .expect("dashboard lifetime total should backfill");
+        let dashboard_domain = conn
+            .query_row(
+                "SELECT blocked
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'domain' AND value = 'ads.example.org'",
+                [],
+                |row| read_u64(row, 0),
+            )
+            .expect("dashboard domain summary should backfill");
 
         assert_eq!(queries, 2);
         assert_eq!(blocked, 1);
@@ -1700,6 +1872,8 @@ mod tests {
         assert_eq!(latency_total, 24);
         assert_eq!(client_queries, 2);
         assert_eq!(unknown_blocklist_hits, 1);
+        assert_eq!(dashboard_total, (2, 1, 1));
+        assert_eq!(dashboard_domain, 1);
     }
 
     #[test]

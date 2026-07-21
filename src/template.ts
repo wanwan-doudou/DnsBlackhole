@@ -56,7 +56,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </svg>
               <div class="spark-tooltip hidden" id="query_spark_tooltip"></div>
             </div>
-            <span class="spark-caption"><span>DNS 查询</span><small>最近 15 天 · 每日</small></span>
+            <span class="spark-caption"><span>DNS 查询</span><small>累计总数 · 曲线为近 30 天</small></span>
           </article>
 
           <article class="spark-card blocked-spark">
@@ -80,7 +80,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </svg>
               <div class="spark-tooltip hidden" id="blocked_spark_tooltip"></div>
             </div>
-            <span class="spark-caption"><span>已被过滤器拦截</span><small>最近 15 天 · 每日</small></span>
+            <span class="spark-caption"><span>已被过滤器拦截</span><small>累计总数 · 曲线为近 30 天</small></span>
           </article>
         </div>
 
@@ -89,7 +89,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="rank-title">
               <div>
                 <h2>请求域名排行</h2>
-                <span id="query_rank_window">最近 90 天</span>
+                <span id="query_rank_window">暂无汇总数据</span>
               </div>
               <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
             </div>
@@ -106,7 +106,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="rank-title">
               <div>
                 <h2>被拦截域名排行</h2>
-                <span id="blocked_rank_window">最近 90 天</span>
+                <span id="blocked_rank_window">暂无汇总数据</span>
               </div>
               <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
             </div>
@@ -125,7 +125,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="rank-title">
               <div>
                 <h2>客户端排行</h2>
-                <span id="client_rank_window">最近 90 天</span>
+                <span id="client_rank_window">暂无汇总数据</span>
               </div>
               <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
             </div>
@@ -142,7 +142,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="rank-title">
               <div>
                 <h2>DNS 黑名单排行</h2>
-                <span id="blocklist_rank_window">最近 90 天</span>
+                <span id="blocklist_rank_window">暂无汇总数据</span>
               </div>
               <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
             </div>
@@ -161,7 +161,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="rank-title">
               <div>
                 <h2>经常请求的上游服务器</h2>
-                <span id="upstream_rank_window">最近 90 天</span>
+                <span id="upstream_rank_window">暂无汇总数据</span>
               </div>
               <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
             </div>
@@ -178,7 +178,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="rank-title">
               <div>
                 <h2>上游服务器的平均响应时间</h2>
-                <span id="upstream_latency_window">最近 90 天</span>
+                <span id="upstream_latency_window">暂无汇总数据</span>
               </div>
               <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
             </div>
@@ -505,6 +505,20 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <small>按解压后的实际读取大小限制，超过后立即中断下载。</small>
                   <input id="filter_max_size_mb" type="number" min="1" max="256" step="1" />
                 </label>
+                <label class="field">
+                  <span>下载代理</span>
+                  <small id="filter_proxy_status">自动读取当前用户的系统代理，并交给后台服务使用。</small>
+                  <select id="filter_proxy_mode">
+                    <option value="system">跟随系统代理</option>
+                    <option value="direct">直接连接</option>
+                    <option value="custom">自定义代理</option>
+                  </select>
+                </label>
+                <label class="field filter-proxy-url-field" id="filter_proxy_url_field">
+                  <span>自定义代理地址</span>
+                  <small>支持 HTTP/HTTPS 代理，例如 http://127.0.0.1:7897。</small>
+                  <input id="filter_proxy_url" type="url" placeholder="http://127.0.0.1:7897" spellcheck="false" />
+                </label>
                 <label class="check-row warning-check-row">
                   <input id="allow_insecure_http" type="checkbox" />
                   <span>
@@ -714,7 +728,9 @@ export function renderAppTemplate(appIconUrl: string): string {
           <div class="panel-title with-actions">
             <h2>DNS 黑名单</h2>
             <div class="button-group">
+              <span class="filter-update-progress hidden" id="filter_update_progress" role="status"></span>
               <button id="add_filter_btn" type="button">添加黑名单</button>
+              <button class="hidden" id="cancel_filter_update_btn" type="button">取消更新</button>
               <button class="primary" id="update_filters_btn" type="button">检查更新</button>
             </div>
           </div>

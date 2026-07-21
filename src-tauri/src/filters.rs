@@ -1,6 +1,11 @@
 use std::{
     io::Read,
     path::Path,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -8,36 +13,83 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use serde::Serialize;
 
 use crate::{
-    config::{self, AppConfig, FilterSubscription},
+    config::{self, AppConfig, FilterProxyMode, FilterSubscription},
     dns,
 };
 
 const FILTER_DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
+const FILTER_DOWNLOAD_CONCURRENCY: usize = 3;
+const FILTER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const FILTER_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FilterUpdateReport {
     pub updated: usize,
     pub failed: usize,
+    pub cancelled: usize,
     pub message: String,
 }
 
-pub fn update_enabled_filters(
-    data_dir: &Path,
-    config: &mut AppConfig,
-) -> Result<FilterUpdateReport, String> {
-    update_matching_filters(data_dir, config, "没有启用的远程清单", |_| true)
+#[derive(Debug, Clone, Copy)]
+pub struct FilterUpdateProgress {
+    pub total: usize,
+    pub completed: usize,
+    pub updated: usize,
+    pub failed: usize,
 }
 
-pub fn update_due_filters(
+#[derive(Debug, Clone)]
+struct FilterDownloadJob {
+    config_index: usize,
+    id: String,
+    name: String,
+    url: String,
+}
+
+struct FilterDownloadOutcome {
+    config_index: usize,
+    summary: Result<dns::RuleSummary, String>,
+}
+
+pub fn update_enabled_filters<P>(
+    data_dir: &Path,
+    config: &mut AppConfig,
+    cancelled: &AtomicBool,
+    on_progress: P,
+) -> Result<FilterUpdateReport, String>
+where
+    P: FnMut(FilterUpdateProgress),
+{
+    update_matching_filters(
+        data_dir,
+        config,
+        "没有启用的远程清单",
+        |_| true,
+        cancelled,
+        on_progress,
+    )
+}
+
+pub fn update_due_filters<P>(
     data_dir: &Path,
     config: &mut AppConfig,
     now: u64,
-) -> Result<FilterUpdateReport, String> {
+    cancelled: &AtomicBool,
+    on_progress: P,
+) -> Result<FilterUpdateReport, String>
+where
+    P: FnMut(FilterUpdateProgress),
+{
     let interval_seconds = u64::from(config.filter_update_interval_hours) * 3600;
-    update_matching_filters(data_dir, config, "没有到期的远程清单", |filter| {
-        is_filter_due(filter, now, interval_seconds)
-    })
+    update_matching_filters(
+        data_dir,
+        config,
+        "没有到期的远程清单",
+        |filter| is_filter_due(filter, now, interval_seconds),
+        cancelled,
+        on_progress,
+    )
 }
 
 pub fn has_due_filters(config: &AppConfig, now: u64) -> bool {
@@ -54,85 +106,167 @@ fn is_filter_due(filter: &FilterSubscription, now: u64, interval_seconds: u64) -
         .is_none_or(|updated| now.saturating_sub(updated) >= interval_seconds)
 }
 
-fn update_matching_filters<F>(
+fn update_matching_filters<F, P>(
     data_dir: &Path,
     config: &mut AppConfig,
     empty_message: &str,
     should_update: F,
+    cancelled: &AtomicBool,
+    mut on_progress: P,
 ) -> Result<FilterUpdateReport, String>
 where
     F: Fn(&FilterSubscription) -> bool,
+    P: FnMut(FilterUpdateProgress),
 {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent(concat!("DnsBlackhole/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| format!("创建下载客户端失败：{e}"))?;
-
+    let client = build_download_client(config)?;
+    let jobs = config
+        .filters
+        .iter()
+        .enumerate()
+        .filter(|(_, filter)| filter.enabled && should_update(filter))
+        .map(|(config_index, filter)| FilterDownloadJob {
+            config_index,
+            id: filter.id.clone(),
+            name: filter.name.clone(),
+            url: filter.url.clone(),
+        })
+        .collect::<Vec<_>>();
+    let total = jobs.len();
     let mut updated = 0;
     let mut failed = 0;
-    let mut messages = Vec::new();
+    let mut completed = 0;
     let max_size_mb = config.filter_max_size_mb;
+    on_progress(FilterUpdateProgress {
+        total,
+        completed,
+        updated,
+        failed,
+    });
 
-    for filter in &mut config.filters {
-        if !filter.enabled || !should_update(filter) {
-            continue;
-        }
+    if total > 0 {
+        let worker_count = total.min(FILTER_DOWNLOAD_CONCURRENCY);
+        let next_job = AtomicUsize::new(0);
+        let (outcome_tx, outcome_rx) = mpsc::sync_channel(worker_count);
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let outcome_tx = outcome_tx.clone();
+                let jobs = &jobs;
+                let client = &client;
+                let next_job = &next_job;
+                scope.spawn(move || {
+                    loop {
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let job_index = next_job.fetch_add(1, Ordering::AcqRel);
+                        let Some(job) = jobs.get(job_index) else {
+                            break;
+                        };
+                        let outcome = process_filter_download(data_dir, client, job, max_size_mb);
+                        if outcome_tx.send(outcome).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(outcome_tx);
 
-        let download_started = Instant::now();
-        let download = download_filter(&client, &filter.url, max_size_mb);
-        let outcome = if download.is_ok() { "成功" } else { "失败" };
-        crate::performance::log_service(
-            "远程清单更新",
-            &format!("{}（{outcome}）", filter.name),
-            download_started,
-        );
-
-        match download {
-            Ok(content) => {
-                let summary = dns::summarize_rules(&content);
-                if let Err(error) = config::write_filter_cache(data_dir, &filter.id, &content) {
-                    filter.last_error = Some(error.clone());
-                    messages.push(format!("{}：{error}", filter.name));
-                    failed += 1;
-                    continue;
+            for outcome in outcome_rx {
+                let filter = &mut config.filters[outcome.config_index];
+                match outcome.summary {
+                    Ok(summary) => {
+                        filter.rule_count = summary.block_rules + summary.allow_rules;
+                        filter.block_rule_count = summary.block_rules;
+                        filter.allow_rule_count = summary.allow_rules;
+                        filter.ignored_rule_count = summary.ignored_rules;
+                        filter.ignored_comment_count = summary.ignored_comment_rules;
+                        filter.ignored_regex_count = summary.ignored_regex_rules;
+                        filter.ignored_unsupported_count = summary.ignored_unsupported_rules;
+                        filter.ignored_invalid_count = summary.ignored_invalid_rules;
+                        filter.last_updated = unix_now();
+                        filter.last_error = None;
+                        updated += 1;
+                    }
+                    Err(error) => {
+                        filter.last_error = Some(error);
+                        failed += 1;
+                    }
                 }
-                filter.rule_count = summary.block_rules + summary.allow_rules;
-                filter.block_rule_count = summary.block_rules;
-                filter.allow_rule_count = summary.allow_rules;
-                filter.ignored_rule_count = summary.ignored_rules;
-                filter.ignored_comment_count = summary.ignored_comment_rules;
-                filter.ignored_regex_count = summary.ignored_regex_rules;
-                filter.ignored_unsupported_count = summary.ignored_unsupported_rules;
-                filter.ignored_invalid_count = summary.ignored_invalid_rules;
-                filter.last_updated = unix_now();
-                filter.last_error = None;
-                updated += 1;
+                completed += 1;
+                on_progress(FilterUpdateProgress {
+                    total,
+                    completed,
+                    updated,
+                    failed,
+                });
             }
-            Err(error) => {
-                filter.last_error = Some(error.clone());
-                messages.push(format!("{}：{error}", filter.name));
-                failed += 1;
-            }
-        }
+        });
     }
 
-    let message = if updated == 0 && failed == 0 {
+    let cancelled_count = total.saturating_sub(completed);
+    let message = if total == 0 {
         empty_message.to_string()
+    } else if cancelled_count > 0 {
+        format!("更新已取消：{updated} 个成功，{failed} 个失败，{cancelled_count} 个未处理")
     } else if failed == 0 {
         format!("已更新 {updated} 个远程清单")
     } else {
-        format!(
-            "已更新 {updated} 个远程清单，{failed} 个失败：{}",
-            messages.join("；")
-        )
+        format!("更新完成：{updated} 个成功，{failed} 个失败，请查看各清单状态")
     };
 
     Ok(FilterUpdateReport {
         updated,
         failed,
+        cancelled: cancelled_count,
         message,
     })
+}
+
+fn build_download_client(config: &AppConfig) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .connect_timeout(FILTER_CONNECT_TIMEOUT)
+        .timeout(FILTER_TOTAL_TIMEOUT)
+        .user_agent(concat!("DnsBlackhole/", env!("CARGO_PKG_VERSION")));
+    let proxy_url = match config.filter_proxy_mode {
+        FilterProxyMode::Direct => {
+            builder = builder.no_proxy();
+            None
+        }
+        FilterProxyMode::System => Some(config.filter_system_proxy_url.trim()),
+        FilterProxyMode::Custom => Some(config.filter_proxy_url.trim()),
+    };
+    if let Some(proxy_url) = proxy_url.filter(|url| !url.is_empty()) {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .map_err(|error| format!("创建过滤器下载代理失败：{error}"))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("创建下载客户端失败：{error}"))
+}
+
+fn process_filter_download(
+    data_dir: &Path,
+    client: &reqwest::blocking::Client,
+    job: &FilterDownloadJob,
+    max_size_mb: u32,
+) -> FilterDownloadOutcome {
+    let download_started = Instant::now();
+    let summary = download_filter(client, &job.url, max_size_mb).and_then(|content| {
+        let summary = dns::summarize_rules(&content);
+        config::write_filter_cache(data_dir, &job.id, &content)?;
+        Ok(summary)
+    });
+    let outcome = if summary.is_ok() { "成功" } else { "失败" };
+    crate::performance::log_service(
+        "远程清单更新",
+        &format!("{}（{outcome}）", job.name),
+        download_started,
+    );
+    FilterDownloadOutcome {
+        config_index: job.config_index,
+        summary,
+    }
 }
 
 fn download_filter(

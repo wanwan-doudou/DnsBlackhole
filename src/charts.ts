@@ -2,7 +2,7 @@ import { query } from "./dom";
 import { escapeHtml, formatCount, formatSparkDayLabel } from "./format";
 import type { ChartPoint, HistoryPoint, TrafficBucket } from "./types";
 
-export const DAILY_TREND_DAYS = 15;
+export const DAILY_TREND_DAYS = 30;
 
 export function buildDailyTrafficSeries(
   buckets: TrafficBucket[] | undefined,

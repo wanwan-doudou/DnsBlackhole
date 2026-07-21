@@ -5,9 +5,12 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
+  cancelFilterUpdate,
   clearDnsCache as clearDnsCacheCommand,
   clearFilterCache as clearFilterCacheCommand,
+  detectSystemProxy,
   getConfig,
+  getFilterUpdateProgress,
   getMacosServiceStatus,
   getWindowsServiceStatus,
   getStorageInfo,
@@ -32,7 +35,6 @@ import {
   escapeHtml,
   formatCount,
   formatBytes,
-  formatDuration,
   formatElapsedMs,
   formatLogDate,
   formatLogTime,
@@ -45,6 +47,8 @@ import type {
   AppConfig,
   BlockingMode,
   FilterSubscription,
+  FilterProxyMode,
+  FilterUpdateProgress,
   MacosServiceState,
   MacosServiceStatus,
   QueryLogFilter,
@@ -100,7 +104,6 @@ let activeView: ViewName = "dashboard";
 let filtersState: FilterSubscription[] = [];
 let editingFilterIds = new Set<string>();
 let currentQueryLogEnabled = true;
-let currentQueryLogRetentionHours = 90 * 24;
 let refreshInFlight = false;
 let isContentScrolling = false;
 let queuedAutoRefresh = false;
@@ -126,6 +129,10 @@ let initialBootstrapComplete = false;
 let backgroundServiceRefreshInFlight = false;
 let windowsServiceStatusInFlight: Promise<WindowsServiceStatus | null> | null = null;
 let windowsServiceUnavailableSince: number | null = null;
+let detectedSystemProxy: string | null = null;
+let savedSystemProxyUrl = "";
+let filterUpdateProgressTimer: number | undefined;
+let filterUpdateProgressInFlight = false;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
@@ -157,6 +164,10 @@ const rateLimitPerSecondInput = query<HTMLInputElement>("#rate_limit_per_second"
 const refuseAnyInput = query<HTMLInputElement>("#refuse_any");
 const filterUpdateIntervalInput = query<HTMLSelectElement>("#filter_update_interval");
 const filterMaxSizeInput = query<HTMLInputElement>("#filter_max_size_mb");
+const filterProxyModeInput = query<HTMLSelectElement>("#filter_proxy_mode");
+const filterProxyUrlField = query<HTMLLabelElement>("#filter_proxy_url_field");
+const filterProxyUrlInput = query<HTMLInputElement>("#filter_proxy_url");
+const filterProxyStatus = query<HTMLElement>("#filter_proxy_status");
 const allowInsecureHttpInput = query<HTMLInputElement>("#allow_insecure_http");
 const upstreamModeInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="upstream_mode"]'),
@@ -204,6 +215,8 @@ const startButton = query<HTMLButtonElement>("#start_btn");
 const stopButton = query<HTMLButtonElement>("#stop_btn");
 const addFilterButton = query<HTMLButtonElement>("#add_filter_btn");
 const updateFiltersButton = query<HTMLButtonElement>("#update_filters_btn");
+const cancelFilterUpdateButton = query<HTMLButtonElement>("#cancel_filter_update_btn");
+const filterUpdateProgressElement = query<HTMLElement>("#filter_update_progress");
 const clearDnsCacheButton = query<HTMLButtonElement>("#clear_dns_cache_btn");
 const clearFilterCacheButton = query<HTMLButtonElement>("#clear_filter_cache_btn");
 const dataStoragePathInput = query<HTMLInputElement>("#data_storage_path");
@@ -408,6 +421,7 @@ queryLogBody.addEventListener("focusin", (event) => {
 contentElement.addEventListener("scroll", markContentScrolling, { passive: true });
 
 queryLogEnabledInput.addEventListener("change", updateLogControls);
+filterProxyModeInput.addEventListener("change", updateFilterProxyControls);
 dnsCacheEnabledInput.addEventListener("change", updateDnsCacheControls);
 runtimeWatchdogEnabledInput.addEventListener("change", updateRuntimeWatchdogControls);
 blockingModeInputs.forEach((input) => {
@@ -485,19 +499,32 @@ addFilterButton.addEventListener("click", () => {
 
 updateFiltersButton.addEventListener("click", async () => {
   setFilterUpdating(true);
-  setBusy(true);
+  startFilterUpdateProgressPolling();
   try {
     await waitForPaint();
     const result = await updateFiltersCommand(collectConfig());
     renderStatus(result.status);
-    showMessage(result.message, result.failed > 0);
+    showMessage(result.message, result.failed > 0 && result.cancelled === 0);
     await loadConfig();
   } catch (error) {
     showMessage(String(error), true);
     await refreshStatus();
   } finally {
-    setBusy(false);
+    stopFilterUpdateProgressPolling();
     setFilterUpdating(false);
+  }
+});
+
+cancelFilterUpdateButton.addEventListener("click", async () => {
+  cancelFilterUpdateButton.disabled = true;
+  cancelFilterUpdateButton.textContent = "正在取消";
+  try {
+    const progress = await cancelFilterUpdate();
+    renderFilterUpdateProgress(progress);
+  } catch (error) {
+    cancelFilterUpdateButton.disabled = false;
+    cancelFilterUpdateButton.textContent = "取消更新";
+    showMessage(String(error), true);
   }
 });
 
@@ -841,6 +868,7 @@ async function bootstrapApplication(): Promise<void> {
   void getVersion().then((version) => {
     appVersionElement.textContent = version;
   });
+  const systemProxyReady = loadDetectedSystemProxy();
 
   const serviceStatusStarted = performance.now();
   let [initialWindowsServiceStatus] = await Promise.all([
@@ -860,6 +888,8 @@ async function bootstrapApplication(): Promise<void> {
   const [configReady] = windowsCoreReady
     ? await Promise.all([loadConfig(), loadStorageInfo()])
     : [false];
+  await systemProxyReady;
+  updateFilterProxyControls();
   logLoadTime("初始配置与存储信息", initialDataStarted, `configReady=${configReady}`);
   if (!windowsCoreReady && !configReady) {
     activeView = "settings";
@@ -879,6 +909,15 @@ async function bootstrapApplication(): Promise<void> {
   logLoadTime("前端启动总计", frontendStartedAt);
 
   startBackgroundRefresh();
+}
+
+async function loadDetectedSystemProxy(): Promise<void> {
+  try {
+    detectedSystemProxy = await detectSystemProxy();
+  } catch (error) {
+    detectedSystemProxy = null;
+    console.warn("检测当前用户系统代理失败", error);
+  }
 }
 
 function startBackgroundRefresh(): void {
@@ -948,6 +987,9 @@ async function loadConfig(): Promise<boolean> {
     refuseAnyInput.checked = config.refuse_any;
     filterUpdateIntervalInput.value = String(config.filter_update_interval_hours);
     filterMaxSizeInput.value = String(config.filter_max_size_mb);
+    filterProxyModeInput.value = config.filter_proxy_mode;
+    filterProxyUrlInput.value = config.filter_proxy_url;
+    savedSystemProxyUrl = config.filter_system_proxy_url;
     allowInsecureHttpInput.checked = config.allow_insecure_http;
     setRadioValue(upstreamModeInputs, config.upstream_mode);
     queryLogEnabledInput.checked = config.query_log_enabled;
@@ -968,9 +1010,8 @@ async function loadConfig(): Promise<boolean> {
     queryLogIgnoredInput.value = config.query_log_ignored_domains;
     clientNameMap = parseClientNames(config.client_names);
     currentQueryLogEnabled = config.query_log_enabled;
-    currentQueryLogRetentionHours = config.query_log_retention_hours;
-    renderRetentionWindow();
     updateLogControls();
+    updateFilterProxyControls();
     updateDnsCacheControls();
     updateRuntimeWatchdogControls();
     updateBlockingModeControls();
@@ -1302,6 +1343,9 @@ function collectConfig(): AppConfig {
     refuse_any: refuseAnyInput.checked,
     filter_update_interval_hours: Number(filterUpdateIntervalInput.value),
     filter_max_size_mb: Number(filterMaxSizeInput.value || 50),
+    filter_proxy_mode: filterProxyModeInput.value as FilterProxyMode,
+    filter_proxy_url: filterProxyUrlInput.value.trim(),
+    filter_system_proxy_url: detectedSystemProxy ?? savedSystemProxyUrl,
     allow_insecure_http: allowInsecureHttpInput.checked,
     query_log_enabled: queryLogEnabledInput.checked,
     anonymize_client_ip: anonymizeClientIpInput.checked,
@@ -1625,6 +1669,10 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#queries"), formatCount(status.stats.queries));
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
+  renderDashboardSummaryWindow(
+    status.stats.dashboard_started_at,
+    status.stats.dashboard_ended_at,
+  );
   renderSparkline(
     "#query_sparkline",
     buildDailyTrafficSeries(status.stats.traffic, "queries"),
@@ -2509,10 +2557,25 @@ async function downloadAndInstallWithRetry(): Promise<void> {
   );
 }
 
-function renderRetentionWindow(): void {
-  const label = currentQueryLogEnabled
-    ? `最近 ${formatDuration(currentQueryLogRetentionHours)}`
-    : "本次运行";
+function renderDashboardSummaryWindow(
+  startedAt: number | null | undefined,
+  endedAt: number | null | undefined,
+): void {
+  let label = "暂无汇总数据";
+  if (startedAt && endedAt) {
+    const start = new Date(startedAt * 1000);
+    const end = new Date(endedAt * 1000);
+    const days = Math.max(1, Math.floor((end.getTime() - start.getTime()) / 86_400_000) + 1);
+    if (days < 32) {
+      label = `累计汇总 ${days} 天`;
+    } else {
+      const months = Math.max(
+        1,
+        (end.getFullYear() - start.getFullYear()) * 12 + end.getMonth() - start.getMonth() + 1,
+      );
+      label = `累计汇总 ${months} 个月`;
+    }
+  }
   query("#query_rank_window").textContent = label;
   query("#blocked_rank_window").textContent = label;
   query("#client_rank_window").textContent = label;
@@ -2718,7 +2781,84 @@ function setRefreshButtonState(button: HTMLButtonElement | undefined, refreshing
 function setFilterUpdating(updating: boolean): void {
   updateFiltersButton.classList.toggle("loading", updating);
   updateFiltersButton.textContent = updating ? "更新中" : "检查更新";
+  updateFiltersButton.disabled = updating;
+  addFilterButton.disabled = updating;
   filtersTable.classList.toggle("is-updating", updating);
+  for (const control of filtersTable.querySelectorAll<HTMLInputElement | HTMLButtonElement>(
+    "input, button",
+  )) {
+    control.disabled = updating;
+  }
+  cancelFilterUpdateButton.classList.toggle("hidden", !updating);
+  cancelFilterUpdateButton.disabled = !updating;
+  cancelFilterUpdateButton.textContent = "取消更新";
+  filterUpdateProgressElement.classList.toggle("hidden", !updating);
+  if (updating) {
+    filterUpdateProgressElement.textContent = "正在准备更新…";
+  }
+}
+
+function updateFilterProxyControls(): void {
+  const mode = filterProxyModeInput.value as FilterProxyMode;
+  filterProxyUrlField.classList.toggle("hidden", mode !== "custom");
+  filterProxyUrlInput.disabled = mode !== "custom";
+
+  if (mode === "direct") {
+    filterProxyStatus.textContent = "后台将直接连接，不使用任何系统或环境代理。";
+    return;
+  }
+  if (mode === "custom") {
+    filterProxyStatus.textContent = "后台服务将使用这里填写的 HTTP/HTTPS 代理地址。";
+    return;
+  }
+
+  const proxy = detectedSystemProxy ?? savedSystemProxyUrl;
+  filterProxyStatus.textContent = proxy
+    ? `已同步当前用户的系统代理：${proxy}`
+    : "当前未检测到系统代理；后台将按系统默认网络直接连接。";
+}
+
+function startFilterUpdateProgressPolling(): void {
+  if (filterUpdateProgressTimer !== undefined) {
+    window.clearInterval(filterUpdateProgressTimer);
+  }
+  void refreshFilterUpdateProgress();
+  filterUpdateProgressTimer = window.setInterval(() => {
+    void refreshFilterUpdateProgress();
+  }, 400);
+}
+
+function stopFilterUpdateProgressPolling(): void {
+  if (filterUpdateProgressTimer !== undefined) {
+    window.clearInterval(filterUpdateProgressTimer);
+    filterUpdateProgressTimer = undefined;
+  }
+}
+
+async function refreshFilterUpdateProgress(): Promise<void> {
+  if (filterUpdateProgressInFlight) {
+    return;
+  }
+  filterUpdateProgressInFlight = true;
+  try {
+    renderFilterUpdateProgress(await getFilterUpdateProgress());
+  } catch (error) {
+    console.warn("读取过滤器更新进度失败", error);
+  } finally {
+    filterUpdateProgressInFlight = false;
+  }
+}
+
+function renderFilterUpdateProgress(progress: FilterUpdateProgress): void {
+  if (!progress.running && progress.total === 0) {
+    return;
+  }
+  const suffix = progress.cancel_requested
+    ? " · 正在取消"
+    : ` · 成功 ${progress.updated} · 失败 ${progress.failed}`;
+  filterUpdateProgressElement.textContent = `已处理 ${progress.completed}/${progress.total}${suffix}`;
+  cancelFilterUpdateButton.disabled = progress.cancel_requested || !progress.running;
+  cancelFilterUpdateButton.textContent = progress.cancel_requested ? "正在取消" : "取消更新";
 }
 
 function setQueryLogLoading(loading: boolean, background = false): void {
