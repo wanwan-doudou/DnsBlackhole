@@ -326,6 +326,7 @@ button.refreshing:disabled {
   width: 100%;
   min-height: 0;
   margin: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
@@ -569,7 +570,7 @@ button.refreshing:disabled {
 .query-log-head,
 .query-log-row {
   display: grid;
-  grid-template-columns: 140px minmax(320px, 1.35fr) minmax(230px, 0.95fr) 170px;
+  grid-template-columns: 130px minmax(280px, 1.35fr) minmax(210px, 0.95fr) 160px;
   align-items: center;
 }
 
@@ -689,6 +690,7 @@ button.refreshing:disabled {
 }
 
 .log-detail-anchor::after {
+  display: none;
   position: absolute;
   top: 100%;
   left: -6px;
@@ -706,6 +708,7 @@ button.refreshing:disabled {
 
 .log-detail-anchor:hover::after,
 .log-detail-anchor:focus-within::after {
+  display: block;
   pointer-events: auto;
 }
 
@@ -744,6 +747,7 @@ button.refreshing:disabled {
 }
 
 .log-detail-popover {
+  display: none;
   position: absolute;
   top: calc(100% + 8px);
   left: -6px;
@@ -808,6 +812,7 @@ button.refreshing:disabled {
 
 .log-detail-anchor:hover .log-detail-popover,
 .log-detail-anchor:focus-within .log-detail-popover {
+  display: block;
   visibility: visible;
   opacity: 1;
   pointer-events: auto;

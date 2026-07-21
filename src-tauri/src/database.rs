@@ -2,8 +2,11 @@ use std::{
     collections::HashMap,
     fs,
     net::IpAddr,
-    path::Path,
-    sync::Mutex,
+    path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -102,6 +105,10 @@ const UPSERT_DASHBOARD_LIFETIME_STATS_SQL: &str = "
         first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
         last_seen_at = MAX(last_seen_at, excluded.last_seen_at)";
 const READ_CONNECTION_POOL_SIZE: usize = 4;
+const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+const WAL_MAINTENANCE_INTERVAL_SECONDS: u64 = 5 * 60;
+const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 type DomainRankings = (HashMap<String, u64>, HashMap<String, u64>);
 type DashboardTotals = (u64, u64, u64, u64, Option<u64>, Option<u64>);
 
@@ -115,6 +122,8 @@ pub struct Database {
     // WAL 模式下读写可并行；仪表盘/日志查询走独立只读连接，
     // 避免和批量日志写入互相阻塞。内存库（测试）没有独立连接，回退主连接。
     read_conns: Vec<Mutex<Connection>>,
+    wal_path: Option<PathBuf>,
+    last_wal_maintenance_at: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +211,8 @@ impl Database {
         crate::performance::log_service("数据库启动", "主连接打开", connection_started);
         let schema_started = Instant::now();
         let mut database = Self::from_connection(conn)?;
+        database.wal_path = Some(wal_path_for_database(&path));
+        database.truncate_oversized_wal_at_startup();
         crate::performance::log_service("数据库启动", "连接配置与结构检查", schema_started);
         // 主连接完成建表和 WAL 设置后再打开只读连接
         let read_pool_started = Instant::now();
@@ -220,13 +231,15 @@ impl Database {
     }
 
     fn from_connection(conn: Connection) -> Result<Self, String> {
-        conn.busy_timeout(Duration::from_secs(2))
+        conn.busy_timeout(DATABASE_BUSY_TIMEOUT)
             .map_err(|e| format!("设置数据库等待超时失败：{e}"))?;
         configure_connection(&conn)?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             read_conns: Vec::new(),
+            wal_path: None,
+            last_wal_maintenance_at: AtomicU64::new(unix_now()),
         })
     }
 
@@ -319,6 +332,7 @@ impl Database {
         }
         tx.commit()
             .map_err(|e| format!("提交查询日志批量写入失败：{e}"))?;
+        self.maintain_wal_if_due(&conn);
         Ok(())
     }
 
@@ -326,37 +340,43 @@ impl Database {
         let since_raw = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
         let since = u64_to_db_i64(since_raw, "日志清理时间戳")?;
         let since_minute = u64_to_db_i64(since_raw / 60, "日志统计清理分钟")?;
-        let conn = self.lock()?;
-        conn.execute(
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("创建查询日志清理事务失败：{e}"))?;
+        tx.execute(
             "DELETE FROM query_logs WHERE timestamp < ?1",
             params![since],
         )
         .map_err(|e| format!("清理查询日志失败：{e}"))?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM query_log_minute_stats WHERE minute < ?1",
             params![since_minute],
         )
         .map_err(|e| format!("清理分钟统计失败：{e}"))?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM query_log_domain_stats WHERE minute < ?1",
             params![since_minute],
         )
         .map_err(|e| format!("清理域名统计失败：{e}"))?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM query_log_upstream_stats WHERE minute < ?1",
             params![since_minute],
         )
         .map_err(|e| format!("清理上游统计失败：{e}"))?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM query_log_client_stats WHERE minute < ?1",
             params![since_minute],
         )
         .map_err(|e| format!("清理客户端统计失败：{e}"))?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM query_log_blocklist_stats WHERE minute < ?1",
             params![since_minute],
         )
         .map_err(|e| format!("清理黑名单统计失败：{e}"))?;
+        tx.commit()
+            .map_err(|e| format!("提交查询日志清理失败：{e}"))?;
+        self.truncate_oversized_wal(&conn);
         Ok(())
     }
 
@@ -496,6 +516,76 @@ impl Database {
             return read_conn.lock().map_err(|_| "数据库只读连接已损坏".into());
         }
         self.lock()
+    }
+
+    fn truncate_oversized_wal_at_startup(&self) {
+        let started = Instant::now();
+        let Ok(conn) = self.lock() else {
+            return;
+        };
+        if self.truncate_oversized_wal(&conn) {
+            crate::performance::log_service("数据库启动", "WAL 空间回收", started);
+        }
+    }
+
+    fn maintain_wal_if_due(&self, conn: &Connection) {
+        let now = unix_now();
+        let previous = self.last_wal_maintenance_at.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) < WAL_MAINTENANCE_INTERVAL_SECONDS
+            || self
+                .last_wal_maintenance_at
+                .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        self.truncate_oversized_wal(conn);
+    }
+
+    fn truncate_oversized_wal(&self, conn: &Connection) -> bool {
+        let Some(wal_path) = self.wal_path.as_ref() else {
+            return false;
+        };
+        let Ok(metadata) = fs::metadata(wal_path) else {
+            return false;
+        };
+        if metadata.len() <= WAL_TRUNCATE_THRESHOLD_BYTES {
+            return false;
+        }
+
+        match checkpoint_and_truncate_wal(conn) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(error) => {
+                eprintln!("回收数据库 WAL 空间失败：{error}");
+                false
+            }
+        }
+    }
+}
+
+fn wal_path_for_database(database_path: &Path) -> PathBuf {
+    let mut path = database_path.as_os_str().to_os_string();
+    path.push("-wal");
+    path.into()
+}
+
+fn checkpoint_and_truncate_wal(conn: &Connection) -> Result<bool, String> {
+    conn.busy_timeout(Duration::ZERO)
+        .map_err(|e| format!("设置 WAL 回收等待策略失败：{e}"))?;
+    let checkpoint_result = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|busy| busy == 0)
+        .map_err(|e| format!("执行 WAL 检查点失败：{e}"));
+    let restore_result = conn
+        .busy_timeout(DATABASE_BUSY_TIMEOUT)
+        .map_err(|e| format!("恢复数据库等待超时失败：{e}"));
+
+    match (checkpoint_result, restore_result) {
+        (Ok(truncated), Ok(())) => Ok(truncated),
+        (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
 
@@ -1041,6 +1131,12 @@ fn configure_connection(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(|e| format!("配置数据库连接失败：{e}"))?;
+    conn.pragma_update(
+        None,
+        "journal_size_limit",
+        WAL_JOURNAL_SIZE_LIMIT_BYTES as i64,
+    )
+    .map_err(|e| format!("配置 WAL 文件大小限制失败：{e}"))?;
     Ok(())
 }
 
@@ -1898,6 +1994,53 @@ mod tests {
         assert_eq!(stats.blocked, 0);
 
         drop(database);
+        fs::remove_dir_all(storage_dir).expect("test storage directory should remove");
+    }
+
+    #[test]
+    fn checkpoint_truncates_wal_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let storage_dir = std::env::temp_dir().join(format!(
+            "dnsblackhole-wal-test-{}-{unique}",
+            std::process::id()
+        ));
+        let database_path = storage_dir.join("test.sqlite3");
+        let wal_path = wal_path_for_database(&database_path);
+
+        fs::create_dir_all(&storage_dir).expect("test storage directory should create");
+        let conn = Connection::open(&database_path).expect("test database should open");
+        configure_connection(&conn).expect("test database should configure");
+        conn.execute_batch(
+            "
+            CREATE TABLE wal_test (value BLOB NOT NULL);
+            WITH RECURSIVE sequence(value) AS (
+                SELECT 1
+                UNION ALL
+                SELECT value + 1 FROM sequence WHERE value < 100
+            )
+            INSERT INTO wal_test (value) SELECT zeroblob(2048) FROM sequence;
+            ",
+        )
+        .expect("test WAL should receive data");
+        assert!(
+            fs::metadata(&wal_path)
+                .expect("test WAL should exist")
+                .len()
+                > 0
+        );
+
+        assert!(checkpoint_and_truncate_wal(&conn).expect("test WAL should checkpoint"));
+        assert_eq!(
+            fs::metadata(&wal_path)
+                .expect("truncated WAL should remain accessible")
+                .len(),
+            0
+        );
+
+        drop(conn);
         fs::remove_dir_all(storage_dir).expect("test storage directory should remove");
     }
 }
