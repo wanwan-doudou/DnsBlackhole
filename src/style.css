@@ -1691,17 +1691,167 @@ button.refreshing:disabled {
   margin-top: 0;
 }
 
-.about-row {
+.about-panel {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.about-hero {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  border-bottom: 1px solid #e0e7ef;
+  padding: 14px 8px 26px;
+}
+
+.about-app-mark {
+  width: 68px;
+  height: 68px;
+  flex: 0 0 auto;
+  border-radius: 12px;
+  object-fit: contain;
+}
+
+.about-intro h3 {
+  margin: 0;
+  color: #203346;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.about-intro p {
+  margin: 7px 0 0;
+  color: #738294;
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+.about-capabilities {
+  display: flex;
+  gap: 7px;
+  margin-top: 11px;
+  flex-wrap: wrap;
+}
+
+.about-capabilities span {
+  border: 1px solid #dce6e1;
+  border-radius: 999px;
+  padding: 3px 9px;
+  color: #56806c;
+  background: #f5faf7;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.about-update-section {
+  margin-top: 18px;
+  border: 1px solid #dce5ed;
+  border-radius: 6px;
+  padding: 16px 18px;
+  background: #f8fafc;
+}
+
+.about-update-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 18px;
+}
+
+.about-update-row h3 {
+  margin: 0;
+  color: #354556;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.about-update-row p {
+  margin: 7px 0 0;
+  color: #7a8999;
+  font-size: 13px;
 }
 
 .about-version {
   color: #3b4e62;
+  font-weight: 650;
+}
+
+.about-links-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.about-link-card {
+  display: grid;
+  height: auto;
+  min-height: 82px;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  border-color: #dce5ed;
+  border-radius: 6px;
+  padding: 14px 15px;
+  background: #fff;
+  text-align: left;
+}
+
+.about-link-card:hover:not(:disabled) {
+  border-color: #a9d5b4;
+  background: #fbfefc;
+  box-shadow: 0 3px 10px rgba(49, 88, 67, 0.07);
+}
+
+.about-link-icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  place-items: center;
+  color: #55a976;
+  background: #edf8f1;
+}
+
+.about-link-icon svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.about-link-copy {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.about-link-copy strong {
+  color: #33475a;
   font-size: 13.5px;
   font-weight: 650;
+}
+
+.about-link-copy small {
+  overflow: hidden;
+  color: #8996a5;
+  font-size: 12px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.about-link-arrow {
+  color: #a2aebb;
+  font-size: 23px;
+  font-weight: 300;
+}
+
+.about-link-card:hover .about-link-arrow {
+  color: var(--green);
 }
 
 .update-actions {

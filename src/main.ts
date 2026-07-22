@@ -137,6 +137,12 @@ let filterUpdateProgressInFlight = false;
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
   "https://api.github.com/repos/wanwan-doudou/DnsBlackhole/releases";
+const ABOUT_LINKS = {
+  repository: "https://github.com/wanwan-doudou/DnsBlackhole",
+  releases: RELEASES_URL,
+  issues: "https://github.com/wanwan-doudou/DnsBlackhole/issues",
+  license: "https://github.com/wanwan-doudou/DnsBlackhole/blob/main/LICENSE",
+} as const;
 const QUERY_LOG_PAGE_SIZE = 50;
 const QUERY_LOG_SEARCH_DEBOUNCE_MS = 800;
 // 排行卡片渲染上限：超出可视高度的部分在卡片内滚动查看
@@ -278,6 +284,19 @@ document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => 
       // 点击下拉菜单项后关闭所有下拉框
       closeAllDropdowns();
     }
+  });
+});
+
+document.querySelectorAll<HTMLButtonElement>("[data-about-link]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const link = button.dataset.aboutLink as keyof typeof ABOUT_LINKS | undefined;
+    if (!link || !(link in ABOUT_LINKS)) {
+      return;
+    }
+    void openUrl(ABOUT_LINKS[link]).catch((error) => {
+      console.error("打开关于链接失败", error);
+      showMessage(`打开浏览器失败：${String(error)}`, true);
+    });
   });
 });
 

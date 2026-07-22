@@ -13,7 +13,16 @@
       "identifier": "opener:allow-open-url",
       "allow": [
         {
+          "url": "https://github.com/wanwan-doudou/DnsBlackhole"
+        },
+        {
           "url": "https://github.com/wanwan-doudou/DnsBlackhole/releases*"
+        },
+        {
+          "url": "https://github.com/wanwan-doudou/DnsBlackhole/issues*"
+        },
+        {
+          "url": "https://github.com/wanwan-doudou/DnsBlackhole/blob/main/LICENSE"
         }
       ]
     },

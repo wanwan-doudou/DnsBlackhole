@@ -5,6 +5,7 @@ export type ViewName =
   | "filters"
   | "custom"
   | "logs"
+  | "about"
   | "settings";
 export type QueryLogFilter = "all" | "processed" | "blocked" | "failed";
 

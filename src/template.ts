@@ -29,6 +29,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             </div>
           </div>
           <button class="nav-item" data-view="logs" type="button">查询日志</button>
+          <button class="nav-item" data-view="about" type="button">关于</button>
         </nav>
       </div>
     </header>
@@ -682,44 +683,112 @@ export function renderAppTemplate(appIconUrl: string): string {
               </label>
             </section>
 
-            <section class="settings-section about-section">
-              <h3>关于与更新</h3>
-              <div class="about-row">
-                <span class="about-version">DnsBlackhole v<span id="app_version">-</span></span>
-                <div class="button-group update-actions">
-                  <button id="check_update_btn" type="button">检查更新</button>
+          </div>
+        </section>
+      </section>
+
+      <section class="view about-view" data-view-panel="about">
+        <section class="panel module-panel about-panel">
+          <div class="panel-title">
+            <h2>关于</h2>
+          </div>
+
+          <div class="about-hero">
+            <img class="about-app-mark" src="${appIconUrl}" alt="" />
+            <div class="about-intro">
+              <h3>DnsBlackhole</h3>
+              <p>轻量的本地 DNS 转发与域名拦截工具。</p>
+              <div class="about-capabilities" aria-label="应用特性">
+                <span>DNS 转发</span>
+                <span>域名拦截</span>
+                <span>Windows / macOS</span>
+              </div>
+            </div>
+          </div>
+
+          <section class="about-update-section" aria-labelledby="about_update_title">
+            <div class="about-update-row">
+              <div>
+                <h3 id="about_update_title">软件更新</h3>
+                <p>当前版本：<strong class="about-version">v<span id="app_version">-</span></strong></p>
+              </div>
+              <div class="button-group update-actions">
+                <button class="primary" id="check_update_btn" type="button">检查更新</button>
+              </div>
+            </div>
+            <div class="update-status hidden" id="update_status"></div>
+          </section>
+
+          <div class="about-links-grid" aria-label="项目相关链接">
+            <button class="about-link-card" data-about-link="repository" type="button">
+              <span class="about-link-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M9 18H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4M15 4h4a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-4M8 12h8M13 9l3 3-3 3" /></svg>
+              </span>
+              <span class="about-link-copy">
+                <strong>项目主页</strong>
+                <small>查看源码与使用文档</small>
+              </span>
+              <span class="about-link-arrow" aria-hidden="true">›</span>
+            </button>
+            <button class="about-link-card" data-about-link="releases" type="button">
+              <span class="about-link-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6zM14 3v4h4M9 12h6M9 16h6" /></svg>
+              </span>
+              <span class="about-link-copy">
+                <strong>更新记录</strong>
+                <small>查看历史版本与变更</small>
+              </span>
+              <span class="about-link-arrow" aria-hidden="true">›</span>
+            </button>
+            <button class="about-link-card" data-about-link="issues" type="button">
+              <span class="about-link-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M4 5h16v12H8l-4 4zM8 9h8M8 13h5" /></svg>
+              </span>
+              <span class="about-link-copy">
+                <strong>意见反馈</strong>
+                <small>报告问题或提出建议</small>
+              </span>
+              <span class="about-link-arrow" aria-hidden="true">›</span>
+            </button>
+            <button class="about-link-card" data-about-link="license" type="button">
+              <span class="about-link-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6zM9 12l2 2 4-4" /></svg>
+              </span>
+              <span class="about-link-copy">
+                <strong>开源许可</strong>
+                <small>基于 MIT License 发布</small>
+              </span>
+              <span class="about-link-arrow" aria-hidden="true">›</span>
+            </button>
+          </div>
+
+          <dialog class="update-dialog" id="update_dialog">
+            <div class="update-dialog-panel">
+              <div class="update-dialog-header">
+                <div>
+                  <span class="update-dialog-kicker">软件更新</span>
+                  <h3>发现新版本</h3>
+                </div>
+                <button class="update-dialog-close" id="update_dialog_close_btn" type="button" aria-label="关闭">×</button>
+              </div>
+              <div class="update-dialog-body">
+                <div class="update-version-change">
+                  <span>v<span id="update_current_version">-</span></span>
+                  <span aria-hidden="true">→</span>
+                  <strong id="update_release_version">v-</strong>
+                </div>
+                <div class="update-release-notes">
+                  <div class="update-release-notes-title">本次更新内容</div>
+                  <div class="update-release-notes-body" id="update_release_notes_body"></div>
                 </div>
               </div>
-              <div class="update-status hidden" id="update_status"></div>
-              <dialog class="update-dialog" id="update_dialog">
-                <div class="update-dialog-panel">
-                  <div class="update-dialog-header">
-                    <div>
-                      <span class="update-dialog-kicker">软件更新</span>
-                      <h3>发现新版本</h3>
-                    </div>
-                    <button class="update-dialog-close" id="update_dialog_close_btn" type="button" aria-label="关闭">×</button>
-                  </div>
-                  <div class="update-dialog-body">
-                    <div class="update-version-change">
-                      <span>v<span id="update_current_version">-</span></span>
-                      <span aria-hidden="true">→</span>
-                      <strong id="update_release_version">v-</strong>
-                    </div>
-                    <div class="update-release-notes">
-                      <div class="update-release-notes-title">本次更新内容</div>
-                      <div class="update-release-notes-body" id="update_release_notes_body"></div>
-                    </div>
-                  </div>
-                  <div class="update-dialog-footer">
-                    <button id="update_dialog_later_btn" type="button">稍后</button>
-                    <button id="manual_download_btn" type="button">浏览器下载</button>
-                    <button class="primary" id="install_update_btn" type="button">下载并安装</button>
-                  </div>
-                </div>
-              </dialog>
-            </section>
-          </div>
+              <div class="update-dialog-footer">
+                <button id="update_dialog_later_btn" type="button">稍后</button>
+                <button id="manual_download_btn" type="button">浏览器下载</button>
+                <button class="primary" id="install_update_btn" type="button">下载并安装</button>
+              </div>
+            </div>
+          </dialog>
         </section>
       </section>
 
