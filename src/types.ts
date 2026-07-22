@@ -47,6 +47,15 @@ export type WindowsServiceStatus = {
   diagnostic: string | null;
 };
 
+export type WindowsSystemDnsStatus = {
+  managed: boolean;
+  inEffect: boolean;
+  adapters: string[];
+  restoreIpv4Automatic: boolean;
+};
+
+export type WindowsSystemDnsFallback = "automatic" | "dns114" | "google";
+
 export type FilterSubscription = {
   id: string;
   name: string;

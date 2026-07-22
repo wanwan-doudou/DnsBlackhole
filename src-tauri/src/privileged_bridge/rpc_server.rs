@@ -21,6 +21,8 @@ use crate::{
     storage,
 };
 
+#[cfg(windows)]
+use super::windows_system_dns;
 use super::{
     BRIDGE_PROTOCOL_VERSION, HelloParams, HelloResult, RpcRequest, RpcResponse, read_message,
     write_message,
@@ -50,6 +52,12 @@ struct ConfigParams {
 #[derive(Debug, Deserialize)]
 struct MigrationParams {
     target_path: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+struct SystemDnsFallbackParams {
+    preset: windows_system_dns::WindowsSystemDnsFallback,
 }
 
 pub(crate) fn initialize_state(default_dir: PathBuf) -> Result<Arc<AppState>, String> {
@@ -191,6 +199,8 @@ fn dispatch_request(
         }
         "save_config" => {
             let params: ConfigParams = parse_params(params)?;
+            #[cfg(windows)]
+            validate_managed_system_dns_config(state, &params.config)?;
             to_value(save_config_blocking(Arc::clone(state), params.config)?)?
         }
         "get_status" => {
@@ -214,13 +224,102 @@ fn dispatch_request(
         "get_filter_update_progress" => to_value(state.filter_update_progress()?)?,
         "cancel_filter_update" => to_value(state.request_filter_update_cancel()?)?,
         "start_dns" => to_value(start_dns_blocking(Arc::clone(state))?)?,
-        "stop_dns" => to_value(stop_dns_blocking(Arc::clone(state))?)?,
+        "stop_dns" => {
+            #[cfg(windows)]
+            ensure_system_dns_not_managed(state)?;
+            to_value(stop_dns_blocking(Arc::clone(state))?)?
+        }
         "clear_dns_cache" => to_value(clear_dns_cache_blocking(state)?)?,
         "clear_filter_cache" => to_value(clear_filter_cache_blocking(Arc::clone(state))?)?,
+        #[cfg(windows)]
+        "get_windows_system_dns_status" => to_value(windows_system_dns::system_dns_status(
+            &state.default_data_dir,
+        )?)?,
+        #[cfg(windows)]
+        "take_over_windows_system_dns" => {
+            validate_system_dns_takeover(state)?;
+            to_value(windows_system_dns::take_over_system_dns(
+                &state.default_data_dir,
+            )?)?
+        }
+        #[cfg(windows)]
+        "restore_windows_system_dns" => to_value(windows_system_dns::restore_system_dns(
+            &state.default_data_dir,
+        )?)?,
+        #[cfg(windows)]
+        "replace_unmanaged_windows_system_dns" => {
+            let params: SystemDnsFallbackParams = parse_params(params)?;
+            to_value(windows_system_dns::replace_unmanaged_local_dns(
+                &state.default_data_dir,
+                params.preset,
+            )?)?
+        }
+        #[cfg(windows)]
+        "restore_windows_system_dns_with_fallback" => {
+            let params: SystemDnsFallbackParams = parse_params(params)?;
+            to_value(windows_system_dns::restore_system_dns_with_fallback(
+                &state.default_data_dir,
+                params.preset,
+            )?)?
+        }
         "restart_service" => return Ok((Value::Null, true)),
         _ => return Err(format!("未知的后台服务方法：{method}")),
     };
     Ok((result, false))
+}
+
+#[cfg(windows)]
+fn validate_system_dns_takeover(state: &AppState) -> Result<(), String> {
+    let config = state.current_config()?;
+    if !config.enabled || !state.status(false).running {
+        return Err("请先启动 DnsBlackhole DNS 服务，再接管系统 DNS".to_string());
+    }
+    validate_system_dns_config(&config)
+}
+
+#[cfg(windows)]
+fn validate_managed_system_dns_config(state: &AppState, config: &AppConfig) -> Result<(), String> {
+    if windows_system_dns::system_dns_is_managed(&state.default_data_dir) {
+        if !config.enabled {
+            return Err(
+                "系统 DNS 正由 DnsBlackhole 接管，请先恢复原 DNS，再关闭自动运行".to_string(),
+            );
+        }
+        validate_system_dns_config(config)
+            .map_err(|error| format!("系统 DNS 正由 DnsBlackhole 接管，请先恢复原 DNS。{error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_system_dns_not_managed(state: &AppState) -> Result<(), String> {
+    if windows_system_dns::system_dns_is_managed(&state.default_data_dir) {
+        return Err(
+            "系统 DNS 正由 DnsBlackhole 接管，请先在设置中恢复原 DNS，再停止服务".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_system_dns_config(config: &AppConfig) -> Result<(), String> {
+    use std::net::Ipv4Addr;
+
+    if config.listen_port != 53 {
+        return Err("接管系统 DNS 前，请将 DNS 监听端口设置为 53".to_string());
+    }
+    let listen_host = config
+        .listen_host
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "接管系统 DNS 前，监听地址必须是 0.0.0.0 或 127.0.0.1".to_string())?;
+    if listen_host != Ipv4Addr::UNSPECIFIED && listen_host != Ipv4Addr::LOCALHOST {
+        return Err("接管系统 DNS 前，监听地址必须是 0.0.0.0 或 127.0.0.1".to_string());
+    }
+    if !config.listen_ipv6 {
+        return Err("接管系统 DNS 前，请启用 IPv6 双栈监听，避免 IPv6 DNS 绕过过滤".to_string());
+    }
+    Ok(())
 }
 
 fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, String> {

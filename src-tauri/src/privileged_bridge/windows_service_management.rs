@@ -28,7 +28,7 @@ use windows_sys::Win32::{
 
 use crate::storage;
 
-use super::ServiceClient;
+use super::{ServiceClient, windows_system_dns};
 
 pub(crate) const WINDOWS_SERVICE_NAME: &str = "DnsBlackholeService";
 const WINDOWS_SERVICE_DISPLAY_NAME: &str = "DnsBlackhole DNS Service";
@@ -179,6 +179,9 @@ pub fn install_windows_service_elevated(
 }
 
 pub fn uninstall_windows_service_elevated() -> Result<(), String> {
+    let default_data_dir = storage::windows_service_default_dir()?;
+    windows_system_dns::restore_system_dns_if_managed(&default_data_dir)
+        .map_err(|error| format!("卸载系统服务前恢复原 DNS 失败：{error}"))?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|error| service_error("连接 Windows 服务管理器失败", error))?;
     remove_existing_service(&manager)?;

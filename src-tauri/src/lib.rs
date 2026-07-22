@@ -312,6 +312,108 @@ async fn uninstall_windows_service() -> Result<serde_json::Value, String> {
     Err("当前平台不支持 Windows DNS 后台服务".to_string())
 }
 
+#[cfg(windows)]
+fn call_windows_system_dns(method: &'static str) -> Result<serde_json::Value, String> {
+    let status: privileged_bridge::WindowsSystemDnsStatus =
+        privileged_bridge::ServiceClient::call(method, &serde_json::json!({}))?;
+    serde_json::to_value(status)
+        .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn get_windows_system_dns_status() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        call_windows_system_dns("get_windows_system_dns_status")
+    })
+    .await
+    .map_err(|error| format!("读取 Windows 系统 DNS 状态任务异常：{error}"))?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn get_windows_system_dns_status() -> Result<serde_json::Value, String> {
+    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn take_over_windows_system_dns() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| call_windows_system_dns("take_over_windows_system_dns"))
+        .await
+        .map_err(|error| format!("接管 Windows 系统 DNS 任务异常：{error}"))?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn take_over_windows_system_dns() -> Result<serde_json::Value, String> {
+    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn restore_windows_system_dns() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| call_windows_system_dns("restore_windows_system_dns"))
+        .await
+        .map_err(|error| format!("恢复 Windows 系统 DNS 任务异常：{error}"))?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn restore_windows_system_dns() -> Result<serde_json::Value, String> {
+    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn replace_unmanaged_windows_system_dns(preset: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let status: privileged_bridge::WindowsSystemDnsStatus =
+            privileged_bridge::ServiceClient::call(
+                "replace_unmanaged_windows_system_dns",
+                &serde_json::json!({ "preset": preset }),
+            )?;
+        serde_json::to_value(status)
+            .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
+    })
+    .await
+    .map_err(|error| format!("解除 Windows 本机 DNS 任务异常：{error}"))?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn replace_unmanaged_windows_system_dns(
+    _preset: String,
+) -> Result<serde_json::Value, String> {
+    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn restore_windows_system_dns_with_fallback(
+    preset: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let status: privileged_bridge::WindowsSystemDnsStatus =
+            privileged_bridge::ServiceClient::call(
+                "restore_windows_system_dns_with_fallback",
+                &serde_json::json!({ "preset": preset }),
+            )?;
+        serde_json::to_value(status)
+            .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
+    })
+    .await
+    .map_err(|error| format!("设置 Windows 外部 DNS 任务异常：{error}"))?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn restore_windows_system_dns_with_fallback(
+    _preset: String,
+) -> Result<serde_json::Value, String> {
+    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+}
+
 #[tauri::command]
 async fn save_config(
     app: tauri::AppHandle,
@@ -695,6 +797,11 @@ pub fn run() {
             get_windows_service_status,
             install_windows_service,
             uninstall_windows_service,
+            get_windows_system_dns_status,
+            take_over_windows_system_dns,
+            restore_windows_system_dns,
+            replace_unmanaged_windows_system_dns,
+            restore_windows_system_dns_with_fallback,
             save_config,
             get_status,
             get_query_logs,

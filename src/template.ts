@@ -601,6 +601,55 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
+            <section class="settings-section background-service-section hidden" id="windows_system_dns_section">
+              <div>
+                <h3>系统 DNS</h3>
+                <p id="windows_system_dns_status">正在读取系统 DNS 状态…</p>
+                <small>接管时仅修改已连接的物理网卡，并先保存其原始 DNS（包括自动获取状态）；没有备份时，可选择自动获取或公共 DNS 来解除本机 DNS。</small>
+              </div>
+              <div class="button-group background-service-actions">
+                <button class="primary" id="take_over_windows_system_dns_btn" type="button">接管系统 DNS</button>
+                <button id="restore_windows_system_dns_btn" type="button">恢复原 DNS</button>
+              </div>
+            </section>
+
+            <dialog class="update-dialog dns-fallback-dialog" id="dns_fallback_dialog">
+              <div class="update-dialog-panel">
+                <div class="update-dialog-header">
+                  <div>
+                    <span class="update-dialog-kicker">系统 DNS</span>
+                    <h3 id="dns_fallback_dialog_title">解除本机 DNS</h3>
+                  </div>
+                  <button class="update-dialog-close" id="dns_fallback_dialog_close_btn" type="button" aria-label="关闭">×</button>
+                </div>
+                <div class="update-dialog-body">
+                  <p class="dns-fallback-intro" id="dns_fallback_dialog_intro">当前没有原 DNS 备份，请选择解除后使用的 DNS。只会修改仍指向 127.0.0.1 或 ::1 的设置。</p>
+                  <div class="dns-fallback-options">
+                    <label class="dns-fallback-option hidden" id="dns_restore_original_option">
+                      <input type="radio" name="dns_fallback" value="original" />
+                      <span><strong>按原备份恢复</strong><small>恢复为自动获取；静态 IPv4 网络可能无法取得 DNS</small></span>
+                    </label>
+                    <label class="dns-fallback-option" id="dns_fallback_automatic_option">
+                      <input type="radio" name="dns_fallback" value="automatic" />
+                      <span><strong>自动获取</strong><small>仅适合能通过 DHCP 或路由器获得 DNS 的网络</small></span>
+                    </label>
+                    <label class="dns-fallback-option">
+                      <input type="radio" name="dns_fallback" value="dns114" checked />
+                      <span><strong>114DNS（推荐）</strong><small>114.114.114.114 / 114.114.115.115</small></span>
+                    </label>
+                    <label class="dns-fallback-option">
+                      <input type="radio" name="dns_fallback" value="google" />
+                      <span><strong>Google DNS</strong><small>8.8.8.8 / 8.8.4.4，并配置 IPv6</small></span>
+                    </label>
+                  </div>
+                </div>
+                <div class="update-dialog-footer">
+                  <button id="dns_fallback_dialog_cancel_btn" type="button">取消</button>
+                  <button class="primary" id="dns_fallback_dialog_confirm_btn" type="button">确认解除</button>
+                </div>
+              </div>
+            </dialog>
+
             <section class="settings-section background-service-section hidden" id="macos_service_section">
               <div>
                 <h3>macOS DNS 后台服务</h3>

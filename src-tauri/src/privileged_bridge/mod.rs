@@ -16,6 +16,8 @@ mod windows_pipe;
 mod windows_service;
 #[cfg(windows)]
 mod windows_service_management;
+#[cfg(windows)]
+mod windows_system_dns;
 
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) use client::ServiceClient;
@@ -40,6 +42,8 @@ pub(crate) use windows_service_management::{
     WindowsServiceStatus, ensure_windows_service_current, install_windows_service,
     uninstall_windows_service, windows_service_status,
 };
+#[cfg(windows)]
+pub(crate) use windows_system_dns::WindowsSystemDnsStatus;
 #[cfg(windows)]
 pub fn handle_windows_service_command() -> Option<Result<(), String>> {
     use std::path::PathBuf;
@@ -86,9 +90,9 @@ pub fn handle_windows_service_command() -> Option<Result<(), String>> {
     )
 }
 
-// 协议 2：控制面 RPC。DNS 引擎完整运行在 root 后台服务内，
+// 协议 5：控制面 RPC，并由 Windows 服务负责系统 DNS 的接管、恢复与外部 DNS 选择。
 // GUI 只通过本协议做配置、状态查询和日志读取，不再转发 DNS 查询。
-pub const BRIDGE_PROTOCOL_VERSION: u16 = 2;
+pub const BRIDGE_PROTOCOL_VERSION: u16 = 5;
 pub const BRIDGE_SOCKET_PATH: &str = "/var/run/dnsblackhole/service.sock";
 // 单帧上限：查询日志分页（最多 200 条记录）与统计快照都远小于该值
 const MAX_FRAME_SIZE: usize = 512 * 1024;

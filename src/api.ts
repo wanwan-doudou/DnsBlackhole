@@ -11,6 +11,8 @@ import type {
   RuntimeStatus,
   StorageInfo,
   WindowsServiceStatus,
+  WindowsSystemDnsFallback,
+  WindowsSystemDnsStatus,
 } from "./types";
 
 type QueryLogRequest = {
@@ -119,6 +121,32 @@ export function installWindowsService(): Promise<WindowsServiceStatus> {
 
 export function uninstallWindowsService(): Promise<WindowsServiceStatus> {
   return timedInvoke<WindowsServiceStatus>("uninstall_windows_service");
+}
+
+export function getWindowsSystemDnsStatus(): Promise<WindowsSystemDnsStatus> {
+  return timedInvoke<WindowsSystemDnsStatus>("get_windows_system_dns_status");
+}
+
+export function takeOverWindowsSystemDns(): Promise<WindowsSystemDnsStatus> {
+  return timedInvoke<WindowsSystemDnsStatus>("take_over_windows_system_dns");
+}
+
+export function restoreWindowsSystemDns(): Promise<WindowsSystemDnsStatus> {
+  return timedInvoke<WindowsSystemDnsStatus>("restore_windows_system_dns");
+}
+
+export function replaceUnmanagedWindowsSystemDns(
+  preset: WindowsSystemDnsFallback,
+): Promise<WindowsSystemDnsStatus> {
+  return timedInvoke<WindowsSystemDnsStatus>("replace_unmanaged_windows_system_dns", { preset });
+}
+
+export function restoreWindowsSystemDnsWithFallback(
+  preset: WindowsSystemDnsFallback,
+): Promise<WindowsSystemDnsStatus> {
+  return timedInvoke<WindowsSystemDnsStatus>("restore_windows_system_dns_with_fallback", {
+    preset,
+  });
 }
 
 export function recordFrontendTiming(

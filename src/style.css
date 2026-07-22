@@ -2425,6 +2425,62 @@ select:focus {
   transition: opacity 0.2s ease;
 }
 
+.dns-fallback-dialog {
+  width: min(500px, calc(100vw - 40px));
+}
+
+.dns-fallback-intro {
+  margin: 0 0 14px;
+  color: #647487;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.dns-fallback-options {
+  display: grid;
+  gap: 9px;
+}
+
+.dns-fallback-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+  border: 1px solid #dbe4ec;
+  border-radius: 7px;
+  padding: 11px 13px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.dns-fallback-option:hover,
+.dns-fallback-option:has(input:checked) {
+  border-color: #79bd8a;
+  background: #f5fbf7;
+}
+
+.dns-fallback-option input {
+  margin: 0;
+  accent-color: var(--green);
+}
+
+.dns-fallback-option span,
+.dns-fallback-option strong,
+.dns-fallback-option small {
+  display: block;
+}
+
+.dns-fallback-option strong {
+  color: #304457;
+  font-size: 13px;
+}
+
+.dns-fallback-option small {
+  margin-top: 3px;
+  color: #8290a0;
+  font-size: 12px;
+}
+
 .filters-head,
 .filter-summary {
   display: grid;

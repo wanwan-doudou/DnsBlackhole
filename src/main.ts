@@ -12,18 +12,23 @@ import {
   getConfig,
   getFilterUpdateProgress,
   getMacosServiceStatus,
+  getWindowsSystemDnsStatus,
   getWindowsServiceStatus,
   getStorageInfo,
   getQueryLogs,
   getStatus,
   saveConfig as saveConfigCommand,
   requestDataMigration,
+  restoreWindowsSystemDns,
   installMacosService,
   installWindowsService,
   openMacosServiceSettings,
   recordFrontendTiming,
+  replaceUnmanagedWindowsSystemDns,
+  restoreWindowsSystemDnsWithFallback,
   startDns,
   stopDns,
+  takeOverWindowsSystemDns,
   uninstallMacosService,
   uninstallWindowsService,
   updateFilters as updateFiltersCommand,
@@ -65,6 +70,8 @@ import type {
   ViewName,
   WindowsServiceState,
   WindowsServiceStatus,
+  WindowsSystemDnsFallback,
+  WindowsSystemDnsStatus,
 } from "./types";
 import "./style.css";
 
@@ -125,9 +132,11 @@ const isMacOS = navigator.userAgent.includes("Macintosh");
 const isWindows = navigator.userAgent.includes("Windows");
 let currentMacosServiceStatus: MacosServiceStatus | null = null;
 let currentWindowsServiceStatus: WindowsServiceStatus | null = null;
+let currentWindowsSystemDnsStatus: WindowsSystemDnsStatus | null = null;
 let initialBootstrapComplete = false;
 let backgroundServiceRefreshInFlight = false;
 let windowsServiceStatusInFlight: Promise<WindowsServiceStatus | null> | null = null;
+let windowsSystemDnsStatusInFlight: Promise<WindowsSystemDnsStatus | null> | null = null;
 let windowsServiceUnavailableSince: number | null = null;
 let detectedSystemProxy: string | null = null;
 let savedSystemProxyUrl = "";
@@ -245,6 +254,29 @@ const windowsServiceSection = query<HTMLElement>("#windows_service_section");
 const windowsServiceStatusElement = query<HTMLElement>("#windows_service_status");
 const installWindowsServiceButton = query<HTMLButtonElement>("#install_windows_service_btn");
 const uninstallWindowsServiceButton = query<HTMLButtonElement>("#uninstall_windows_service_btn");
+const windowsSystemDnsSection = query<HTMLElement>("#windows_system_dns_section");
+const windowsSystemDnsStatusElement = query<HTMLElement>("#windows_system_dns_status");
+const takeOverWindowsSystemDnsButton = query<HTMLButtonElement>(
+  "#take_over_windows_system_dns_btn",
+);
+const restoreWindowsSystemDnsButton = query<HTMLButtonElement>("#restore_windows_system_dns_btn");
+const dnsFallbackDialog = query<HTMLDialogElement>("#dns_fallback_dialog");
+const dnsFallbackDialogCloseButton = query<HTMLButtonElement>(
+  "#dns_fallback_dialog_close_btn",
+);
+const dnsFallbackDialogCancelButton = query<HTMLButtonElement>(
+  "#dns_fallback_dialog_cancel_btn",
+);
+const dnsFallbackDialogConfirmButton = query<HTMLButtonElement>(
+  "#dns_fallback_dialog_confirm_btn",
+);
+const dnsFallbackDialogTitle = query<HTMLElement>("#dns_fallback_dialog_title");
+const dnsFallbackDialogIntro = query<HTMLElement>("#dns_fallback_dialog_intro");
+const dnsRestoreOriginalOption = query<HTMLElement>("#dns_restore_original_option");
+const dnsFallbackAutomaticOption = query<HTMLElement>("#dns_fallback_automatic_option");
+const dnsFallbackInputs = Array.from(
+  document.querySelectorAll<HTMLInputElement>('input[name="dns_fallback"]'),
+);
 const appVersionElement = query<HTMLElement>("#app_version");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
 const installUpdateButton = query<HTMLButtonElement>("#install_update_btn");
@@ -813,7 +845,7 @@ installWindowsServiceButton.addEventListener("click", async () => {
 
 uninstallWindowsServiceButton.addEventListener("click", async () => {
   const confirmed = window.confirm(
-    "卸载 Windows DNS 系统服务后，127.0.0.1/::1 将不再提供 DNS；若网卡仍指向本机 DNS，解析可能立即失败。是否继续？",
+    "卸载 Windows DNS 系统服务后，127.0.0.1/::1 将不再提供 DNS；若系统 DNS 已接管，会先自动恢复原 DNS。是否继续？",
   );
   if (!confirmed) {
     return;
@@ -823,12 +855,101 @@ uninstallWindowsServiceButton.addEventListener("click", async () => {
   try {
     const status = requireWindowsServiceStatus(await uninstallWindowsService());
     renderWindowsServiceStatus(status);
-    showMessage("Windows DNS 系统服务已卸载，数据和配置未删除", false);
+    currentWindowsSystemDnsStatus = null;
+    showMessage("Windows DNS 系统服务已卸载，原 DNS 已恢复，数据和配置未删除", false);
   } catch (error) {
     showMessage(String(error), true);
   } finally {
     uninstallWindowsServiceButton.disabled = false;
     uninstallWindowsServiceButton.classList.remove("loading");
+  }
+});
+
+takeOverWindowsSystemDnsButton.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "接管后，当前已连接的物理网卡将只使用 127.0.0.1 和 ::1 作为 DNS，不设置公共备用 DNS。原 DNS（包括自动获取）会先保存，可随时恢复。是否继续？",
+  );
+  if (!confirmed) {
+    return;
+  }
+  setWindowsSystemDnsBusy(true);
+  try {
+    const status = requireWindowsSystemDnsStatus(await takeOverWindowsSystemDns());
+    renderWindowsSystemDnsStatus(status);
+    showMessage(
+      status.inEffect ? "系统 DNS 已接管，所有 DNS 查询将交给 DnsBlackhole" : "系统 DNS 备份已保存，但接管状态需要检查",
+      !status.inEffect,
+    );
+  } catch (error) {
+    showMessage(String(error), true);
+    await loadWindowsSystemDnsStatus();
+  } finally {
+    setWindowsSystemDnsBusy(false);
+  }
+});
+
+restoreWindowsSystemDnsButton.addEventListener("click", async () => {
+  const statusBeforeAction = currentWindowsSystemDnsStatus;
+  if (!statusBeforeAction) {
+    return;
+  }
+  if (!statusBeforeAction.managed && statusBeforeAction.inEffect) {
+    showDnsFallbackDialog();
+    return;
+  }
+  if (!statusBeforeAction.managed) {
+    return;
+  }
+  if (statusBeforeAction.restoreIpv4Automatic) {
+    showDnsFallbackDialog();
+    return;
+  }
+  setWindowsSystemDnsBusy(true);
+  try {
+    const status = requireWindowsSystemDnsStatus(await restoreWindowsSystemDns());
+    renderWindowsSystemDnsStatus(status);
+    showMessage("已按备份恢复原 DNS 设置", false);
+  } catch (error) {
+    showMessage(String(error), true);
+    await loadWindowsSystemDnsStatus();
+  } finally {
+    setWindowsSystemDnsBusy(false);
+  }
+});
+
+dnsFallbackDialogCloseButton.addEventListener("click", closeDnsFallbackDialog);
+dnsFallbackDialogCancelButton.addEventListener("click", closeDnsFallbackDialog);
+dnsFallbackDialog.addEventListener("click", (event) => {
+  if (event.target === dnsFallbackDialog) {
+    closeDnsFallbackDialog();
+  }
+});
+dnsFallbackDialogConfirmButton.addEventListener("click", async () => {
+  const selection = dnsFallbackInputs.find((input) => input.checked)?.value ?? "dns114";
+  const restoringManagedDns = currentWindowsSystemDnsStatus?.managed === true;
+  closeDnsFallbackDialog();
+  setWindowsSystemDnsBusy(true);
+  try {
+    const result = restoringManagedDns
+      ? selection === "original"
+        ? await restoreWindowsSystemDns()
+        : await restoreWindowsSystemDnsWithFallback(selection as WindowsSystemDnsFallback)
+      : await replaceUnmanagedWindowsSystemDns(selection as WindowsSystemDnsFallback);
+    const status = requireWindowsSystemDnsStatus(result);
+    renderWindowsSystemDnsStatus(status);
+    showMessage(
+      restoringManagedDns
+        ? selection === "original"
+          ? "已按备份恢复原 DNS 设置"
+          : "已恢复为所选外部 DNS"
+        : "已解除本机 DNS，现在可以重新接管并保存该恢复配置",
+      false,
+    );
+  } catch (error) {
+    showMessage(String(error), true);
+    await loadWindowsSystemDnsStatus();
+  } finally {
+    setWindowsSystemDnsBusy(false);
   }
 });
 
@@ -966,6 +1087,8 @@ function refreshActiveView(): void {
     void refreshStatus({ auto: true });
   } else if (activeView === "filters") {
     void refreshFilterUpdateMetadata();
+  } else if (activeView === "settings") {
+    void loadWindowsSystemDnsStatus();
   }
 }
 
@@ -1112,7 +1235,11 @@ async function refreshAfterBackgroundServiceEnabled(): Promise<void> {
   }
   backgroundServiceRefreshInFlight = true;
   try {
-    const [configReady] = await Promise.all([loadConfig(), loadStorageInfo()]);
+    const [configReady] = await Promise.all([
+      loadConfig(),
+      loadStorageInfo(),
+      loadWindowsSystemDnsStatus(),
+    ]);
     if (configReady) {
       await refreshStatus();
     }
@@ -1230,6 +1357,151 @@ function renderWindowsServiceStatus(status: WindowsServiceStatus): void {
     windowsServiceStatusElement.textContent = `${stateText}${versionText}`;
   }
   uninstallWindowsServiceButton.disabled = !status.installed;
+  if (!status.ready) {
+    renderWindowsSystemDnsUnavailable("请先安装并启动 Windows DNS 系统服务");
+  }
+}
+
+async function loadWindowsSystemDnsStatus(): Promise<WindowsSystemDnsStatus | null> {
+  if (!isWindows) {
+    return null;
+  }
+  windowsSystemDnsSection.classList.remove("hidden");
+  if (!currentWindowsServiceStatus?.ready) {
+    renderWindowsSystemDnsUnavailable("请先安装并启动 Windows DNS 系统服务");
+    return null;
+  }
+  if (windowsSystemDnsStatusInFlight) {
+    return windowsSystemDnsStatusInFlight;
+  }
+  const request = (async (): Promise<WindowsSystemDnsStatus | null> => {
+    try {
+      const status = requireWindowsSystemDnsStatus(await getWindowsSystemDnsStatus());
+      renderWindowsSystemDnsStatus(status);
+      return status;
+    } catch (error) {
+      windowsSystemDnsSection.classList.remove("is-ready");
+      windowsSystemDnsSection.classList.add("needs-repair");
+      windowsSystemDnsStatusElement.textContent = `读取系统 DNS 状态失败：${String(error)}`;
+      takeOverWindowsSystemDnsButton.disabled = true;
+      restoreWindowsSystemDnsButton.disabled = true;
+      return null;
+    }
+  })();
+  windowsSystemDnsStatusInFlight = request;
+  try {
+    return await request;
+  } finally {
+    windowsSystemDnsStatusInFlight = null;
+  }
+}
+
+function renderWindowsSystemDnsStatus(status: WindowsSystemDnsStatus): void {
+  currentWindowsSystemDnsStatus = status;
+  windowsSystemDnsSection.classList.remove("hidden");
+  windowsSystemDnsSection.classList.toggle("is-ready", status.managed && status.inEffect);
+  windowsSystemDnsSection.classList.toggle(
+    "needs-repair",
+    (status.managed && !status.inEffect) || (!status.managed && status.inEffect),
+  );
+  const adapterText = status.adapters.length > 0 ? status.adapters.join("、") : "暂无已连接的物理网卡";
+  if (status.managed && status.inEffect) {
+    windowsSystemDnsStatusElement.textContent = `已接管 ${adapterText}，DNS 指向 127.0.0.1 和 ::1。`;
+  } else if (status.managed) {
+    windowsSystemDnsStatusElement.textContent = `已保存 ${adapterText} 的原 DNS，但当前系统设置已发生变化，可点击“恢复原 DNS”。`;
+  } else if (status.inEffect) {
+    windowsSystemDnsStatusElement.textContent = `检测到 ${adapterText} 的 DNS 已指向 127.0.0.1 或 ::1，但没有 DnsBlackhole 原 DNS 备份。请选择解除后使用的 DNS。`;
+  } else {
+    windowsSystemDnsStatusElement.textContent = status.adapters.length > 0
+      ? `尚未接管，可接管：${adapterText}。`
+      : "尚未接管，当前未检测到已连接的物理网卡。";
+  }
+  takeOverWindowsSystemDnsButton.disabled =
+    status.managed || status.inEffect || !currentWindowsServiceStatus?.ready;
+  const canReplaceUnmanagedLocalDns = !status.managed && status.inEffect;
+  restoreWindowsSystemDnsButton.textContent = canReplaceUnmanagedLocalDns
+    ? "解除本机 DNS"
+    : "恢复原 DNS";
+  restoreWindowsSystemDnsButton.disabled =
+    (!status.managed && !canReplaceUnmanagedLocalDns) || !currentWindowsServiceStatus?.ready;
+}
+
+function renderWindowsSystemDnsUnavailable(message: string): void {
+  if (!isWindows) {
+    return;
+  }
+  windowsSystemDnsSection.classList.remove("hidden", "is-ready", "needs-repair");
+  windowsSystemDnsStatusElement.textContent = message;
+  takeOverWindowsSystemDnsButton.disabled = true;
+  restoreWindowsSystemDnsButton.disabled = true;
+}
+
+function setWindowsSystemDnsBusy(busy: boolean): void {
+  takeOverWindowsSystemDnsButton.classList.toggle("loading", busy);
+  restoreWindowsSystemDnsButton.classList.toggle("loading", busy);
+  if (busy) {
+    takeOverWindowsSystemDnsButton.disabled = true;
+    restoreWindowsSystemDnsButton.disabled = true;
+    return;
+  }
+  takeOverWindowsSystemDnsButton.disabled =
+    !currentWindowsServiceStatus?.ready ||
+    currentWindowsSystemDnsStatus?.managed !== false ||
+    currentWindowsSystemDnsStatus.inEffect;
+  restoreWindowsSystemDnsButton.disabled =
+    !currentWindowsServiceStatus?.ready ||
+    (currentWindowsSystemDnsStatus?.managed !== true &&
+      !(
+        currentWindowsSystemDnsStatus?.managed === false &&
+        currentWindowsSystemDnsStatus.inEffect
+      ));
+}
+
+function showDnsFallbackDialog(): void {
+  const restoringAutomaticBackup =
+    currentWindowsSystemDnsStatus?.managed === true &&
+    currentWindowsSystemDnsStatus.restoreIpv4Automatic;
+  dnsRestoreOriginalOption.classList.toggle("hidden", !restoringAutomaticBackup);
+  dnsFallbackAutomaticOption.classList.toggle("hidden", restoringAutomaticBackup);
+  dnsFallbackDialogTitle.textContent = restoringAutomaticBackup
+    ? "选择恢复后的 DNS"
+    : "解除本机 DNS";
+  dnsFallbackDialogIntro.textContent = restoringAutomaticBackup
+    ? "原备份的 IPv4 DNS 为自动获取。如果网络使用静态 IPv4，原样恢复后可能没有 IPv4 DNS；建议改用公共 DNS。"
+    : "当前没有原 DNS 备份，请选择解除后使用的 DNS。只会修改仍指向 127.0.0.1 或 ::1 的设置。";
+  dnsFallbackDialogConfirmButton.textContent = restoringAutomaticBackup
+    ? "确认恢复"
+    : "确认解除";
+  const recommended = dnsFallbackInputs.find((input) => input.value === "dns114");
+  if (recommended) {
+    recommended.checked = true;
+  }
+  if (!dnsFallbackDialog.open) {
+    dnsFallbackDialog.showModal();
+  }
+}
+
+function closeDnsFallbackDialog(): void {
+  if (dnsFallbackDialog.open) {
+    dnsFallbackDialog.close();
+  }
+}
+
+function requireWindowsSystemDnsStatus(value: unknown): WindowsSystemDnsStatus {
+  if (!value || typeof value !== "object") {
+    throw new Error("Windows 系统 DNS 状态接口返回了空结果");
+  }
+  const status = value as Partial<WindowsSystemDnsStatus>;
+  if (
+    typeof status.managed !== "boolean" ||
+    typeof status.inEffect !== "boolean" ||
+    !Array.isArray(status.adapters) ||
+    status.adapters.some((adapter) => typeof adapter !== "string") ||
+    typeof status.restoreIpv4Automatic !== "boolean"
+  ) {
+    throw new Error("Windows 系统 DNS 状态接口返回格式无效");
+  }
+  return status as WindowsSystemDnsStatus;
 }
 
 function shouldWaitForWindowsService(status: WindowsServiceStatus | null): boolean {
@@ -1539,6 +1811,7 @@ function setActiveView(view: ViewName): void {
   }
   if (view === "settings" && viewChanged) {
     void loadMacosServiceStatus();
+    void loadWindowsSystemDnsStatus();
   }
 }
 
