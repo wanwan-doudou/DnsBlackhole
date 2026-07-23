@@ -109,6 +109,10 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const WAL_MAINTENANCE_INTERVAL_SECONDS: u64 = 5 * 60;
 const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
+// 定时清理后按需压缩的双阈值：空闲页绝对量和占比都超过才值得整库重写，
+// 避免稳态下为极小收益频繁 VACUUM。
+const VACUUM_FREELIST_MIN_BYTES: u64 = 32 * 1024 * 1024;
+const VACUUM_FREELIST_MIN_RATIO: f64 = 0.25;
 type DomainRankings = (HashMap<String, u64>, HashMap<String, u64>);
 type DashboardTotals = (u64, u64, u64, u64, Option<u64>, Option<u64>);
 
@@ -562,6 +566,43 @@ impl Database {
             }
         }
     }
+
+    /// 重建数据库文件，回收 DELETE 后残留的空闲页并归还磁盘。
+    /// SQLite 的 DELETE 只把页放入 freelist、不收缩文件；用户缩短保留时间、
+    /// 清理大量历史日志后调用此方法，磁盘占用才会真正下降。
+    pub fn vacuum(&self) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute_batch("VACUUM")
+            .map_err(|e| format!("压缩数据库失败：{e}"))?;
+        // VACUUM 经由 WAL 重写数据，随后显式检查点并截断，确保 -wal 文件占用同步下降
+        let _ = checkpoint_and_truncate_wal(&conn);
+        Ok(())
+    }
+
+    /// 定时清理后按需回收：仅当空闲页(freelist)堆积超过阈值时才整库 VACUUM。
+    /// 稳态下空闲页会被新日志复用、占比很低，不会触发；只有长期定时删除
+    /// 导致空闲堆积过多时才压缩一次，避免每轮清理都为极小收益重写整库。
+    /// 返回是否执行了压缩。
+    pub fn vacuum_if_bloated(&self) -> Result<bool, String> {
+        // 先在独立作用域内读取空闲页指标并释放写连接，避免下面 vacuum() 重复加锁死锁
+        let bloated = {
+            let conn = self.lock()?;
+            let freelist: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .map_err(|e| format!("读取数据库空闲页数失败：{e}"))?;
+            let page_count: i64 = conn
+                .query_row("PRAGMA page_count", [], |row| row.get(0))
+                .map_err(|e| format!("读取数据库总页数失败：{e}"))?;
+            let page_size: i64 = conn
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .map_err(|e| format!("读取数据库页大小失败：{e}"))?;
+            freelist_is_bloated(freelist, page_count, page_size)
+        };
+        if bloated {
+            self.vacuum()?;
+        }
+        Ok(bloated)
+    }
 }
 
 fn wal_path_for_database(database_path: &Path) -> PathBuf {
@@ -587,6 +628,17 @@ fn checkpoint_and_truncate_wal(conn: &Connection) -> Result<bool, String> {
         (Ok(truncated), Ok(())) => Ok(truncated),
         (Err(error), _) | (_, Err(error)) => Err(error),
     }
+}
+
+/// 判断空闲页是否堆积到值得整库压缩：绝对空闲空间和占比都超过阈值才返回 true。
+/// 双阈值避免小库频繁重写，也避免大库里少量空闲误触发。
+fn freelist_is_bloated(freelist_pages: i64, page_count: i64, page_size: i64) -> bool {
+    if freelist_pages <= 0 || page_count <= 0 || page_size <= 0 {
+        return false;
+    }
+    let free_bytes = (freelist_pages as u64).saturating_mul(page_size as u64);
+    let ratio = freelist_pages as f64 / page_count as f64;
+    free_bytes >= VACUUM_FREELIST_MIN_BYTES && ratio >= VACUUM_FREELIST_MIN_RATIO
 }
 
 fn log_stats_with_connection(conn: &Connection) -> Result<LogStats, String> {
@@ -1995,6 +2047,80 @@ mod tests {
 
         drop(database);
         fs::remove_dir_all(storage_dir).expect("test storage directory should remove");
+    }
+
+    #[test]
+    fn vacuum_preserves_data_and_keeps_database_writable() {
+        let db = Database::open_in_memory().expect("db should open");
+        let config = AppConfig {
+            query_log_retention_hours: 24,
+            ..AppConfig::default()
+        };
+        db.save_config(&config).expect("config should save");
+
+        let sample = |domain: &str| QueryLogEntry {
+            domain: domain.into(),
+            query_type: 1,
+            query_class: 1,
+            transport: "udp".into(),
+            response_source: "upstream".into(),
+            response: None,
+            client_ip: Some("192.168.1.1".into()),
+            blocked: false,
+            forwarded: true,
+            failed: false,
+            upstream_server: Some("1.1.1.1:53".into()),
+            upstream_duration_ms: Some(10),
+            processing_duration_ms: 1.0,
+            error: None,
+            matched_rule: None,
+            rule_source: None,
+            rule_type: None,
+            important_overrode: false,
+            allowlist_rule: None,
+        };
+
+        db.insert_query_logs(&[(sample("a.example.com"), true)])
+            .expect("query log should save");
+
+        db.vacuum().expect("vacuum should succeed");
+
+        // VACUUM 后配置与日志仍完整
+        let stored = db
+            .load_config()
+            .expect("config should load")
+            .expect("config should exist");
+        assert_eq!(stored.query_log_retention_hours, 24);
+        assert_eq!(
+            db.query_logs(24, "all", "", 1, 20)
+                .expect("logs should load")
+                .total,
+            1
+        );
+
+        // VACUUM 后库仍可继续写入
+        db.insert_query_logs(&[(sample("b.example.com"), true)])
+            .expect("query log should save after vacuum");
+        assert_eq!(
+            db.query_logs(24, "all", "", 1, 20)
+                .expect("logs should load")
+                .total,
+            2
+        );
+    }
+
+    #[test]
+    fn freelist_bloat_threshold_requires_size_and_ratio() {
+        let page_size = 4096;
+        let big_pages = (VACUUM_FREELIST_MIN_BYTES / page_size as u64) as i64 + 16;
+        // 绝对量和占比都达标 → 压缩
+        assert!(freelist_is_bloated(big_pages, big_pages + 64, page_size));
+        // 占比高但绝对量太小 → 不压缩
+        assert!(!freelist_is_bloated(100, 120, page_size));
+        // 绝对量大但占比太低 → 不压缩
+        assert!(!freelist_is_bloated(big_pages, big_pages * 8, page_size));
+        // 空库或异常值 → 不压缩
+        assert!(!freelist_is_bloated(0, 0, page_size));
     }
 
     #[test]

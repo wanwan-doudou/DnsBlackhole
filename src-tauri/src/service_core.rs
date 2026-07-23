@@ -406,6 +406,12 @@ impl AppState {
 
         self.database.prune_query_logs(retention_hours)?;
         *last_prune_at = now;
+        drop(last_prune_at);
+        // 定时清理同样只删行不收缩文件；空闲页堆积过多时按需整库压缩一次。
+        // 稳态下不会触发，失败也不影响清理本身。
+        if let Err(error) = self.database.vacuum_if_bloated() {
+            eprintln!("定时清理后按需压缩数据库失败：{error}");
+        }
         Ok(())
     }
 
@@ -561,6 +567,11 @@ pub(crate) fn save_config_blocking(
     // 保留时间调短后立即清理超出新窗口的历史日志，无需等待下一轮定时清理
     if config.query_log_retention_hours < previous.query_log_retention_hours {
         state.prune_query_logs_now(config.query_log_retention_hours, unix_now())?;
+        // 清理只删行不收缩文件，主动 VACUUM 一次把空闲页归还磁盘。
+        // 失败（如临时磁盘空间不足）不影响已完成的保存与清理，仅记录。
+        if let Err(error) = state.database.vacuum() {
+            eprintln!("缩短日志保留后压缩数据库失败：{error}");
+        }
     }
 
     state.invalidate_log_stats_cache();
