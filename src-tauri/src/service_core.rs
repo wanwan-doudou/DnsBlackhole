@@ -409,6 +409,22 @@ impl AppState {
         Ok(())
     }
 
+    /// 立即清理超出保留窗口的查询日志，跳过定时节流。
+    /// 用于用户调短保留时间后立刻释放历史数据，无需等待下一轮定时清理。
+    pub(crate) fn prune_query_logs_now(
+        &self,
+        retention_hours: u32,
+        now: u64,
+    ) -> Result<(), String> {
+        let mut last_prune_at = self
+            .last_prune_at
+            .lock()
+            .map_err(|_| "读取日志清理时间失败".to_string())?;
+        self.database.prune_query_logs(retention_hours)?;
+        *last_prune_at = now;
+        Ok(())
+    }
+
     fn invalidate_log_stats_cache(&self) {
         if let Ok(mut cache) = self.log_stats_cache.lock() {
             *cache = None;
@@ -540,6 +556,11 @@ pub(crate) fn save_config_blocking(
         }
     } else {
         state.set_error(None);
+    }
+
+    // 保留时间调短后立即清理超出新窗口的历史日志，无需等待下一轮定时清理
+    if config.query_log_retention_hours < previous.query_log_retention_hours {
+        state.prune_query_logs_now(config.query_log_retention_hours, unix_now())?;
     }
 
     state.invalidate_log_stats_cache();
