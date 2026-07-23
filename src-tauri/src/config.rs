@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 11;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
 const MAX_FILTER_SIZE_MB: u32 = 256;
@@ -75,6 +75,10 @@ pub struct AppConfig {
     pub launch_at_startup: bool,
     #[serde(default = "default_query_log_retention_hours")]
     pub query_log_retention_hours: u32,
+    #[serde(default = "default_statistics_enabled")]
+    pub statistics_enabled: bool,
+    #[serde(default = "default_statistics_retention_hours")]
+    pub statistics_retention_hours: u32,
     #[serde(default = "default_dns_cache_enabled")]
     pub dns_cache_enabled: bool,
     #[serde(default = "default_dns_cache_size")]
@@ -101,6 +105,8 @@ pub struct AppConfig {
     pub client_names: String,
     #[serde(default)]
     pub query_log_ignored_domains: String,
+    #[serde(default)]
+    pub statistics_ignored_domains: String,
     #[serde(default = "default_filters")]
     pub filters: Vec<FilterSubscription>,
     #[serde(default = "default_custom_rules")]
@@ -189,12 +195,6 @@ impl Default for FilterSubscription {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct FilterCacheClearStats {
-    pub removed_files: usize,
-    pub removed_bytes: u64,
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -222,6 +222,8 @@ impl Default for AppConfig {
             anonymize_client_ip: false,
             launch_at_startup: default_launch_at_startup(),
             query_log_retention_hours: default_query_log_retention_hours(),
+            statistics_enabled: default_statistics_enabled(),
+            statistics_retention_hours: default_statistics_retention_hours(),
             dns_cache_enabled: default_dns_cache_enabled(),
             dns_cache_size: default_dns_cache_size(),
             dns_cache_min_ttl: default_dns_cache_min_ttl(),
@@ -235,6 +237,7 @@ impl Default for AppConfig {
             dns_rewrites: String::new(),
             client_names: String::new(),
             query_log_ignored_domains: String::new(),
+            statistics_ignored_domains: String::new(),
             filters: default_filters(),
             blacklist: default_custom_rules(),
         }
@@ -315,6 +318,9 @@ impl AppConfig {
         if self.query_log_retention_hours == 0 || self.query_log_retention_hours > 24 * 365 {
             return Err("查询日志保留时间必须在 1 小时到 365 天之间".into());
         }
+        if self.statistics_retention_hours > 24 * 365 {
+            return Err("统计数据保留时间必须为永久或 1 小时到 365 天".into());
+        }
         if self.dns_cache_enabled && self.dns_cache_size == 0 {
             return Err("DNS 缓存大小必须大于 0".into());
         }
@@ -332,6 +338,7 @@ impl AppConfig {
         validate_dns_rewrites(&self.dns_rewrites)?;
         validate_client_names(&self.client_names)?;
         validate_ignored_domains(&self.query_log_ignored_domains)?;
+        validate_ignored_domains(&self.statistics_ignored_domains)?;
         Ok(())
     }
 }
@@ -485,6 +492,14 @@ fn default_launch_at_startup() -> bool {
 
 fn default_query_log_retention_hours() -> u32 {
     90 * 24
+}
+
+fn default_statistics_enabled() -> bool {
+    true
+}
+
+fn default_statistics_retention_hours() -> u32 {
+    30 * 24
 }
 
 fn default_dns_cache_enabled() -> bool {
@@ -1031,6 +1046,13 @@ fn read_config_file(path: &Path) -> Result<AppConfig, String> {
 }
 
 pub fn migrate_legacy_defaults(config: &mut AppConfig) {
+    if config.schema_version < 11 {
+        // 旧版本的日志开关与忽略域名同时控制持久化统计；迁移时保持原有行为，
+        // 用户之后可以在设置中独立调整。
+        config.statistics_enabled = config.query_log_enabled;
+        config.statistics_retention_hours = config.query_log_retention_hours;
+        config.statistics_ignored_domains = config.query_log_ignored_domains.clone();
+    }
     if config.listen_host.trim() == "127.0.0.1" && config.listen_port == 5353 {
         config.listen_port = default_listen_port();
     }
@@ -1233,56 +1255,6 @@ fn sync_directory(dir: &Path) {
     if let Ok(file) = File::open(dir) {
         let _ = file.sync_all();
     }
-}
-
-pub fn clear_filter_cache(
-    data_dir: &Path,
-    config: &mut AppConfig,
-) -> Result<FilterCacheClearStats, String> {
-    let dir = crate::storage::filters_dir(data_dir);
-    let stats = clear_filter_cache_dir(&dir)?;
-
-    for filter in &mut config.filters {
-        filter.rule_count = 0;
-        filter.block_rule_count = 0;
-        filter.allow_rule_count = 0;
-        filter.ignored_rule_count = 0;
-        filter.ignored_comment_count = 0;
-        filter.ignored_regex_count = 0;
-        filter.ignored_unsupported_count = 0;
-        filter.ignored_invalid_count = 0;
-        filter.last_updated = None;
-        filter.last_error = None;
-    }
-
-    Ok(stats)
-}
-
-fn clear_filter_cache_dir(dir: &Path) -> Result<FilterCacheClearStats, String> {
-    if !dir.exists() {
-        return Ok(FilterCacheClearStats::default());
-    }
-
-    let mut stats = FilterCacheClearStats::default();
-    let entries =
-        fs::read_dir(dir).map_err(|e| format!("读取清单缓存目录失败：{}：{e}", dir.display()))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("读取清单缓存文件失败：{e}"))?;
-        let path = entry.path();
-        let metadata = entry
-            .metadata()
-            .map_err(|e| format!("读取清单缓存文件信息失败：{}：{e}", path.display()))?;
-        if !metadata.is_file() {
-            continue;
-        }
-
-        fs::remove_file(&path).map_err(|e| format!("删除清单缓存失败：{}：{e}", path.display()))?;
-        stats.removed_files += 1;
-        stats.removed_bytes += metadata.len();
-    }
-
-    Ok(stats)
 }
 
 pub fn build_effective_rules(data_dir: &Path, config: &AppConfig) -> String {
@@ -1521,6 +1493,53 @@ mod tests {
     }
 
     #[test]
+    fn migrates_coupled_query_log_settings_to_statistics() {
+        let mut config = AppConfig {
+            schema_version: 10,
+            query_log_enabled: false,
+            query_log_retention_hours: 168,
+            query_log_ignored_domains: "heartbeat.example".into(),
+            statistics_enabled: true,
+            statistics_retention_hours: 720,
+            statistics_ignored_domains: String::new(),
+            ..AppConfig::default()
+        };
+
+        migrate_legacy_defaults(&mut config);
+
+        assert!(!config.statistics_enabled);
+        assert_eq!(config.statistics_retention_hours, 168);
+        assert_eq!(
+            config.statistics_ignored_domains,
+            config.query_log_ignored_domains
+        );
+    }
+
+    #[test]
+    fn current_config_preserves_statistics_retention() {
+        let mut config = AppConfig {
+            statistics_retention_hours: 365 * 24,
+            ..AppConfig::default()
+        };
+
+        migrate_legacy_defaults(&mut config);
+
+        assert_eq!(config.statistics_retention_hours, 365 * 24);
+    }
+
+    #[test]
+    fn permanent_statistics_retention_is_valid() {
+        let config = AppConfig {
+            statistics_retention_hours: 0,
+            ..AppConfig::default()
+        };
+
+        config
+            .validate()
+            .expect("permanent retention should validate");
+    }
+
+    #[test]
     fn migrates_old_default_rate_limit_but_preserves_custom_value() {
         let mut legacy_default = AppConfig {
             schema_version: 7,
@@ -1666,28 +1685,5 @@ mod tests {
         config
             .validate()
             .expect("legacy HTTP config should remain valid");
-    }
-
-    #[test]
-    fn clears_filter_cache_files_without_removing_subdirectories() {
-        let dir = std::env::temp_dir().join(format!(
-            "dnsblackhole-filter-cache-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time should be valid")
-                .as_nanos()
-        ));
-        fs::create_dir_all(dir.join("nested")).expect("test cache directory should create");
-        fs::write(dir.join("a.txt"), "abc").expect("test cache file should write");
-        fs::write(dir.join("nested").join("keep.txt"), "x").expect("nested test file should write");
-
-        let stats = clear_filter_cache_dir(&dir).expect("cache should clear");
-
-        assert_eq!(stats.removed_files, 1);
-        assert_eq!(stats.removed_bytes, 3);
-        assert!(!dir.join("a.txt").exists());
-        assert!(dir.join("nested").join("keep.txt").exists());
-
-        fs::remove_dir_all(dir).expect("test cache directory should remove");
     }
 }

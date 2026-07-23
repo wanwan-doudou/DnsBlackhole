@@ -13,7 +13,7 @@ mod worker;
 
 pub(crate) use filter_runtime::{build_filter_runtime_with_rules, replace_filter_runtime};
 pub(crate) use protocol::{DnsResponseAnswer, DnsResponseSummary};
-pub(crate) use rule_cache::{RuleLoadSource, load_or_compile_rules};
+pub(crate) use rule_cache::{RuleLoadSource, clear_rule_cache, load_or_compile_rules};
 pub use rules::{RuleSummary, summarize_rules};
 pub use server::DnsServer;
 pub use stats::{

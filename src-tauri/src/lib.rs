@@ -19,9 +19,10 @@ use database::QueryLogPage;
 use dns::RuntimeStatus;
 #[cfg(not(any(target_os = "macos", windows)))]
 use service_core::{
-    AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, query_logs_blocking,
-    save_config_blocking, spawn_filter_auto_update, spawn_initial_runtime, spawn_runtime_watchdog,
-    start_dns_blocking, stop_dns_blocking, update_filters_blocking,
+    AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, clear_query_logs_blocking,
+    clear_statistics_blocking, query_logs_blocking, save_config_blocking, spawn_filter_auto_update,
+    spawn_initial_runtime, spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking,
+    update_filters_blocking,
 };
 use service_core::{FilterCacheClearResult, FilterUpdateProgressState, FilterUpdateResult};
 use storage::StorageInfo;
@@ -514,6 +515,46 @@ async fn get_query_logs(
 }
 
 #[tauri::command]
+async fn clear_query_logs(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = state;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            privileged_bridge::ServiceClient::call("clear_query_logs", &serde_json::json!({}))
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            clear_query_logs_blocking(state.local()?)
+        }
+    })
+    .await
+    .map_err(|error| format!("清除查询日志任务异常：{error}"))?
+}
+
+#[tauri::command]
+async fn clear_statistics(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = state;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            privileged_bridge::ServiceClient::call("clear_statistics", &serde_json::json!({}))
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            clear_statistics_blocking(state.local()?)
+        }
+    })
+    .await
+    .map_err(|error| format!("清除统计数据任务异常：{error}"))?
+}
+
+#[tauri::command]
 async fn update_filters(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<GuiState>>,
@@ -672,7 +713,7 @@ async fn clear_filter_cache(
         }
     })
     .await
-    .map_err(|error| format!("清理过滤器缓存任务异常：{error}"))?
+    .map_err(|error| format!("清理缓存任务异常：{error}"))?
 }
 
 #[cfg(all(
@@ -805,6 +846,8 @@ pub fn run() {
             save_config,
             get_status,
             get_query_logs,
+            clear_query_logs,
+            clear_statistics,
             update_filters,
             get_filter_update_progress,
             cancel_filter_update,

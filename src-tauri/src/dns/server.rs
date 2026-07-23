@@ -12,7 +12,10 @@ use std::{
 
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
-use crate::{config::AppConfig, database::Database};
+use crate::{
+    config::AppConfig,
+    database::{Database, QueryPersistenceEntry},
+};
 
 use super::{
     access::ClientAccess,
@@ -23,7 +26,7 @@ use super::{
     upstream::build_runtime_upstreams,
     worker::{
         DnsResponseTarget, DnsWorkItem, DnsWorkerContext, PENDING_QUERY_SHARDS, PendingQueries,
-        QueryLogMessage, dns_worker_loop,
+        dns_worker_loop,
     },
 };
 
@@ -41,8 +44,8 @@ const TCP_MAX_CONNECTIONS: usize = 256;
 const UDP_SOCKET_BUFFER_SIZE: usize = 1024 * 1024;
 const DNS_WORK_QUEUE_CAPACITY: usize = 8192;
 const QUERY_LOG_QUEUE_CAPACITY: usize = 16384;
-const QUERY_LOG_BATCH_SIZE: usize = 128;
-const QUERY_LOG_BATCH_WAIT_TIMEOUT: Duration = Duration::from_millis(10);
+const QUERY_LOG_BATCH_SIZE: usize = 512;
+const QUERY_LOG_BATCH_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const DNS_MIN_WORKERS: usize = 4;
 const DNS_MAX_WORKERS: usize = 32;
 const DNS_CACHE_SHARDS: usize = 64;
@@ -92,6 +95,7 @@ impl DnsServer {
         let runtime_state_started = Instant::now();
         let upstream_mode = config.upstream_mode.clone();
         let query_log_enabled = config.query_log_enabled;
+        let statistics_enabled = config.statistics_enabled;
         let anonymize_client_ip = config.anonymize_client_ip;
         let access = Arc::new(ClientAccess::from_config(&config)?);
         let refuse_any = config.refuse_any;
@@ -119,7 +123,7 @@ impl DnsServer {
         let mut threads = Vec::new();
 
         let mut query_log_thread = None;
-        let query_log_sender = if query_log_enabled {
+        let persistence_sender = if query_log_enabled || statistics_enabled {
             let (sender, receiver) = mpsc::sync_channel(QUERY_LOG_QUEUE_CAPACITY);
             query_log_thread = Some(spawn_query_log_writer(Arc::clone(&database), receiver));
             Some(sender)
@@ -140,9 +144,11 @@ impl DnsServer {
             dns_cache: dns_cache.clone(),
             dns_cache_config,
             pending_queries: Arc::new(PendingQueries::new(PENDING_QUERY_SHARDS)),
-            query_log_sender,
+            persistence_sender,
+            query_log_enabled,
+            statistics_enabled,
             anonymize_client_ip,
-            detailed_runtime_stats: !query_log_enabled,
+            detailed_runtime_stats: !statistics_enabled,
         });
 
         let worker_count = dns_worker_count();
@@ -355,23 +361,23 @@ fn dns_worker_queue_capacity(worker_count: usize) -> usize {
 
 fn spawn_query_log_writer(
     database: Arc<Database>,
-    receiver: mpsc::Receiver<QueryLogMessage>,
+    receiver: mpsc::Receiver<QueryPersistenceEntry>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut batch = Vec::with_capacity(QUERY_LOG_BATCH_SIZE);
 
         while let Ok(message) = receiver.recv() {
-            batch.push((message.entry, message.anonymize_client_ip));
+            batch.push(message);
 
             while batch.len() < QUERY_LOG_BATCH_SIZE {
                 match receiver.recv_timeout(QUERY_LOG_BATCH_WAIT_TIMEOUT) {
-                    Ok(message) => batch.push((message.entry, message.anonymize_client_ip)),
+                    Ok(message) => batch.push(message),
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
 
-            if let Err(error) = database.insert_query_logs(&batch) {
+            if let Err(error) = database.insert_query_events(&batch) {
                 eprintln!("{error}");
             }
             batch.clear();

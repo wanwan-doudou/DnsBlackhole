@@ -18,7 +18,8 @@ use crate::{
     database::{Database, LogStats, QueryLogPage},
     dns::{
         self, DnsServer, DnsStats, RuleLoadSource, RuleSummary, RuntimeStatus,
-        build_filter_runtime_with_rules, load_or_compile_rules, replace_filter_runtime,
+        build_filter_runtime_with_rules, clear_rule_cache, load_or_compile_rules,
+        replace_filter_runtime,
     },
     filters,
 };
@@ -317,9 +318,13 @@ impl AppState {
             .lock()
             .map(|stats| stats.clone())
             .unwrap_or_default();
-        if config.query_log_enabled && include_log_stats {
+        if config.statistics_enabled && include_log_stats {
             let log_stats_started = Instant::now();
-            match self.cached_log_stats(config.query_log_retention_hours, force_log_stats) {
+            match self.cached_log_stats(
+                config.query_log_retention_hours,
+                config.statistics_retention_hours,
+                force_log_stats,
+            ) {
                 Ok(log_stats) => {
                     stats.queries = log_stats.queries;
                     stats.blocked = log_stats.blocked;
@@ -358,7 +363,8 @@ impl AppState {
 
     fn cached_log_stats(
         &self,
-        retention_hours: u32,
+        query_log_retention_hours: u32,
+        statistics_retention_hours: u32,
         force_refresh: bool,
     ) -> Result<LogStats, String> {
         let now = unix_now();
@@ -371,29 +377,34 @@ impl AppState {
                 .clone()
         };
         if let Some(cached) = cached_stats
-            && cached.retention_hours == retention_hours
+            && cached.retention_hours == statistics_retention_hours
             && now.saturating_sub(cached.created_at) < LOG_STATS_CACHE_SECONDS
         {
             return Ok(cached.stats);
         }
 
-        self.prune_query_logs_if_due(retention_hours, now)?;
-        let stats = self.database.log_stats(retention_hours)?;
+        self.prune_persisted_data_if_due(
+            query_log_retention_hours,
+            statistics_retention_hours,
+            now,
+        )?;
+        let stats = self.database.log_stats(statistics_retention_hours)?;
         let mut cache = self
             .log_stats_cache
             .lock()
             .map_err(|_| "写入日志统计缓存失败".to_string())?;
         *cache = Some(CachedLogStats {
-            retention_hours,
+            retention_hours: statistics_retention_hours,
             created_at: now,
             stats: stats.clone(),
         });
         Ok(stats)
     }
 
-    pub(crate) fn prune_query_logs_if_due(
+    pub(crate) fn prune_persisted_data_if_due(
         &self,
-        retention_hours: u32,
+        query_log_retention_hours: u32,
+        statistics_retention_hours: u32,
         now: u64,
     ) -> Result<(), String> {
         let mut last_prune_at = self
@@ -404,7 +415,8 @@ impl AppState {
             return Ok(());
         }
 
-        self.database.prune_query_logs(retention_hours)?;
+        self.database
+            .prune_expired(query_log_retention_hours, statistics_retention_hours)?;
         *last_prune_at = now;
         drop(last_prune_at);
         // 定时清理同样只删行不收缩文件；空闲页堆积过多时按需整库压缩一次。
@@ -415,18 +427,20 @@ impl AppState {
         Ok(())
     }
 
-    /// 立即清理超出保留窗口的查询日志，跳过定时节流。
+    /// 立即清理超出保留窗口的查询日志和统计数据，跳过定时节流。
     /// 用于用户调短保留时间后立刻释放历史数据，无需等待下一轮定时清理。
-    pub(crate) fn prune_query_logs_now(
+    pub(crate) fn prune_persisted_data_now(
         &self,
-        retention_hours: u32,
+        query_log_retention_hours: u32,
+        statistics_retention_hours: u32,
         now: u64,
     ) -> Result<(), String> {
         let mut last_prune_at = self
             .last_prune_at
             .lock()
             .map_err(|_| "读取日志清理时间失败".to_string())?;
-        self.database.prune_query_logs(retention_hours)?;
+        self.database
+            .prune_expired(query_log_retention_hours, statistics_retention_hours)?;
         *last_prune_at = now;
         Ok(())
     }
@@ -504,6 +518,7 @@ pub(crate) fn filter_runtime_changed(previous: &AppConfig, next: &AppConfig) -> 
         || previous.blocking_custom_ipv6 != next.blocking_custom_ipv6
         || previous.dns_rewrites != next.dns_rewrites
         || previous.query_log_ignored_domains != next.query_log_ignored_domains
+        || previous.statistics_ignored_domains != next.statistics_ignored_domains
 }
 
 /// 判断配置差异是否触及 DNS 服务的结构性参数（监听、上游、访问控制、缓存等）。
@@ -522,6 +537,7 @@ pub(crate) fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool 
         || previous.rate_limit_per_second != next.rate_limit_per_second
         || previous.refuse_any != next.refuse_any
         || previous.query_log_enabled != next.query_log_enabled
+        || previous.statistics_enabled != next.statistics_enabled
         || previous.anonymize_client_ip != next.anonymize_client_ip
         || previous.dns_cache_enabled != next.dns_cache_enabled
         || previous.dns_cache_size != next.dns_cache_size
@@ -539,9 +555,18 @@ pub(crate) fn save_config_blocking(
         .runtime_update_lock
         .lock()
         .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
-    config::migrate_legacy_defaults(&mut config);
-    config.validate()?;
     let previous = state.current_config()?;
+    let submitted_without_statistics_config =
+        config.schema_version < config::CURRENT_CONFIG_SCHEMA_VERSION;
+    config::migrate_legacy_defaults(&mut config);
+    if submitted_without_statistics_config {
+        // 旧版界面不知道独立统计配置，保存其他设置时沿用服务端现值，
+        // 避免 serde 默认值或旧版日志设置意外覆盖统计保留期。
+        config.statistics_enabled = previous.statistics_enabled;
+        config.statistics_retention_hours = previous.statistics_retention_hours;
+        config.statistics_ignored_domains = previous.statistics_ignored_domains.clone();
+    }
+    config.validate()?;
     let filter_changed = filter_runtime_changed(&previous, &config);
     let restart_required = needs_dns_restart(&previous, &config);
     let start_required =
@@ -565,8 +590,17 @@ pub(crate) fn save_config_blocking(
     }
 
     // 保留时间调短后立即清理超出新窗口的历史日志，无需等待下一轮定时清理
-    if config.query_log_retention_hours < previous.query_log_retention_hours {
-        state.prune_query_logs_now(config.query_log_retention_hours, unix_now())?;
+    if config.query_log_retention_hours < previous.query_log_retention_hours
+        || statistics_retention_was_shortened(
+            previous.statistics_retention_hours,
+            config.statistics_retention_hours,
+        )
+    {
+        state.prune_persisted_data_now(
+            config.query_log_retention_hours,
+            config.statistics_retention_hours,
+            unix_now(),
+        )?;
         // 清理只删行不收缩文件，主动 VACUUM 一次把空闲页归还磁盘。
         // 失败（如临时磁盘空间不足）不影响已完成的保存与清理，仅记录。
         if let Err(error) = state.database.vacuum() {
@@ -576,6 +610,10 @@ pub(crate) fn save_config_blocking(
 
     state.invalidate_log_stats_cache();
     Ok(state.status(true))
+}
+
+fn statistics_retention_was_shortened(previous: u32, next: u32) -> bool {
+    next != 0 && (previous == 0 || next < previous)
 }
 
 pub(crate) fn query_logs_blocking(
@@ -595,7 +633,11 @@ pub(crate) fn query_logs_blocking(
         });
     }
 
-    state.prune_query_logs_if_due(config.query_log_retention_hours, unix_now())?;
+    state.prune_persisted_data_if_due(
+        config.query_log_retention_hours,
+        config.statistics_retention_hours,
+        unix_now(),
+    )?;
     state.database.query_logs(
         config.query_log_retention_hours,
         filter.as_deref().unwrap_or("all"),
@@ -603,6 +645,17 @@ pub(crate) fn query_logs_blocking(
         page.unwrap_or(1),
         page_size.unwrap_or(50),
     )
+}
+
+pub(crate) fn clear_query_logs_blocking(state: &AppState) -> Result<RuntimeStatus, String> {
+    state.database.clear_query_logs()?;
+    Ok(state.status_with_log_stats(true, true))
+}
+
+pub(crate) fn clear_statistics_blocking(state: &AppState) -> Result<RuntimeStatus, String> {
+    state.database.clear_statistics()?;
+    state.invalidate_log_stats_cache();
+    Ok(state.status_with_log_stats(true, true))
 }
 
 /// 更新启用的远程清单并应用。前端事件通知由调用方处理。
@@ -733,29 +786,13 @@ pub(crate) fn clear_filter_cache_blocking(
         .runtime_update_lock
         .lock()
         .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
-    let previous = state.current_config()?;
-    let mut config = previous.clone();
-    let stats = config::clear_filter_cache(&state.data_dir, &mut config)?;
-    state.database.save_config(&config)?;
-    state.replace_config(config.clone())?;
-
-    if config.enabled {
-        state
-            .apply_config_change(&previous, &config)
-            .inspect_err(|error| {
-                state.set_error(Some(error.clone()));
-            })?;
-    } else {
-        state.set_effective_summary(configured_rule_summary(&config))?;
-        state.set_error(None);
-    }
+    let stats = clear_rule_cache(&state.data_dir)?;
 
     let message = if stats.removed_files == 0 {
-        "没有可清理的过滤器缓存".to_string()
+        "没有可清理的缓存".to_string()
     } else {
         format!(
-            "已清理 {} 个过滤器缓存（{}），远程黑名单需要重新检查更新",
-            stats.removed_files,
+            "已清理规则编译缓存（{}），远程黑名单和当前过滤规则继续生效",
             format_bytes(stats.removed_bytes)
         )
     };

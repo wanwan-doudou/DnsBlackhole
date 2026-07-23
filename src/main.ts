@@ -6,6 +6,8 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   cancelFilterUpdate,
+  clearQueryLogs as clearQueryLogsCommand,
+  clearStatistics as clearStatisticsCommand,
   clearDnsCache as clearDnsCacheCommand,
   clearFilterCache as clearFilterCacheCommand,
   detectSystemProxy,
@@ -76,6 +78,7 @@ import type {
 import "./style.css";
 
 const frontendStartedAt = performance.now();
+const CURRENT_CONFIG_SCHEMA_VERSION = 11;
 
 function logLoadTime(
   module: string,
@@ -123,7 +126,10 @@ let queryLogRefreshInFlight = false;
 let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
 let queryLogSearchComposing = false;
-let currentConfigSchemaVersion = 2;
+let currentConfigSchemaVersion = CURRENT_CONFIG_SCHEMA_VERSION;
+let currentStatisticsRetentionHours = 30 * 24;
+let latestDashboardStartedAt: number | null | undefined;
+let latestDashboardEndedAt: number | null | undefined;
 let clientNameMap = new Map<string, string>();
 let currentStorageInfo: StorageInfo | null = null;
 let selectedDataStoragePath = "";
@@ -194,6 +200,14 @@ const queryLogRetentionInputs = Array.from(
 );
 const customRetentionField = query<HTMLLabelElement>("#custom_retention_field");
 const queryLogRetentionCustomInput = query<HTMLInputElement>("#query_log_retention_custom");
+const statisticsEnabledInput = query<HTMLInputElement>("#statistics_enabled");
+const statisticsRetentionInputs = Array.from(
+  document.querySelectorAll<HTMLInputElement>('input[name="statistics_retention"]'),
+);
+const statisticsCustomRetentionField = query<HTMLLabelElement>(
+  "#statistics_custom_retention_field",
+);
+const statisticsRetentionCustomInput = query<HTMLInputElement>("#statistics_retention_custom");
 const dnsCacheEnabledInput = query<HTMLInputElement>("#dns_cache_enabled");
 const dnsCacheSizeInput = query<HTMLInputElement>("#dns_cache_size");
 const dnsCacheMinTtlInput = query<HTMLInputElement>("#dns_cache_min_ttl");
@@ -210,6 +224,9 @@ const blockingCustomIpv6Input = query<HTMLInputElement>("#blocking_custom_ipv6")
 const dnsRewritesInput = query<HTMLTextAreaElement>("#dns_rewrites");
 const clientNamesInput = query<HTMLTextAreaElement>("#client_names");
 const queryLogIgnoredInput = query<HTMLTextAreaElement>("#query_log_ignored_domains");
+const statisticsIgnoredInput = query<HTMLTextAreaElement>("#statistics_ignored_domains");
+const clearQueryLogsButton = query<HTMLButtonElement>("#clear_query_logs_btn");
+const clearStatisticsButton = query<HTMLButtonElement>("#clear_statistics_btn");
 const blacklistInput = query<HTMLTextAreaElement>("#blacklist");
 const filtersTable = query<HTMLDivElement>(".filters-table");
 const filtersBody = query<HTMLDivElement>("#filters_body");
@@ -217,11 +234,15 @@ const saveButton = query<HTMLButtonElement>("#save_btn");
 const saveSettingsButton = query<HTMLButtonElement>("#save_settings_btn");
 const saveSecurityButton = query<HTMLButtonElement>("#save_security_btn");
 const saveCustomButton = query<HTMLButtonElement>("#save_custom_btn");
+const saveQueryLogSettingsButton = query<HTMLButtonElement>("#save_query_log_settings_btn");
+const saveStatisticsSettingsButton = query<HTMLButtonElement>("#save_statistics_settings_btn");
 const configSaveButtons = [
   saveButton,
   saveSettingsButton,
   saveSecurityButton,
   saveCustomButton,
+  saveQueryLogSettingsButton,
+  saveStatisticsSettingsButton,
 ];
 configSaveButtons.forEach((button) => {
   button.disabled = true;
@@ -472,6 +493,7 @@ queryLogBody.addEventListener("focusin", (event) => {
 contentElement.addEventListener("scroll", markContentScrolling, { passive: true });
 
 queryLogEnabledInput.addEventListener("change", updateLogControls);
+statisticsEnabledInput.addEventListener("change", updateStatisticsControls);
 filterProxyModeInput.addEventListener("change", updateFilterProxyControls);
 dnsCacheEnabledInput.addEventListener("change", updateDnsCacheControls);
 runtimeWatchdogEnabledInput.addEventListener("change", updateRuntimeWatchdogControls);
@@ -483,6 +505,14 @@ queryLogRetentionInputs.forEach((input) => {
     updateLogControls();
     if (input.checked && input.value === "custom") {
       queryLogRetentionCustomInput.focus();
+    }
+  });
+});
+statisticsRetentionInputs.forEach((input) => {
+  input.addEventListener("change", () => {
+    updateStatisticsControls();
+    if (input.checked && input.value === "custom") {
+      statisticsRetentionCustomInput.focus();
     }
   });
 });
@@ -500,6 +530,14 @@ saveSecurityButton.addEventListener("click", async () => {
 });
 
 saveCustomButton.addEventListener("click", async () => {
+  await saveConfig();
+});
+
+saveQueryLogSettingsButton.addEventListener("click", async () => {
+  await saveConfig();
+});
+
+saveStatisticsSettingsButton.addEventListener("click", async () => {
   await saveConfig();
 });
 
@@ -595,7 +633,7 @@ clearDnsCacheButton.addEventListener("click", async () => {
 
 clearFilterCacheButton.addEventListener("click", async () => {
   const confirmed = window.confirm(
-    "这会删除已下载的远程黑名单缓存，并重载当前过滤规则。配置、查询日志和统计数据不会删除。清理后需要重新检查更新才能恢复远程黑名单缓存。是否继续？",
+    "这会删除可重新生成的规则编译缓存。已下载的远程黑名单和当前生效规则不会删除；下次启动或规则变更时会自动重新生成缓存。是否继续？",
   );
   if (!confirmed) {
     return;
@@ -607,7 +645,7 @@ clearFilterCacheButton.addEventListener("click", async () => {
     const result = await clearFilterCacheCommand();
     renderStatus(result.status);
     showMessage(result.message, false);
-    await loadConfig();
+    await loadStorageInfo();
   } catch (error) {
     showMessage(String(error), true);
     await refreshStatus();
@@ -820,6 +858,54 @@ openMacosServiceSettingsButton.addEventListener("click", async () => {
     await openMacosServiceSettings();
   } catch (error) {
     showMessage(String(error), true);
+  }
+});
+
+clearQueryLogsButton.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "这会永久删除全部查询日志，但不会删除统计数据和配置。清除后，新查询仍会继续记录。是否继续？",
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  setBusy(true);
+  clearQueryLogsButton.classList.add("loading");
+  try {
+    const status = await clearQueryLogsCommand();
+    renderStatus(status);
+    queryLogPage = 1;
+    await refreshQueryLogs();
+    await loadStorageInfo();
+    showMessage("查询日志已清除，统计数据未受影响", false);
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    clearQueryLogsButton.classList.remove("loading");
+    setBusy(false);
+  }
+});
+
+clearStatisticsButton.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "这会永久删除全部累计统计、趋势和排行，但不会删除查询日志和配置。清除后将从新的 DNS 查询重新统计。是否继续？",
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  setBusy(true);
+  clearStatisticsButton.classList.add("loading");
+  try {
+    const status = await clearStatisticsCommand();
+    renderStatus(status);
+    await loadStorageInfo();
+    showMessage("统计数据已清除，查询日志未受影响", false);
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    clearStatisticsButton.classList.remove("loading");
+    setBusy(false);
   }
 });
 
@@ -1113,7 +1199,8 @@ async function loadConfig(): Promise<boolean> {
     if (!config || typeof config.schema_version !== "number") {
       throw new Error("DNS 服务返回了空配置或配置格式无效");
     }
-    currentConfigSchemaVersion = config.schema_version;
+    currentConfigSchemaVersion = Math.max(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
+    currentStatisticsRetentionHours = config.statistics_retention_hours;
     enabledInput.checked = config.enabled;
     launchAtStartupInput.checked = config.launch_at_startup;
     useFiltersInput.checked = config.use_filters;
@@ -1137,6 +1224,8 @@ async function loadConfig(): Promise<boolean> {
     queryLogEnabledInput.checked = config.query_log_enabled;
     anonymizeClientIpInput.checked = config.anonymize_client_ip;
     setRetentionValue(config.query_log_retention_hours);
+    statisticsEnabledInput.checked = config.statistics_enabled;
+    setStatisticsRetentionValue(config.statistics_retention_hours);
     dnsCacheEnabledInput.checked = config.dns_cache_enabled;
     dnsCacheSizeInput.value = String(config.dns_cache_size);
     dnsCacheMinTtlInput.value = String(config.dns_cache_min_ttl);
@@ -1150,9 +1239,12 @@ async function loadConfig(): Promise<boolean> {
     dnsRewritesInput.value = config.dns_rewrites;
     clientNamesInput.value = config.client_names;
     queryLogIgnoredInput.value = config.query_log_ignored_domains;
+    statisticsIgnoredInput.value = config.statistics_ignored_domains;
     clientNameMap = parseClientNames(config.client_names);
     currentQueryLogEnabled = config.query_log_enabled;
     updateLogControls();
+    updateStatisticsControls();
+    renderDashboardSummaryWindow();
     updateFilterProxyControls();
     updateDnsCacheControls();
     updateRuntimeWatchdogControls();
@@ -1408,7 +1500,7 @@ function renderWindowsSystemDnsStatus(status: WindowsSystemDnsStatus): void {
   if (status.managed && status.inEffect) {
     windowsSystemDnsStatusElement.textContent = `已接管 ${adapterText}，DNS 指向 127.0.0.1 和 ::1。`;
   } else if (status.managed) {
-    windowsSystemDnsStatusElement.textContent = `已保存 ${adapterText} 的原 DNS，但当前系统设置已发生变化，可点击“恢复原 DNS”。`;
+    windowsSystemDnsStatusElement.textContent = `已保存 ${adapterText} 的原 DNS，但当前系统设置已发生变化，可点击“恢复 DNS”。`;
   } else if (status.inEffect) {
     windowsSystemDnsStatusElement.textContent = `检测到 ${adapterText} 的 DNS 已指向 127.0.0.1 或 ::1，但没有 DnsBlackhole 原 DNS 备份。请选择解除后使用的 DNS。`;
   } else {
@@ -1421,7 +1513,7 @@ function renderWindowsSystemDnsStatus(status: WindowsSystemDnsStatus): void {
   const canReplaceUnmanagedLocalDns = !status.managed && status.inEffect;
   restoreWindowsSystemDnsButton.textContent = canReplaceUnmanagedLocalDns
     ? "解除本机 DNS"
-    : "恢复原 DNS";
+    : "恢复 DNS";
   restoreWindowsSystemDnsButton.disabled =
     (!status.managed && !canReplaceUnmanagedLocalDns) || !currentWindowsServiceStatus?.ready;
 }
@@ -1579,7 +1671,7 @@ function isWindowsServiceState(value: unknown): value is WindowsServiceState {
 function renderStorageInfo(info: StorageInfo): void {
   const displayPath = selectedDataStoragePath || info.current_path;
   dataStoragePathInput.value = displayPath;
-  dataStorageSizeElement.textContent = `当前占用 ${formatBytes(info.total_bytes)}（数据库 ${formatBytes(info.database_bytes)}，过滤器缓存 ${formatBytes(info.filter_cache_bytes)}）`;
+  dataStorageSizeElement.textContent = `当前占用 ${formatBytes(info.total_bytes)}（数据库 ${formatBytes(info.database_bytes)}，过滤器数据 ${formatBytes(info.filter_cache_bytes)}）`;
   dataStorageStateElement.textContent = info.is_default ? "默认目录" : "自定义目录";
   dataStorageStateElement.classList.toggle("custom", !info.is_default);
 
@@ -1615,12 +1707,20 @@ async function saveConfig(): Promise<void> {
 }
 
 async function saveConfigOnly(): Promise<RuntimeStatus> {
-  return saveConfigCommand(collectConfig());
+  const config = collectConfig();
+  const previousStatisticsRetentionHours = currentStatisticsRetentionHours;
+  currentStatisticsRetentionHours = config.statistics_retention_hours;
+  try {
+    return await saveConfigCommand(config);
+  } catch (error) {
+    currentStatisticsRetentionHours = previousStatisticsRetentionHours;
+    throw error;
+  }
 }
 
 function collectConfig(): AppConfig {
   return {
-    schema_version: currentConfigSchemaVersion,
+    schema_version: Math.max(currentConfigSchemaVersion, CURRENT_CONFIG_SCHEMA_VERSION),
     enabled: enabledInput.checked,
     launch_at_startup: launchAtStartupInput.checked,
     use_filters: useFiltersInput.checked,
@@ -1641,6 +1741,8 @@ function collectConfig(): AppConfig {
     query_log_enabled: queryLogEnabledInput.checked,
     anonymize_client_ip: anonymizeClientIpInput.checked,
     query_log_retention_hours: selectedRetentionHours(),
+    statistics_enabled: statisticsEnabledInput.checked,
+    statistics_retention_hours: selectedStatisticsRetentionHours(),
     dns_cache_enabled: dnsCacheEnabledInput.checked,
     dns_cache_size: Number(dnsCacheSizeInput.value || 0),
     dns_cache_min_ttl: Number(dnsCacheMinTtlInput.value || 0),
@@ -1654,6 +1756,7 @@ function collectConfig(): AppConfig {
     dns_rewrites: dnsRewritesInput.value,
     client_names: clientNamesInput.value,
     query_log_ignored_domains: queryLogIgnoredInput.value,
+    statistics_ignored_domains: statisticsIgnoredInput.value,
     listen_host: listenHostInput.value.trim(),
     listen_port: Number(listenPortInput.value),
     listen_ipv6: listenIpv6Input.checked,
@@ -1961,10 +2064,7 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#queries"), formatCount(status.stats.queries));
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
-  renderDashboardSummaryWindow(
-    status.stats.dashboard_started_at,
-    status.stats.dashboard_ended_at,
-  );
+  renderDashboardSummaryWindow(status.stats.dashboard_started_at, status.stats.dashboard_ended_at);
   renderSparkline(
     "#query_sparkline",
     buildDailyTrafficSeries(status.stats.traffic, "queries"),
@@ -2497,9 +2597,39 @@ function selectedRetentionHours(): number {
   return Number(queryLogRetentionCustomInput.value || 2160);
 }
 
+function setStatisticsRetentionValue(hours: number): void {
+  if (hours === 0) {
+    setRadioValue(statisticsRetentionInputs, "forever");
+    statisticsRetentionCustomInput.value = "";
+    return;
+  }
+  const preset = statisticsRetentionInputs.find((input) => input.value === String(hours));
+  if (preset) {
+    preset.checked = true;
+    statisticsRetentionCustomInput.value = "";
+    return;
+  }
+
+  setRadioValue(statisticsRetentionInputs, "custom");
+  statisticsRetentionCustomInput.value = String(Math.ceil(hours / 24));
+}
+
+function selectedStatisticsRetentionHours(): number {
+  const value = selectedRadioValue(statisticsRetentionInputs, "720");
+  if (value === "forever") {
+    return 0;
+  }
+  if (value !== "custom") {
+    return Number(value);
+  }
+
+  return Number(statisticsRetentionCustomInput.value || 30) * 24;
+}
+
 function updateLogControls(): void {
   const enabled = queryLogEnabledInput.checked;
-  anonymizeClientIpInput.disabled = !enabled;
+  updatePersistencePrivacyControl();
+  queryLogIgnoredInput.disabled = !enabled;
 
   for (const input of queryLogRetentionInputs) {
     input.disabled = !enabled;
@@ -2511,6 +2641,27 @@ function updateLogControls(): void {
     "visible",
     enabled && selectedRadioValue(queryLogRetentionInputs, "2160") === "custom",
   );
+}
+
+function updateStatisticsControls(): void {
+  const enabled = statisticsEnabledInput.checked;
+  updatePersistencePrivacyControl();
+  statisticsIgnoredInput.disabled = !enabled;
+
+  for (const input of statisticsRetentionInputs) {
+    input.disabled = !enabled;
+  }
+
+  statisticsRetentionCustomInput.disabled =
+    !enabled || selectedRadioValue(statisticsRetentionInputs, "720") !== "custom";
+  statisticsCustomRetentionField.classList.toggle(
+    "visible",
+    enabled && selectedRadioValue(statisticsRetentionInputs, "720") === "custom",
+  );
+}
+
+function updatePersistencePrivacyControl(): void {
+  anonymizeClientIpInput.disabled = !queryLogEnabledInput.checked && !statisticsEnabledInput.checked;
 }
 
 function updateDnsCacheControls(): void {
@@ -2850,13 +3001,24 @@ async function downloadAndInstallWithRetry(): Promise<void> {
 }
 
 function renderDashboardSummaryWindow(
-  startedAt: number | null | undefined,
-  endedAt: number | null | undefined,
+  startedAt?: number | null,
+  endedAt?: number | null,
 ): void {
-  let label = "暂无汇总数据";
-  if (startedAt && endedAt) {
-    const start = new Date(startedAt * 1000);
-    const end = new Date(endedAt * 1000);
+  if (startedAt !== undefined) {
+    latestDashboardStartedAt = startedAt;
+  }
+  if (endedAt !== undefined) {
+    latestDashboardEndedAt = endedAt;
+  }
+  const summaryStartedAt = startedAt ?? latestDashboardStartedAt;
+  const summaryEndedAt = endedAt ?? latestDashboardEndedAt;
+  let label: string;
+  if (currentStatisticsRetentionHours !== 0) {
+    const days = Math.max(1, Math.ceil(currentStatisticsRetentionHours / 24));
+    label = `最近 ${days} 天`;
+  } else if (summaryStartedAt && summaryEndedAt) {
+    const start = new Date(summaryStartedAt * 1000);
+    const end = new Date(summaryEndedAt * 1000);
     const days = Math.max(1, Math.floor((end.getTime() - start.getTime()) / 86_400_000) + 1);
     if (days < 32) {
       label = `累计汇总 ${days} 天`;
@@ -2867,6 +3029,8 @@ function renderDashboardSummaryWindow(
       );
       label = `累计汇总 ${months} 个月`;
     }
+  } else {
+    label = "暂无汇总数据";
   }
   query("#query_rank_window").textContent = label;
   query("#blocked_rank_window").textContent = label;

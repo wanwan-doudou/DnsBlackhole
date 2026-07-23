@@ -57,7 +57,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </svg>
               <div class="spark-tooltip hidden" id="query_spark_tooltip"></div>
             </div>
-            <span class="spark-caption"><span>DNS 查询</span><small>累计总数 · 曲线为近 30 天</small></span>
+            <span class="spark-caption"><span>DNS 查询</span></span>
           </article>
 
           <article class="spark-card blocked-spark">
@@ -81,7 +81,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </svg>
               <div class="spark-tooltip hidden" id="blocked_spark_tooltip"></div>
             </div>
-            <span class="spark-caption"><span>已被过滤器拦截</span><small>累计总数 · 曲线为近 30 天</small></span>
+            <span class="spark-caption"><span>已被过滤器拦截</span></span>
           </article>
         </div>
 
@@ -608,8 +608,8 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <small>接管时仅修改已连接的物理网卡，并先保存其原始 DNS（包括自动获取状态）；没有备份时，可选择自动获取或公共 DNS 来解除本机 DNS。</small>
               </div>
               <div class="button-group background-service-actions">
-                <button class="primary" id="take_over_windows_system_dns_btn" type="button">接管系统 DNS</button>
-                <button id="restore_windows_system_dns_btn" type="button">恢复原 DNS</button>
+                <button class="primary" id="take_over_windows_system_dns_btn" type="button">接管 DNS</button>
+                <button id="restore_windows_system_dns_btn" type="button">恢复 DNS</button>
               </div>
             </section>
 
@@ -666,7 +666,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <section class="settings-section data-storage-section">
               <div class="section-heading">
                 <h3>数据存储</h3>
-                <span>查询日志、统计数据库和过滤器缓存会保存在此目录。迁移在重启后执行，失败时继续使用原目录。</span>
+                <span>查询日志、统计数据库和过滤器数据会保存在此目录。迁移在重启后执行，失败时继续使用原目录。</span>
               </div>
               <div class="data-storage-path-row">
                 <input id="data_storage_path" type="text" readonly aria-label="数据存储路径" />
@@ -689,9 +689,9 @@ export function renderAppTemplate(appIconUrl: string): string {
             <section class="settings-section cache-maintenance-section">
               <div>
                 <h3>磁盘缓存</h3>
-                <p>清理已下载的远程黑名单缓存，不会删除配置、查询日志和统计数据。</p>
+                <p>清理可重新生成的规则编译缓存，不会删除远程黑名单、当前生效规则、配置、查询日志和统计数据。</p>
               </div>
-              <button id="clear_filter_cache_btn" type="button">清理过滤器缓存</button>
+              <button id="clear_filter_cache_btn" type="button">清理缓存</button>
             </section>
 
             <section class="settings-section">
@@ -706,7 +706,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <input id="anonymize_client_ip" type="checkbox" />
                 <span>
                   <strong>匿名化客户端 IP</strong>
-                  <small>持久化查询日志中仅保存匿名化后的客户端 IP；运行期安全事件仍会显示来源 IP。</small>
+                  <small>持久化查询日志和统计中仅保存匿名化后的客户端 IP；运行期安全事件仍会显示来源 IP。</small>
                 </span>
               </label>
               <div class="retention-settings">
@@ -727,9 +727,50 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
               <label class="field log-ignore-field">
                 <span>日志忽略域名</span>
-                <small>每行一个域名，自动包含其子域名。命中的查询不会写入日志和统计，可用于过滤 NAS 心跳等高频噪音。</small>
+                <small>每行一个域名，自动包含其子域名。命中的查询不会写入查询日志。</small>
                 <textarea id="query_log_ignored_domains" autocomplete="off" spellcheck="false" placeholder="example.com"></textarea>
               </label>
+              <div class="button-group persistence-actions">
+                <button class="primary" id="save_query_log_settings_btn" type="button">保存</button>
+                <button id="clear_query_logs_btn" type="button">清除查询日志</button>
+              </div>
+            </section>
+
+            <section class="settings-section">
+              <h3>统计配置</h3>
+              <label class="check-row">
+                <input id="statistics_enabled" type="checkbox" />
+                <span>
+                  <strong>启用统计数据</strong>
+                  <small>按小时聚合查询趋势、域名、客户端、上游和黑名单命中，不保存完整 DNS 响应。</small>
+                </span>
+              </label>
+              <div class="retention-settings">
+                <span class="retention-title">统计数据保留时间</span>
+                <div class="retention-options">
+                  <label><input name="statistics_retention" type="radio" value="24" /> 24 小时</label>
+                  <label><input name="statistics_retention" type="radio" value="168" /> 7 天</label>
+                  <label><input name="statistics_retention" type="radio" value="720" /> 30 天</label>
+                  <label><input name="statistics_retention" type="radio" value="2160" /> 90 天</label>
+                  <label><input name="statistics_retention" type="radio" value="4320" /> 180 天</label>
+                  <label><input name="statistics_retention" type="radio" value="8760" /> 365 天</label>
+                  <label><input name="statistics_retention" type="radio" value="forever" /> 永久</label>
+                  <label><input name="statistics_retention" type="radio" value="custom" /> 自定义</label>
+                </div>
+                <label class="field custom-retention-field" id="statistics_custom_retention_field">
+                  <span>自定义保留时间（天）</span>
+                  <input id="statistics_retention_custom" type="number" min="1" max="365" step="1" placeholder="例如 120" />
+                </label>
+              </div>
+              <label class="field log-ignore-field">
+                <span>统计忽略域名</span>
+                <small>每行一个域名，自动包含其子域名。适合排除 NAS 心跳、探活等高频噪音，不影响查询日志。</small>
+                <textarea id="statistics_ignored_domains" autocomplete="off" spellcheck="false" placeholder="example.com"></textarea>
+              </label>
+              <div class="button-group persistence-actions">
+                <button class="primary" id="save_statistics_settings_btn" type="button">保存</button>
+                <button id="clear_statistics_btn" type="button">清除统计数据</button>
+              </div>
             </section>
 
           </div>

@@ -18,6 +18,7 @@ pub(crate) struct FilterRuntime {
     pub(crate) rewrites: CompiledRewrites,
     pub(crate) blocking: BlockingPolicy,
     pub(crate) log_ignore: DomainSet,
+    pub(crate) statistics_ignore: DomainSet,
 }
 
 impl FilterRuntime {
@@ -42,6 +43,7 @@ pub(crate) fn build_filter_runtime_with_rules(
         rewrites: compile_rewrites(&config.dns_rewrites),
         blocking: BlockingPolicy::from_config(config),
         log_ignore: compile_domain_set(&config.query_log_ignored_domains),
+        statistics_ignore: compile_domain_set(&config.statistics_ignored_domains),
     }
 }
 

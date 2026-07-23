@@ -1255,6 +1255,8 @@ button.refreshing:disabled {
 
 .rank-head {
   min-height: 30px;
+  /* 列表始终为 10px 滚动条预留空间，表头同步预留后两侧网格分隔线才能对齐。 */
+  padding-right: 10px;
   color: #4b5661;
   background: #fbfcfd;
   box-shadow: 0 3px 10px rgba(32, 48, 64, 0.12);
@@ -1471,10 +1473,8 @@ button.refreshing:disabled {
 }
 
 .background-service-section {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
+  display: grid;
+  gap: 12px;
 }
 
 .filter-update-progress {
@@ -1502,8 +1502,8 @@ button.refreshing:disabled {
 }
 
 .background-service-section .background-service-actions {
-  flex: 0 0 auto;
-  flex-wrap: nowrap;
+  justify-content: flex-start;
+  flex-wrap: wrap;
 }
 
 .background-service-section.is-ready p {
@@ -2374,6 +2374,15 @@ select:focus {
 .log-ignore-field {
   max-width: 560px;
   margin-top: 16px;
+}
+
+.persistence-actions {
+  justify-content: flex-start;
+  margin-top: 18px;
+}
+
+.persistence-actions .primary {
+  min-width: 150px;
 }
 
 .dns-rewrites-section {

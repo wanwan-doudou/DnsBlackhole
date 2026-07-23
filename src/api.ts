@@ -55,6 +55,14 @@ export function getQueryLogs(request: QueryLogRequest): Promise<QueryLogPage> {
   return timedInvoke<QueryLogPage>("get_query_logs", request);
 }
 
+export function clearQueryLogs(): Promise<RuntimeStatus> {
+  return timedInvoke<RuntimeStatus>("clear_query_logs");
+}
+
+export function clearStatistics(): Promise<RuntimeStatus> {
+  return timedInvoke<RuntimeStatus>("clear_statistics");
+}
+
 export function updateFilters(config: AppConfig): Promise<FilterUpdateResult> {
   return timedInvoke<FilterUpdateResult>("update_filters", { config });
 }

@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{config::UpstreamMode, database::QueryLogEntry};
+use crate::{
+    config::UpstreamMode,
+    database::{QueryLogEntry, QueryPersistenceEntry},
+};
 
 use super::{
     access::{ClientAccess, ClientAccessDecision},
@@ -78,14 +81,11 @@ pub(crate) struct DnsWorkerContext {
     pub(crate) dns_cache: Option<Arc<DnsCacheStore>>,
     pub(crate) dns_cache_config: Option<DnsCacheConfig>,
     pub(crate) pending_queries: Arc<PendingQueries>,
-    pub(crate) query_log_sender: Option<mpsc::SyncSender<QueryLogMessage>>,
+    pub(crate) persistence_sender: Option<mpsc::SyncSender<QueryPersistenceEntry>>,
+    pub(crate) query_log_enabled: bool,
+    pub(crate) statistics_enabled: bool,
     pub(crate) anonymize_client_ip: bool,
     pub(crate) detailed_runtime_stats: bool,
-}
-
-pub(crate) struct QueryLogMessage {
-    pub(crate) entry: QueryLogEntry,
-    pub(crate) anonymize_client_ip: bool,
 }
 
 type PendingQuery = Arc<PendingQueryState>;
@@ -1014,12 +1014,15 @@ fn queue_query_log_with_match(
     response: Option<&[u8]>,
     rule_match: Option<&super::rules::BlockMatch>,
 ) {
-    if filter.log_ignore.contains(metadata.domain) {
-        return;
-    }
-    let Some(sender) = &context.query_log_sender else {
+    let Some(sender) = &context.persistence_sender else {
         return;
     };
+    let persist_log = context.query_log_enabled && !filter.log_ignore.contains(metadata.domain);
+    let persist_statistics =
+        context.statistics_enabled && !filter.statistics_ignore.contains(metadata.domain);
+    if !persist_log && !persist_statistics {
+        return;
+    }
 
     let entry = QueryLogEntry {
         domain: metadata.domain.to_string(),
@@ -1043,17 +1046,22 @@ fn queue_query_log_with_match(
         allowlist_rule: rule_match.and_then(|matched| matched.allowlist_rule.clone()),
     };
 
-    let message = QueryLogMessage {
+    let message = QueryPersistenceEntry {
         entry,
         anonymize_client_ip: context.anonymize_client_ip,
+        persist_log,
+        persist_statistics,
     };
     match sender.try_send(message) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(_)) => {
-            record_error(&context.stats, "查询日志队列已满，已丢弃日志".to_string());
+            record_error(
+                &context.stats,
+                "查询数据队列已满，已丢弃持久化事件".to_string(),
+            );
         }
         Err(mpsc::TrySendError::Disconnected(_)) => {
-            record_error(&context.stats, "查询日志写入队列已关闭".to_string());
+            record_error(&context.stats, "查询数据写入队列已关闭".to_string());
         }
     }
 }

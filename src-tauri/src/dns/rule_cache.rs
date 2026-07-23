@@ -30,6 +30,12 @@ pub(crate) enum RuleLoadSource {
     Compiled,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RuleCacheClearStats {
+    pub(crate) removed_files: usize,
+    pub(crate) removed_bytes: u64,
+}
+
 pub(crate) struct LoadedRules {
     pub(crate) rules: Arc<CompiledRules>,
     pub(crate) source: RuleLoadSource,
@@ -97,6 +103,50 @@ fn persist_rule_cache(path: PathBuf, fingerprint: u64, rules: Arc<CompiledRules>
 
 fn rule_cache_path(data_dir: &Path) -> PathBuf {
     storage::filters_dir(data_dir).join(RULE_CACHE_FILE)
+}
+
+pub(crate) fn clear_rule_cache(data_dir: &Path) -> Result<RuleCacheClearStats, String> {
+    // 让尚未完成的后台写入任务放弃启用旧缓存，避免清理后又立即写回。
+    LATEST_CACHE_FINGERPRINT.store(0, Ordering::Release);
+    let dir = storage::filters_dir(data_dir);
+    if !dir.exists() {
+        return Ok(RuleCacheClearStats::default());
+    }
+
+    let mut stats = RuleCacheClearStats::default();
+    let entries = fs::read_dir(&dir)
+        .map_err(|error| format!("读取规则编译缓存目录失败（{}）：{error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取规则编译缓存文件失败：{error}"))?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_rule_cache_file(file_name) {
+            continue;
+        }
+
+        let metadata = entry.metadata().map_err(|error| {
+            format!(
+                "读取规则编译缓存文件信息失败（{}）：{error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            continue;
+        }
+
+        fs::remove_file(&path)
+            .map_err(|error| format!("删除规则编译缓存失败（{}）：{error}", path.display()))?;
+        stats.removed_files += 1;
+        stats.removed_bytes += metadata.len();
+    }
+    Ok(stats)
+}
+
+fn is_rule_cache_file(file_name: &str) -> bool {
+    file_name == RULE_CACHE_FILE
+        || (file_name.starts_with(&format!("{RULE_CACHE_FILE}.")) && file_name.ends_with(".tmp"))
 }
 
 fn effective_rules_fingerprint(data_dir: &Path, app_config: &AppConfig) -> u64 {
@@ -291,6 +341,31 @@ mod tests {
         let changed = load_or_compile_rules(&dir, &config);
         assert_eq!(changed.source, RuleLoadSource::Compiled);
         assert!(changed.rules.is_blocked("second.example", 1));
+
+        fs::remove_dir_all(dir).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn clearing_rule_cache_preserves_downloaded_filter_sources() {
+        let dir = temporary_directory("safe-clear");
+        let filters_dir = storage::filters_dir(&dir);
+        fs::create_dir_all(filters_dir.join("nested")).expect("filters directory should create");
+        fs::write(filters_dir.join("sample.txt"), "||example.org^")
+            .expect("filter source should write");
+        fs::write(filters_dir.join(RULE_CACHE_FILE), "cache").expect("compiled cache should write");
+        let temporary_cache = filters_dir.join(format!("{RULE_CACHE_FILE}.1.2.tmp"));
+        fs::write(&temporary_cache, "tmp").expect("temporary cache should write");
+        fs::write(filters_dir.join("nested").join("keep.txt"), "keep")
+            .expect("nested file should write");
+
+        let stats = clear_rule_cache(&dir).expect("compiled cache should clear");
+
+        assert_eq!(stats.removed_files, 2);
+        assert_eq!(stats.removed_bytes, 8);
+        assert!(filters_dir.join("sample.txt").exists());
+        assert!(filters_dir.join("nested").join("keep.txt").exists());
+        assert!(!filters_dir.join(RULE_CACHE_FILE).exists());
+        assert!(!temporary_cache.exists());
 
         fs::remove_dir_all(dir).expect("temporary directory should remove");
     }

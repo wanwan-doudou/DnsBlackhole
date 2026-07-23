@@ -104,6 +104,8 @@ export type AppConfig = {
   anonymize_client_ip: boolean;
   launch_at_startup: boolean;
   query_log_retention_hours: number;
+  statistics_enabled: boolean;
+  statistics_retention_hours: number;
   dns_cache_enabled: boolean;
   dns_cache_size: number;
   dns_cache_min_ttl: number;
@@ -117,6 +119,7 @@ export type AppConfig = {
   dns_rewrites: string;
   client_names: string;
   query_log_ignored_domains: string;
+  statistics_ignored_domains: string;
   filters: FilterSubscription[];
   blacklist: string;
 };
