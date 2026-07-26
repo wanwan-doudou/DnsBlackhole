@@ -4,7 +4,7 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -113,11 +113,44 @@ struct StatDelta {
 
 pub struct Database {
     conn: Mutex<Connection>,
-    // WAL 模式下读写可并行；仪表盘/日志查询走独立只读连接，
-    // 避免和批量日志写入互相阻塞。内存库（测试）没有独立连接，回退主连接。
-    read_conns: Vec<Mutex<Connection>>,
+    // 文件数据库按次打开只读连接并在查询结束后关闭，避免 24×7 运行时
+    // 长驻连接意外保留 WAL 快照。读写门闩让 VACUUM/TRUNCATE 能等待内部查询退出。
+    read_path: Option<PathBuf>,
+    read_gate: RwLock<()>,
     wal_path: Option<PathBuf>,
     last_wal_maintenance_at: AtomicU64,
+}
+
+enum DatabaseReadGuard<'a> {
+    Main(std::sync::MutexGuard<'a, Connection>),
+    File {
+        connection: Connection,
+        _gate: std::sync::RwLockReadGuard<'a, ()>,
+    },
+}
+
+impl std::ops::Deref for DatabaseReadGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Main(connection) => connection,
+            Self::File { connection, .. } => connection,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalCheckpointResult {
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+}
+
+impl WalCheckpointResult {
+    fn completed(self) -> bool {
+        self.busy == 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -213,15 +246,10 @@ impl Database {
         crate::performance::log_service("数据库启动", "主连接打开", connection_started);
         let schema_started = Instant::now();
         let mut database = Self::from_connection(conn)?;
+        database.read_path = Some(path.clone());
         database.wal_path = Some(wal_path_for_database(&path));
         database.truncate_oversized_wal_at_startup();
         crate::performance::log_service("数据库启动", "连接配置与结构检查", schema_started);
-        // 主连接完成建表和 WAL 设置后再打开只读连接
-        let read_pool_started = Instant::now();
-        database.read_conns = (0..READ_CONNECTION_POOL_SIZE)
-            .filter_map(|_| open_read_connection(&path))
-            .collect();
-        crate::performance::log_service("数据库启动", "只读连接池", read_pool_started);
         crate::performance::log_service("数据库启动", "总计", total_started);
         Ok(database)
     }
@@ -239,7 +267,8 @@ impl Database {
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            read_conns: Vec::new(),
+            read_path: None,
+            read_gate: RwLock::new(()),
             wal_path: None,
             last_wal_maintenance_at: AtomicU64::new(unix_now()),
         })
@@ -468,8 +497,15 @@ impl Database {
         } else {
             unix_now().saturating_sub(u64::from(retention_hours) * 3600) / 3600
         };
-        if self.read_conns.len() >= READ_CONNECTION_POOL_SIZE {
-            return parallel_log_stats(&self.read_conns, since_hour);
+        if let Some(path) = self.read_path.as_ref() {
+            let _read_guard = self
+                .read_gate
+                .read()
+                .map_err(|_| "数据库读取门闩已损坏".to_string())?;
+            let read_conns = (0..READ_CONNECTION_POOL_SIZE)
+                .map(|_| open_read_connection(path).map(Mutex::new))
+                .collect::<Result<Vec<_>, _>>()?;
+            return parallel_log_stats(&read_conns, since_hour);
         }
         let conn = self.lock_read()?;
         log_stats_with_connection(&conn, since_hour)
@@ -598,11 +634,19 @@ impl Database {
         self.conn.lock().map_err(|_| "数据库连接已损坏".into())
     }
 
-    fn lock_read(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
-        if let Some(read_conn) = self.read_conns.first() {
-            return read_conn.lock().map_err(|_| "数据库只读连接已损坏".into());
+    fn lock_read(&self) -> Result<DatabaseReadGuard<'_>, String> {
+        if let Some(path) = self.read_path.as_ref() {
+            let gate = self
+                .read_gate
+                .read()
+                .map_err(|_| "数据库读取门闩已损坏".to_string())?;
+            let connection = open_read_connection(path)?;
+            return Ok(DatabaseReadGuard::File {
+                connection,
+                _gate: gate,
+            });
         }
-        self.lock()
+        self.lock().map(DatabaseReadGuard::Main)
     }
 
     fn truncate_oversized_wal_at_startup(&self) {
@@ -654,34 +698,32 @@ impl Database {
         }
 
         match self.checkpoint_and_truncate_wal(conn) {
-            Ok(true) => true,
-            Ok(false) => {
-                eprintln!("数据库 WAL 正被外部读取占用，将自动重试回收");
+            Ok(result) if result.completed() => true,
+            Ok(result) => {
+                log_database_warning(&format!(
+                    "数据库 WAL 检查点未完成，将自动重试：busy={}，WAL 帧={}，已回写帧={}",
+                    result.busy, result.log_frames, result.checkpointed_frames
+                ));
                 false
             }
             Err(error) => {
-                eprintln!("回收数据库 WAL 空间失败：{error}");
+                log_database_warning(&format!("回收数据库 WAL 空间失败：{error}"));
                 false
             }
         }
     }
 
-    fn checkpoint_and_truncate_wal(&self, conn: &Connection) -> Result<bool, String> {
-        // 先等待应用内部的只读查询结束，避免 TRUNCATE 用零等待策略时长期碰撞。
-        // 持有这些互斥锁期间不会有新的内部读事务进入。
-        let _read_guards = self.lock_read_connections()?;
+    fn checkpoint_and_truncate_wal(
+        &self,
+        conn: &Connection,
+    ) -> Result<WalCheckpointResult, String> {
+        // 阻止新的内部读取并等待现有按次只读连接关闭，保证长期运行时
+        // 不会由服务自身的读快照持续阻塞 TRUNCATE。
+        let _read_guard = self
+            .read_gate
+            .write()
+            .map_err(|_| "数据库读取门闩已损坏".to_string())?;
         run_checkpoint_and_truncate(conn, DATABASE_BUSY_TIMEOUT)
-    }
-
-    fn lock_read_connections(&self) -> Result<Vec<std::sync::MutexGuard<'_, Connection>>, String> {
-        self.read_conns
-            .iter()
-            .map(|read_conn| {
-                read_conn
-                    .lock()
-                    .map_err(|_| "数据库只读连接已损坏".to_string())
-            })
-            .collect()
     }
 
     /// 重建数据库文件，回收 DELETE 后残留的空闲页并归还磁盘。
@@ -689,7 +731,10 @@ impl Database {
     /// 清理大量历史日志后调用此方法，磁盘占用才会真正下降。
     pub fn vacuum(&self) -> Result<(), String> {
         let conn = self.lock()?;
-        let _read_guards = self.lock_read_connections()?;
+        let _read_guard = self
+            .read_gate
+            .write()
+            .map_err(|_| "数据库读取门闩已损坏".to_string())?;
         conn.execute_batch("VACUUM")
             .map_err(|e| format!("压缩数据库失败：{e}"))?;
         // VACUUM 经由 WAL 重写数据，随后显式检查点并截断，确保 -wal 文件占用同步下降
@@ -729,21 +774,27 @@ fn wal_path_for_database(database_path: &Path) -> PathBuf {
     path.into()
 }
 
-fn run_checkpoint_and_truncate(conn: &Connection, wait: Duration) -> Result<bool, String> {
+fn run_checkpoint_and_truncate(
+    conn: &Connection,
+    wait: Duration,
+) -> Result<WalCheckpointResult, String> {
     conn.busy_timeout(wait)
         .map_err(|e| format!("设置 WAL 回收等待策略失败：{e}"))?;
     let checkpoint_result = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            row.get::<_, i64>(0)
+            Ok(WalCheckpointResult {
+                busy: row.get(0)?,
+                log_frames: row.get(1)?,
+                checkpointed_frames: row.get(2)?,
+            })
         })
-        .map(|busy| busy == 0)
         .map_err(|e| format!("执行 WAL 检查点失败：{e}"));
     let restore_result = conn
         .busy_timeout(DATABASE_BUSY_TIMEOUT)
         .map_err(|e| format!("恢复数据库等待超时失败：{e}"));
 
     match (checkpoint_result, restore_result) {
-        (Ok(truncated), Ok(())) => Ok(truncated),
+        (Ok(result), Ok(())) => Ok(result),
         (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
@@ -885,22 +936,28 @@ fn total_log_counts(conn: &Connection, since_hour: u64) -> Result<DashboardTotal
     .map_err(|e| format!("读取仪表盘累计统计失败：{e}"))
 }
 
-fn open_read_connection(path: &std::path::Path) -> Option<Mutex<Connection>> {
+fn open_read_connection(path: &std::path::Path) -> Result<Connection, String> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .ok()?;
-    if conn.busy_timeout(Duration::from_secs(2)).is_err() {
-        return None;
-    }
-    let _ = conn.execute_batch(
+    .map_err(|e| format!("打开数据库只读连接失败：{e}"))?;
+    conn.busy_timeout(DATABASE_BUSY_TIMEOUT)
+        .map_err(|e| format!("设置数据库只读等待超时失败：{e}"))?;
+    conn.execute_batch(
         "
         PRAGMA temp_store = MEMORY;
         PRAGMA cache_size = -8192;
         ",
-    );
-    Some(Mutex::new(conn))
+    )
+    .map_err(|e| format!("配置数据库只读连接失败：{e}"))?;
+    Ok(conn)
+}
+
+fn log_database_warning(message: &str) {
+    eprintln!("{message}");
+    #[cfg(windows)]
+    crate::privileged_bridge::write_windows_service_performance_log(message);
 }
 
 fn execute_query_log_insert(
@@ -2500,7 +2557,7 @@ mod tests {
     }
 
     #[test]
-    fn file_database_reads_log_stats_with_connection_pool() {
+    fn file_database_reads_log_stats_with_short_lived_connections() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be valid")
@@ -2511,15 +2568,168 @@ mod tests {
         ));
 
         fs::create_dir_all(&storage_dir).expect("test storage directory should create");
-        let database = Database::open(&storage_dir).expect("file database should open");
+        let database =
+            std::sync::Arc::new(Database::open(&storage_dir).expect("file database should open"));
 
-        assert_eq!(database.read_conns.len(), READ_CONNECTION_POOL_SIZE);
+        assert!(database.read_path.is_some());
         let stats = database
             .log_stats(6)
             .expect("parallel log stats should load");
         assert_eq!(stats.queries, 0);
         assert_eq!(stats.blocked, 0);
 
+        drop(database);
+        fs::remove_dir_all(storage_dir).expect("test storage directory should remove");
+    }
+
+    #[test]
+    fn repeated_file_reads_do_not_require_restart_to_truncate_wal() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let storage_dir = std::env::temp_dir().join(format!(
+            "dnsblackhole-read-checkpoint-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&storage_dir).expect("test storage directory should create");
+        let database = Database::open(&storage_dir).expect("file database should open");
+        let wal_path = database.wal_path.clone().expect("WAL path should exist");
+
+        for _ in 0..8 {
+            database.log_stats(24).expect("log stats should load");
+            database
+                .query_logs(24, "all", "", 1, 20)
+                .expect("query logs should load");
+        }
+
+        let conn = database.lock().expect("database should lock");
+        conn.execute_batch(
+            "
+            CREATE TABLE wal_lifetime_test (value BLOB NOT NULL);
+            WITH RECURSIVE sequence(value) AS (
+                SELECT 1
+                UNION ALL
+                SELECT value + 1 FROM sequence WHERE value < 100
+            )
+            INSERT INTO wal_lifetime_test (value)
+            SELECT zeroblob(2048) FROM sequence;
+            ",
+        )
+        .expect("WAL test data should write");
+        assert!(fs::metadata(&wal_path).expect("WAL should exist").len() > 0);
+
+        assert!(
+            database
+                .checkpoint_and_truncate_wal(&conn)
+                .expect("checkpoint should succeed without restarting")
+                .completed()
+        );
+        assert!(
+            fs::metadata(&wal_path)
+                .expect("truncated WAL should remain accessible")
+                .len()
+                <= WAL_JOURNAL_SIZE_LIMIT_BYTES
+        );
+        drop(conn);
+        drop(database);
+        fs::remove_dir_all(storage_dir).expect("test storage directory should remove");
+    }
+
+    #[test]
+    fn oversized_wal_is_automatically_truncated_by_normal_writes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let storage_dir = std::env::temp_dir().join(format!(
+            "dnsblackhole-wal-maintenance-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&storage_dir).expect("test storage directory should create");
+        let database =
+            std::sync::Arc::new(Database::open(&storage_dir).expect("file database should open"));
+        let wal_path = database.wal_path.clone().expect("WAL path should exist");
+
+        {
+            let conn = database.lock().expect("database should lock");
+            conn.execute_batch(&format!(
+                "CREATE TABLE wal_maintenance_test (value BLOB NOT NULL);
+                 INSERT INTO wal_maintenance_test VALUES (zeroblob({}));",
+                WAL_TRUNCATE_THRESHOLD_BYTES + 1024 * 1024
+            ))
+            .expect("oversized WAL test data should write");
+        }
+        assert!(
+            fs::metadata(&wal_path)
+                .expect("oversized WAL should exist")
+                .len()
+                > WAL_TRUNCATE_THRESHOLD_BYTES
+        );
+
+        let reader_database = std::sync::Arc::clone(&database);
+        let reader_ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader_barrier = std::sync::Arc::clone(&reader_ready);
+        let reader = std::thread::spawn(move || {
+            let _read_guard = reader_database
+                .read_gate
+                .read()
+                .expect("read gate should lock");
+            let path = reader_database
+                .read_path
+                .as_ref()
+                .expect("read path should exist");
+            let conn = open_read_connection(path).expect("read connection should open");
+            conn.execute_batch("BEGIN")
+                .expect("read transaction should begin");
+            conn.query_row("SELECT COUNT(*) FROM query_logs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("read snapshot should establish");
+            reader_barrier.wait();
+            std::thread::sleep(Duration::from_millis(100));
+            conn.execute_batch("COMMIT")
+                .expect("read transaction should finish");
+        });
+        reader_ready.wait();
+
+        database.last_wal_maintenance_at.store(0, Ordering::Relaxed);
+        database
+            .insert_query_events(&[QueryPersistenceEntry {
+                entry: QueryLogEntry {
+                    domain: "maintenance.example.com".into(),
+                    query_type: 1,
+                    query_class: 1,
+                    transport: "udp".into(),
+                    response_source: "upstream".into(),
+                    response: None,
+                    client_ip: Some("192.168.1.1".into()),
+                    blocked: false,
+                    forwarded: true,
+                    failed: false,
+                    upstream_server: Some("1.1.1.1:53".into()),
+                    upstream_duration_ms: Some(10),
+                    processing_duration_ms: 1.0,
+                    error: None,
+                    matched_rule: None,
+                    rule_source: None,
+                    rule_type: None,
+                    important_overrode: false,
+                    allowlist_rule: None,
+                },
+                anonymize_client_ip: false,
+                persist_log: true,
+                persist_statistics: true,
+            }])
+            .expect("normal write should run WAL maintenance");
+        reader.join().expect("concurrent reader should finish");
+
+        assert!(
+            fs::metadata(&wal_path)
+                .expect("truncated WAL should remain accessible")
+                .len()
+                <= WAL_JOURNAL_SIZE_LIMIT_BYTES
+        );
         drop(database);
         fs::remove_dir_all(storage_dir).expect("test storage directory should remove");
     }
@@ -2636,6 +2846,7 @@ mod tests {
         assert!(
             run_checkpoint_and_truncate(&conn, DATABASE_BUSY_TIMEOUT)
                 .expect("test WAL should checkpoint")
+                .completed()
         );
         assert_eq!(
             fs::metadata(&wal_path)
@@ -2699,6 +2910,7 @@ mod tests {
         assert!(
             run_checkpoint_and_truncate(&writer, DATABASE_BUSY_TIMEOUT)
                 .expect("checkpoint should wait for reader")
+                .completed()
         );
         reader.join().expect("reader thread should finish");
         assert_eq!(
