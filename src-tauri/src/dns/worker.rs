@@ -38,6 +38,7 @@ use super::{
 
 const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
 const PENDING_QUERY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const OPTIMISTIC_REFRESH_MAX_QUEUE_WAIT: Duration = Duration::from_secs(2);
 // Windows 刚连上或自动恢复 Wi-Fi 时，路由表和既有 UDP socket 可能暂时不可用。
 // connect 会返回 WSAENETUNREACH/WSAEHOSTUNREACH，复用 socket 的 send 可能返回 WSAEINVAL；
 // 短暂等待后重试，避免首个 NCSI 探测直接收到失败。
@@ -860,7 +861,12 @@ fn refresh_expired_cache_async(
 
     let cache_on_reject = Arc::clone(&cache);
     let cache_key_on_reject = cache_key.clone();
-    if !task_pool::spawn_task(move || {
+    let queued_at = Instant::now();
+    if !task_pool::spawn_coordination_task(move || {
+        if queued_at.elapsed() > OPTIMISTIC_REFRESH_MAX_QUEUE_WAIT {
+            cache.finish_refresh(&cache_key);
+            return;
+        }
         let next_upstream = AtomicUsize::new(0);
         let fallback_next_upstream = AtomicUsize::new(0);
         match forward_query_with_fallback(

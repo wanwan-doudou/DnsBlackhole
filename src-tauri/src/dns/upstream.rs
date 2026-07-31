@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpStream, UdpSocket},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -68,6 +68,35 @@ pub(crate) struct UpstreamForwardResponse {
 struct IpLatencyProbe {
     response_index: usize,
     duration: Duration,
+}
+
+struct ParallelForwardBatch {
+    receiver: mpsc::Receiver<Result<UpstreamForwardResponse, String>>,
+    expected: usize,
+    synchronous_fallback: Option<RuntimeUpstream>,
+    control: Arc<ParallelRequestControl>,
+}
+
+struct ParallelRequestControl {
+    deadline: Instant,
+    cancelled: AtomicBool,
+}
+
+impl ParallelRequestControl {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn can_start(&self) -> bool {
+        !self.cancelled.load(Ordering::Acquire) && Instant::now() < self.deadline
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
 }
 
 pub(crate) fn build_runtime_upstreams(
@@ -308,23 +337,28 @@ fn forward_parallel(
         return Err("没有可用的上游 DNS".into());
     }
 
-    let (receiver, expected, synchronous_fallback) =
-        spawn_parallel_forwards(query, selected_upstreams);
-    if expected == 0 {
-        return synchronous_fallback
+    let deadline = Instant::now() + PARALLEL_RESULT_WAIT;
+    let batch = spawn_parallel_forwards(query, selected_upstreams, deadline, true);
+    if batch.expected == 0 {
+        return batch
+            .synchronous_fallback
             .ok_or_else(|| "并发任务队列已满".to_string())
             .and_then(|upstream| forward_to_upstream(query, &upstream));
     }
-    let deadline = Instant::now() + PARALLEL_RESULT_WAIT;
     let mut last_error = None;
-    for _ in 0..expected {
-        match recv_until(&receiver, deadline) {
-            Some(Ok(response)) => return Ok(response),
+    for _ in 0..batch.expected {
+        match recv_until(&batch.receiver, deadline) {
+            Some(Ok(response)) => {
+                batch.control.cancel();
+                return Ok(response);
+            }
             Some(Err(error)) => last_error = Some(error),
             None => break,
         }
     }
 
+    // 调用方不再等待后，尚未开始的同组任务应直接丢弃，避免网络异常时积压旧请求。
+    batch.control.cancel();
     Err(last_error.unwrap_or_else(|| "并行请求上游 DNS 超时".into()))
 }
 
@@ -337,23 +371,24 @@ fn forward_fastest_addr(
         return Err("没有可用的上游 DNS".into());
     }
 
-    let (receiver, expected, synchronous_fallback) =
-        spawn_parallel_forwards(query, selected_upstreams);
-    if expected == 0 {
-        return synchronous_fallback
+    let deadline = Instant::now() + PARALLEL_RESULT_WAIT;
+    let batch = spawn_parallel_forwards(query, selected_upstreams, deadline, false);
+    if batch.expected == 0 {
+        return batch
+            .synchronous_fallback
             .ok_or_else(|| "并发任务队列已满".to_string())
             .and_then(|upstream| forward_to_upstream(query, &upstream));
     }
-    let deadline = Instant::now() + PARALLEL_RESULT_WAIT;
     let mut responses = Vec::new();
     let mut last_error = None;
-    for _ in 0..expected {
-        match recv_until(&receiver, deadline) {
+    for _ in 0..batch.expected {
+        match recv_until(&batch.receiver, deadline) {
             Some(Ok(response)) => responses.push(response),
             Some(Err(error)) => last_error = Some(error),
             None => break,
         }
     }
+    batch.control.cancel();
 
     if responses.is_empty() {
         return Err(last_error.unwrap_or_else(|| "并行请求上游 DNS 超时".into()));
@@ -369,21 +404,28 @@ fn forward_fastest_addr(
 fn spawn_parallel_forwards(
     query: &[u8],
     selected_upstreams: Vec<RuntimeUpstream>,
-) -> (
-    mpsc::Receiver<Result<UpstreamForwardResponse, String>>,
-    usize,
-    Option<RuntimeUpstream>,
-) {
+    deadline: Instant,
+    cancel_on_success: bool,
+) -> ParallelForwardBatch {
     let (sender, receiver) = mpsc::channel();
     let query = Arc::new(query.to_vec());
+    let control = Arc::new(ParallelRequestControl::new(deadline));
     let mut scheduled = 0;
     let mut synchronous_fallback = None;
     for upstream in selected_upstreams {
         let sender = sender.clone();
         let query = Arc::clone(&query);
+        let task_control = Arc::clone(&control);
         let fallback = upstream.clone();
         if task_pool::spawn_task(move || {
-            let _ = sender.send(forward_to_upstream(query.as_ref().as_slice(), &upstream));
+            if !task_control.can_start() {
+                return;
+            }
+            let result = forward_to_upstream(query.as_ref().as_slice(), &upstream);
+            if cancel_on_success && result.is_ok() {
+                task_control.cancel();
+            }
+            let _ = sender.send(result);
         }) {
             scheduled += 1;
         } else {
@@ -391,7 +433,12 @@ fn spawn_parallel_forwards(
             break;
         }
     }
-    (receiver, scheduled, synchronous_fallback)
+    ParallelForwardBatch {
+        receiver,
+        expected: scheduled,
+        synchronous_fallback,
+        control,
+    }
 }
 
 fn recv_until<T>(receiver: &mpsc::Receiver<T>, deadline: Instant) -> Option<T> {
@@ -954,5 +1001,16 @@ mod tests {
             (MAX_DNS_PACKET_SIZE + 1).to_string().parse().unwrap(),
         );
         assert!(validate_doh_response_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn parallel_request_control_rejects_cancelled_and_expired_tasks() {
+        let active = ParallelRequestControl::new(Instant::now() + Duration::from_secs(1));
+        assert!(active.can_start());
+        active.cancel();
+        assert!(!active.can_start());
+
+        let expired = ParallelRequestControl::new(Instant::now());
+        assert!(!expired.can_start());
     }
 }

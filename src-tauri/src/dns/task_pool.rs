@@ -6,16 +6,19 @@ use std::{
 const TASK_POOL_MIN_THREADS: usize = 8;
 const TASK_POOL_MAX_THREADS: usize = 32;
 const TASK_POOL_QUEUE_CAPACITY: usize = 4096;
+const COORDINATION_POOL_THREADS: usize = 4;
+const COORDINATION_POOL_QUEUE_CAPACITY: usize = 256;
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
 
-/// 常驻任务线程池，替代上游并发转发、IP 拨测和乐观缓存刷新时的临时 thread::spawn，
+/// 常驻上游 I/O 任务线程池，替代并发转发和 IP 拨测时的临时 thread::spawn，
 /// 避免高 QPS 下每次查询都创建/销毁 OS 线程。
 struct TaskPool {
     sender: Mutex<mpsc::SyncSender<Task>>,
 }
 
 static TASK_POOL: OnceLock<TaskPool> = OnceLock::new();
+static COORDINATION_POOL: OnceLock<TaskPool> = OnceLock::new();
 
 fn task_pool() -> &'static TaskPool {
     TASK_POOL.get_or_init(|| {
@@ -25,6 +28,13 @@ fn task_pool() -> &'static TaskPool {
             .clamp(TASK_POOL_MIN_THREADS, TASK_POOL_MAX_THREADS);
         TaskPool::new(thread_count, TASK_POOL_QUEUE_CAPACITY)
     })
+}
+
+/// 协调任务可能继续向上游 I/O 池提交子任务并等待结果，必须与 I/O 池隔离，
+/// 否则协调任务占满全部线程后会形成线程池饥饿。
+fn coordination_pool() -> &'static TaskPool {
+    COORDINATION_POOL
+        .get_or_init(|| TaskPool::new(COORDINATION_POOL_THREADS, COORDINATION_POOL_QUEUE_CAPACITY))
 }
 
 impl TaskPool {
@@ -68,6 +78,13 @@ where
     F: FnOnce() + Send + 'static,
 {
     task_pool().try_spawn(Box::new(task))
+}
+
+pub(crate) fn spawn_coordination_task<F>(task: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    coordination_pool().try_spawn(Box::new(task))
 }
 
 #[cfg(test)]
@@ -120,5 +137,28 @@ mod tests {
         assert!(pool.try_spawn(Box::new(|| {})));
         assert!(!pool.try_spawn(Box::new(|| {})));
         let _ = release_sender.send(());
+    }
+
+    #[test]
+    fn separate_coordination_pool_can_wait_for_io_pool() {
+        let io_pool = Arc::new(TaskPool::new(1, 1));
+        let coordination_pool = TaskPool::new(1, 1);
+        let (completed_sender, completed_receiver) = mpsc::channel();
+        let io_pool_for_task = Arc::clone(&io_pool);
+
+        assert!(coordination_pool.try_spawn(Box::new(move || {
+            let (io_sender, io_receiver) = mpsc::channel();
+            assert!(io_pool_for_task.try_spawn(Box::new(move || {
+                let _ = io_sender.send(());
+            })));
+            io_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("io task should not be starved by its coordinator");
+            let _ = completed_sender.send(());
+        })));
+
+        completed_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("coordination task should complete");
     }
 }

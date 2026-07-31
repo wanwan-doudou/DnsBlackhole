@@ -18,8 +18,10 @@ use crate::{config, config::AppConfig, storage};
 
 use super::rules::{CompiledRules, compile_rules};
 
-const RULE_CACHE_FORMAT_VERSION: u32 = 1;
-const RULE_CACHE_FILE: &str = ".compiled-rules-v1.postcard";
+const RULE_CACHE_FORMAT_VERSION: u32 = 2;
+const RULE_CACHE_MAGIC: [u8; 8] = *b"DNSBRC02";
+const RULE_CACHE_FILE: &str = ".compiled-rules-v2.postcard";
+const LEGACY_RULE_CACHE_FILES: [&str; 1] = [".compiled-rules-v1.postcard"];
 const FINGERPRINT_BUFFER_SIZE: usize = 256 * 1024;
 const DESERIALIZE_BUFFER_SIZE: usize = 1024 * 1024;
 static LATEST_CACHE_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
@@ -43,15 +45,11 @@ pub(crate) struct LoadedRules {
 
 #[derive(Serialize)]
 struct RuleCacheRef<'a> {
-    format_version: u32,
-    fingerprint: u64,
     rules: &'a CompiledRules,
 }
 
 #[derive(Deserialize)]
 struct RuleCacheOwned {
-    format_version: u32,
-    fingerprint: u64,
     rules: CompiledRules,
 }
 
@@ -145,8 +143,12 @@ pub(crate) fn clear_rule_cache(data_dir: &Path) -> Result<RuleCacheClearStats, S
 }
 
 fn is_rule_cache_file(file_name: &str) -> bool {
-    file_name == RULE_CACHE_FILE
-        || (file_name.starts_with(&format!("{RULE_CACHE_FILE}.")) && file_name.ends_with(".tmp"))
+    std::iter::once(RULE_CACHE_FILE)
+        .chain(LEGACY_RULE_CACHE_FILES)
+        .any(|cache_file| {
+            file_name == cache_file
+                || (file_name.starts_with(&format!("{cache_file}.")) && file_name.ends_with(".tmp"))
+        })
 }
 
 fn effective_rules_fingerprint(data_dir: &Path, app_config: &AppConfig) -> u64 {
@@ -199,14 +201,41 @@ fn hash_reader(fingerprint: &mut Fnv1a64, reader: &mut impl Read) {
 
 fn load_rule_cache(path: &Path, fingerprint: u64) -> Result<CompiledRules, String> {
     let file = File::open(path).map_err(|error| format!("打开缓存失败：{error}"))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
+    let (format_version, cached_fingerprint) = read_rule_cache_header(&mut reader)?;
+    if format_version != RULE_CACHE_FORMAT_VERSION || cached_fingerprint != fingerprint {
+        return Err("规则缓存已过期".to_string());
+    }
     let mut scratch = vec![0_u8; DESERIALIZE_BUFFER_SIZE];
     let (cache, _) = postcard::from_io::<RuleCacheOwned, _>((reader, scratch.as_mut_slice()))
         .map_err(|error| format!("解析缓存失败：{error}"))?;
-    if cache.format_version != RULE_CACHE_FORMAT_VERSION || cache.fingerprint != fingerprint {
-        return Err("规则缓存已过期".to_string());
-    }
     Ok(cache.rules)
+}
+
+fn read_rule_cache_header(reader: &mut impl Read) -> Result<(u32, u64), String> {
+    let mut magic = [0_u8; RULE_CACHE_MAGIC.len()];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|error| format!("读取缓存头失败：{error}"))?;
+    if magic != RULE_CACHE_MAGIC {
+        return Err("规则缓存格式不受支持".to_string());
+    }
+
+    let mut version = [0_u8; std::mem::size_of::<u32>()];
+    let mut fingerprint = [0_u8; std::mem::size_of::<u64>()];
+    reader
+        .read_exact(&mut version)
+        .and_then(|_| reader.read_exact(&mut fingerprint))
+        .map_err(|error| format!("读取缓存头失败：{error}"))?;
+    Ok((u32::from_le_bytes(version), u64::from_le_bytes(fingerprint)))
+}
+
+fn write_rule_cache_header(writer: &mut impl Write, fingerprint: u64) -> Result<(), String> {
+    writer
+        .write_all(&RULE_CACHE_MAGIC)
+        .and_then(|_| writer.write_all(&RULE_CACHE_FORMAT_VERSION.to_le_bytes()))
+        .and_then(|_| writer.write_all(&fingerprint.to_le_bytes()))
+        .map_err(|error| format!("写入缓存头失败：{error}"))
 }
 
 fn save_rule_cache(
@@ -231,15 +260,9 @@ fn save_rule_cache(
     let result = (|| {
         let file = File::create(&temporary).map_err(|error| format!("创建缓存失败：{error}"))?;
         let mut writer = BufWriter::new(file);
-        postcard::to_io(
-            &RuleCacheRef {
-                format_version: RULE_CACHE_FORMAT_VERSION,
-                fingerprint,
-                rules,
-            },
-            &mut writer,
-        )
-        .map_err(|error| format!("序列化缓存失败：{error}"))?;
+        write_rule_cache_header(&mut writer, fingerprint)?;
+        postcard::to_io(&RuleCacheRef { rules }, &mut writer)
+            .map_err(|error| format!("序列化缓存失败：{error}"))?;
         writer
             .flush()
             .map_err(|error| format!("刷新缓存失败：{error}"))?;
@@ -255,7 +278,11 @@ fn save_rule_cache(
         if path.exists() {
             fs::remove_file(path).map_err(|error| format!("替换旧缓存失败：{error}"))?;
         }
-        fs::rename(&temporary, path).map_err(|error| format!("启用缓存失败：{error}"))
+        fs::rename(&temporary, path).map_err(|error| format!("启用缓存失败：{error}"))?;
+        for legacy in LEGACY_RULE_CACHE_FILES {
+            let _ = fs::remove_file(parent.join(legacy));
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -346,6 +373,27 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_mismatch_is_rejected_before_payload_deserialization() {
+        let dir = temporary_directory("header-mismatch");
+        fs::create_dir_all(&dir).expect("temporary directory should create");
+        let path = dir.join("rules.cache");
+        let mut file = File::create(&path).expect("cache should create");
+        write_rule_cache_header(&mut file, 42).expect("cache header should write");
+        file.write_all(b"invalid postcard payload")
+            .expect("invalid payload should write");
+        drop(file);
+
+        let mismatch = match load_rule_cache(&path, 43) {
+            Ok(_) => panic!("fingerprint should mismatch"),
+            Err(error) => error,
+        };
+        assert_eq!(mismatch, "规则缓存已过期");
+        assert!(load_rule_cache(&path, 42).is_err());
+
+        fs::remove_dir_all(dir).expect("temporary directory should remove");
+    }
+
+    #[test]
     fn clearing_rule_cache_preserves_downloaded_filter_sources() {
         let dir = temporary_directory("safe-clear");
         let filters_dir = storage::filters_dir(&dir);
@@ -353,6 +401,8 @@ mod tests {
         fs::write(filters_dir.join("sample.txt"), "||example.org^")
             .expect("filter source should write");
         fs::write(filters_dir.join(RULE_CACHE_FILE), "cache").expect("compiled cache should write");
+        fs::write(filters_dir.join(LEGACY_RULE_CACHE_FILES[0]), "old")
+            .expect("legacy cache should write");
         let temporary_cache = filters_dir.join(format!("{RULE_CACHE_FILE}.1.2.tmp"));
         fs::write(&temporary_cache, "tmp").expect("temporary cache should write");
         fs::write(filters_dir.join("nested").join("keep.txt"), "keep")
@@ -360,11 +410,12 @@ mod tests {
 
         let stats = clear_rule_cache(&dir).expect("compiled cache should clear");
 
-        assert_eq!(stats.removed_files, 2);
-        assert_eq!(stats.removed_bytes, 8);
+        assert_eq!(stats.removed_files, 3);
+        assert_eq!(stats.removed_bytes, 11);
         assert!(filters_dir.join("sample.txt").exists());
         assert!(filters_dir.join("nested").join("keep.txt").exists());
         assert!(!filters_dir.join(RULE_CACHE_FILE).exists());
+        assert!(!filters_dir.join(LEGACY_RULE_CACHE_FILES[0]).exists());
         assert!(!temporary_cache.exists());
 
         fs::remove_dir_all(dir).expect("temporary directory should remove");

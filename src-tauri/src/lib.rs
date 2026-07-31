@@ -188,7 +188,7 @@ async fn inspect_data_storage_target(
     let _ = state;
     #[cfg(not(any(target_os = "macos", windows)))]
     let state = Arc::clone(state.inner());
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    match tauri::async_runtime::spawn_blocking(move || {
         #[cfg(any(target_os = "macos", windows))]
         {
             privileged_bridge::ServiceClient::call(
@@ -203,8 +203,10 @@ async fn inspect_data_storage_target(
         }
     })
     .await
-    .map_err(|error| format!("检查数据目录任务异常：{error}"))?;
-    result
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("检查数据目录任务异常：{error}")),
+    }
 }
 
 #[tauri::command]
