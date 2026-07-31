@@ -894,7 +894,11 @@ mod tests {
 
         let info = request_storage_change(&current, &current, &target)
             .expect("adoption request should save");
-        let expected_target = path_for_display(&target);
+        let expected_target = path_for_display(
+            &target
+                .canonicalize()
+                .expect("target directory should canonicalize"),
+        );
         assert_eq!(info.pending_path.as_deref(), Some(expected_target.as_str()));
         let pending = read_locator(&current).expect("pending locator should read");
         assert_eq!(pending.pending_action, Some(StorageTargetAction::UseExisting));
