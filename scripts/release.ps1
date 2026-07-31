@@ -1,6 +1,7 @@
 # DnsBlackhole release script: build signed installers and generate latest.json.
 # Usage: run .\scripts\release.ps1 from the project root.
-# Prerequisite: updater private key at %USERPROFILE%\.tauri\dnsblackhole.key.
+# Prerequisite: TAURI_SIGNING_PRIVATE_KEY, or updater private key at
+# %USERPROFILE%\.tauri\dnsblackhole.key.
 
 $ErrorActionPreference = "Stop"
 
@@ -35,23 +36,34 @@ if ($uniqueVersions.Count -ne 1) {
 $version = $uniqueVersions[0]
 
 $keyPath = "$env:USERPROFILE\.tauri\dnsblackhole.key"
-if (-not (Test-Path $keyPath)) {
-    throw "Updater signing private key not found: $keyPath"
+$ownsSigningKey = $false
+$ownsSigningPassword = $false
+if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+    if (-not (Test-Path $keyPath)) {
+        throw "Updater signing private key not found in TAURI_SIGNING_PRIVATE_KEY or at: $keyPath"
+    }
+    $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content $keyPath -Raw -Encoding UTF8).Trim()
+    $ownsSigningKey = $true
+}
+if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+    $ownsSigningPassword = $true
 }
 
 try {
-    # The Tauri CLI reliably accepts the private key content through this env var.
-    $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content $keyPath -Raw -Encoding UTF8).Trim()
-    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
-
     pnpm.cmd tauri build --ci
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed"
     }
 
-    $bundleDir = "src-tauri/target/release/bundle"
+    $metadataJson = (& cargo metadata --manifest-path "src-tauri/Cargo.toml" --no-deps --format-version 1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to resolve Cargo target directory"
+    }
+    $targetDir = [string]($metadataJson | ConvertFrom-Json).target_directory
+    $bundleDir = Join-Path $targetDir "release/bundle"
     $setupName = "DnsBlackhole_${version}_x64-setup.exe"
-    $sigPath = "$bundleDir/nsis/$setupName.sig"
+    $sigPath = Join-Path $bundleDir "nsis/$setupName.sig"
 
     if (-not (Test-Path $sigPath)) {
         throw "Signature file not found: $sigPath. Check createUpdaterArtifacts in tauri.conf.json."
@@ -69,7 +81,7 @@ try {
         }
     }
 
-    $latestPath = Join-Path $projectRoot "$bundleDir/latest.json"
+    $latestPath = Join-Path $bundleDir "latest.json"
     $latestJson = $latest | ConvertTo-Json -Depth 4
     [IO.File]::WriteAllText(
         [string]$latestPath,
@@ -84,6 +96,10 @@ try {
     Write-Host "  $latestPath   <- updater manifest, required"
 }
 finally {
-    Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
-    Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+    if ($ownsSigningKey) {
+        Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+    }
+    if ($ownsSigningPassword) {
+        Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+    }
 }

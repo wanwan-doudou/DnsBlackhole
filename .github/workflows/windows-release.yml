@@ -1,0 +1,77 @@
+# Windows 正式发布产物只在维护者手动触发时构建，签名密钥来自仓库 Secret。
+name: Windows Release Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建 Windows x64 安装包
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: windows-release
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建并签名发布产物
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: .\scripts\release.ps1
+
+      - name: 校验安装包与 updater 清单
+        shell: pwsh
+        run: |
+          $version = (Get-Content "package.json" -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          $bundleDir = "src-tauri/target/release/bundle"
+          $setupName = "DnsBlackhole_${version}_x64-setup.exe"
+          $setupPath = "$bundleDir/nsis/$setupName"
+          $msiPath = "$bundleDir/msi/DnsBlackhole_${version}_x64_en-US.msi"
+          $manifestPath = "$bundleDir/latest.json"
+          $signaturePath = "$setupPath.sig"
+
+          @($setupPath, $msiPath, $manifestPath, $signaturePath) | ForEach-Object {
+            if (-not (Test-Path -LiteralPath $_)) {
+              throw "发布产物不存在: $_"
+            }
+          }
+
+          $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          $platform = $manifest.platforms.'windows-x86_64'
+          $expectedUrl = "https://github.com/${{ github.repository }}/releases/download/v$version/$setupName"
+          $signature = (Get-Content $signaturePath -Raw -Encoding UTF8).Trim()
+          if ($manifest.version -ne $version -or $platform.url -ne $expectedUrl) {
+            throw "updater 清单中的版本或下载地址不正确"
+          }
+          if ([string]::IsNullOrWhiteSpace($platform.signature) -or $platform.signature -ne $signature) {
+            throw "updater 清单中的签名不正确"
+          }
+
+      - name: 上传 Windows Release artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: DnsBlackhole-windows-x64-release
+          path: |
+            src-tauri/target/release/bundle/nsis/DnsBlackhole_*_x64-setup.exe
+            src-tauri/target/release/bundle/msi/DnsBlackhole_*_x64_en-US.msi
+            src-tauri/target/release/bundle/latest.json
+          if-no-files-found: error
