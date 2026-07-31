@@ -38,8 +38,9 @@ use super::{
 
 const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
 const PENDING_QUERY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
-// Windows 刚连上 Wi-Fi 时，路由表通常会晚几秒可用。此时 UDP connect 会立即返回
-// WSAENETUNREACH/WSAEHOSTUNREACH；短暂等待后重试，避免首个 NCSI 探测直接收到失败。
+// Windows 刚连上或自动恢复 Wi-Fi 时，路由表和既有 UDP socket 可能暂时不可用。
+// connect 会返回 WSAENETUNREACH/WSAEHOSTUNREACH，复用 socket 的 send 可能返回 WSAEINVAL；
+// 短暂等待后重试，避免首个 NCSI 探测直接收到失败。
 const NETWORK_UNAVAILABLE_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(200),
     Duration::from_millis(400),
@@ -826,7 +827,9 @@ fn forward_query_once_with_fallback(
 
 fn is_network_temporarily_unavailable(error: &str) -> bool {
     // io::Error 的展示文本会本地化，但 Windows raw OS error 始终保留在末尾。
-    error.contains("(os error 10051)") || error.contains("(os error 10065)")
+    error.contains("(os error 10051)")
+        || error.contains("(os error 10065)")
+        || (error.contains("请求上游 DNS 失败") && error.contains("(os error 10022)"))
 }
 
 pub(crate) fn prepare_forwarded_response(response: &[u8], query: &[u8]) -> Vec<u8> {
@@ -1085,6 +1088,12 @@ mod tests {
         ));
         assert!(is_network_temporarily_unavailable(
             "连接上游 DNS 失败：网络不可达。 (os error 10051)"
+        ));
+        assert!(is_network_temporarily_unavailable(
+            "请求上游 DNS 失败：提供了一个无效的参数。 (os error 10022)"
+        ));
+        assert!(!is_network_temporarily_unavailable(
+            "解析监听地址失败：提供了一个无效的参数。 (os error 10022)"
         ));
         assert!(!is_network_temporarily_unavailable("读取上游 DNS 响应超时"));
     }
