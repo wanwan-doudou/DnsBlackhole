@@ -2,7 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OpenFlags, backup::Backup};
@@ -33,12 +33,31 @@ pub struct StorageInfo {
     pub total_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageTargetAction {
+    Current,
+    Migrate,
+    UseExisting,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageTargetInfo {
+    pub path: String,
+    pub action: StorageTargetAction,
+    pub database_bytes: u64,
+    pub filter_cache_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct StorageLocator {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_data_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_action: Option<StorageTargetAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cleanup_data_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,18 +88,36 @@ pub(crate) fn initialize_at(default_dir: PathBuf) -> Result<StorageBootstrap, St
     }
 
     if let Some(pending_dir) = locator.pending_data_dir.take() {
+        let pending_action = locator
+            .pending_action
+            .take()
+            .unwrap_or(StorageTargetAction::Migrate);
         if same_directory(&data_dir, &pending_dir) {
             locator.data_dir = custom_data_dir(&default_dir, &pending_dir);
         } else {
-            match migrate_data(&data_dir, &pending_dir) {
+            let change_result = match pending_action {
+                StorageTargetAction::Migrate => migrate_data(&data_dir, &pending_dir),
+                StorageTargetAction::UseExisting => {
+                    prepare_existing_data_for_adoption(&data_dir, &pending_dir)
+                }
+                StorageTargetAction::Current => Err("数据目录切换类型无效".to_string()),
+            };
+            match change_result {
                 Ok(()) => {
                     locator.data_dir = custom_data_dir(&default_dir, &pending_dir);
-                    locator.cleanup_data_dir = Some(data_dir.clone());
+                    locator.cleanup_data_dir = match pending_action {
+                        StorageTargetAction::Migrate => Some(data_dir.clone()),
+                        StorageTargetAction::UseExisting | StorageTargetAction::Current => None,
+                    };
                     data_dir = pending_dir;
                     locator.last_migration_error = None;
                 }
                 Err(error) => {
-                    let error = format!("数据目录迁移失败，已继续使用原目录：{error}");
+                    let operation = match pending_action {
+                        StorageTargetAction::UseExisting => "使用现有数据目录",
+                        StorageTargetAction::Migrate | StorageTargetAction::Current => "数据目录迁移",
+                    };
+                    let error = format!("{operation}失败，已继续使用原目录：{error}");
                     locator.last_migration_error = Some(error.clone());
                     migration_error = Some(error);
                 }
@@ -129,21 +166,56 @@ pub fn storage_info(default_dir: &Path, current_data_dir: &Path) -> Result<Stora
     })
 }
 
-pub fn request_migration(
+pub fn inspect_storage_target(
+    current_data_dir: &Path,
+    selected_dir: &Path,
+) -> Result<StorageTargetInfo, String> {
+    let (selected_dir, action) = resolve_storage_target(current_data_dir, selected_dir)?;
+    let database_bytes = database_files_size(&selected_dir)?;
+    let filter_cache_bytes = directory_size(&filters_dir(&selected_dir))?;
+    Ok(StorageTargetInfo {
+        path: path_for_display(&selected_dir),
+        action,
+        database_bytes,
+        filter_cache_bytes,
+        total_bytes: database_bytes.saturating_add(filter_cache_bytes),
+    })
+}
+
+pub fn request_storage_change(
     default_dir: &Path,
     current_data_dir: &Path,
     selected_dir: &Path,
 ) -> Result<StorageInfo, String> {
-    let selected_dir = validate_target_directory(current_data_dir, selected_dir)?;
+    let (selected_dir, action) = resolve_storage_target(current_data_dir, selected_dir)?;
     let mut locator = read_locator(default_dir)?;
     locator.last_migration_error = None;
-    if same_directory(current_data_dir, &selected_dir) {
+    if action == StorageTargetAction::Current {
         locator.pending_data_dir = None;
+        locator.pending_action = None;
     } else {
         locator.pending_data_dir = Some(selected_dir);
+        locator.pending_action = Some(action);
     }
     write_locator(default_dir, &locator)?;
     storage_info(default_dir, current_data_dir)
+}
+
+fn resolve_storage_target(
+    current_data_dir: &Path,
+    selected_dir: &Path,
+) -> Result<(PathBuf, StorageTargetAction), String> {
+    let selected_dir = validate_storage_directory(current_data_dir, selected_dir)?;
+    let action = if same_directory(current_data_dir, &selected_dir) {
+        StorageTargetAction::Current
+    } else if database_path(&selected_dir).exists() {
+        validate_existing_database(&database_path(&selected_dir))?;
+        StorageTargetAction::UseExisting
+    } else {
+        ensure_target_available(&selected_dir)?;
+        StorageTargetAction::Migrate
+    };
+    Ok((selected_dir, action))
 }
 
 pub fn database_path(data_dir: &Path) -> PathBuf {
@@ -193,6 +265,7 @@ pub(crate) fn prepare_windows_service_storage(
         {
             locator.data_dir = Some(legacy_data_dir);
             locator.pending_data_dir = legacy_locator.pending_data_dir;
+            locator.pending_action = legacy_locator.pending_action;
             locator.cleanup_data_dir = legacy_locator.cleanup_data_dir;
             locator.last_migration_error = legacy_locator.last_migration_error;
             write_locator(&service_default_dir, &locator)?;
@@ -286,6 +359,17 @@ fn validate_target_directory(
     current_data_dir: &Path,
     selected_dir: &Path,
 ) -> Result<PathBuf, String> {
+    let selected_dir = validate_storage_directory(current_data_dir, selected_dir)?;
+    if !same_directory(current_data_dir, &selected_dir) {
+        ensure_target_available(&selected_dir)?;
+    }
+    Ok(selected_dir)
+}
+
+fn validate_storage_directory(
+    current_data_dir: &Path,
+    selected_dir: &Path,
+) -> Result<PathBuf, String> {
     if !selected_dir.is_absolute() {
         return Err("数据存储路径必须是绝对路径".to_string());
     }
@@ -324,7 +408,6 @@ fn validate_target_directory(
         return Err("新旧数据目录不能互相嵌套".to_string());
     }
     if selected_dir != current {
-        ensure_target_available(&selected_dir)?;
         verify_writable(&selected_dir)?;
     }
     Ok(selected_dir)
@@ -431,6 +514,54 @@ fn migrate_data(source_dir: &Path, target_dir: &Path) -> Result<(), String> {
     result
 }
 
+fn prepare_existing_data_for_adoption(
+    current_data_dir: &Path,
+    target_dir: &Path,
+) -> Result<(), String> {
+    let target = inspect_storage_target(current_data_dir, target_dir)?;
+    if target.action != StorageTargetAction::UseExisting {
+        return Err("所选目录中没有可使用的 DnsBlackhole 数据".to_string());
+    }
+
+    let source_database = database_path(target_dir);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let backup_path = target_dir.join(format!(
+        "{DATABASE_FILE}.backup-before-adoption-{timestamp}-{}",
+        std::process::id()
+    ));
+    if let Err(error) = backup_database(&source_database, &backup_path) {
+        let _ = fs::remove_file(&backup_path);
+        return Err(format!("备份现有数据库失败：{error}"));
+    }
+    if let Err(error) = verify_database(&backup_path) {
+        let _ = fs::remove_file(&backup_path);
+        return Err(format!("校验现有数据库备份失败：{error}"));
+    }
+
+    let database = crate::database::Database::open(target_dir).map_err(|error| {
+        format!(
+            "升级现有数据库失败：{error}；升级前备份已保留在 {}",
+            backup_path.display()
+        )
+    })?;
+    let config = database.load_config().map_err(|error| {
+        format!(
+            "升级后读取现有配置失败：{error}；升级前备份已保留在 {}",
+            backup_path.display()
+        )
+    })?;
+    if config.is_none() {
+        return Err(format!(
+            "升级后未找到现有配置；升级前备份已保留在 {}",
+            backup_path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn backup_database(source_path: &Path, target_path: &Path) -> Result<(), String> {
     let source = Connection::open_with_flags(
         source_path,
@@ -460,6 +591,50 @@ fn verify_database(path: &Path) -> Result<(), String> {
     } else {
         Err(format!("迁移后的数据库完整性校验未通过：{result}"))
     }
+}
+
+fn validate_existing_database(path: &Path) -> Result<(), String> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("打开现有数据库失败（{}）：{error}", path.display()))?;
+    let integrity = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("校验现有数据库失败：{error}"))?;
+    if integrity != "ok" {
+        return Err(format!("现有数据库完整性校验未通过：{integrity}"));
+    }
+
+    let has_config_table = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'app_config')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("识别现有数据库失败：{error}"))?;
+    if !has_config_table {
+        return Err("所选数据库不是有效的 DnsBlackhole 数据库：缺少应用配置".to_string());
+    }
+
+    let raw = connection
+        .query_row("SELECT value FROM app_config WHERE id = 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| format!("读取现有数据库配置失败：{error}"))?;
+    let mut config: crate::config::AppConfig = serde_json::from_str(&raw)
+        .map_err(|error| format!("解析现有数据库配置失败：{error}"))?;
+    if config.schema_version > crate::config::CURRENT_CONFIG_SCHEMA_VERSION {
+        return Err(format!(
+            "现有数据库配置版本 {} 高于当前支持的版本 {}",
+            config.schema_version,
+            crate::config::CURRENT_CONFIG_SCHEMA_VERSION
+        ));
+    }
+    crate::config::migrate_legacy_defaults(&mut config);
+    config
+        .validate()
+        .map_err(|error| format!("现有数据库配置不兼容：{error}"))
 }
 
 fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
@@ -622,6 +797,14 @@ mod tests {
         path
     }
 
+    fn create_application_database(data_dir: &Path) {
+        fs::create_dir_all(data_dir).expect("data directory should create");
+        let database = crate::database::Database::open(data_dir).expect("database should create");
+        database
+            .save_config(&crate::config::AppConfig::default())
+            .expect("default config should save");
+    }
+
     #[test]
     fn migrates_database_and_filter_cache() {
         let root = temporary_directory("migration");
@@ -665,6 +848,75 @@ mod tests {
         let error = validate_target_directory(&source, &target)
             .expect_err("existing application data should be rejected");
         assert!(error.contains("已经存在 DnsBlackhole 数据"));
+        fs::remove_dir_all(root).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn identifies_valid_existing_application_data_for_adoption() {
+        let root = temporary_directory("inspect-existing");
+        let current = root.join("current");
+        let target = root.join("target");
+        fs::create_dir_all(&current).expect("current directory should create");
+        create_application_database(&target);
+
+        let info = inspect_storage_target(&current, &target)
+            .expect("existing application data should be recognized");
+
+        assert_eq!(info.action, StorageTargetAction::UseExisting);
+        assert!(info.database_bytes > 0);
+        fs::remove_dir_all(root).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn rejects_invalid_existing_database_during_inspection() {
+        let root = temporary_directory("inspect-invalid");
+        let current = root.join("current");
+        let target = root.join("target");
+        fs::create_dir_all(&current).expect("current directory should create");
+        fs::create_dir_all(&target).expect("target directory should create");
+        fs::write(database_path(&target), "not a sqlite database")
+            .expect("invalid database should write");
+
+        let error = inspect_storage_target(&current, &target)
+            .expect_err("invalid existing database should be rejected");
+
+        assert!(error.contains("现有数据库"));
+        fs::remove_dir_all(root).expect("temporary directory should remove");
+    }
+
+    #[test]
+    fn adopts_existing_data_without_removing_current_data() {
+        let root = temporary_directory("adopt-existing");
+        let current = root.join("current");
+        let target = root.join("target");
+        create_application_database(&current);
+        create_application_database(&target);
+
+        let info = request_storage_change(&current, &current, &target)
+            .expect("adoption request should save");
+        let expected_target = path_for_display(&target);
+        assert_eq!(info.pending_path.as_deref(), Some(expected_target.as_str()));
+        let pending = read_locator(&current).expect("pending locator should read");
+        assert_eq!(pending.pending_action, Some(StorageTargetAction::UseExisting));
+
+        let bootstrap = initialize_at(current.clone()).expect("existing data should adopt");
+
+        assert!(same_directory(&bootstrap.data_dir, &target));
+        assert!(database_path(&current).exists());
+        let backup_exists = fs::read_dir(&target)
+            .expect("target directory should read")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("dnsblackhole.sqlite3.backup-before-adoption-")
+            });
+        assert!(backup_exists);
+        let locator = read_locator(&current).expect("adopted locator should read");
+        assert!(locator.pending_data_dir.is_none());
+        assert!(locator.pending_action.is_none());
+        assert!(locator.cleanup_data_dir.is_none());
         fs::remove_dir_all(root).expect("temporary directory should remove");
     }
 
@@ -730,6 +982,7 @@ mod tests {
             &StorageLocator {
                 data_dir: Some(custom_data.clone()),
                 pending_data_dir: Some(pending_data.clone()),
+                pending_action: Some(StorageTargetAction::Migrate),
                 cleanup_data_dir: None,
                 last_migration_error: Some("previous error".to_string()),
             },
@@ -742,6 +995,10 @@ mod tests {
 
         assert_eq!(data_dir, custom_data);
         assert_eq!(locator.pending_data_dir, Some(pending_data));
+        assert_eq!(
+            locator.pending_action,
+            Some(StorageTargetAction::Migrate)
+        );
         assert_eq!(
             locator.last_migration_error.as_deref(),
             Some("previous error")

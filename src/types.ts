@@ -273,6 +273,16 @@ export type StorageInfo = {
   total_bytes: number;
 };
 
+export type StorageTargetAction = "current" | "migrate" | "use_existing";
+
+export type StorageTargetInfo = {
+  path: string;
+  action: StorageTargetAction;
+  database_bytes: number;
+  filter_cache_bytes: number;
+  total_bytes: number;
+};
+
 export type RefreshOptions = {
   auto?: boolean;
   button?: HTMLButtonElement;

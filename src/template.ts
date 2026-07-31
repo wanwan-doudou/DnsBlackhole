@@ -666,7 +666,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <section class="settings-section data-storage-section">
               <div class="section-heading">
                 <h3>数据存储</h3>
-                <span>查询日志、统计数据库和过滤器数据会保存在此目录。迁移在重启后执行，失败时继续使用原目录。</span>
+                <span>查询日志、统计数据库和过滤器数据会保存在此目录。可迁移到空目录，也可在重装系统后安全使用保留的现有数据。</span>
               </div>
               <div class="data-storage-path-row">
                 <input id="data_storage_path" type="text" readonly aria-label="数据存储路径" />

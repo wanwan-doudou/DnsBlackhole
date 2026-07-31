@@ -17,6 +17,7 @@ import {
   getWindowsSystemDnsStatus,
   getWindowsServiceStatus,
   getStorageInfo,
+  inspectDataStorageTarget,
   getQueryLogs,
   getStatus,
   saveConfig as saveConfigCommand,
@@ -66,6 +67,7 @@ import type {
   RuntimeStatus,
   SecurityEvent,
   StorageInfo,
+  StorageTargetInfo,
   UpstreamLatencyStat,
   UpstreamMode,
   UpstreamRequestStat,
@@ -133,6 +135,9 @@ let latestDashboardEndedAt: number | null | undefined;
 let clientNameMap = new Map<string, string>();
 let currentStorageInfo: StorageInfo | null = null;
 let selectedDataStoragePath = "";
+let selectedStorageTarget: StorageTargetInfo | null = null;
+let storageSelectionError = "";
+let storageInspectionToken = 0;
 let configLoaded = false;
 const isMacOS = navigator.userAgent.includes("Macintosh");
 const isWindows = navigator.userAgent.includes("Windows");
@@ -667,29 +672,35 @@ chooseDataStorageButton.addEventListener("click", async () => {
       defaultPath: currentStorageInfo.current_path,
     });
     if (typeof selected === "string") {
-      selectedDataStoragePath = selected;
-      renderStorageInfo(currentStorageInfo);
+      await selectDataStoragePath(selected);
     }
   } catch (error) {
     showMessage(`选择数据目录失败：${String(error)}`, true);
   }
 });
 
-resetDataStorageButton.addEventListener("click", () => {
+resetDataStorageButton.addEventListener("click", async () => {
   if (!currentStorageInfo) {
     return;
   }
-  selectedDataStoragePath = currentStorageInfo.default_path;
-  renderStorageInfo(currentStorageInfo);
+  await selectDataStoragePath(currentStorageInfo.default_path);
 });
 
 migrateDataStorageButton.addEventListener("click", async () => {
-  if (!currentStorageInfo || !hasPendingStorageSelection()) {
+  if (
+    !currentStorageInfo ||
+    !hasPendingStorageSelection() ||
+    !selectedStorageTarget ||
+    selectedStorageTarget.action === "current"
+  ) {
     return;
   }
   const targetPath = selectedDataStoragePath;
+  const useExisting = selectedStorageTarget.action === "use_existing";
   const confirmed = window.confirm(
-    `应用将重启并把数据库与过滤器缓存迁移到：\n${targetPath}\n\n目标数据验证成功后才会清理原目录。是否继续？`,
+    useExisting
+      ? `检测到现有 DnsBlackhole 数据：\n${targetPath}\n\n应用将验证并备份该数据库，然后切换使用此目录。现有目录和当前目录都不会被删除。是否继续？`
+      : `应用将重启并把数据库与过滤器缓存迁移到：\n${targetPath}\n\n目标数据验证成功后才会清理原目录。是否继续？`,
   );
   if (!confirmed) {
     return;
@@ -699,7 +710,12 @@ migrateDataStorageButton.addEventListener("click", async () => {
   migrateDataStorageButton.classList.add("loading");
   try {
     await requestDataMigration(targetPath);
-    showMessage("迁移任务已保存，正在重启应用…", false);
+    showMessage(
+      useExisting
+        ? "现有数据接管任务已保存，正在重启应用…"
+        : "迁移任务已保存，正在重启应用…",
+      false,
+    );
     await relaunch();
   } catch (error) {
     showMessage(String(error), true);
@@ -1276,7 +1292,12 @@ async function loadStorageInfo(): Promise<void> {
   try {
     currentStorageInfo = await getStorageInfo();
     selectedDataStoragePath = currentStorageInfo.pending_path ?? currentStorageInfo.current_path;
+    selectedStorageTarget = null;
+    storageSelectionError = "";
     renderStorageInfo(currentStorageInfo);
+    if (currentStorageInfo.pending_path) {
+      await selectDataStoragePath(currentStorageInfo.pending_path);
+    }
     succeeded = true;
   } catch (error) {
     dataStorageError.textContent = String(error);
@@ -1677,14 +1698,57 @@ function renderStorageInfo(info: StorageInfo): void {
 
   const pending = hasPendingStorageSelection();
   dataStoragePending.classList.toggle("hidden", !pending);
-  dataStoragePendingText.textContent = pending
-    ? `重启后迁移到：${displayPath}`
-    : "";
-  migrateDataStorageButton.disabled = !pending;
+  if (!pending) {
+    dataStoragePendingText.textContent = "";
+    migrateDataStorageButton.textContent = "迁移并重启";
+  } else if (!selectedStorageTarget) {
+    dataStoragePendingText.textContent = storageSelectionError
+      ? "所选目录不可用"
+      : "正在检查所选目录…";
+    migrateDataStorageButton.textContent = "检查目录中…";
+  } else if (selectedStorageTarget.action === "use_existing") {
+    dataStoragePendingText.textContent = `检测到现有数据 ${formatBytes(selectedStorageTarget.total_bytes)}（数据库 ${formatBytes(selectedStorageTarget.database_bytes)}，过滤器数据 ${formatBytes(selectedStorageTarget.filter_cache_bytes)}）`;
+    migrateDataStorageButton.textContent = "使用现有数据并重启";
+  } else {
+    dataStoragePendingText.textContent = `重启后迁移到：${displayPath}`;
+    migrateDataStorageButton.textContent = "迁移并重启";
+  }
+  migrateDataStorageButton.disabled =
+    !pending || !selectedStorageTarget || Boolean(storageSelectionError);
   resetDataStorageButton.disabled = info.is_default && !pending;
 
-  dataStorageError.textContent = info.migration_error ?? "";
-  dataStorageError.classList.toggle("hidden", !info.migration_error);
+  const error = storageSelectionError || info.migration_error || "";
+  dataStorageError.textContent = error;
+  dataStorageError.classList.toggle("hidden", !error);
+}
+
+async function selectDataStoragePath(path: string): Promise<void> {
+  if (!currentStorageInfo) {
+    return;
+  }
+  const token = ++storageInspectionToken;
+  selectedDataStoragePath = path;
+  selectedStorageTarget = null;
+  storageSelectionError = "";
+  renderStorageInfo(currentStorageInfo);
+  if (!hasPendingStorageSelection()) {
+    return;
+  }
+
+  try {
+    const target = await inspectDataStorageTarget(path);
+    if (token !== storageInspectionToken) {
+      return;
+    }
+    selectedDataStoragePath = target.path;
+    selectedStorageTarget = target;
+  } catch (error) {
+    if (token !== storageInspectionToken) {
+      return;
+    }
+    storageSelectionError = String(error);
+  }
+  renderStorageInfo(currentStorageInfo);
 }
 
 function hasPendingStorageSelection(): boolean {

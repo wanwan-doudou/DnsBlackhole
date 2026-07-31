@@ -187,14 +187,28 @@ fn dispatch_request(
             &state.default_data_dir,
             &state.data_dir,
         )?)?,
+        "inspect_data_storage_target" => {
+            let params: MigrationParams = parse_params(params)?;
+            let target_path = Path::new(params.target_path.trim());
+            if target_path.as_os_str().is_empty() {
+                return Err("请选择数据存储目录".to_string());
+            }
+            to_value(storage::inspect_storage_target(
+                &state.data_dir,
+                target_path,
+            )?)?
+        }
         "request_data_migration" => {
             let params: MigrationParams = parse_params(params)?;
             let target_path = Path::new(params.target_path.trim());
             if target_path.as_os_str().is_empty() {
                 return Err("请选择新的数据存储目录".to_string());
             }
-            let info =
-                storage::request_migration(&state.default_data_dir, &state.data_dir, target_path)?;
+            let info = storage::request_storage_change(
+                &state.default_data_dir,
+                &state.data_dir,
+                target_path,
+            )?;
             let should_restart = info.pending_path.is_some();
             return Ok((to_value(info)?, should_restart));
         }

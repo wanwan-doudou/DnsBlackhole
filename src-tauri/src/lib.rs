@@ -25,7 +25,7 @@ use service_core::{
     update_filters_blocking,
 };
 use service_core::{FilterCacheClearResult, FilterUpdateProgressState, FilterUpdateResult};
-use storage::StorageInfo;
+use storage::{StorageInfo, StorageTargetInfo};
 use tauri::{Emitter, Manager, WindowEvent};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri_plugin_autostart::MacosLauncher;
@@ -176,6 +176,38 @@ async fn get_storage_info(state: tauri::State<'_, Arc<GuiState>>) -> Result<Stor
 }
 
 #[tauri::command]
+async fn inspect_data_storage_target(
+    state: tauri::State<'_, Arc<GuiState>>,
+    target_path: String,
+) -> Result<StorageTargetInfo, String> {
+    let target_path = target_path.trim().to_string();
+    if target_path.is_empty() {
+        return Err("请选择数据存储目录".to_string());
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = state;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let state = Arc::clone(state.inner());
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            privileged_bridge::ServiceClient::call(
+                "inspect_data_storage_target",
+                &serde_json::json!({ "target_path": target_path }),
+            )
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            let state = state.local()?;
+            storage::inspect_storage_target(&state.data_dir, Path::new(&target_path))
+        }
+    })
+    .await
+    .map_err(|error| format!("检查数据目录任务异常：{error}"))?;
+    result
+}
+
+#[tauri::command]
 fn request_data_migration(
     state: tauri::State<'_, Arc<GuiState>>,
     target_path: String,
@@ -195,7 +227,7 @@ fn request_data_migration(
         if target_path.as_os_str().is_empty() {
             return Err("请选择新的数据存储目录".to_string());
         }
-        storage::request_migration(&state.default_data_dir, &state.data_dir, target_path)
+        storage::request_storage_change(&state.default_data_dir, &state.data_dir, target_path)
     }
 }
 
@@ -830,6 +862,7 @@ pub fn run() {
             detect_system_proxy,
             get_config,
             get_storage_info,
+            inspect_data_storage_target,
             request_data_migration,
             get_macos_service_status,
             install_macos_service,

@@ -10,6 +10,7 @@ import type {
   QueryLogPage,
   RuntimeStatus,
   StorageInfo,
+  StorageTargetInfo,
   WindowsServiceStatus,
   WindowsSystemDnsFallback,
   WindowsSystemDnsStatus,
@@ -97,6 +98,12 @@ export function clearFilterCache(): Promise<FilterCacheClearResult> {
 
 export function getStorageInfo(): Promise<StorageInfo> {
   return timedInvoke<StorageInfo>("get_storage_info");
+}
+
+export function inspectDataStorageTarget(
+  targetPath: string,
+): Promise<StorageTargetInfo> {
+  return timedInvoke<StorageTargetInfo>("inspect_data_storage_target", { targetPath });
 }
 
 export function requestDataMigration(targetPath: string): Promise<StorageInfo> {
