@@ -128,6 +128,7 @@ let queryLogRefreshInFlight = false;
 let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
 let queryLogSearchComposing = false;
+let lastDashboardRefreshAt: number | null = null;
 let currentConfigSchemaVersion = CURRENT_CONFIG_SCHEMA_VERSION;
 let currentStatisticsRetentionHours = 30 * 24;
 let latestDashboardStartedAt: number | null | undefined;
@@ -165,6 +166,8 @@ const ABOUT_LINKS = {
 } as const;
 const QUERY_LOG_PAGE_SIZE = 50;
 const QUERY_LOG_SEARCH_DEBOUNCE_MS = 800;
+const BACKGROUND_REFRESH_INTERVAL_MS = 5_000;
+const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 30_000;
 // 排行卡片渲染上限：超出可视高度的部分在卡片内滚动查看
 const RANK_ROW_LIMIT = 50;
 const CHECK_RETRY_DELAYS_MS = [800, 2_000, 5_000];
@@ -328,6 +331,10 @@ const securityAccessDenied = query<HTMLElement>("#security_access_denied");
 const securityRateLimited = query<HTMLElement>("#security_rate_limited");
 const securityDroppedUdp = query<HTMLElement>("#security_dropped_udp");
 const securityRefusedAny = query<HTMLElement>("#security_refused_any");
+const workerQueueDropped = query<HTMLElement>("#worker_queue_dropped");
+const persistenceQueueDropped = query<HTMLElement>("#persistence_queue_dropped");
+const upstreamTaskQueueRejected = query<HTMLElement>("#upstream_task_queue_rejected");
+const tcpConnectionRejected = query<HTMLElement>("#tcp_connection_rejected");
 const securityEventBody = query<HTMLDivElement>("#security_event_body");
 
 document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
@@ -1170,7 +1177,7 @@ function startBackgroundRefresh(): void {
     }
     refreshBackgroundServiceStatusIfNeeded();
     refreshActiveView();
-  }, 5000);
+  }, BACKGROUND_REFRESH_INTERVAL_MS);
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
@@ -1184,14 +1191,36 @@ function startBackgroundRefresh(): void {
 
 function refreshActiveView(): void {
   if (activeView === "logs") {
-    void refreshQueryLogs({ auto: true });
-  } else if (activeView === "dashboard" || activeView === "security") {
+    if (shouldAutoRefreshQueryLogs()) {
+      void refreshQueryLogs({ auto: true });
+    }
+  } else if (activeView === "dashboard") {
+    if (shouldAutoRefreshDashboard()) {
+      void refreshStatus({ auto: true });
+    }
+  } else if (activeView === "security") {
     void refreshStatus({ auto: true });
   } else if (activeView === "filters") {
     void refreshFilterUpdateMetadata();
   } else if (activeView === "settings") {
     void loadWindowsSystemDnsStatus();
   }
+}
+
+function shouldAutoRefreshQueryLogs(): boolean {
+  return (
+    queryLogPage === 1 &&
+    queryLogFilterInput.value === "all" &&
+    queryLogSearchInput.value.trim() === "" &&
+    !queryLogSearchComposing
+  );
+}
+
+function shouldAutoRefreshDashboard(): boolean {
+  return (
+    lastDashboardRefreshAt === null ||
+    performance.now() - lastDashboardRefreshAt >= DASHBOARD_AUTO_REFRESH_INTERVAL_MS
+  );
 }
 
 function refreshBackgroundServiceStatusIfNeeded(): void {
@@ -1850,6 +1879,9 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
     const renderDashboard = activeView === "dashboard";
     const status = await getStatus(options.auto !== true, renderDashboard);
     renderStatus(status, { renderDashboard });
+    if (renderDashboard) {
+      lastDashboardRefreshAt = performance.now();
+    }
     succeeded = true;
   } catch (error) {
     // 自动轮询会撞上后台服务重启或等待批准的窗口，瞬态错误只记录不打扰用户
@@ -2159,6 +2191,19 @@ function renderSecurityEvents(status: RuntimeStatus): void {
   setTextIfChanged(securityRateLimited, formatCount(status.stats.rate_limited_total));
   setTextIfChanged(securityDroppedUdp, formatCount(status.stats.dropped_udp_total));
   setTextIfChanged(securityRefusedAny, formatCount(status.stats.refused_any_total));
+  setTextIfChanged(workerQueueDropped, formatCount(status.stats.worker_queue_dropped_total ?? 0));
+  setTextIfChanged(
+    persistenceQueueDropped,
+    formatCount(status.stats.persistence_queue_dropped_total ?? 0),
+  );
+  setTextIfChanged(
+    upstreamTaskQueueRejected,
+    formatCount(status.stats.upstream_task_queue_rejected_total ?? 0),
+  );
+  setTextIfChanged(
+    tcpConnectionRejected,
+    formatCount(status.stats.tcp_connection_rejected_total ?? 0),
+  );
 
   const events = [...(status.stats.security_events ?? [])].reverse();
   if (events.length === 0) {

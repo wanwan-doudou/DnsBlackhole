@@ -22,7 +22,10 @@ use super::{
     cache::{DnsCacheConfig, DnsCacheStore},
     filter_runtime::{FilterRuntime, SharedFilterRuntime, share_filter_runtime},
     protocol::MAX_DNS_PACKET_SIZE,
-    stats::{DnsStats, record_error, reset_stats},
+    stats::{
+        DnsStats, record_error, record_tcp_connection_rejected, record_worker_queue_drop,
+        reset_stats,
+    },
     upstream::build_runtime_upstreams,
     worker::{
         DnsResponseTarget, DnsWorkItem, DnsWorkerContext, PENDING_QUERY_SHARDS, PendingQueries,
@@ -34,12 +37,13 @@ use super::{
 use super::filter_runtime::build_filter_runtime;
 
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(500);
-const TCP_ACCEPT_SLEEP: Duration = Duration::from_millis(100);
+const TCP_ACCEPT_SLEEP: Duration = Duration::from_millis(10);
 const TCP_READ_TIMEOUT: Duration = Duration::from_millis(500);
 const TCP_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TCP_MAX_CONNECTIONS: usize = 256;
+const TCP_CONNECTION_STACK_SIZE: usize = 512 * 1024;
 // 路由器会把多台设备的查询汇聚到同一监听套接字，放大缓冲区以承接瞬时突发。
 const UDP_SOCKET_BUFFER_SIZE: usize = 1024 * 1024;
 const DNS_WORK_QUEUE_CAPACITY: usize = 8192;
@@ -420,11 +424,12 @@ fn serve_udp(
                 socket: Arc::clone(&socket),
                 client_addr,
             },
+            queued_at: Instant::now(),
         };
         match dispatch_dns_work(&work_senders, work_item, &mut next_worker) {
             Ok(()) => {}
             Err(DispatchDnsWorkError::Full) => {
-                record_error(&stats, "DNS 请求队列已满，已丢弃请求".to_string());
+                record_worker_queue_drop(&stats, "DNS 请求队列已满，已丢弃请求".to_string());
             }
             Err(DispatchDnsWorkError::Disconnected) => break,
         }
@@ -453,7 +458,7 @@ fn serve_tcp(
         };
 
         if !try_acquire_tcp_connection_slot(&active_connections) {
-            record_error(&stats, "TCP DNS 连接数已满，已拒绝新连接".to_string());
+            record_tcp_connection_rejected(&stats, "TCP DNS 连接数已满，已拒绝新连接".to_string());
             continue;
         }
 
@@ -461,12 +466,18 @@ fn serve_tcp(
             active_connections: Arc::clone(&active_connections),
         };
         let work_senders = work_senders.clone();
-        let stats = Arc::clone(&stats);
+        let connection_stats = Arc::clone(&stats);
         let stop = Arc::clone(&stop);
-        thread::spawn(move || {
-            let _slot = connection_slot;
-            handle_tcp_connection(stream, client_addr, work_senders, stats, stop);
-        });
+        if let Err(error) = thread::Builder::new()
+            .name("dns-tcp-connection".to_string())
+            .stack_size(TCP_CONNECTION_STACK_SIZE)
+            .spawn(move || {
+                let _slot = connection_slot;
+                handle_tcp_connection(stream, client_addr, work_senders, connection_stats, stop);
+            })
+        {
+            record_error(&stats, format!("创建 TCP DNS 连接线程失败：{error}"));
+        }
     }
 
     while active_connections.load(Ordering::Acquire) > 0 {
@@ -520,12 +531,13 @@ fn handle_tcp_connection(
             query,
             client_addr,
             response_target: DnsResponseTarget::Tcp(response_sender),
+            queued_at: Instant::now(),
         };
 
         match dispatch_dns_work(&work_senders, work_item, &mut next_worker) {
             Ok(()) => {}
             Err(DispatchDnsWorkError::Full) => {
-                record_error(&stats, "DNS 请求队列已满，已丢弃 TCP 请求".to_string());
+                record_worker_queue_drop(&stats, "DNS 请求队列已满，已丢弃 TCP 请求".to_string());
                 break;
             }
             Err(DispatchDnsWorkError::Disconnected) => break,
@@ -549,6 +561,9 @@ fn handle_tcp_connection(
 }
 
 fn configure_tcp_stream(stream: &TcpStream) -> Result<(), String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("设置 TCP DNS 阻塞模式失败：{e}"))?;
     stream
         .set_read_timeout(Some(TCP_READ_TIMEOUT))
         .map_err(|e| format!("设置 TCP DNS 读取超时失败：{e}"))?;
@@ -771,6 +786,41 @@ mod tests {
             .expect_err("partial TCP query should report disconnect");
 
         assert!(error.contains("完整读取前关闭"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_tcp_stream_restores_blocking_mode_after_nonblocking_accept() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => thread::yield_now(),
+                Err(error) => panic!("接受测试 TCP 连接失败：{error}"),
+            }
+        };
+
+        configure_tcp_stream(&server).expect("TCP 连接配置应成功");
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("应可缩短测试读取超时");
+
+        let started = Instant::now();
+        let error = server
+            .read(&mut [0_u8; 1])
+            .expect_err("空闲阻塞连接应在读取超时后返回错误");
+
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "空闲读取不应因继承非阻塞模式而立即返回"
+        );
     }
 
     #[test]

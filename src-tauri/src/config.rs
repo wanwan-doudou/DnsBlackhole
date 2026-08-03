@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU16, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 11;
+pub(crate) const MAX_STATISTICS_RETENTION_HOURS: u32 = 24 * 365;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
 const MAX_FILTER_SIZE_MB: u32 = 256;
@@ -318,7 +319,7 @@ impl AppConfig {
         if self.query_log_retention_hours == 0 || self.query_log_retention_hours > 24 * 365 {
             return Err("查询日志保留时间必须在 1 小时到 365 天之间".into());
         }
-        if self.statistics_retention_hours > 24 * 365 {
+        if self.statistics_retention_hours > MAX_STATISTICS_RETENTION_HOURS {
             return Err("统计数据保留时间必须为永久或 1 小时到 365 天".into());
         }
         if self.dns_cache_enabled && self.dns_cache_size == 0 {
@@ -814,6 +815,32 @@ pub(crate) fn resolve_hostname_socket_addrs(
     Ok(addrs)
 }
 
+pub(crate) fn resolve_hostname_socket_addrs_until(
+    host: &str,
+    port: u16,
+    bootstrap_servers: &[SocketAddr],
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, String> {
+    if bootstrap_servers.is_empty() {
+        return Err("运行期间重新解析域名上游需要配置 bootstrap DNS".to_string());
+    }
+
+    for &server in bootstrap_servers {
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .map(|remaining| remaining.min(BOOTSTRAP_TIMEOUT))
+            .ok_or_else(|| "解析上游 DNS 地址超过总超时".to_string())?;
+        match resolve_hostname_with_bootstrap_timeout(host, port, server, timeout) {
+            Ok(addrs) if !addrs.is_empty() => return Ok(addrs),
+            Err(_) => continue,
+            Ok(_) => continue,
+        }
+    }
+
+    Err("无法在总超时内通过 bootstrap 解析上游 DNS 地址".to_string())
+}
+
 fn parse_bootstrap_servers(value: &str) -> Result<Vec<SocketAddr>, String> {
     let mut servers = Vec::new();
     for (index, line) in value.lines().enumerate() {
@@ -844,9 +871,18 @@ fn resolve_hostname_with_bootstrap(
     port: u16,
     server: SocketAddr,
 ) -> Result<Vec<SocketAddr>, String> {
+    resolve_hostname_with_bootstrap_timeout(host, port, server, BOOTSTRAP_TIMEOUT)
+}
+
+fn resolve_hostname_with_bootstrap_timeout(
+    host: &str,
+    port: u16,
+    server: SocketAddr,
+    timeout: Duration,
+) -> Result<Vec<SocketAddr>, String> {
     let (ipv4, ipv6) = thread::scope(|scope| {
-        let ipv4 = scope.spawn(|| query_bootstrap_records(host, server, 1));
-        let ipv6 = scope.spawn(|| query_bootstrap_records(host, server, 28));
+        let ipv4 = scope.spawn(|| query_bootstrap_records(host, server, 1, timeout));
+        let ipv6 = scope.spawn(|| query_bootstrap_records(host, server, 28, timeout));
         (
             ipv4.join()
                 .unwrap_or_else(|_| Err("bootstrap A 查询线程异常".into())),
@@ -881,6 +917,7 @@ fn query_bootstrap_records(
     host: &str,
     server: SocketAddr,
     qtype: u16,
+    timeout: Duration,
 ) -> Result<Vec<IpAddr>, String> {
     let query = build_dns_query(host, qtype)?;
     let bind_addr = if server.is_ipv4() {
@@ -890,7 +927,7 @@ fn query_bootstrap_records(
     };
     let socket = UdpSocket::bind(bind_addr).map_err(|e| format!("创建 bootstrap 查询失败：{e}"))?;
     socket
-        .set_read_timeout(Some(BOOTSTRAP_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|e| format!("设置 bootstrap 查询超时失败：{e}"))?;
     socket
         .connect(server)
@@ -1396,6 +1433,26 @@ mod tests {
                 "192.0.2.10:443".parse().unwrap(),
                 "[::1]:443".parse().unwrap()
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_bootstrap_resolution_respects_shared_deadline() {
+        let blackhole = UdpSocket::bind("127.0.0.1:0").expect("blackhole bootstrap should bind");
+        let server = blackhole.local_addr().unwrap();
+        let started = Instant::now();
+
+        let result = resolve_hostname_socket_addrs_until(
+            "dns.example.test",
+            443,
+            &[server, server],
+            started + Duration::from_millis(150),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "多个 bootstrap 服务器必须共享总截止时间"
         );
     }
 

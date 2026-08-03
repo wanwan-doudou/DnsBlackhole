@@ -304,7 +304,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <input name="upstream_mode" type="radio" value="parallel_requests" />
                   <span>
                     <strong>并行请求</strong>
-                    <small>同时查询所有上游服务器，并使用最先成功的响应。</small>
+                    <small>优先查询一个上游；25 毫秒内未成功时并发查询其余上游，并使用最先成功的响应。</small>
                   </span>
                 </label>
                 <label class="radio-row">
@@ -491,6 +491,31 @@ export function renderAppTemplate(appIconUrl: string): string {
                 </div>
                 <div class="security-event-body" id="security_event_body">
                   <div class="security-event-empty">暂无安全事件</div>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-section dns-security-section">
+              <div class="section-heading">
+                <h3>容量保护</h3>
+                <span>展示本次服务运行期间因内部队列或连接上限触发的降级；正常情况下都应为 0。</span>
+              </div>
+              <div class="security-stat-grid">
+                <div class="security-stat-card">
+                  <span>DNS 工作队列丢弃</span>
+                  <strong id="worker_queue_dropped">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>日志持久化丢弃</span>
+                  <strong id="persistence_queue_dropped">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>上游任务池降级</span>
+                  <strong id="upstream_task_queue_rejected">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>TCP 连接拒绝</span>
+                  <strong id="tcp_connection_rejected">0</strong>
                 </div>
               </div>
             </section>

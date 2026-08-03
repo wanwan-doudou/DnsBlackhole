@@ -16,6 +16,8 @@ use super::protocol::{ParsedQuery, prepare_cached_response, response_cache_ttl};
 const DNS_CACHE_ENTRY_OVERHEAD_BYTES: usize = 96;
 // 淘汰时从迭代起点抽样对比 last_used，避免全表扫描找最旧条目
 const DNS_CACHE_EVICT_SAMPLE: usize = 16;
+// 缓存满载后若工作集持续换入，不能让每次插入都在写锁内扫描整个 shard。
+const DNS_CACHE_EXPIRED_SCAN_INTERVAL_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DnsCacheConfig {
@@ -63,6 +65,7 @@ pub(crate) struct DnsCache {
     entries: HashMap<QueryCacheKey, CachedDnsResponse>,
     total_size: usize,
     access_counter: AtomicU64,
+    last_expired_scan_at: u64,
 }
 
 pub(crate) struct DnsCacheStore {
@@ -196,6 +199,7 @@ impl DnsCache {
             entries: HashMap::new(),
             total_size: 0,
             access_counter: AtomicU64::new(0),
+            last_expired_scan_at: 0,
         })
     }
 
@@ -281,11 +285,13 @@ impl DnsCache {
     fn clear(&mut self) {
         self.entries.clear();
         self.total_size = 0;
+        self.last_expired_scan_at = 0;
     }
 
     fn evict_over_limit(&mut self, now: u64) {
-        if self.total_size > self.config.max_size_bytes {
+        if self.total_size > self.config.max_size_bytes && self.should_scan_expired(now) {
             self.evict_expired(now);
+            self.last_expired_scan_at = now;
         }
 
         while self.total_size > self.config.max_size_bytes {
@@ -317,6 +323,12 @@ impl DnsCache {
             keep
         });
         self.total_size = self.total_size.saturating_sub(removed_size);
+    }
+
+    fn should_scan_expired(&self, now: u64) -> bool {
+        self.last_expired_scan_at == 0
+            || now.saturating_sub(self.last_expired_scan_at)
+                >= DNS_CACHE_EXPIRED_SCAN_INTERVAL_SECONDS
     }
 }
 
@@ -368,4 +380,27 @@ pub(crate) fn cache_ttl_seconds(packet: &[u8], config: &DnsCacheConfig) -> Optio
         ttl = ttl.min(config.max_ttl);
     }
     Some(ttl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DNS_CACHE_EXPIRED_SCAN_INTERVAL_SECONDS, DnsCache, DnsCacheConfig};
+
+    #[test]
+    fn throttles_full_expired_entry_scans() {
+        let mut cache = DnsCache::from_config(DnsCacheConfig {
+            enabled: true,
+            max_size_bytes: 1024,
+            min_ttl: 0,
+            max_ttl: 60,
+            optimistic: true,
+        })
+        .expect("cache should build");
+
+        assert!(cache.should_scan_expired(100));
+        cache.last_expired_scan_at = 100;
+        assert!(!cache.should_scan_expired(100));
+        assert!(!cache.should_scan_expired(100 + DNS_CACHE_EXPIRED_SCAN_INTERVAL_SECONDS - 1));
+        assert!(cache.should_scan_expired(100 + DNS_CACHE_EXPIRED_SCAN_INTERVAL_SECONDS));
+    }
 }

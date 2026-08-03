@@ -30,6 +30,14 @@ pub struct DnsStats {
     pub rate_limited_total: u64,
     pub refused_any_total: u64,
     pub dropped_udp_total: u64,
+    #[serde(default)]
+    pub worker_queue_dropped_total: u64,
+    #[serde(default)]
+    pub persistence_queue_dropped_total: u64,
+    #[serde(default)]
+    pub upstream_task_queue_rejected_total: u64,
+    #[serde(default)]
+    pub tcp_connection_rejected_total: u64,
     pub security_events: VecDeque<SecurityEvent>,
     pub last_query: Option<String>,
     pub last_blocked: Option<String>,
@@ -231,6 +239,37 @@ pub(crate) fn record_error(stats: &Arc<Mutex<DnsStats>>, error: String) {
     }
 }
 
+pub(crate) fn record_worker_queue_drop(stats: &Arc<Mutex<DnsStats>>, error: String) {
+    if let Ok(mut current) = stats.lock() {
+        current.failed += 1;
+        current.worker_queue_dropped_total += 1;
+        current.last_error = Some(error);
+    }
+}
+
+pub(crate) fn record_persistence_queue_drop(stats: &Arc<Mutex<DnsStats>>, error: String) {
+    if let Ok(mut current) = stats.lock() {
+        // DNS 响应已经完成，持久化降级不能污染真实查询失败数。
+        current.persistence_queue_dropped_total += 1;
+        current.last_error = Some(error);
+    }
+}
+
+pub(crate) fn record_upstream_task_queue_rejected(stats: &Arc<Mutex<DnsStats>>) {
+    if let Ok(mut current) = stats.lock() {
+        // 调用方仍会同步执行兜底，上游任务池拒绝本身不代表 DNS 查询失败。
+        current.upstream_task_queue_rejected_total += 1;
+    }
+}
+
+pub(crate) fn record_tcp_connection_rejected(stats: &Arc<Mutex<DnsStats>>, error: String) {
+    if let Ok(mut current) = stats.lock() {
+        current.failed += 1;
+        current.tcp_connection_rejected_total += 1;
+        current.last_error = Some(error);
+    }
+}
+
 pub(crate) fn record_access_denied(
     stats: &Arc<Mutex<DnsStats>>,
     client_ip: IpAddr,
@@ -419,6 +458,28 @@ mod tests {
 
         let current = stats.lock().unwrap();
         assert_eq!(current.failed, 1);
+        assert!(current.last_error.is_none());
+    }
+
+    #[test]
+    fn persistence_drop_does_not_count_as_dns_query_failure() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        record_persistence_queue_drop(&stats, "持久化队列已满".to_string());
+
+        let current = stats.lock().unwrap();
+        assert_eq!(current.failed, 0);
+        assert_eq!(current.persistence_queue_dropped_total, 1);
+        assert_eq!(current.last_error.as_deref(), Some("持久化队列已满"));
+    }
+
+    #[test]
+    fn upstream_task_rejection_is_diagnostic_not_query_failure() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        record_upstream_task_queue_rejected(&stats);
+
+        let current = stats.lock().unwrap();
+        assert_eq!(current.failed, 0);
+        assert_eq!(current.upstream_task_queue_rejected_total, 1);
         assert!(current.last_error.is_none());
     }
 }

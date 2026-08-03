@@ -162,6 +162,10 @@ export type DnsStats = {
   rate_limited_total: number;
   refused_any_total: number;
   dropped_udp_total: number;
+  worker_queue_dropped_total?: number;
+  persistence_queue_dropped_total?: number;
+  upstream_task_queue_rejected_total?: number;
+  tcp_connection_rejected_total?: number;
   security_events: SecurityEvent[];
   last_query: string | null;
   last_blocked: string | null;

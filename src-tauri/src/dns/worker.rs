@@ -30,7 +30,8 @@ use super::{
     },
     stats::{
         DnsStats, DnsTransport, current_second, record_access_denied, record_blocked_query,
-        record_error, record_forwarded, record_query, record_rate_limited, record_refused_any,
+        record_error, record_forwarded, record_persistence_queue_drop, record_query,
+        record_rate_limited, record_refused_any,
     },
     task_pool,
     upstream::{RuntimeUpstream, UpstreamForwardResponse, forward_query},
@@ -39,6 +40,7 @@ use super::{
 const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
 const PENDING_QUERY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OPTIMISTIC_REFRESH_MAX_QUEUE_WAIT: Duration = Duration::from_secs(2);
+const FORWARD_QUERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
 // Windows 刚连上或自动恢复 Wi-Fi 时，路由表和既有 UDP socket 可能暂时不可用。
 // connect 会返回 WSAENETUNREACH/WSAEHOSTUNREACH，复用 socket 的 send 可能返回 WSAEINVAL；
 // 短暂等待后重试，避免首个 NCSI 探测直接收到失败。
@@ -60,6 +62,7 @@ pub(crate) struct DnsWorkItem {
     pub(crate) query: Vec<u8>,
     pub(crate) client_addr: SocketAddr,
     pub(crate) response_target: DnsResponseTarget,
+    pub(crate) queued_at: Instant,
 }
 
 pub(crate) enum DnsResponseTarget {
@@ -235,7 +238,8 @@ pub(crate) fn dns_worker_loop(
 }
 
 fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
-    let processing_started = Instant::now();
+    // 从监听线程入队时开始计时，确保持久化的处理耗时包含内部工作队列等待。
+    let processing_started = work_item.queued_at;
     let query = work_item.query.as_slice();
     let client_addr = work_item.client_addr;
     let response_target = &work_item.response_target;
@@ -469,6 +473,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     Arc::clone(&context.upstream_servers),
                     Arc::clone(&context.fallback_upstream_servers),
                     context.upstream_mode.clone(),
+                    Arc::clone(&context.stats),
                     context.dns_cache.clone(),
                     context.dns_cache_config.clone(),
                 );
@@ -549,6 +554,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         &context.upstream_mode,
         &context.next_upstream,
         &context.fallback_next_upstream,
+        &context.stats,
     );
     if let (Some(cache_key), Some(pending_query)) = (cache_key.as_ref(), pending_query.as_ref()) {
         finish_pending_query(context, cache_key, pending_query, forward_result.clone());
@@ -769,7 +775,9 @@ fn forward_query_with_fallback(
     upstream_mode: &UpstreamMode,
     next_upstream: &AtomicUsize,
     fallback_next_upstream: &AtomicUsize,
+    stats: &Arc<Mutex<DnsStats>>,
 ) -> Result<UpstreamForwardResponse, String> {
+    let deadline = Instant::now() + FORWARD_QUERY_TOTAL_TIMEOUT;
     let mut result = forward_query_once_with_fallback(
         query,
         upstream_servers,
@@ -777,11 +785,19 @@ fn forward_query_with_fallback(
         upstream_mode,
         next_upstream,
         fallback_next_upstream,
+        deadline,
+        stats,
     );
     for delay in NETWORK_UNAVAILABLE_RETRY_DELAYS {
         if !result
             .as_ref()
             .is_err_and(|error| is_network_temporarily_unavailable(error))
+        {
+            break;
+        }
+        if deadline
+            .checked_duration_since(Instant::now())
+            .is_none_or(|remaining| remaining <= delay)
         {
             break;
         }
@@ -793,11 +809,14 @@ fn forward_query_with_fallback(
             upstream_mode,
             next_upstream,
             fallback_next_upstream,
+            deadline,
+            stats,
         );
     }
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn forward_query_once_with_fallback(
     query: &[u8],
     upstream_servers: &[RuntimeUpstream],
@@ -805,8 +824,17 @@ fn forward_query_once_with_fallback(
     upstream_mode: &UpstreamMode,
     next_upstream: &AtomicUsize,
     fallback_next_upstream: &AtomicUsize,
+    deadline: Instant,
+    stats: &Arc<Mutex<DnsStats>>,
 ) -> Result<UpstreamForwardResponse, String> {
-    match forward_query(query, upstream_servers, upstream_mode, next_upstream) {
+    match forward_query(
+        query,
+        upstream_servers,
+        upstream_mode,
+        next_upstream,
+        deadline,
+        stats,
+    ) {
         Ok(response) => Ok(response),
         Err(primary_error) => {
             if fallback_upstream_servers.is_empty() {
@@ -818,6 +846,8 @@ fn forward_query_once_with_fallback(
                 fallback_upstream_servers,
                 upstream_mode,
                 fallback_next_upstream,
+                deadline,
+                stats,
             )
             .map_err(|fallback_error| {
                 format!("主上游失败：{primary_error}；fallback 上游也失败：{fallback_error}")
@@ -843,12 +873,14 @@ pub(crate) fn prepare_forwarded_response(response: &[u8], query: &[u8]) -> Vec<u
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_expired_cache_async(
     query: Vec<u8>,
     cache_key: QueryCacheKey,
     upstream_servers: Arc<Vec<RuntimeUpstream>>,
     fallback_upstream_servers: Arc<Vec<RuntimeUpstream>>,
     upstream_mode: UpstreamMode,
+    stats: Arc<Mutex<DnsStats>>,
     dns_cache: Option<Arc<DnsCacheStore>>,
     dns_cache_config: Option<DnsCacheConfig>,
 ) {
@@ -876,6 +908,7 @@ fn refresh_expired_cache_async(
             &upstream_mode,
             &next_upstream,
             &fallback_next_upstream,
+            &stats,
         ) {
             Ok(forwarded) => {
                 let cache_for_insert = Some(Arc::clone(&cache));
@@ -1064,13 +1097,13 @@ fn queue_query_log_with_match(
     match sender.try_send(message) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(_)) => {
-            record_error(
+            record_persistence_queue_drop(
                 &context.stats,
                 "查询数据队列已满，已丢弃持久化事件".to_string(),
             );
         }
         Err(mpsc::TrySendError::Disconnected(_)) => {
-            record_error(&context.stats, "查询数据写入队列已关闭".to_string());
+            record_persistence_queue_drop(&context.stats, "查询数据写入队列已关闭".to_string());
         }
     }
 }

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
 use crate::{
-    config::{self, AppConfig},
+    config::{self, AppConfig, MAX_STATISTICS_RETENTION_HOURS},
     dns::{
         DnsResponseAnswer, DnsResponseSummary, TrafficBucket, UpstreamLatencyStat,
         UpstreamRequestStat,
@@ -78,6 +78,33 @@ const UPSERT_HOURLY_STAT_SQL: &str = "
         requests = requests + excluded.requests,
         latency_total_ms = latency_total_ms + excluded.latency_total_ms,
         latency_samples = latency_samples + excluded.latency_samples";
+const UPSERT_LIFETIME_STAT_SQL: &str = "
+    INSERT INTO dashboard_summary_stats
+        (
+            scope,
+            dimension,
+            value,
+            queries,
+            blocked,
+            forwarded,
+            failed,
+            requests,
+            latency_total_ms,
+            latency_samples,
+            first_seen_at,
+            last_seen_at
+        )
+    VALUES ('all', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+    ON CONFLICT(scope, dimension, value) DO UPDATE SET
+        queries = queries + excluded.queries,
+        blocked = blocked + excluded.blocked,
+        forwarded = forwarded + excluded.forwarded,
+        failed = failed + excluded.failed,
+        requests = requests + excluded.requests,
+        latency_total_ms = latency_total_ms + excluded.latency_total_ms,
+        latency_samples = latency_samples + excluded.latency_samples,
+        first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+        last_seen_at = MAX(last_seen_at, excluded.last_seen_at)";
 const READ_CONNECTION_POOL_SIZE: usize = 4;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const WAL_MAINTENANCE_INTERVAL_SECONDS: u64 = 5 * 60;
@@ -85,6 +112,8 @@ const WAL_MAINTENANCE_RETRY_SECONDS: u64 = 15;
 const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const HOURLY_STATISTICS_INITIALIZED_KEY: &str = "hourly_statistics_initialized_v1";
+const LIFETIME_STATISTICS_INITIALIZED_KEY: &str = "lifetime_statistics_initialized_v1";
+const QUERY_LOG_SEARCH_INITIALIZED_KEY: &str = "query_log_search_initialized_v1";
 const TRAFFIC_RETENTION_HOURS: u64 = 30 * 24;
 // 定时清理后按需压缩的双阈值：空闲页绝对量和占比都超过才值得整库重写，
 // 避免稳态下为极小收益频繁 VACUUM。
@@ -119,6 +148,7 @@ pub struct Database {
     read_gate: RwLock<()>,
     wal_path: Option<PathBuf>,
     last_wal_maintenance_at: AtomicU64,
+    statistics_retention_hours: AtomicU32,
 }
 
 enum DatabaseReadGuard<'a> {
@@ -271,6 +301,9 @@ impl Database {
             read_gate: RwLock::new(()),
             wal_path: None,
             last_wal_maintenance_at: AtomicU64::new(unix_now()),
+            // 配置会在服务开始接收请求前载入；先按永久模式初始化，兼容单元测试及
+            // 没有旧配置的新数据库。
+            statistics_retention_hours: AtomicU32::new(0),
         })
     }
 
@@ -304,28 +337,47 @@ impl Database {
             .optional()
             .map_err(|e| format!("读取数据库配置失败：{e}"))?;
 
-        raw.map(|value| {
-            let mut config: AppConfig =
-                serde_json::from_str(&value).map_err(|e| format!("解析数据库配置失败：{e}"))?;
-            config::migrate_legacy_defaults(&mut config);
-            config.validate()?;
-            Ok(config)
-        })
-        .transpose()
+        let config = raw
+            .map(|value| {
+                let mut config: AppConfig =
+                    serde_json::from_str(&value).map_err(|e| format!("解析数据库配置失败：{e}"))?;
+                config::migrate_legacy_defaults(&mut config);
+                config.validate()?;
+                Ok::<AppConfig, String>(config)
+            })
+            .transpose()?;
+        if let Some(config) = config.as_ref() {
+            self.statistics_retention_hours
+                .store(config.statistics_retention_hours, Ordering::Relaxed);
+        }
+        Ok(config)
     }
 
     pub fn save_config(&self, config: &AppConfig) -> Result<(), String> {
         config.validate()?;
         let raw = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
         let now = u64_to_db_i64(unix_now(), "配置更新时间")?;
-        let conn = self.lock()?;
-        conn.execute(
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("创建配置保存事务失败：{e}"))?;
+        let previous_statistics_retention = self.statistics_retention_hours.load(Ordering::Relaxed);
+        if config.statistics_retention_hours == 0 && previous_statistics_retention != 0 {
+            let since_hour =
+                unix_now().saturating_sub(u64::from(previous_statistics_retention) * 3600) / 3600;
+            rebuild_lifetime_statistics(&tx, Some(u64_to_db_i64(since_hour, "永久统计切换小时")?))?;
+        }
+        tx.execute(
             "INSERT INTO app_config (id, value, updated_at)
              VALUES (1, ?1, ?2)
              ON CONFLICT(id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![raw, now],
         )
         .map_err(|e| format!("保存数据库配置失败：{e}"))?;
+        tx.commit()
+            .map_err(|e| format!("提交配置保存事务失败：{e}"))?;
+        self.statistics_retention_hours
+            .store(config.statistics_retention_hours, Ordering::Relaxed);
         Ok(())
     }
 
@@ -356,8 +408,18 @@ impl Database {
             let mut statistics_stmt = tx
                 .prepare(UPSERT_HOURLY_STAT_SQL)
                 .map_err(|e| format!("准备批量写入小时统计失败：{e}"))?;
+            let mut lifetime_statistics_stmt =
+                (self.statistics_retention_hours.load(Ordering::Relaxed) == 0)
+                    .then(|| {
+                        tx.prepare(UPSERT_LIFETIME_STAT_SQL)
+                            .map_err(|e| format!("准备批量写入永久统计失败：{e}"))
+                    })
+                    .transpose()?;
             for (key, delta) in hourly_stats {
                 execute_hourly_stat_upsert(&mut statistics_stmt, &key, &delta)?;
+                if let Some(statement) = lifetime_statistics_stmt.as_mut() {
+                    execute_lifetime_stat_upsert(statement, &key, &delta, timestamp)?;
+                }
             }
         }
         tx.commit()
@@ -397,56 +459,61 @@ impl Database {
             params![query_since],
         )
         .map_err(|e| format!("清理查询日志失败：{e}"))?;
-        if statistics_retention_hours != 0 {
-            let statistics_since_raw =
-                now.saturating_sub(u64::from(statistics_retention_hours) * 3600);
-            let statistics_since_hour = u64_to_db_i64(statistics_since_raw / 3600, "统计清理小时")?;
-            let traffic_since_hour = u64_to_db_i64(
-                now.saturating_sub(TRAFFIC_RETENTION_HOURS * 3600) / 3600,
-                "趋势清理小时",
-            )?;
-            let total_since_hour = statistics_since_hour.min(traffic_since_hour);
-            let legacy_statistics_since_minute =
-                u64_to_db_i64(statistics_since_raw / 60, "旧统计清理分钟")?;
-            tx.execute(
-                "DELETE FROM statistics_hourly
-                 WHERE dimension != 'total' AND hour < ?1",
-                params![statistics_since_hour],
-            )
-            .map_err(|e| format!("清理小时统计失败：{e}"))?;
-            tx.execute(
-                "DELETE FROM statistics_hourly
-                 WHERE dimension = 'total' AND hour < ?1",
-                params![total_since_hour],
-            )
-            .map_err(|e| format!("清理趋势统计失败：{e}"))?;
-            // 旧版本分钟统计不再读取，随新的统计保留期逐步清理，避免升级时制造大事务。
-            tx.execute(
-                "DELETE FROM query_log_minute_stats WHERE minute < ?1",
-                params![legacy_statistics_since_minute],
-            )
-            .map_err(|e| format!("清理分钟统计失败：{e}"))?;
-            tx.execute(
-                "DELETE FROM query_log_domain_stats WHERE minute < ?1",
-                params![legacy_statistics_since_minute],
-            )
-            .map_err(|e| format!("清理域名统计失败：{e}"))?;
-            tx.execute(
-                "DELETE FROM query_log_upstream_stats WHERE minute < ?1",
-                params![legacy_statistics_since_minute],
-            )
-            .map_err(|e| format!("清理上游统计失败：{e}"))?;
-            tx.execute(
-                "DELETE FROM query_log_client_stats WHERE minute < ?1",
-                params![legacy_statistics_since_minute],
-            )
-            .map_err(|e| format!("清理客户端统计失败：{e}"))?;
-            tx.execute(
-                "DELETE FROM query_log_blocklist_stats WHERE minute < ?1",
-                params![legacy_statistics_since_minute],
-            )
-            .map_err(|e| format!("清理黑名单统计失败：{e}"))?;
-        }
+        // 永久累计由 dashboard_summary_stats 精确保留。小时明细只需覆盖配置允许的
+        // 最大有限窗口，这既限制高基数域名按小时持续膨胀，也保证用户之后切换到
+        // 任一合法有限保留期时仍能得到完整结果。
+        let detail_retention_hours = if statistics_retention_hours == 0 {
+            MAX_STATISTICS_RETENTION_HOURS
+        } else {
+            statistics_retention_hours
+        };
+        let statistics_since_raw = now.saturating_sub(u64::from(detail_retention_hours) * 3600);
+        let statistics_since_hour = u64_to_db_i64(statistics_since_raw / 3600, "统计清理小时")?;
+        let traffic_since_hour = u64_to_db_i64(
+            now.saturating_sub(TRAFFIC_RETENTION_HOURS * 3600) / 3600,
+            "趋势清理小时",
+        )?;
+        let total_since_hour = statistics_since_hour.min(traffic_since_hour);
+        let legacy_statistics_since_minute =
+            u64_to_db_i64(statistics_since_raw / 60, "旧统计清理分钟")?;
+        tx.execute(
+            "DELETE FROM statistics_hourly
+             WHERE dimension != 'total' AND hour < ?1",
+            params![statistics_since_hour],
+        )
+        .map_err(|e| format!("清理小时统计失败：{e}"))?;
+        tx.execute(
+            "DELETE FROM statistics_hourly
+             WHERE dimension = 'total' AND hour < ?1",
+            params![total_since_hour],
+        )
+        .map_err(|e| format!("清理趋势统计失败：{e}"))?;
+        // 旧版本分钟统计不再读取，随明细保留窗口逐步清理，避免升级时制造大事务。
+        tx.execute(
+            "DELETE FROM query_log_minute_stats WHERE minute < ?1",
+            params![legacy_statistics_since_minute],
+        )
+        .map_err(|e| format!("清理分钟统计失败：{e}"))?;
+        tx.execute(
+            "DELETE FROM query_log_domain_stats WHERE minute < ?1",
+            params![legacy_statistics_since_minute],
+        )
+        .map_err(|e| format!("清理域名统计失败：{e}"))?;
+        tx.execute(
+            "DELETE FROM query_log_upstream_stats WHERE minute < ?1",
+            params![legacy_statistics_since_minute],
+        )
+        .map_err(|e| format!("清理上游统计失败：{e}"))?;
+        tx.execute(
+            "DELETE FROM query_log_client_stats WHERE minute < ?1",
+            params![legacy_statistics_since_minute],
+        )
+        .map_err(|e| format!("清理客户端统计失败：{e}"))?;
+        tx.execute(
+            "DELETE FROM query_log_blocklist_stats WHERE minute < ?1",
+            params![legacy_statistics_since_minute],
+        )
+        .map_err(|e| format!("清理黑名单统计失败：{e}"))?;
         tx.commit()
             .map_err(|e| format!("提交查询数据清理失败：{e}"))?;
         self.truncate_oversized_wal(&conn);
@@ -528,6 +595,30 @@ impl Database {
             _ => "",
         };
         let search = search.trim();
+        let query_logs_source = if search.is_empty() {
+            match filter {
+                "blocked" => "query_logs INDEXED BY idx_query_logs_blocked_timestamp",
+                "processed" => "query_logs INDEXED BY idx_query_logs_processed_timestamp",
+                "failed" => "query_logs INDEXED BY idx_query_logs_failed_timestamp",
+                _ => "query_logs",
+            }
+        } else {
+            "query_logs"
+        };
+        let use_search_index = query_log_search_is_indexable(search);
+        let search_index_sql = if use_search_index {
+            " AND id IN (
+                SELECT rowid FROM query_logs_search WHERE domain LIKE :search
+                UNION
+                SELECT rowid FROM query_logs_search WHERE client_ip LIKE :search
+                UNION
+                SELECT rowid FROM query_logs_search WHERE upstream_server LIKE :search
+                UNION
+                SELECT rowid FROM query_logs_search WHERE error LIKE :search
+             )"
+        } else {
+            ""
+        };
         let search_sql = if search.is_empty() {
             ""
         } else {
@@ -538,7 +629,7 @@ impl Database {
                 OR COALESCE(error, '') LIKE :search
              )"
         };
-        let where_sql = format!("timestamp >= :since{search_sql}{filter_sql}");
+        let where_sql = format!("timestamp >= :since{search_index_sql}{search_sql}{filter_sql}");
         let sql = format!(
             "SELECT
                 id,
@@ -565,7 +656,7 @@ impl Database {
                 response_answer_count,
                 response_answers,
                 response_truncated
-             FROM query_logs
+             FROM {query_logs_source}
              WHERE {where_sql}
              ORDER BY timestamp DESC, id DESC
              LIMIT :limit OFFSET :offset"
@@ -576,7 +667,7 @@ impl Database {
         let limit = i64::from(page_size);
         let offset = i64::from(page.saturating_sub(1)) * i64::from(page_size);
         let conn = self.lock_read()?;
-        let total_sql = format!("SELECT COUNT(*) FROM query_logs WHERE {where_sql}");
+        let total_sql = format!("SELECT COUNT(*) FROM {query_logs_source} WHERE {where_sql}");
         let total = if search.is_empty() {
             conn.query_row(
                 &total_sql,
@@ -735,6 +826,13 @@ impl Database {
             .read_gate
             .write()
             .map_err(|_| "数据库读取门闩已损坏".to_string())?;
+        // VACUUM 不会合并 FTS5 的删除记录；大量日志清理后先压缩倒排段，
+        // 避免搜索已删除关键词时仍遍历旧 posting list。
+        conn.execute(
+            "INSERT INTO query_logs_search(query_logs_search) VALUES('optimize')",
+            [],
+        )
+        .map_err(|e| format!("压缩查询日志搜索索引失败：{e}"))?;
         conn.execute_batch("VACUUM")
             .map_err(|e| format!("压缩数据库失败：{e}"))?;
         // VACUUM 经由 WAL 重写数据，随后显式检查点并截断，确保 -wal 文件占用同步下降
@@ -910,6 +1008,28 @@ fn parallel_log_stats(
 }
 
 fn total_log_counts(conn: &Connection, since_hour: u64) -> Result<DashboardTotals, String> {
+    if since_hour == 0 {
+        return conn
+            .query_row(
+                "SELECT queries, blocked, forwarded, failed, first_seen_at, last_seen_at
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'total' AND value = ''",
+                [],
+                |row| {
+                    Ok((
+                        read_u64(row, 0)?,
+                        read_u64(row, 1)?,
+                        read_u64(row, 2)?,
+                        read_u64(row, 3)?,
+                        read_optional_u64(row, 4)?,
+                        read_optional_u64(row, 5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map(|counts| counts.unwrap_or_default())
+            .map_err(|e| format!("读取永久累计统计失败：{e}"));
+    }
     let since = u64_to_db_i64(since_hour, "统计起始小时")?;
     conn.query_row(
         "SELECT
@@ -1151,6 +1271,29 @@ fn execute_hourly_stat_upsert(
     Ok(())
 }
 
+fn execute_lifetime_stat_upsert(
+    statement: &mut rusqlite::Statement<'_>,
+    key: &HourlyStatKey,
+    delta: &StatDelta,
+    observed_at: u64,
+) -> Result<(), String> {
+    statement
+        .execute(params![
+            key.dimension,
+            key.value,
+            u64_to_db_i64(delta.queries, "永久统计查询数")?,
+            u64_to_db_i64(delta.blocked, "永久统计拦截数")?,
+            u64_to_db_i64(delta.forwarded, "永久统计转发数")?,
+            u64_to_db_i64(delta.failed, "永久统计失败数")?,
+            u64_to_db_i64(delta.requests, "永久统计上游请求数")?,
+            u64_to_db_i64(delta.latency_total_ms, "永久统计上游总耗时")?,
+            u64_to_db_i64(delta.latency_samples, "永久统计上游耗时样本数")?,
+            u64_to_db_i64(observed_at, "永久统计观测时间")?,
+        ])
+        .map_err(|e| format!("写入永久统计失败：{e}"))?;
+    Ok(())
+}
+
 fn stored_client_ip(entry: &QueryLogEntry, anonymize_client_ip: bool) -> Option<String> {
     entry.client_ip.as_deref().map(|ip| {
         if anonymize_client_ip {
@@ -1201,7 +1344,18 @@ fn read_query_log_record(row: &Row<'_>) -> rusqlite::Result<QueryLogRecord> {
     })
 }
 
+fn query_log_search_is_indexable(search: &str) -> bool {
+    // trigram 至少需要三个字符。LIKE 中的通配符必须继续走原查询，否则会改变
+    // 既有搜索语义；NUL 也回退给普通 LIKE 处理。
+    search.chars().count() >= 3
+        && !search
+            .chars()
+            .any(|character| matches!(character, '%' | '_' | '\0'))
+}
+
 fn init_schema(conn: &Connection) -> Result<(), String> {
+    let query_log_search_existed = sqlite_object_exists(conn, "table", "query_logs_search")
+        .map_err(|e| format!("检查查询日志搜索索引失败：{e}"))?;
     conn.execute_batch(
         "
         PRAGMA journal_mode = WAL;
@@ -1339,14 +1493,61 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     add_column_if_missing(conn, "query_logs", "response_truncated", "INTEGER")?;
     conn.execute_batch(
         "
+        CREATE VIRTUAL TABLE IF NOT EXISTS query_logs_search USING fts5(
+            domain,
+            client_ip,
+            upstream_server,
+            error,
+            content = 'query_logs',
+            content_rowid = 'id',
+            tokenize = 'trigram',
+            detail = 'none'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS query_logs_search_insert
+        AFTER INSERT ON query_logs BEGIN
+            INSERT INTO query_logs_search(
+                rowid, domain, client_ip, upstream_server, error
+            ) VALUES (
+                new.id, new.domain, new.client_ip, new.upstream_server, new.error
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS query_logs_search_delete
+        AFTER DELETE ON query_logs BEGIN
+            INSERT INTO query_logs_search(
+                query_logs_search, rowid, domain, client_ip, upstream_server, error
+            ) VALUES (
+                'delete', old.id, old.domain, old.client_ip, old.upstream_server, old.error
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS query_logs_search_update
+        AFTER UPDATE OF domain, client_ip, upstream_server, error ON query_logs BEGIN
+            INSERT INTO query_logs_search(
+                query_logs_search, rowid, domain, client_ip, upstream_server, error
+            ) VALUES (
+                'delete', old.id, old.domain, old.client_ip, old.upstream_server, old.error
+            );
+            INSERT INTO query_logs_search(
+                rowid, domain, client_ip, upstream_server, error
+            ) VALUES (
+                new.id, new.domain, new.client_ip, new.upstream_server, new.error
+            );
+        END;
+
+        -- 下面三个旧索引服务于早期直接扫描 query_logs 的统计/精确筛选；当前统计走
+        -- 汇总表、模糊搜索走 trigram，继续维护它们只会放大每条日志的写入与占用。
+        DROP INDEX IF EXISTS idx_query_logs_domain;
+        DROP INDEX IF EXISTS idx_query_logs_blocked_domain;
+        DROP INDEX IF EXISTS idx_query_logs_upstream_server;
+
         CREATE INDEX IF NOT EXISTS idx_query_logs_timestamp
             ON query_logs(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_query_logs_domain
-            ON query_logs(domain);
-        CREATE INDEX IF NOT EXISTS idx_query_logs_blocked_domain
-            ON query_logs(blocked, domain);
-        CREATE INDEX IF NOT EXISTS idx_query_logs_upstream_server
-            ON query_logs(upstream_server);
+        CREATE INDEX IF NOT EXISTS idx_query_logs_blocked_timestamp
+            ON query_logs(timestamp DESC, id DESC) WHERE blocked = 1;
+        CREATE INDEX IF NOT EXISTS idx_query_logs_failed_timestamp
+            ON query_logs(timestamp DESC, id DESC) WHERE failed = 1;
+        CREATE INDEX IF NOT EXISTS idx_query_logs_processed_timestamp
+            ON query_logs(timestamp DESC, id DESC) WHERE blocked = 0 AND failed = 0;
         CREATE INDEX IF NOT EXISTS idx_query_log_domain_stats_domain
             ON query_log_domain_stats(domain);
         CREATE INDEX IF NOT EXISTS idx_query_log_upstream_stats_upstream
@@ -1355,35 +1556,49 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             ON query_log_client_stats(client_ip);
         CREATE INDEX IF NOT EXISTS idx_query_log_blocklist_stats_source
             ON query_log_blocklist_stats(rule_source);
-        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_queries
-            ON dashboard_summary_stats(scope, dimension, queries DESC, value);
-        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_blocked
-            ON dashboard_summary_stats(scope, dimension, blocked DESC, value);
-        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_requests
-            ON dashboard_summary_stats(scope, dimension, requests DESC, value);
+        -- 永久排行榜只读取非零数据。升级时移除旧的全量索引，改用新名称的部分索引；
+        -- 后续启动因 IF NOT EXISTS 不会重复重建。
+        DROP INDEX IF EXISTS idx_dashboard_summary_queries;
+        DROP INDEX IF EXISTS idx_dashboard_summary_blocked;
+        DROP INDEX IF EXISTS idx_dashboard_summary_requests;
+        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_queries_nonzero
+            ON dashboard_summary_stats(scope, dimension, queries DESC, value)
+            WHERE queries > 0;
+        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_blocked_nonzero
+            ON dashboard_summary_stats(scope, dimension, blocked DESC, value)
+            WHERE blocked > 0;
+        CREATE INDEX IF NOT EXISTS idx_dashboard_summary_requests_nonzero
+            ON dashboard_summary_stats(scope, dimension, requests DESC, value)
+            WHERE requests > 0;
         CREATE INDEX IF NOT EXISTS idx_statistics_hourly_dimension_window
             ON statistics_hourly(dimension, hour, value);
         ",
     )
     .map_err(|e| format!("初始化数据库索引失败：{e}"))?;
-    if !table_has_rows(conn, "dashboard_summary_stats")
-        .map_err(|e| format!("检查仪表盘汇总数据失败：{e}"))?
+    let hourly_statistics_initialized = database_meta_key_exists(
+        conn,
+        HOURLY_STATISTICS_INITIALIZED_KEY,
+        "检查小时统计迁移状态",
+    )?;
+    if !hourly_statistics_initialized
+        && !table_has_rows(conn, "dashboard_summary_stats")
+            .map_err(|e| format!("检查仪表盘汇总数据失败：{e}"))?
     {
         backfill_query_log_stats_if_empty(conn)?;
         backfill_dashboard_summary_if_empty(conn)?;
     }
     initialize_hourly_statistics(conn)?;
+    initialize_lifetime_statistics(conn)?;
+    initialize_query_log_search(conn, query_log_search_existed)?;
     Ok(())
 }
 
 fn initialize_hourly_statistics(conn: &Connection) -> Result<(), String> {
-    let initialized = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM database_meta WHERE key = ?1)",
-            params![HOURLY_STATISTICS_INITIALIZED_KEY],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|e| format!("检查小时统计迁移状态失败：{e}"))?;
+    let initialized = database_meta_key_exists(
+        conn,
+        HOURLY_STATISTICS_INITIALIZED_KEY,
+        "检查小时统计迁移状态",
+    )?;
     if initialized {
         return Ok(());
     }
@@ -1399,6 +1614,91 @@ fn mark_hourly_statistics_initialized(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("保存小时统计迁移状态失败：{e}"))?;
     Ok(())
+}
+
+fn initialize_lifetime_statistics(conn: &Connection) -> Result<(), String> {
+    let initialized = database_meta_key_exists(
+        conn,
+        LIFETIME_STATISTICS_INITIALIZED_KEY,
+        "检查永久统计迁移状态",
+    )?;
+    if initialized {
+        return Ok(());
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("创建永久统计迁移事务失败：{e}"))?;
+    rebuild_lifetime_statistics(&tx, None)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO database_meta (key, value) VALUES (?1, '1')",
+        params![LIFETIME_STATISTICS_INITIALIZED_KEY],
+    )
+    .map_err(|e| format!("保存永久统计迁移状态失败：{e}"))?;
+    tx.commit()
+        .map_err(|e| format!("提交永久统计迁移失败：{e}"))
+}
+
+fn rebuild_lifetime_statistics(conn: &Connection, since_hour: Option<i64>) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM dashboard_summary_stats WHERE scope = 'all'",
+        [],
+    )
+    .map_err(|e| format!("重置旧永久统计失败：{e}"))?;
+    let where_sql = if since_hour.is_some() {
+        "WHERE hour >= ?1"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "INSERT INTO dashboard_summary_stats (
+            scope, dimension, value, queries, blocked, forwarded, failed,
+            requests, latency_total_ms, latency_samples, first_seen_at, last_seen_at
+         )
+         SELECT
+            'all', dimension, value, SUM(queries), SUM(blocked), SUM(forwarded),
+            SUM(failed), SUM(requests), SUM(latency_total_ms), SUM(latency_samples),
+            MIN(hour) * 3600, MAX(hour) * 3600
+         FROM statistics_hourly
+         {where_sql}
+         GROUP BY dimension, value"
+    );
+    match since_hour {
+        Some(since_hour) => conn.execute(&sql, params![since_hour]),
+        None => conn.execute(&sql, []),
+    }
+    .map_err(|e| format!("汇总永久统计失败：{e}"))?;
+    Ok(())
+}
+
+fn initialize_query_log_search(
+    conn: &Connection,
+    search_table_existed: bool,
+) -> Result<(), String> {
+    let initialized = database_meta_key_exists(
+        conn,
+        QUERY_LOG_SEARCH_INITIALIZED_KEY,
+        "检查查询日志搜索迁移状态",
+    )?;
+    if initialized && search_table_existed {
+        return Ok(());
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("创建查询日志搜索迁移事务失败：{e}"))?;
+    tx.execute(
+        "INSERT INTO query_logs_search(query_logs_search) VALUES('rebuild')",
+        [],
+    )
+    .map_err(|e| format!("构建查询日志搜索索引失败：{e}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO database_meta (key, value) VALUES (?1, '1')",
+        params![QUERY_LOG_SEARCH_INITIALIZED_KEY],
+    )
+    .map_err(|e| format!("保存查询日志搜索迁移状态失败：{e}"))?;
+    tx.commit()
+        .map_err(|e| format!("提交查询日志搜索迁移失败：{e}"))
 }
 
 fn configure_connection(conn: &Connection) -> Result<(), String> {
@@ -1692,6 +1992,29 @@ fn table_has_rows(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
     )
 }
 
+fn database_meta_key_exists(conn: &Connection, key: &str, label: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM database_meta WHERE key = ?1)",
+        params![key],
+        |row| row.get(0),
+    )
+    .map_err(|e| format!("{label}失败：{e}"))
+}
+
+fn sqlite_object_exists(
+    conn: &Connection,
+    object_type: &str,
+    name: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2
+         )",
+        params![object_type, name],
+        |row| row.get(0),
+    )
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -1720,6 +2043,9 @@ fn add_column_if_missing(
 }
 
 fn grouped_domain_counts(conn: &Connection, since_hour: u64) -> Result<DomainRankings, String> {
+    if since_hour == 0 {
+        return grouped_lifetime_domain_counts(conn);
+    }
     let since = u64_to_db_i64(since_hour, "域名统计起始小时")?;
     let mut stmt = conn
         .prepare(
@@ -1774,10 +2100,62 @@ fn grouped_domain_counts(conn: &Connection, since_hour: u64) -> Result<DomainRan
     Ok((query_counts, blocked_counts))
 }
 
+fn grouped_lifetime_domain_counts(conn: &Connection) -> Result<DomainRankings, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT 0 AS ranking, value, queries AS count
+             FROM (
+                 SELECT value, queries
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'domain' AND queries > 0
+                 ORDER BY queries DESC, value ASC
+                 LIMIT 200
+             )
+             UNION ALL
+             SELECT 1 AS ranking, value, blocked AS count
+             FROM (
+                 SELECT value, blocked
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'domain' AND blocked > 0
+                 ORDER BY blocked DESC, value ASC
+                 LIMIT 200
+             )",
+        )
+        .map_err(|e| format!("准备永久域名排行查询失败：{e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                read_u64(row, 2)?,
+            ))
+        })
+        .map_err(|e| format!("读取永久域名排行失败：{e}"))?;
+
+    let mut query_counts = HashMap::new();
+    let mut blocked_counts = HashMap::new();
+    for row in rows {
+        let (ranking, domain, count) = row.map_err(|e| format!("解析永久域名排行失败：{e}"))?;
+        match ranking {
+            0 => {
+                query_counts.insert(domain, count);
+            }
+            1 => {
+                blocked_counts.insert(domain, count);
+            }
+            _ => return Err("永久域名排行类型无效".into()),
+        }
+    }
+    Ok((query_counts, blocked_counts))
+}
+
 fn client_request_counts(
     conn: &Connection,
     since_hour: u64,
 ) -> Result<HashMap<String, u64>, String> {
+    if since_hour == 0 {
+        return lifetime_count_ranking(conn, "client", "queries", "客户端");
+    }
     let since = u64_to_db_i64(since_hour, "客户端统计起始小时")?;
     let mut stmt = conn
         .prepare(
@@ -1808,6 +2186,9 @@ fn blocklist_hit_counts(
     conn: &Connection,
     since_hour: u64,
 ) -> Result<HashMap<String, u64>, String> {
+    if since_hour == 0 {
+        return lifetime_count_ranking(conn, "blocklist", "blocked", "黑名单");
+    }
     let since = u64_to_db_i64(since_hour, "黑名单统计起始小时")?;
     let mut stmt = conn
         .prepare(
@@ -1830,6 +2211,35 @@ fn blocklist_hit_counts(
     for row in rows {
         let (source, count) = row.map_err(|e| format!("解析黑名单排行失败：{e}"))?;
         counts.insert(source, count);
+    }
+    Ok(counts)
+}
+
+fn lifetime_count_ranking(
+    conn: &Connection,
+    dimension: &str,
+    count_column: &str,
+    label: &str,
+) -> Result<HashMap<String, u64>, String> {
+    let sql = format!(
+        "SELECT value, {count_column}
+         FROM dashboard_summary_stats
+         WHERE scope = 'all' AND dimension = ?1 AND {count_column} > 0
+         ORDER BY {count_column} DESC, value ASC
+         LIMIT 200"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备永久{label}排行查询失败：{e}"))?;
+    let rows = stmt
+        .query_map(params![dimension], |row| {
+            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
+        })
+        .map_err(|e| format!("读取永久{label}排行失败：{e}"))?;
+    let mut counts = HashMap::new();
+    for row in rows {
+        let (value, count) = row.map_err(|e| format!("解析永久{label}排行失败：{e}"))?;
+        counts.insert(value, count);
     }
     Ok(counts)
 }
@@ -1874,6 +2284,28 @@ fn upstream_request_counts(
     conn: &Connection,
     since_hour: u64,
 ) -> Result<Vec<UpstreamRequestStat>, String> {
+    if since_hour == 0 {
+        let mut stmt = conn
+            .prepare(
+                "SELECT value, requests
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'upstream' AND requests > 0
+                 ORDER BY requests DESC, value ASC
+                 LIMIT 200",
+            )
+            .map_err(|e| format!("准备永久上游请求排行失败：{e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UpstreamRequestStat {
+                    upstream: row.get(0)?,
+                    requests: read_u64(row, 1)?,
+                })
+            })
+            .map_err(|e| format!("读取永久上游请求排行失败：{e}"))?;
+        return rows
+            .map(|row| row.map_err(|e| format!("解析永久上游请求排行失败：{e}")))
+            .collect();
+    }
     let since = u64_to_db_i64(since_hour, "上游统计起始小时")?;
     let mut stmt = conn
         .prepare(
@@ -1906,6 +2338,34 @@ fn upstream_avg_latency(
     conn: &Connection,
     since_hour: u64,
 ) -> Result<Vec<UpstreamLatencyStat>, String> {
+    if since_hour == 0 {
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    value,
+                    CAST(ROUND(
+                        CAST(latency_total_ms AS REAL) / latency_samples
+                    ) AS INTEGER)
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all'
+                   AND dimension = 'upstream'
+                   AND latency_samples > 0
+                 ORDER BY CAST(latency_total_ms AS REAL) / latency_samples ASC, value ASC
+                 LIMIT 200",
+            )
+            .map_err(|e| format!("准备永久上游响应时间排行失败：{e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(UpstreamLatencyStat {
+                    upstream: row.get(0)?,
+                    avg_ms: read_u64(row, 1)?,
+                })
+            })
+            .map_err(|e| format!("读取永久上游响应时间排行失败：{e}"))?;
+        return rows
+            .map(|row| row.map_err(|e| format!("解析永久上游响应时间排行失败：{e}")))
+            .collect();
+    }
     let since = u64_to_db_i64(since_hour, "上游延迟统计起始小时")?;
     let mut stmt = conn
         .prepare(
@@ -1993,6 +2453,30 @@ fn anonymize_ip(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_query_log(domain: &str) -> QueryLogEntry {
+        QueryLogEntry {
+            domain: domain.into(),
+            query_type: 1,
+            query_class: 1,
+            transport: "udp".into(),
+            response_source: "upstream".into(),
+            response: None,
+            client_ip: Some("192.168.1.42".into()),
+            blocked: false,
+            forwarded: true,
+            failed: false,
+            upstream_server: Some("223.5.5.5:53".into()),
+            upstream_duration_ms: Some(12),
+            processing_duration_ms: 12.5,
+            error: None,
+            matched_rule: None,
+            rule_source: None,
+            rule_type: None,
+            important_overrode: false,
+            allowlist_rule: None,
+        }
+    }
 
     #[test]
     fn stores_config_and_query_logs() {
@@ -2159,6 +2643,353 @@ mod tests {
         assert_eq!(expired.queries, 0);
         assert_eq!(expired.blocked, 0);
         assert!(expired.query_domains.is_empty());
+    }
+
+    #[test]
+    fn query_log_search_index_preserves_like_results_and_stays_in_sync() {
+        let db = Database::open_in_memory().expect("db should open");
+        let mut blocked = sample_query_log("ads.example.org");
+        blocked.blocked = true;
+        blocked.forwarded = false;
+        blocked.upstream_server = None;
+        blocked.error = Some("命中过滤规则".into());
+        let safe = sample_query_log("safe.test");
+        db.insert_query_logs(&[(blocked, false), (safe, false)])
+            .expect("query logs should save");
+
+        let by_domain = db
+            .query_logs(24, "all", "example", 1, 20)
+            .expect("domain substring should search");
+        assert_eq!(by_domain.total, 1);
+        assert_eq!(by_domain.records[0].domain, "ads.example.org");
+
+        let by_client = db
+            .query_logs(24, "all", "168.1", 1, 20)
+            .expect("client substring should search");
+        assert_eq!(by_client.total, 2);
+        let by_upstream = db
+            .query_logs(24, "all", "223.5", 1, 20)
+            .expect("upstream substring should search");
+        assert_eq!(by_upstream.total, 1);
+        let by_error = db
+            .query_logs(24, "all", "过滤规则", 1, 20)
+            .expect("error substring should search");
+        assert_eq!(by_error.total, 1);
+
+        // 少于三个字符和 LIKE 通配符保持原语义，自动回退到原查询。
+        assert_eq!(
+            db.query_logs(24, "all", "ad", 1, 20)
+                .expect("short search should fall back")
+                .total,
+            1
+        );
+        assert_eq!(
+            db.query_logs(24, "all", "%", 1, 20)
+                .expect("wildcard search should fall back")
+                .total,
+            2
+        );
+
+        let conn = db.lock().expect("database should lock");
+        let search_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM query_logs
+                 WHERE timestamp >= 0
+                   AND id IN (
+                       SELECT rowid FROM query_logs_search
+                       WHERE domain LIKE '%missing-value%'
+                   )",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("search query plan should load");
+        assert!(
+            search_plan
+                .iter()
+                .any(|detail| detail.contains("VIRTUAL TABLE INDEX"))
+        );
+        drop(conn);
+
+        db.clear_query_logs().expect("query logs should clear");
+        assert_eq!(
+            db.query_logs(24, "all", "example", 1, 20)
+                .expect("cleared search index should remain readable")
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn filtered_query_logs_use_partial_time_indexes() {
+        let db = Database::open_in_memory().expect("db should open");
+        let conn = db.lock().expect("database should lock");
+        for (predicate, index) in [
+            ("blocked = 1", "idx_query_logs_blocked_timestamp"),
+            ("failed = 1", "idx_query_logs_failed_timestamp"),
+            (
+                "blocked = 0 AND failed = 0",
+                "idx_query_logs_processed_timestamp",
+            ),
+        ] {
+            let sql = format!(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM query_logs INDEXED BY {index}
+                 WHERE timestamp >= 0 AND {predicate}
+                 ORDER BY timestamp DESC, id DESC LIMIT 50"
+            );
+            let details = conn
+                .prepare(&sql)
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(3))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("filter query plan should load");
+            assert!(
+                details.iter().any(|detail| detail.contains(index)),
+                "{predicate} should use {index}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_summary_migrates_to_partial_ranking_indexes() {
+        let db = Database::open_in_memory().expect("db should open");
+        let conn = db.lock().expect("database should lock");
+        conn.execute_batch(
+            "DROP INDEX idx_dashboard_summary_queries_nonzero;
+             DROP INDEX idx_dashboard_summary_blocked_nonzero;
+             DROP INDEX idx_dashboard_summary_requests_nonzero;
+             CREATE INDEX idx_dashboard_summary_queries
+                 ON dashboard_summary_stats(scope, dimension, queries DESC, value);
+             CREATE INDEX idx_dashboard_summary_blocked
+                 ON dashboard_summary_stats(scope, dimension, blocked DESC, value);
+             CREATE INDEX idx_dashboard_summary_requests
+                 ON dashboard_summary_stats(scope, dimension, requests DESC, value);",
+        )
+        .expect("legacy dashboard indexes should create");
+
+        init_schema(&conn).expect("dashboard indexes should migrate");
+        init_schema(&conn).expect("dashboard index migration should be idempotent");
+
+        let legacy_indexes: u64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN (
+                       'idx_dashboard_summary_queries',
+                       'idx_dashboard_summary_blocked',
+                       'idx_dashboard_summary_requests'
+                   )",
+                [],
+                |row| read_u64(row, 0),
+            )
+            .expect("legacy dashboard indexes should count");
+        assert_eq!(legacy_indexes, 0);
+
+        for (index, count_column, predicate, dimension) in [
+            (
+                "idx_dashboard_summary_queries_nonzero",
+                "queries",
+                "queries > 0",
+                "domain",
+            ),
+            (
+                "idx_dashboard_summary_blocked_nonzero",
+                "blocked",
+                "blocked > 0",
+                "domain",
+            ),
+            (
+                "idx_dashboard_summary_requests_nonzero",
+                "requests",
+                "requests > 0",
+                "upstream",
+            ),
+        ] {
+            let index_sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .expect("partial dashboard index should exist exactly once");
+            assert!(
+                index_sql.contains(&format!("WHERE {predicate}")),
+                "{index} should retain its partial predicate: {index_sql}"
+            );
+
+            let explain_sql = format!(
+                "EXPLAIN QUERY PLAN
+                 SELECT value, {count_column}
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = ?1 AND {predicate}
+                 ORDER BY {count_column} DESC, value ASC
+                 LIMIT 200"
+            );
+            let details = conn
+                .prepare(&explain_sql)
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![dimension], |row| row.get::<_, String>(3))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .expect("dashboard ranking query plan should load");
+            assert!(
+                details.iter().any(|detail| detail.contains(index)),
+                "{predicate} ranking should use {index}: {details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_statistics_survive_hourly_detail_pruning() {
+        let db = Database::open_in_memory().expect("db should open");
+        db.insert_query_logs(&[(sample_query_log("old.example"), false)])
+            .expect("statistics should save");
+        {
+            let conn = db.lock().expect("database should lock");
+            conn.execute("UPDATE statistics_hourly SET hour = 1", [])
+                .expect("hourly detail should become old");
+        }
+
+        db.prune_expired(24, 0)
+            .expect("permanent statistics should prune bounded detail");
+        let permanent = db.log_stats(0).expect("permanent statistics should load");
+        assert_eq!(permanent.queries, 1);
+        assert_eq!(permanent.query_domains.get("old.example"), Some(&1));
+        let finite = db.log_stats(24).expect("finite statistics should load");
+        assert_eq!(finite.queries, 0);
+        assert!(finite.query_domains.is_empty());
+
+        let conn = db.lock().expect("database should lock");
+        let hourly_rows: u64 = conn
+            .query_row("SELECT COUNT(*) FROM statistics_hourly", [], |row| {
+                read_u64(row, 0)
+            })
+            .expect("hourly rows should count");
+        assert_eq!(hourly_rows, 0);
+    }
+
+    #[test]
+    fn lifetime_statistics_migration_aggregates_existing_hourly_rows_once() {
+        let db = Database::open_in_memory().expect("db should open");
+        let conn = db.lock().expect("database should lock");
+        conn.execute(
+            "DELETE FROM database_meta WHERE key = ?1",
+            params![LIFETIME_STATISTICS_INITIALIZED_KEY],
+        )
+        .expect("lifetime migration marker should clear");
+        conn.execute(
+            "DELETE FROM dashboard_summary_stats WHERE scope = 'all'",
+            [],
+        )
+        .expect("lifetime summary should clear");
+        conn.execute_batch(
+            "INSERT INTO statistics_hourly
+                (hour, dimension, value, queries, blocked)
+             VALUES
+                (10, 'total', '', 3, 1),
+                (11, 'total', '', 4, 2),
+                (10, 'domain', 'ads.example', 3, 1),
+                (11, 'domain', 'ads.example', 4, 2);",
+        )
+        .expect("old hourly statistics should insert");
+
+        initialize_lifetime_statistics(&conn).expect("lifetime statistics should migrate");
+        initialize_lifetime_statistics(&conn).expect("lifetime migration should be idempotent");
+        let totals: (u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT queries, blocked, first_seen_at, last_seen_at
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = 'total' AND value = ''",
+                [],
+                |row| {
+                    Ok((
+                        read_u64(row, 0)?,
+                        read_u64(row, 1)?,
+                        read_u64(row, 2)?,
+                        read_u64(row, 3)?,
+                    ))
+                },
+            )
+            .expect("lifetime totals should load");
+        assert_eq!(totals, (7, 3, 10 * 3600, 11 * 3600));
+    }
+
+    #[test]
+    fn finite_retention_defers_lifetime_updates_until_switching_to_permanent() {
+        let db = Database::open_in_memory().expect("db should open");
+        let finite = AppConfig {
+            statistics_retention_hours: 24,
+            ..AppConfig::default()
+        };
+        db.save_config(&finite).expect("finite config should save");
+        db.insert_query_logs(&[(sample_query_log("retained.example"), false)])
+            .expect("finite statistics should save");
+        {
+            let conn = db.lock().expect("database should lock");
+            let lifetime_rows: u64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM dashboard_summary_stats WHERE scope = 'all'",
+                    [],
+                    |row| read_u64(row, 0),
+                )
+                .expect("lifetime rows should count");
+            assert_eq!(lifetime_rows, 0);
+        }
+
+        let permanent = AppConfig {
+            statistics_retention_hours: 0,
+            ..finite
+        };
+        db.save_config(&permanent)
+            .expect("permanent config should rebuild lifetime statistics");
+        let stats = db.log_stats(0).expect("permanent statistics should load");
+        assert_eq!(stats.queries, 1);
+        assert_eq!(stats.query_domains.get("retained.example"), Some(&1));
+    }
+
+    #[test]
+    fn switching_to_permanent_rolls_back_summary_when_config_save_fails() {
+        let db = Database::open_in_memory().expect("db should open");
+        let finite = AppConfig {
+            statistics_retention_hours: 24,
+            ..AppConfig::default()
+        };
+        db.save_config(&finite).expect("finite config should save");
+        db.insert_query_logs(&[(sample_query_log("retained.example"), false)])
+            .expect("finite statistics should save");
+        {
+            let conn = db.lock().expect("database should lock");
+            conn.execute_batch(
+                "CREATE TRIGGER reject_config_update
+                 BEFORE UPDATE ON app_config
+                 BEGIN
+                    SELECT RAISE(ABORT, 'reject test config update');
+                 END;",
+            )
+            .expect("failure trigger should create");
+        }
+
+        let permanent = AppConfig {
+            statistics_retention_hours: 0,
+            ..finite
+        };
+        assert!(db.save_config(&permanent).is_err());
+        assert_eq!(db.statistics_retention_hours.load(Ordering::Relaxed), 24);
+
+        let conn = db.lock().expect("database should lock");
+        let lifetime_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dashboard_summary_stats WHERE scope = 'all'",
+                [],
+                |row| read_u64(row, 0),
+            )
+            .expect("lifetime rows should count");
+        assert_eq!(lifetime_rows, 0);
     }
 
     #[test]
@@ -2364,13 +3195,13 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("upstream_server column should exist");
-        let upstream_index: String = conn
+        let search_table: String = conn
             .query_row(
-                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_query_logs_upstream_server'",
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'query_logs_search'",
                 [],
                 |row| row.get(0),
             )
-            .expect("upstream index should exist");
+            .expect("query log search table should exist");
         let query_type: String = conn
             .query_row(
                 "SELECT name FROM pragma_table_info('query_logs') WHERE name = 'query_type'",
@@ -2415,7 +3246,7 @@ mod tests {
             .expect("blocklist stats table should exist");
 
         assert_eq!(upstream_server, "upstream_server");
-        assert_eq!(upstream_index, "idx_query_logs_upstream_server");
+        assert_eq!(search_table, "query_logs_search");
         assert_eq!(query_type, "query_type");
         assert_eq!(response_source, "response_source");
         assert_eq!(processing_duration_ms, "processing_duration_ms");
@@ -2779,6 +3610,12 @@ mod tests {
         assert_eq!(
             db.query_logs(24, "all", "", 1, 20)
                 .expect("logs should load")
+                .total,
+            1
+        );
+        assert_eq!(
+            db.query_logs(24, "all", "a.example", 1, 20)
+                .expect("search index should load after vacuum")
                 .total,
             1
         );
