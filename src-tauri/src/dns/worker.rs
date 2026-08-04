@@ -4,7 +4,7 @@ use std::{
     io,
     net::{SocketAddr, UdpSocket},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -38,7 +38,6 @@ use super::{
 };
 
 const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
-const PENDING_QUERY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OPTIMISTIC_REFRESH_MAX_QUEUE_WAIT: Duration = Duration::from_secs(2);
 const FORWARD_QUERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
 // Windows 刚连上或自动恢复 Wi-Fi 时，路由表和既有 UDP socket 可能暂时不可用。
@@ -57,6 +56,8 @@ const WINDOWS_UDP_NO_BUFFER_SPACE: i32 = 10055;
 const WINDOWS_UDP_SEND_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(1), Duration::from_millis(2)];
 pub(crate) const PENDING_QUERY_SHARDS: usize = 64;
+// 单个域名的等待者上限，避免故障域名被反复重试时无限堆积待投递的响应目标。
+const MAX_PENDING_FOLLOWERS: usize = 512;
 
 pub(crate) struct DnsWorkItem {
     pub(crate) query: Vec<u8>,
@@ -65,6 +66,7 @@ pub(crate) struct DnsWorkItem {
     pub(crate) queued_at: Instant,
 }
 
+#[derive(Clone)]
 pub(crate) enum DnsResponseTarget {
     Udp {
         socket: Arc<UdpSocket>,
@@ -96,8 +98,22 @@ pub(crate) struct DnsWorkerContext {
 type PendingQuery = Arc<PendingQueryState>;
 
 struct PendingQueryState {
-    result: Mutex<Option<Result<UpstreamForwardResponse, String>>>,
-    ready: Condvar,
+    /// 已登记、等待 leader 结果的重复查询。leader 完成时 `take` 成 `None`，
+    /// 此后到达的重复查询会看到 `None` 并退化成自己转发。
+    followers: Mutex<Option<Vec<PendingFollower>>>,
+}
+
+/// 重复查询投递响应所需的全部上下文。leader 拿到上游结果后代替 follower 投递，
+/// follower 因此不必占用 worker 线程阻塞等待。
+struct PendingFollower {
+    query: Vec<u8>,
+    client_addr: SocketAddr,
+    response_target: DnsResponseTarget,
+    domain: String,
+    query_type: u16,
+    query_class: u16,
+    transport: &'static str,
+    processing_started: Instant,
 }
 
 enum PendingQueryRole {
@@ -216,8 +232,7 @@ fn query_cache_key_shard_index(cache_key: &QueryCacheKey, shard_count: usize) ->
 
 fn new_pending_query() -> PendingQuery {
     Arc::new(PendingQueryState {
-        result: Mutex::new(None),
-        ready: Condvar::new(),
+        followers: Mutex::new(Some(Vec::new())),
     })
 }
 
@@ -486,61 +501,23 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         match begin_pending_query(context, cache_key) {
             PendingQueryRole::Leader(pending_query) => Some(pending_query),
             PendingQueryRole::Follower(pending_query) => {
-                match wait_pending_query(&pending_query) {
-                    Ok(forwarded) => {
-                        let response = prepare_forwarded_response(&forwarded.response, query);
-                        if let Err(error) = send_dns_response(response_target, query, &response) {
-                            let message = format!("转发复用响应给客户端失败：{error}");
-                            record_error(&context.stats, message.clone());
-                            queue_query_log(
-                                context,
-                                &filter,
-                                &log_metadata,
-                                client_addr,
-                                QueryResponseSource::Upstream,
-                                false,
-                                true,
-                                true,
-                                Some(&forwarded.upstream),
-                                Some(forwarded.duration_ms),
-                                Some(message),
-                            );
-                        } else {
-                            queue_query_log_with_response(
-                                context,
-                                &filter,
-                                &log_metadata,
-                                client_addr,
-                                QueryResponseSource::Upstream,
-                                false,
-                                false,
-                                false,
-                                Some(&forwarded.upstream),
-                                Some(forwarded.duration_ms),
-                                None,
-                                Some(&response),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        record_error(&context.stats, error.clone());
-                        send_no_response(response_target);
-                        queue_query_log(
-                            context,
-                            &filter,
-                            &log_metadata,
-                            client_addr,
-                            QueryResponseSource::Upstream,
-                            false,
-                            false,
-                            true,
-                            None,
-                            None,
-                            Some(error),
-                        );
-                    }
+                // 登记响应目标后立刻让出 worker 线程，由 leader 代为投递。
+                // 阻塞等待会让同一域名的重复查询吃满 worker，上游抖动时连缓存命中都被拖住。
+                let follower = PendingFollower {
+                    query: work_item.query.clone(),
+                    client_addr,
+                    response_target: response_target.clone(),
+                    domain: question.domain.clone(),
+                    query_type: question.qtype,
+                    query_class: question.qclass,
+                    transport: log_metadata.transport,
+                    processing_started,
+                };
+                if register_pending_follower(&pending_query, follower) {
+                    return;
                 }
-                return;
+                // leader 已经完成或等待者过多，退化成自己转发。
+                None
             }
         }
     } else {
@@ -557,7 +534,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         &context.stats,
     );
     if let (Some(cache_key), Some(pending_query)) = (cache_key.as_ref(), pending_query.as_ref()) {
-        finish_pending_query(context, cache_key, pending_query, forward_result.clone());
+        finish_pending_query(context, &filter, cache_key, pending_query, &forward_result);
     }
 
     match forward_result {
@@ -732,40 +709,113 @@ fn begin_pending_query(context: &DnsWorkerContext, cache_key: &QueryCacheKey) ->
     context.pending_queries.begin(cache_key)
 }
 
-fn finish_pending_query(
-    context: &DnsWorkerContext,
-    cache_key: &QueryCacheKey,
-    pending_query: &PendingQuery,
-    result: Result<UpstreamForwardResponse, String>,
-) {
-    if let Ok(mut current) = pending_query.result.lock() {
-        *current = Some(result);
-        pending_query.ready.notify_all();
+/// 登记成功返回 true，此时 worker 可以立即处理下一个请求。
+/// leader 已经完成（或等待者过多）时返回 false，调用方应退化成自己转发。
+fn register_pending_follower(pending_query: &PendingQuery, follower: PendingFollower) -> bool {
+    let Ok(mut followers) = pending_query.followers.lock() else {
+        return false;
+    };
+    match followers.as_mut() {
+        Some(followers) if followers.len() < MAX_PENDING_FOLLOWERS => {
+            followers.push(follower);
+            true
+        }
+        _ => false,
     }
-
-    context.pending_queries.finish(cache_key, pending_query);
 }
 
-fn wait_pending_query(pending_query: &PendingQuery) -> Result<UpstreamForwardResponse, String> {
-    let result = pending_query
-        .result
+fn finish_pending_query(
+    context: &DnsWorkerContext,
+    filter: &FilterRuntime,
+    cache_key: &QueryCacheKey,
+    pending_query: &PendingQuery,
+    result: &Result<UpstreamForwardResponse, String>,
+) {
+    // 先摘掉共享入口，随后到达的重复查询会另起一个 leader，不会等待已完成的结果。
+    context.pending_queries.finish(cache_key, pending_query);
+
+    let followers = pending_query
+        .followers
         .lock()
-        .map_err(|_| "等待重复 DNS 请求结果失败".to_string())?;
-    let (result, timeout) = pending_query
-        .ready
-        .wait_timeout_while(result, PENDING_QUERY_WAIT_TIMEOUT, |result| {
-            result.is_none()
-        })
-        .map_err(|_| "等待重复 DNS 请求结果失败".to_string())?;
-
-    if timeout.timed_out() && result.is_none() {
-        return Err("等待重复 DNS 请求结果超时".to_string());
+        .ok()
+        .and_then(|mut followers| followers.take())
+        .unwrap_or_default();
+    for follower in followers {
+        deliver_pending_follower(context, filter, follower, result);
     }
+}
 
-    result
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| Err("重复 DNS 请求没有可用结果".to_string()))
+fn deliver_pending_follower(
+    context: &DnsWorkerContext,
+    filter: &FilterRuntime,
+    follower: PendingFollower,
+    result: &Result<UpstreamForwardResponse, String>,
+) {
+    let log_metadata = QueryLogMetadata {
+        domain: &follower.domain,
+        query_type: follower.query_type,
+        query_class: follower.query_class,
+        transport: follower.transport,
+        processing_started: follower.processing_started,
+    };
+    let query = follower.query.as_slice();
+    let response_target = &follower.response_target;
+    let client_addr = follower.client_addr;
+
+    match result {
+        Ok(forwarded) => {
+            let response = prepare_forwarded_response(&forwarded.response, query);
+            if let Err(error) = send_dns_response(response_target, query, &response) {
+                let message = format!("转发复用响应给客户端失败：{error}");
+                record_error(&context.stats, message.clone());
+                queue_query_log(
+                    context,
+                    filter,
+                    &log_metadata,
+                    client_addr,
+                    QueryResponseSource::Upstream,
+                    false,
+                    true,
+                    true,
+                    Some(&forwarded.upstream),
+                    Some(forwarded.duration_ms),
+                    Some(message),
+                );
+            } else {
+                queue_query_log_with_response(
+                    context,
+                    filter,
+                    &log_metadata,
+                    client_addr,
+                    QueryResponseSource::Upstream,
+                    false,
+                    false,
+                    false,
+                    Some(&forwarded.upstream),
+                    Some(forwarded.duration_ms),
+                    None,
+                    Some(&response),
+                );
+            }
+        }
+        Err(error) => {
+            record_error(&context.stats, error.clone());
+            send_no_response(response_target);
+            queue_query_log(
+                context,
+                filter,
+                &log_metadata,
+                client_addr,
+                QueryResponseSource::Upstream,
+                false,
+                false,
+                true,
+                None,
+                None,
+                Some(error.clone()),
+            );
+        }
+    }
 }
 
 fn forward_query_with_fallback(
@@ -1110,6 +1160,110 @@ fn queue_query_log_with_match(
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod pending_query_tests {
+    use std::{sync::mpsc, time::Instant};
+
+    use super::{
+        DnsResponseTarget, MAX_PENDING_FOLLOWERS, PENDING_QUERY_SHARDS, PendingFollower,
+        PendingQueries, PendingQueryRole, new_pending_query, register_pending_follower,
+    };
+    use crate::dns::{cache::QueryCacheKey, protocol::Question};
+
+    fn test_cache_key() -> QueryCacheKey {
+        QueryCacheKey::from_question(&Question {
+            domain: "example.com".into(),
+            qtype: 28,
+            qclass: 1,
+            question_end: 0,
+        })
+    }
+
+    fn test_follower() -> PendingFollower {
+        // 这些用例只验证登记行为，不投递响应，接收端无需保留
+        let (sender, _) = mpsc::sync_channel(1);
+        PendingFollower {
+            query: vec![0x12, 0x34],
+            client_addr: "127.0.0.1:1000".parse().unwrap(),
+            response_target: DnsResponseTarget::Tcp(sender),
+            domain: "example.com".into(),
+            query_type: 28,
+            query_class: 1,
+            transport: "udp",
+            processing_started: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn duplicate_query_registers_instead_of_blocking_worker() {
+        let pending_queries = PendingQueries::new(PENDING_QUERY_SHARDS);
+        let cache_key = test_cache_key();
+
+        let leader = match pending_queries.begin(&cache_key) {
+            PendingQueryRole::Leader(leader) => leader,
+            PendingQueryRole::Follower(_) => panic!("首个查询应成为 leader"),
+        };
+        let follower_pending = match pending_queries.begin(&cache_key) {
+            PendingQueryRole::Follower(pending) => pending,
+            PendingQueryRole::Leader(_) => panic!("重复查询应成为 follower"),
+        };
+
+        // 登记立即返回，worker 不会阻塞在上游结果上
+        assert!(register_pending_follower(&follower_pending, test_follower()));
+        assert_eq!(
+            leader.followers.lock().unwrap().as_ref().map(Vec::len),
+            Some(1),
+            "follower 应登记到 leader 的待投递列表"
+        );
+    }
+
+    #[test]
+    fn follower_registration_fails_after_leader_finished() {
+        let pending = new_pending_query();
+        // 模拟 leader 完成时摘掉待投递列表
+        let taken = pending.followers.lock().unwrap().take();
+        assert!(taken.is_some_and(|followers| followers.is_empty()));
+
+        assert!(
+            !register_pending_follower(&pending, test_follower()),
+            "leader 已完成后不应再登记，调用方需退化成自己转发"
+        );
+    }
+
+    #[test]
+    fn follower_registration_is_bounded() {
+        let pending = new_pending_query();
+        for _ in 0..MAX_PENDING_FOLLOWERS {
+            assert!(register_pending_follower(&pending, test_follower()));
+        }
+
+        assert!(
+            !register_pending_follower(&pending, test_follower()),
+            "等待者数量必须有上限，避免故障域名无限堆积"
+        );
+    }
+
+    #[test]
+    fn finished_leader_lets_next_duplicate_start_a_new_leader() {
+        let pending_queries = PendingQueries::new(PENDING_QUERY_SHARDS);
+        let cache_key = test_cache_key();
+
+        let leader = match pending_queries.begin(&cache_key) {
+            PendingQueryRole::Leader(leader) => leader,
+            PendingQueryRole::Follower(_) => panic!("首个查询应成为 leader"),
+        };
+        pending_queries.finish(&cache_key, &leader);
+
+        assert!(
+            matches!(
+                pending_queries.begin(&cache_key),
+                PendingQueryRole::Leader(_)
+            ),
+            "leader 完成并摘除共享入口后，下一个查询应另起 leader"
+        );
+    }
 }
 
 #[cfg(all(test, windows))]

@@ -4,7 +4,12 @@ use std::{
 };
 
 const TASK_POOL_MIN_THREADS: usize = 8;
-const TASK_POOL_MAX_THREADS: usize = 32;
+// 每个 DNS worker 在并发转发模式下会同时提交多个上游任务（最多
+// MAX_PARALLEL_UPSTREAMS_PER_QUERY 个），线程数必须跟得上 worker 数 × 单查询并行度，
+// 否则任务提交成功却排不上队，直到查询总超时都没被执行。
+// 这些线程始终阻塞在网络 I/O 上，不占 CPU，可以远多于核数。
+const TASK_POOL_MAX_THREADS: usize = 128;
+const TASK_POOL_THREADS_PER_CORE: usize = 8;
 const TASK_POOL_QUEUE_CAPACITY: usize = 4096;
 const COORDINATION_POOL_THREADS: usize = 4;
 const COORDINATION_POOL_QUEUE_CAPACITY: usize = 256;
@@ -23,7 +28,7 @@ static COORDINATION_POOL: OnceLock<TaskPool> = OnceLock::new();
 fn task_pool() -> &'static TaskPool {
     TASK_POOL.get_or_init(|| {
         let thread_count = thread::available_parallelism()
-            .map(|count| count.get().saturating_mul(4))
+            .map(|count| count.get().saturating_mul(TASK_POOL_THREADS_PER_CORE))
             .unwrap_or(TASK_POOL_MIN_THREADS)
             .clamp(TASK_POOL_MIN_THREADS, TASK_POOL_MAX_THREADS);
         TaskPool::new(thread_count, TASK_POOL_QUEUE_CAPACITY)
