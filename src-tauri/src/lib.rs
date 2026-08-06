@@ -20,9 +20,9 @@ use dns::RuntimeStatus;
 #[cfg(not(any(target_os = "macos", windows)))]
 use service_core::{
     AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, clear_query_logs_blocking,
-    clear_statistics_blocking, query_logs_blocking, save_config_blocking, spawn_filter_auto_update,
-    spawn_initial_runtime, spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking,
-    update_filters_blocking,
+    clear_statistics_blocking, query_logs_blocking, save_config_blocking,
+    spawn_database_maintenance, spawn_filter_auto_update, spawn_initial_runtime,
+    spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking, update_filters_blocking,
 };
 use service_core::{FilterCacheClearResult, FilterUpdateProgressState, FilterUpdateResult};
 use storage::{StorageInfo, StorageTargetInfo};
@@ -999,6 +999,7 @@ pub fn run() {
                     local: Some(Arc::clone(&state)),
                 }));
                 spawn_initial_runtime(initial_runtime_state);
+                spawn_database_maintenance(Arc::clone(&state));
                 spawn_runtime_watchdog(watchdog_state);
                 let app_handle = app.handle().clone();
                 spawn_filter_auto_update(auto_update_state, move |config| {
@@ -1036,6 +1037,26 @@ mod tests {
 
     use super::*;
     use crate::{config::FilterSubscription, database::Database, service_core::AppState};
+
+    /// TCP 端口空闲不代表同号 UDP 端口也空闲，而 DNS 服务要同时监听两者。
+    /// 这里探测到一个双协议都能绑的端口再交给测试，避免偶发 WSAEACCES。
+    fn free_dns_port() -> u16 {
+        for _ in 0..32 {
+            let Ok(probe) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+                continue;
+            };
+            let Ok(port) = probe.local_addr().map(|addr| addr.port()) else {
+                continue;
+            };
+            drop(probe);
+            let udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port));
+            let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, port));
+            if udp.is_ok() && tcp.is_ok() {
+                return port;
+            }
+        }
+        panic!("找不到 UDP 与 TCP 同时空闲的端口");
+    }
 
     #[test]
     fn parses_windows_system_proxy_settings() {
@@ -1091,13 +1112,163 @@ mod tests {
         assert_eq!(summary.ignored_rules, 2);
     }
 
+    /// 实测真实规模清单下"保存配置"（规则未变的热替换）的等待时间。默认跳过：
+    ///   $env:DNSBLACKHOLE_BENCH_DIR="<含 filters 子目录的数据目录>"
+    ///   cargo test --release --lib measures_real_scale_hot_swap -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measures_real_scale_hot_swap_save() {
+        let _rule_load_guard = crate::dns::RULE_LOAD_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let data_dir = std::path::PathBuf::from(
+            std::env::var("DNSBLACKHOLE_BENCH_DIR")
+                .expect("需要设置 DNSBLACKHOLE_BENCH_DIR 指向含 filters 子目录的数据目录"),
+        );
+        let mut filters: Vec<_> = fs::read_dir(crate::storage::filters_dir(&data_dir))
+            .expect("filters 目录应可读")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+                    return None;
+                }
+                let id = path.file_stem()?.to_string_lossy().into_owned();
+                Some(FilterSubscription {
+                    name: id.clone(),
+                    // 实测只读本地缓存文件，地址仅用于通过配置校验
+                    url: format!("https://filters.invalid/{id}.txt"),
+                    id,
+                    enabled: true,
+                    ..FilterSubscription::default()
+                })
+            })
+            .collect();
+        filters.sort_by(|left, right| left.id.cmp(&right.id));
+        assert!(!filters.is_empty(), "filters 目录里没有 .txt 清单");
+
+        let port = free_dns_port();
+        let base = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            query_log_enabled: false,
+            blacklist: String::new(),
+            filters,
+            ..AppConfig::default()
+        };
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let state = AppState::new(base.clone(), database, data_dir.clone(), data_dir.clone());
+        state.start_current().expect("DNS 应能启动");
+
+        const ROUNDS: usize = 3;
+        fn measure(rounds: usize, mut run: impl FnMut(usize) -> u128) -> Vec<u128> {
+            (0..rounds).map(&mut run).collect()
+        }
+        fn median(values: &[u128]) -> u128 {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        }
+
+        // 场景一：改 DNS 重写。规则内容没变，是最常见的保存动作。
+        // forget_active_rules 复现优化前"内存里的编译结果用不上"的条件。
+        let mut prev = base.clone();
+        let rewrite_before = measure(ROUNDS, |round| {
+            let mut next = prev.clone();
+            next.dns_rewrites = format!("nas-before{round}.lan 192.168.1.10");
+            crate::dns::forget_active_rules();
+            let started = std::time::Instant::now();
+            assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
+            let elapsed = started.elapsed().as_millis();
+            prev = next;
+            elapsed
+        });
+        let rewrite_after = measure(ROUNDS, |round| {
+            let mut next = prev.clone();
+            next.dns_rewrites = format!("nas-after{round}.lan 192.168.1.11");
+            let started = std::time::Instant::now();
+            assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
+            let elapsed = started.elapsed().as_millis();
+            prev = next;
+            elapsed
+        });
+
+        // 场景二：改自定义规则。优化前 blacklist 参与整份指纹，缓存必然失效，
+        // 要重编全部清单规则；现在清单指纹不含 blacklist，缓存依旧可用。
+        // clear_rule_cache 复现"缓存对新指纹无效"这一优化前的等效条件。
+        let custom_before = measure(ROUNDS, |round| {
+            let mut next = prev.clone();
+            next.blacklist = format!("||before-{round}.example^");
+            crate::dns::clear_rule_cache(&data_dir).expect("规则缓存应可清理");
+            let started = std::time::Instant::now();
+            assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
+            let elapsed = started.elapsed().as_millis();
+            prev = next;
+            elapsed
+        });
+        let custom_after = measure(ROUNDS, |round| {
+            let domain = format!("after-{round}.example");
+            let mut next = prev.clone();
+            next.blacklist = format!("||{domain}^");
+            let started = std::time::Instant::now();
+            assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
+            let elapsed = started.elapsed().as_millis();
+            prev = next;
+            elapsed
+        });
+
+        // 场景三：重启路径（改上游/监听/缓存走这里）。停止旧实例前先保活，
+        // 规则未变时同样复用内存。注意这一项还包含 DNS 工作线程 join 的时间，
+        // 与规则加载无关且抖动较大，规则部分看日志里的"规则加载"。
+        let restart = measure(ROUNDS, |_| {
+            let started = std::time::Instant::now();
+            state.start_current().expect("DNS 应能重启");
+            started.elapsed().as_millis()
+        });
+
+        let summary = state.status(false).summary;
+        println!("\n===== 保存配置端到端实测（{ROUNDS} 轮取中位）=====");
+        println!(
+            "清单 {} 份，生效拦截规则 {} 条",
+            prev.filters.len(),
+            summary.block_rules
+        );
+        println!("【改 DNS 重写等·规则未变】优化点 1");
+        println!(
+            "  优化前（回磁盘反序列化）：{:>6} ms   {rewrite_before:?}",
+            median(&rewrite_before)
+        );
+        println!(
+            "  优化后（复用内存）：      {:>6} ms   {rewrite_after:?}",
+            median(&rewrite_after)
+        );
+        println!("【改自定义规则】优化点 2");
+        println!(
+            "  优化前（重编全部清单）：  {:>6} ms   {custom_before:?}",
+            median(&custom_before)
+        );
+        println!(
+            "  优化后（缓存+增量合并）： {:>6} ms   {custom_after:?}",
+            median(&custom_after)
+        );
+        println!("【重启路径·含线程 join 抖动】");
+        println!(
+            "  优化后：                  {:>6} ms   {restart:?}",
+            median(&restart)
+        );
+
+        state.stop_current().unwrap();
+    }
+
     #[test]
     fn filter_state_can_be_hot_swapped_without_restarting_server() {
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // 规则加载的内存复用记录是进程级单例，与 rule_cache 的测试串行执行
+        let _rule_load_guard = crate::dns::RULE_LOAD_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let port = free_dns_port();
         let previous = AppConfig {
             listen_host: Ipv4Addr::LOCALHOST.to_string(),
             listen_port: port,

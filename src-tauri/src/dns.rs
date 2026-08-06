@@ -11,8 +11,12 @@ mod task_pool;
 mod upstream;
 mod worker;
 
-pub(crate) use filter_runtime::{build_filter_runtime_with_rules, replace_filter_runtime};
+pub(crate) use filter_runtime::{
+    FilterRuntime, build_filter_runtime_with_rules, current_filter_runtime, replace_filter_runtime,
+};
 pub(crate) use protocol::{DnsResponseAnswer, DnsResponseSummary};
+#[cfg(test)]
+pub(crate) use rule_cache::{RULE_LOAD_TEST_GUARD, forget_active_rules};
 pub(crate) use rule_cache::{RuleLoadSource, clear_rule_cache, load_or_compile_rules};
 pub use rules::{RuleSummary, summarize_rules};
 pub use server::DnsServer;
@@ -41,7 +45,7 @@ mod tests {
             truncate_response_for_udp, udp_payload_size, validate_response_for_query,
         },
         rewrites::compile_rewrites,
-        rules::{compile_domain_set, compile_rules, summarize_rules},
+        rules::{compile_domain_set, compile_rules, custom_rules_have_badfilter, summarize_rules},
         stats::{DnsStats, current_second, record_blocked, record_query},
         upstream::{
             RuntimeUpstream, is_upstream_temporarily_unhealthy, mark_upstream_available,
@@ -56,6 +60,142 @@ mod tests {
         assert!(rules.is_blocked("example.org", TYPE_A));
         assert!(rules.is_blocked("ads.example.org", TYPE_A));
         assert!(!rules.is_blocked("badexample.org", TYPE_A));
+    }
+
+    /// 增量合并自定义规则必须和"清单+自定义"整体编译产生完全相同的判定与统计，
+    /// 否则改动自定义规则会悄悄改变拦截行为。
+    #[test]
+    fn incremental_merge_matches_full_compilation() {
+        let remote = concat!(
+            "! dnsblackhole-source:\"清单A\"\n",
+            "||ads.example^\n",
+            "@@||safe.example^\n",
+            "||dup.example^\n",
+            "||typed.example^$dnstype=A\n",
+            "||killed.example^$important,badfilter\n",
+            "||parent.example^\n",
+            "0.0.0.0 hostlist.example\n",
+        );
+        let custom = concat!(
+            "||custom.example^\n",
+            "@@||ads.example^\n",
+            "||safe.example^$important\n",
+            "||dup.example^\n",
+            "||killed.example^$important\n",
+            "0.0.0.0 customhost.example\n",
+            "||branch.example^$denyallow=keep.branch.example\n",
+            "||sub.parent.example^\n",
+            "! 注释行\n",
+            "/regex.not.supported/\n",
+            "bad domain\n",
+        );
+
+        let full = compile_rules(&format!(
+            "{remote}! dnsblackhole-source:\"自定义规则\"\n{custom}"
+        ));
+        let mut merged = compile_rules(remote);
+        merged.merge_custom_rules(custom);
+        let layered = super::rules::CompiledRules::with_custom_layer(
+            std::sync::Arc::new(compile_rules(remote)),
+            custom,
+        );
+
+        let probes = [
+            ("ads.example", TYPE_A),
+            ("sub.ads.example", TYPE_A),
+            ("safe.example", TYPE_A),
+            ("cdn.safe.example", TYPE_A),
+            ("dup.example", TYPE_A),
+            ("custom.example", TYPE_A),
+            ("typed.example", TYPE_A),
+            ("typed.example", 16),
+            ("killed.example", TYPE_A),
+            ("hostlist.example", TYPE_A),
+            ("customhost.example", TYPE_A),
+            ("branch.example", TYPE_A),
+            ("keep.branch.example", TYPE_A),
+            ("sub.parent.example", TYPE_A),
+            ("unrelated.example", TYPE_A),
+        ];
+        for (implementation, actual_rules) in [("原地合并", &merged), ("分层共享", &layered)]
+        {
+            for (domain, qtype) in probes {
+                match (
+                    full.blocking_match(domain, qtype),
+                    actual_rules.blocking_match(domain, qtype),
+                ) {
+                    (None, None) => {}
+                    (Some(expected), Some(actual)) => {
+                        assert_eq!(
+                            expected.rule, actual.rule,
+                            "{implementation}: {domain} 规则原文应一致"
+                        );
+                        assert_eq!(
+                            expected.source, actual.source,
+                            "{implementation}: {domain} 来源应一致"
+                        );
+                        assert_eq!(
+                            expected.rule_type, actual.rule_type,
+                            "{implementation}: {domain} 类型应一致"
+                        );
+                        assert_eq!(
+                            expected.important_overrode, actual.important_overrode,
+                            "{implementation}: {domain} important 覆盖标记应一致"
+                        );
+                        assert_eq!(
+                            expected.allowlist_rule, actual.allowlist_rule,
+                            "{implementation}: {domain} 放行规则应一致"
+                        );
+                    }
+                    (expected, actual) => panic!(
+                        "{implementation}: {domain} 判定不一致：整体编译命中={} / 增量命中={}",
+                        expected.is_some(),
+                        actual.is_some()
+                    ),
+                }
+            }
+        }
+
+        let expected = full.summary();
+        let actual = merged.summary();
+        assert_eq!(expected.block_rules, actual.block_rules, "拦截条数应一致");
+        assert_eq!(expected.allow_rules, actual.allow_rules, "放行条数应一致");
+        assert_eq!(
+            expected.ignored_rules, actual.ignored_rules,
+            "忽略条数应一致"
+        );
+        assert_eq!(expected.ignored_comment_rules, actual.ignored_comment_rules);
+        assert_eq!(expected.ignored_regex_rules, actual.ignored_regex_rules);
+        assert_eq!(expected.ignored_invalid_rules, actual.ignored_invalid_rules);
+        assert_eq!(expected, layered.summary(), "分层共享的摘要也应一致");
+    }
+
+    #[test]
+    fn list_badfilter_still_disables_merged_custom_rule() {
+        let remote = "! dnsblackhole-source:\"清单A\"\n||x.example^$important,badfilter";
+        let custom = "||x.example^$important";
+
+        let mut merged = compile_rules(remote);
+        merged.merge_custom_rules(custom);
+
+        // 清单里的 badfilter 必须继续压制自定义规则里的同一条
+        assert!(!merged.is_blocked("x.example", TYPE_A));
+        assert!(
+            !compile_rules(&format!(
+                "{remote}\n! dnsblackhole-source:\"自定义规则\"\n{custom}"
+            ))
+            .is_blocked("x.example", TYPE_A)
+        );
+    }
+
+    #[test]
+    fn detects_badfilter_in_custom_rules() {
+        assert!(custom_rules_have_badfilter("||x.example^$badfilter"));
+        assert!(custom_rules_have_badfilter(
+            "||keep.example^\n||x.example^$important,badfilter"
+        ));
+        assert!(!custom_rules_have_badfilter("||x.example^$important"));
+        assert!(!custom_rules_have_badfilter("! 注释\n||plain.example^"));
     }
 
     #[test]

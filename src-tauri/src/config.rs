@@ -1294,7 +1294,9 @@ fn sync_directory(dir: &Path) {
     }
 }
 
-pub fn build_effective_rules(data_dir: &Path, config: &AppConfig) -> String {
+/// 只拼接远程清单，不含自定义规则。编译缓存以这一段为单位，
+/// 自定义规则的改动才不会让数百万条清单规则的编译结果失效。
+pub fn build_remote_rules(data_dir: &Path, config: &AppConfig) -> String {
     if !config.use_filters {
         return String::new();
     }
@@ -1317,6 +1319,16 @@ pub fn build_effective_rules(data_dir: &Path, config: &AppConfig) -> String {
             rules.push_str(&content);
         }
     }
+
+    rules
+}
+
+pub fn build_effective_rules(data_dir: &Path, config: &AppConfig) -> String {
+    if !config.use_filters {
+        return String::new();
+    }
+
+    let mut rules = build_remote_rules(data_dir, config);
 
     if !config.blacklist.trim().is_empty() {
         if !rules.is_empty() {

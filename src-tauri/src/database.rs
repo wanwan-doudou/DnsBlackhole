@@ -114,6 +114,11 @@ const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const HOURLY_STATISTICS_INITIALIZED_KEY: &str = "hourly_statistics_initialized_v1";
 const LIFETIME_STATISTICS_INITIALIZED_KEY: &str = "lifetime_statistics_initialized_v1";
 const QUERY_LOG_SEARCH_INITIALIZED_KEY: &str = "query_log_search_initialized_v1";
+/// 每次日志滚动清理最多合并约 1 MiB 的 FTS 页，限制交互路径上的维护延迟。
+const FTS_MERGE_PAGE_BUDGET: i64 = 256;
+/// 结构迁移把旧页留在 freelist 时打上此标记，启动流程随后显式压缩一次。
+/// 压缩成功才清除，压缩失败或中途退出都会在下次启动重试。
+const PENDING_COMPACTION_KEY: &str = "pending_storage_compaction_v1";
 const TRAFFIC_RETENTION_HOURS: u64 = 30 * 24;
 // 定时清理后按需压缩的双阈值：空闲页绝对量和占比都超过才值得整库重写，
 // 避免稳态下为极小收益频繁 VACUUM。
@@ -280,8 +285,39 @@ impl Database {
         database.wal_path = Some(wal_path_for_database(&path));
         database.truncate_oversized_wal_at_startup();
         crate::performance::log_service("数据库启动", "连接配置与结构检查", schema_started);
+        database.compact_if_migration_pending();
         crate::performance::log_service("数据库启动", "总计", total_started);
         Ok(database)
+    }
+
+    /// 结构迁移留下的空闲页占比通常达不到自动压缩门槛，这里按标记显式压缩一次。
+    /// 失败时保留标记，交给下次启动重试；压缩本身不影响数据可用性，故不向上报错。
+    fn compact_if_migration_pending(&self) {
+        let pending = self
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                database_meta_key_exists(&conn, PENDING_COMPACTION_KEY, "检查待压缩标记").ok()
+            })
+            .unwrap_or(false);
+        if !pending {
+            return;
+        }
+
+        let compact_started = Instant::now();
+        if let Err(error) = self.vacuum() {
+            eprintln!("迁移后压缩数据库失败，将在下次启动重试：{error}");
+            return;
+        }
+        if let Ok(conn) = self.lock()
+            && let Err(error) = conn.execute(
+                "DELETE FROM database_meta WHERE key = ?1",
+                params![PENDING_COMPACTION_KEY],
+            )
+        {
+            eprintln!("清除待压缩标记失败：{error}");
+        }
+        crate::performance::log_service("数据库启动", "迁移后压缩", compact_started);
     }
 
     #[cfg(test)]
@@ -454,11 +490,12 @@ impl Database {
         let tx = conn
             .transaction()
             .map_err(|e| format!("创建查询数据清理事务失败：{e}"))?;
-        tx.execute(
-            "DELETE FROM query_logs WHERE timestamp < ?1",
-            params![query_since],
-        )
-        .map_err(|e| format!("清理查询日志失败：{e}"))?;
+        let pruned_logs = tx
+            .execute(
+                "DELETE FROM query_logs WHERE timestamp < ?1",
+                params![query_since],
+            )
+            .map_err(|e| format!("清理查询日志失败：{e}"))?;
         // 永久累计由 dashboard_summary_stats 精确保留。小时明细只需覆盖配置允许的
         // 最大有限窗口，这既限制高基数域名按小时持续膨胀，也保证用户之后切换到
         // 任一合法有限保留期时仍能得到完整结果。
@@ -516,6 +553,12 @@ impl Database {
         .map_err(|e| format!("清理黑名单统计失败：{e}"))?;
         tx.commit()
             .map_err(|e| format!("提交查询数据清理失败：{e}"))?;
+        // external content 的 FTS 删除会留下旧倒排段。按小时滚动清理时做一次有页数
+        // 上限的 merge，让碎片逐步回收，同时避免 optimize 重写整个 FTS、阻塞日志页面。
+        // 用户主动清空或数据库膨胀触发 VACUUM 时仍会执行完整 optimize。
+        if pruned_logs > 0 {
+            merge_query_log_search(&conn);
+        }
         self.truncate_oversized_wal(&conn);
         Ok(())
     }
@@ -630,6 +673,13 @@ impl Database {
              )"
         };
         let where_sql = format!("timestamp >= :since{search_index_sql}{search_sql}{filter_sql}");
+        // 模糊搜索的候选集构建成本远高于普通时间索引分页。把总数作为窗口列
+        // 随当前页一次算出，避免 COUNT 和列表查询各跑一遍四列 trigram 子查询。
+        let total_window_sql = if use_search_index {
+            ", COUNT(*) OVER() AS matched_total"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT
                 id,
@@ -656,6 +706,7 @@ impl Database {
                 response_answer_count,
                 response_answers,
                 response_truncated
+                {total_window_sql}
              FROM {query_logs_source}
              WHERE {where_sql}
              ORDER BY timestamp DESC, id DESC
@@ -668,25 +719,31 @@ impl Database {
         let offset = i64::from(page.saturating_sub(1)) * i64::from(page_size);
         let conn = self.lock_read()?;
         let total_sql = format!("SELECT COUNT(*) FROM {query_logs_source} WHERE {where_sql}");
-        let total = if search.is_empty() {
-            conn.query_row(
-                &total_sql,
-                named_params! {
-                    ":since": since_param,
-                },
-                |row| read_u64(row, 0),
-            )
+        let mut total = if use_search_index {
+            None
         } else {
-            conn.query_row(
-                &total_sql,
-                named_params! {
-                    ":since": since_param,
-                    ":search": search_pattern,
-                },
-                |row| read_u64(row, 0),
+            Some(
+                if search.is_empty() {
+                    conn.query_row(
+                        &total_sql,
+                        named_params! {
+                            ":since": since_param,
+                        },
+                        |row| read_u64(row, 0),
+                    )
+                } else {
+                    conn.query_row(
+                        &total_sql,
+                        named_params! {
+                            ":since": since_param,
+                            ":search": search_pattern,
+                        },
+                        |row| read_u64(row, 0),
+                    )
+                }
+                .map_err(|e| format!("统计查询日志失败：{e}"))?,
             )
-        }
-        .map_err(|e| format!("统计查询日志失败：{e}"))?;
+        };
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("准备查询日志失败：{e}"))?;
@@ -711,8 +768,27 @@ impl Database {
             .next()
             .map_err(|e| format!("读取查询日志行失败：{e}"))?
         {
+            if total.is_none() {
+                total = Some(read_u64(row, 24).map_err(|e| format!("读取日志总数失败：{e}"))?);
+            }
             records.push(read_query_log_record(row).map_err(|e| format!("解析查询日志失败：{e}"))?);
         }
+        drop(rows);
+        drop(stmt);
+        // 页码超出最后一页时窗口查询没有返回行，补一次 COUNT 才能让前端纠正页码。
+        let total = match total {
+            Some(total) => total,
+            None => conn
+                .query_row(
+                    &total_sql,
+                    named_params! {
+                        ":since": since_param,
+                        ":search": search_pattern,
+                    },
+                    |row| read_u64(row, 0),
+                )
+                .map_err(|e| format!("统计查询日志失败：{e}"))?,
+        };
         Ok(QueryLogPage {
             records,
             total,
@@ -1354,6 +1430,7 @@ fn query_log_search_is_indexable(search: &str) -> bool {
 }
 
 fn init_schema(conn: &Connection) -> Result<(), String> {
+    let dropped_legacy_search = drop_legacy_sized_query_log_search(conn)?;
     let query_log_search_existed = sqlite_object_exists(conn, "table", "query_logs_search")
         .map_err(|e| format!("检查查询日志搜索索引失败：{e}"))?;
     conn.execute_batch(
@@ -1493,6 +1570,8 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     add_column_if_missing(conn, "query_logs", "response_truncated", "INTEGER")?;
     conn.execute_batch(
         "
+        -- columnsize = 0 省掉逐行的列长度记录：detail = none 下本就无法用 bm25 排序，
+        -- 搜索只做 LIKE 匹配，这份 docsize 影子表纯属额外占用。
         CREATE VIRTUAL TABLE IF NOT EXISTS query_logs_search USING fts5(
             domain,
             client_ip,
@@ -1501,7 +1580,8 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             content = 'query_logs',
             content_rowid = 'id',
             tokenize = 'trigram',
-            detail = 'none'
+            detail = 'none',
+            columnsize = 0
         );
 
         CREATE TRIGGER IF NOT EXISTS query_logs_search_insert
@@ -1590,6 +1670,9 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     initialize_hourly_statistics(conn)?;
     initialize_lifetime_statistics(conn)?;
     initialize_query_log_search(conn, query_log_search_existed)?;
+    if dropped_legacy_search {
+        mark_pending_compaction(conn)?;
+    }
     Ok(())
 }
 
@@ -1669,6 +1752,41 @@ fn rebuild_lifetime_statistics(conn: &Connection, since_hour: Option<i64>) -> Re
     }
     .map_err(|e| format!("汇总永久统计失败：{e}"))?;
     Ok(())
+}
+
+/// 旧版本的搜索索引带 columnsize = 1，会为每条日志额外维护一份列长度记录。
+/// FTS5 的建表选项无法原地修改，只能删表；随后 init_schema 会按新选项重建结构，
+/// 内容由 initialize_query_log_search 检测到表不存在时 rebuild 补齐。
+fn drop_legacy_sized_query_log_search(conn: &Connection) -> Result<bool, String> {
+    let has_docsize = sqlite_object_exists(conn, "table", "query_logs_search_docsize")
+        .map_err(|e| format!("检查查询日志搜索索引结构失败：{e}"))?;
+    if !has_docsize {
+        return Ok(false);
+    }
+    conn.execute_batch("DROP TABLE IF EXISTS query_logs_search")
+        .map_err(|e| format!("清理旧版查询日志搜索索引失败：{e}"))?;
+    Ok(true)
+}
+
+/// 打上待压缩标记。调用点须保证 database_meta 已建好。
+fn mark_pending_compaction(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO database_meta (key, value) VALUES (?1, '1')",
+        params![PENDING_COMPACTION_KEY],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("标记待压缩状态失败：{e}"))
+}
+
+/// 对 FTS 倒排段执行有界合并。正数预算只处理满足 usermerge 条件或已经开始的合并，
+/// 单次大约写入指定页数；失败不影响日志清理和搜索正确性。
+fn merge_query_log_search(conn: &Connection) {
+    if let Err(error) = conn.execute(
+        "INSERT INTO query_logs_search(query_logs_search, rank) VALUES('merge', ?1)",
+        params![FTS_MERGE_PAGE_BUDGET],
+    ) {
+        eprintln!("合并查询日志搜索索引失败：{error}");
+    }
 }
 
 fn initialize_query_log_search(
@@ -2676,6 +2794,12 @@ mod tests {
             .expect("error substring should search");
         assert_eq!(by_error.total, 1);
 
+        let beyond_last_page = db
+            .query_logs(24, "all", "example", 2, 20)
+            .expect("超出末页仍应返回搜索总数");
+        assert!(beyond_last_page.records.is_empty());
+        assert_eq!(beyond_last_page.total, 1);
+
         // 少于三个字符和 LIKE 通配符保持原语义，自动回退到原查询。
         assert_eq!(
             db.query_logs(24, "all", "ad", 1, 20)
@@ -3165,6 +3289,302 @@ mod tests {
     fn anonymizes_client_ip() {
         assert_eq!(anonymize_ip("192.168.1.42"), "192.168.1.0");
         assert_eq!(anonymize_ip("not-an-ip"), "not-an-ip");
+    }
+
+    /// 完整迁移链路：旧结构库打开后应重建搜索索引、压缩一次并清除标记；
+    /// 再次打开必须不再压缩，否则每次启动都要白付一次 VACUUM。
+    #[test]
+    fn legacy_search_migration_rebuilds_and_compacts_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "dnsblackhole-migrate-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should create");
+        let file = crate::storage::database_path(&dir);
+        {
+            let conn = Connection::open(&file).expect("legacy db should create");
+            conn.execute_batch(
+                "
+                CREATE TABLE query_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER NOT NULL,
+                    domain TEXT NOT NULL,
+                    client_ip TEXT,
+                    blocked INTEGER NOT NULL DEFAULT 0,
+                    forwarded INTEGER NOT NULL DEFAULT 0,
+                    failed INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    upstream_server TEXT
+                );
+                -- 旧结构：缺少 columnsize = 0
+                CREATE VIRTUAL TABLE query_logs_search USING fts5(
+                    domain, client_ip, upstream_server, error,
+                    content = 'query_logs', content_rowid = 'id',
+                    tokenize = 'trigram', detail = 'none'
+                );
+                ",
+            )
+            .expect("legacy schema should create");
+            for i in 0..200 {
+                conn.execute(
+                    "INSERT INTO query_logs (timestamp, domain, client_ip)
+                     VALUES (?1, ?2, '192.168.1.9')",
+                    params![1000 + i, format!("legacy-{i}.example.org")],
+                )
+                .expect("legacy rows should insert");
+            }
+            conn.execute(
+                "INSERT INTO query_logs_search(query_logs_search) VALUES('rebuild')",
+                [],
+            )
+            .expect("legacy index should build");
+        }
+
+        let first = Database::open(&dir).expect("legacy db should migrate");
+        {
+            let conn = first.lock().expect("db should lock");
+            assert!(
+                !sqlite_object_exists(&conn, "table", "query_logs_search_docsize")
+                    .expect("docsize probe should run"),
+                "迁移后不应再有 docsize 影子表"
+            );
+            assert!(
+                !database_meta_key_exists(&conn, PENDING_COMPACTION_KEY, "检查待压缩标记")
+                    .expect("pending probe should run"),
+                "压缩成功后应清除待压缩标记"
+            );
+            let hits: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM query_logs_search WHERE domain LIKE '%legacy-7%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("search should run");
+            assert!(hits > 0, "迁移后搜索索引应已重建并可用");
+        }
+        drop(first);
+        let size_after_migration = fs::metadata(&file).expect("db file should stat").len();
+
+        // 第二次打开：结构已是新版，不应再触发压缩
+        let second = Database::open(&dir).expect("db should reopen");
+        {
+            let conn = second.lock().expect("db should lock");
+            assert!(
+                !database_meta_key_exists(&conn, PENDING_COMPACTION_KEY, "检查待压缩标记")
+                    .expect("pending probe should run"),
+                "重复打开不应重新标记待压缩"
+            );
+        }
+        drop(second);
+        assert_eq!(
+            size_after_migration,
+            fs::metadata(&file).expect("db file should stat").len(),
+            "重复打开不应再压缩数据库"
+        );
+
+        fs::remove_dir_all(&dir).expect("temp dir should remove");
+    }
+
+    /// 在真实库副本上验证升级实际回收多少空间。默认跳过，手动执行：
+    ///   $env:DNSBLACKHOLE_MIGRATE_DIR="<含 dnsblackhole.sqlite3 副本的目录>"
+    ///   cargo test --release --lib measures_real_scale_storage -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measures_real_scale_storage_reclaim() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("DNSBLACKHOLE_MIGRATE_DIR")
+                .expect("需要设置 DNSBLACKHOLE_MIGRATE_DIR 指向含库副本的目录"),
+        );
+        let file = crate::storage::database_path(&dir);
+        let size_mib = |path: &std::path::Path| {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) as f64 / 1048576.0
+        };
+        let before = size_mib(&file);
+
+        // Database::open 会跑 init_schema（含 columnsize=0 重建）并按标记自动压缩一次
+        let started = Instant::now();
+        let db = Database::open(&dir).expect("库副本应能打开并迁移");
+        let migrate_ms = started.elapsed().as_millis();
+        let after = size_mib(&file);
+
+        let (rows, docsize_left, pending_left, hits) = {
+            let conn = db.lock().expect("db should lock");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM query_logs", [], |row| row.get(0))
+                .expect("rows should read");
+            let docsize = sqlite_object_exists(&conn, "table", "query_logs_search_docsize")
+                .expect("docsize probe should run");
+            let pending = database_meta_key_exists(&conn, PENDING_COMPACTION_KEY, "检查待压缩标记")
+                .expect("pending probe should run");
+            let hits: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM query_logs_search WHERE domain LIKE '%.com'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("search should run");
+            (rows, docsize, pending, hits)
+        };
+        assert!(!docsize_left, "迁移后不应再有 docsize 影子表");
+        assert!(!pending_left, "压缩完成后应清除待压缩标记");
+        assert!(after < before, "迁移后文件应真正缩小：{before} -> {after}");
+        assert!(hits > 0, "迁移后搜索索引应仍可用");
+
+        println!("\n===== 存储瘦身实测（真实库副本，一次 Database::open）=====");
+        println!("  日志行数：      {rows:>10}");
+        println!("  迁移前：        {before:>10.2} MiB");
+        println!("  迁移后：        {after:>10.2} MiB");
+        println!(
+            "  回收：          {:>10.2} MiB（{:.1}%）",
+            before - after,
+            (before - after) / before * 100.0
+        );
+        println!("  迁移+压缩耗时： {migrate_ms:>10} ms（一次性）");
+        println!("  迁移后搜索命中：{hits} 条");
+    }
+
+    /// 在真实库副本上量化 trigram 搜索的端到端分页耗时。默认跳过：
+    ///   $env:DNSBLACKHOLE_MIGRATE_DIR="<含 dnsblackhole.sqlite3 副本的目录>"
+    ///   cargo test --release --lib measures_real_scale_query_log_search -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measures_real_scale_query_log_search() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("DNSBLACKHOLE_MIGRATE_DIR")
+                .expect("需要设置 DNSBLACKHOLE_MIGRATE_DIR 指向含库副本的目录"),
+        );
+        let db = Database::open(&dir).expect("库副本应能打开");
+        let mut runs = Vec::new();
+        let mut matched = 0;
+        for _ in 0..5 {
+            let started = Instant::now();
+            let page = db
+                .query_logs(24, "all", "google", 1, 50)
+                .expect("真实库搜索应成功");
+            runs.push(started.elapsed().as_millis());
+            matched = page.total;
+            assert!(!page.records.is_empty());
+        }
+        let median = {
+            let mut sorted = runs.clone();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        };
+        println!("\n===== 真实库日志模糊搜索（总数与分页单 SQL）=====");
+        println!("  命中：{matched} 条");
+        println!("  耗时：{median} ms（中位）  {runs:?}");
+    }
+
+    /// 旧库的搜索索引带 columnsize = 1，升级后应改用 columnsize = 0：
+    /// docsize 影子表消失、内容被重建、搜索结果不变。
+    #[test]
+    fn migrates_legacy_sized_query_log_search() {
+        let conn = Connection::open_in_memory().expect("db should open");
+        conn.execute_batch(
+            "
+            CREATE TABLE query_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                domain TEXT NOT NULL,
+                client_ip TEXT,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                forwarded INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                upstream_server TEXT
+            );
+            INSERT INTO query_logs (timestamp, domain, client_ip, error, upstream_server)
+            VALUES (1000, 'ads.example.org', '192.168.1.5', '上游超时', '1.1.1.1:53');
+            -- 旧结构：没有 columnsize = 0
+            CREATE VIRTUAL TABLE query_logs_search USING fts5(
+                domain, client_ip, upstream_server, error,
+                content = 'query_logs', content_rowid = 'id',
+                tokenize = 'trigram', detail = 'none'
+            );
+            INSERT INTO query_logs_search(query_logs_search) VALUES('rebuild');
+            ",
+        )
+        .expect("legacy search index should create");
+        assert!(
+            sqlite_object_exists(&conn, "table", "query_logs_search_docsize")
+                .expect("docsize probe should run"),
+            "旧结构应带 docsize 影子表"
+        );
+
+        init_schema(&conn).expect("schema should migrate");
+
+        assert!(
+            !sqlite_object_exists(&conn, "table", "query_logs_search_docsize")
+                .expect("docsize probe should run"),
+            "迁移后不应再有 docsize 影子表"
+        );
+        let matched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM query_logs_search WHERE domain LIKE '%example%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("search should still work");
+        assert_eq!(matched, 1, "迁移后搜索应仍能命中");
+
+        // 再跑一次不应重复重建（幂等）
+        init_schema(&conn).expect("schema should stay idempotent");
+        assert!(
+            !sqlite_object_exists(&conn, "table", "query_logs_search_docsize")
+                .expect("docsize probe should run")
+        );
+    }
+
+    /// 滚动清理会在 FTS 里留下 tombstone，清理后要合并倒排段。
+    /// 这里守的是合并不破坏索引正确性：过期项搜不到、保留项仍搜得到。
+    /// （实际压缩率依赖数据规模，不在单测里断言。）
+    #[test]
+    fn pruning_expired_logs_keeps_search_index_consistent() {
+        let db = Database::open_in_memory().expect("db should open");
+        let stale = unix_now().saturating_sub(48 * 3600);
+        let stale_entries: Vec<_> = (0..200)
+            .map(|i| (sample_query_log(&format!("stale-{i}.example.org")), false))
+            .collect();
+        db.insert_query_logs(&stale_entries)
+            .expect("stale logs should insert");
+        {
+            // 时间戳由写入路径生成，这里改写成过期时间以便触发清理。
+            // 只动 timestamp 不会触发搜索索引的 UPDATE 触发器。
+            let conn = db.lock().expect("db should lock");
+            conn.execute(
+                "UPDATE query_logs SET timestamp = ?1",
+                params![stale as i64],
+            )
+            .expect("timestamps should age");
+        }
+        // 这批在保留窗口内，清理后必须完好
+        db.insert_query_logs(&[(sample_query_log("fresh.example.org"), false)])
+            .expect("fresh log should insert");
+
+        db.prune_expired(1, 0).expect("prune should succeed");
+
+        let conn = db.lock().expect("db should lock");
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM query_logs", [], |row| row.get(0))
+            .expect("remaining rows should read");
+        assert_eq!(remaining, 1, "只应保留窗口内的那条日志");
+        let stale_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM query_logs_search WHERE domain LIKE '%stale%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("search should run");
+        assert_eq!(stale_hits, 0, "已删除的日志不应再被搜索命中");
+        let fresh_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM query_logs_search WHERE domain LIKE '%fresh%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("search should run");
+        assert_eq!(fresh_hits, 1, "保留的日志仍应可被搜索命中");
     }
 
     #[test]

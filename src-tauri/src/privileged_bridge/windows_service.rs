@@ -108,6 +108,7 @@ fn run_service_body(
         "规则加载与 DNS 监听初始化完成，耗时 {} ms，规则来源：{}",
         runtime_started.elapsed().as_millis(),
         match rule_source {
+            Some(crate::dns::RuleLoadSource::Memory) => "复用内存",
             Some(crate::dns::RuleLoadSource::Cache) => "编译缓存",
             Some(crate::dns::RuleLoadSource::Compiled) => "重新编译",
             None => "未启用",

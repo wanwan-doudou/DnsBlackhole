@@ -17,15 +17,16 @@ use crate::{
     config::{self, AppConfig},
     database::{Database, LogStats, QueryLogPage},
     dns::{
-        self, DnsServer, DnsStats, RuleLoadSource, RuleSummary, RuntimeStatus,
-        build_filter_runtime_with_rules, clear_rule_cache, load_or_compile_rules,
-        replace_filter_runtime,
+        self, DnsServer, DnsStats, FilterRuntime, RuleLoadSource, RuleSummary, RuntimeStatus,
+        build_filter_runtime_with_rules, clear_rule_cache, current_filter_runtime,
+        load_or_compile_rules, replace_filter_runtime,
     },
     filters,
 };
 
 const LOG_STATS_CACHE_SECONDS: u64 = 15;
 const LOG_PRUNE_INTERVAL_SECONDS: u64 = 60 * 60;
+const DATABASE_MAINTENANCE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const FILTER_AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const FILTER_AUTO_UPDATE_MIN_BACKOFF_SECONDS: u64 = 5 * 60;
 const FILTER_AUTO_UPDATE_MAX_BACKOFF_SECONDS: u64 = 6 * 3600;
@@ -183,8 +184,18 @@ impl AppState {
         Ok(())
     }
 
+    /// 取出当前生效的过滤运行时。持有它即可保活其中的编译结果。
+    fn active_filter_runtime(&self) -> Option<Arc<FilterRuntime>> {
+        let server = self.server.lock().ok()?;
+        let server = server.as_ref()?;
+        Some(current_filter_runtime(&server.filter_runtime_handle()))
+    }
+
     pub(crate) fn start_current(&self) -> Result<RuleLoadSource, String> {
         let total_started = Instant::now();
+        // 停止旧实例会连带释放它持有的编译结果；先保活一份，
+        // 让规则没有变化时下面的加载可以直接复用内存而不必重新读盘。
+        let retained_runtime = self.active_filter_runtime();
         let stop_started = Instant::now();
         self.stop_current()?;
         crate::performance::log_service("DNS 核心启动", "停止旧运行实例", stop_started);
@@ -192,6 +203,7 @@ impl AppState {
         let config = self.current_config()?;
         let rules_started = Instant::now();
         let loaded_rules = load_or_compile_rules(&self.data_dir, &config);
+        drop(retained_runtime);
         crate::performance::log_service("DNS 核心启动", "规则加载", rules_started);
         let source = loaded_rules.source;
         let filter_runtime_started = Instant::now();
@@ -320,11 +332,7 @@ impl AppState {
             .unwrap_or_default();
         if config.statistics_enabled && include_log_stats {
             let log_stats_started = Instant::now();
-            match self.cached_log_stats(
-                config.query_log_retention_hours,
-                config.statistics_retention_hours,
-                force_log_stats,
-            ) {
+            match self.cached_log_stats(config.statistics_retention_hours, force_log_stats) {
                 Ok(log_stats) => {
                     stats.queries = log_stats.queries;
                     stats.blocked = log_stats.blocked;
@@ -363,7 +371,6 @@ impl AppState {
 
     fn cached_log_stats(
         &self,
-        query_log_retention_hours: u32,
         statistics_retention_hours: u32,
         force_refresh: bool,
     ) -> Result<LogStats, String> {
@@ -383,11 +390,6 @@ impl AppState {
             return Ok(cached.stats);
         }
 
-        self.prune_persisted_data_if_due(
-            query_log_retention_hours,
-            statistics_retention_hours,
-            now,
-        )?;
         let stats = self.database.log_stats(statistics_retention_hours)?;
         let mut cache = self
             .log_stats_cache
@@ -401,7 +403,7 @@ impl AppState {
         Ok(stats)
     }
 
-    pub(crate) fn prune_persisted_data_if_due(
+    fn maintain_persisted_data_if_due(
         &self,
         query_log_retention_hours: u32,
         statistics_retention_hours: u32,
@@ -419,8 +421,7 @@ impl AppState {
             .prune_expired(query_log_retention_hours, statistics_retention_hours)?;
         *last_prune_at = now;
         drop(last_prune_at);
-        // 定时清理同样只删行不收缩文件；空闲页堆积过多时按需整库压缩一次。
-        // 稳态下不会触发，失败也不影响清理本身。
+        // 维护线程中按需回收磁盘，不再让首页状态或日志分页承担整库 VACUUM。
         if let Err(error) = self.database.vacuum_if_bloated() {
             eprintln!("定时清理后按需压缩数据库失败：{error}");
         }
@@ -589,23 +590,14 @@ pub(crate) fn save_config_blocking(
         state.set_error(None);
     }
 
-    // 保留时间调短后立即清理超出新窗口的历史日志，无需等待下一轮定时清理
+    // 新窗口会立即用于所有查询；物理删除和 VACUUM 放到后台，避免保存配置卡住数秒。
     if config.query_log_retention_hours < previous.query_log_retention_hours
         || statistics_retention_was_shortened(
             previous.statistics_retention_hours,
             config.statistics_retention_hours,
         )
     {
-        state.prune_persisted_data_now(
-            config.query_log_retention_hours,
-            config.statistics_retention_hours,
-            unix_now(),
-        )?;
-        // 清理只删行不收缩文件，主动 VACUUM 一次把空闲页归还磁盘。
-        // 失败（如临时磁盘空间不足）不影响已完成的保存与清理，仅记录。
-        if let Err(error) = state.database.vacuum() {
-            eprintln!("缩短日志保留后压缩数据库失败：{error}");
-        }
+        spawn_database_maintenance_now(Arc::clone(&state));
     }
 
     state.invalidate_log_stats_cache();
@@ -633,11 +625,6 @@ pub(crate) fn query_logs_blocking(
         });
     }
 
-    state.prune_persisted_data_if_due(
-        config.query_log_retention_hours,
-        config.statistics_retention_hours,
-        unix_now(),
-    )?;
     state.database.query_logs(
         config.query_log_retention_hours,
         filter.as_deref().unwrap_or("all"),
@@ -909,6 +896,54 @@ pub(crate) fn spawn_runtime_watchdog(state: Arc<AppState>) {
     });
 }
 
+/// 数据保留期清理和整库压缩可能耗时数秒，必须与首页状态、日志分页等交互请求解耦。
+/// 维护线程每分钟检查一次，实际清理由小时级节流控制；查询 SQL 自身仍按保留窗口过滤，
+/// 因此启动后的短暂延迟不会让过期数据重新出现在界面上。
+pub(crate) fn spawn_database_maintenance(state: Arc<AppState>) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(DATABASE_MAINTENANCE_CHECK_INTERVAL);
+            let Ok(_runtime_guard) = state.runtime_update_lock.lock() else {
+                continue;
+            };
+            let Ok(config) = state.current_config() else {
+                continue;
+            };
+            if let Err(error) = state.maintain_persisted_data_if_due(
+                config.query_log_retention_hours,
+                config.statistics_retention_hours,
+                unix_now(),
+            ) {
+                eprintln!("数据库后台维护失败：{error}");
+            }
+        }
+    });
+}
+
+fn spawn_database_maintenance_now(state: Arc<AppState>) {
+    thread::spawn(move || {
+        // 与配置保存串行后再读取当前值，避免连续保存时用旧窗口误删数据。
+        let Ok(_runtime_guard) = state.runtime_update_lock.lock() else {
+            return;
+        };
+        let Ok(config) = state.current_config() else {
+            return;
+        };
+        if let Err(error) = state.prune_persisted_data_now(
+            config.query_log_retention_hours,
+            config.statistics_retention_hours,
+            unix_now(),
+        ) {
+            eprintln!("缩短保留期后的后台清理失败：{error}");
+            return;
+        }
+        if let Err(error) = state.database.vacuum() {
+            eprintln!("缩短保留期后的后台压缩失败：{error}");
+        }
+        state.invalidate_log_stats_cache();
+    });
+}
+
 #[cfg(not(windows))]
 pub(crate) fn spawn_initial_runtime(state: Arc<AppState>) {
     thread::spawn(move || {
@@ -955,4 +990,52 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> Arc<AppState> {
+        let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
+        let data_dir = std::env::temp_dir().join("dnsblackhole-service-core-test");
+        Arc::new(AppState::new(
+            AppConfig::default(),
+            database,
+            data_dir.clone(),
+            data_dir,
+        ))
+    }
+
+    #[test]
+    fn interactive_reads_do_not_run_database_maintenance() {
+        let state = test_state();
+
+        let _ = state.status_with_log_stats(false, true);
+        query_logs_blocking(Arc::clone(&state), None, None, Some(1), Some(50))
+            .expect("查询日志应可读取");
+
+        assert_eq!(
+            *state.last_prune_at.lock().expect("清理状态应可读取"),
+            0,
+            "首页和日志分页都不应触发保留期清理"
+        );
+    }
+
+    #[test]
+    fn maintenance_path_updates_its_own_throttle() {
+        let state = test_state();
+        let now = unix_now();
+        let config = state.current_config().expect("配置应可读取");
+
+        state
+            .maintain_persisted_data_if_due(
+                config.query_log_retention_hours,
+                config.statistics_retention_hours,
+                now,
+            )
+            .expect("后台维护应成功");
+
+        assert_eq!(*state.last_prune_at.lock().expect("清理状态应可读取"), now);
+    }
 }

@@ -16,8 +16,8 @@ use crate::{
     service_core::{
         AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, clear_query_logs_blocking,
         clear_statistics_blocking, query_logs_blocking, save_config_blocking,
-        spawn_filter_auto_update, spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking,
-        update_filters_blocking,
+        spawn_database_maintenance, spawn_filter_auto_update, spawn_runtime_watchdog,
+        start_dns_blocking, stop_dns_blocking, update_filters_blocking,
     },
     storage,
 };
@@ -95,6 +95,7 @@ pub(crate) fn start_background_tasks(state: &Arc<AppState>) {
 }
 
 pub(crate) fn start_maintenance_tasks(state: &Arc<AppState>) {
+    spawn_database_maintenance(Arc::clone(state));
     spawn_runtime_watchdog(Arc::clone(state));
     spawn_filter_auto_update(Arc::clone(state), |_| {});
 }

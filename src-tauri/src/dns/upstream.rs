@@ -28,7 +28,21 @@ use super::{
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const UPSTREAM_FAILURE_BACKOFF_SECONDS: u64 = 30;
-const UPSTREAM_HALF_OPEN_PROBE_INTERVAL_SECONDS: u64 = 1;
+/// 地址解析失败后重新解析的最短间隔。解析很廉价，可以频繁重试。
+const UPSTREAM_RESOLUTION_RETRY_INTERVAL_SECONDS: u64 = 1;
+/// 全部上游都在退避时，整体放行一个半开探测的最短间隔。探测必须等满超时才知道
+/// 结果，这个间隔直接决定故障期间有多少用户查询会被拖满超时。
+const UPSTREAM_HALF_OPEN_PROBE_INTERVAL_SECONDS: u64 = 5;
+
+/// 探测名额由所有上游共享。按上游各自计时会让每轮放行的探测数等于上游数量，
+/// 故障期间几乎每个查询都能拿到名额并等满超时（实测一次 9 小时的上游中断里，
+/// 每小时六千余次失败的平均等待稳定在 3.7 秒，退避形同虚设）。
+static HALF_OPEN_PROBE_AFTER: AtomicU64 = AtomicU64::new(0);
+/// 轮流由不同上游承担探测，避免始终探测同一个已经彻底不可用的上游。
+static HALF_OPEN_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+/// 探测节流是进程级单例，触碰它的测试需要串行执行。
+#[cfg(test)]
+pub(crate) static HALF_OPEN_PROBE_TEST_GUARD: Mutex<()> = Mutex::new(());
 const DOH_CLIENT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const FASTEST_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_millis(180);
 const FASTEST_ADDR_MAX_IPS_PER_RESPONSE: usize = 8;
@@ -49,7 +63,6 @@ pub(crate) struct RuntimeUpstream {
     server: UpstreamServer,
     label: String,
     unhealthy_until: Arc<AtomicU64>,
-    half_open_probe_after: Arc<AtomicU64>,
     bootstrap_servers: Arc<Vec<SocketAddr>>,
     resolution_retry_at: Arc<AtomicU64>,
     udp_state: Arc<Mutex<Option<UdpRuntimeState>>>,
@@ -148,7 +161,7 @@ impl RuntimeUpstream {
                 server,
                 UpstreamServer::UdpHostname { .. } | UpstreamServer::Doh(_)
             ) {
-            current_second().saturating_add(UPSTREAM_HALF_OPEN_PROBE_INTERVAL_SECONDS)
+            current_second().saturating_add(UPSTREAM_RESOLUTION_RETRY_INTERVAL_SECONDS)
         } else {
             0
         };
@@ -157,7 +170,6 @@ impl RuntimeUpstream {
             server,
             label,
             unhealthy_until: Arc::new(AtomicU64::new(0)),
-            half_open_probe_after: Arc::new(AtomicU64::new(0)),
             bootstrap_servers: Arc::new(bootstrap_servers.to_vec()),
             resolution_retry_at: Arc::new(AtomicU64::new(resolution_retry_at)),
             udp_state: Arc::new(Mutex::new(initial_udp_state)),
@@ -333,7 +345,7 @@ fn invalidate_resolved_endpoint(upstream: &RuntimeUpstream) {
     match &upstream.server {
         UpstreamServer::UdpHostname { .. } => {
             upstream.resolution_retry_at.store(
-                current_second().saturating_add(UPSTREAM_HALF_OPEN_PROBE_INTERVAL_SECONDS),
+                current_second().saturating_add(UPSTREAM_RESOLUTION_RETRY_INTERVAL_SECONDS),
                 Ordering::Relaxed,
             );
             if let Ok(mut state) = upstream.udp_state.lock() {
@@ -342,7 +354,7 @@ fn invalidate_resolved_endpoint(upstream: &RuntimeUpstream) {
         }
         UpstreamServer::Doh(_) => {
             upstream.resolution_retry_at.store(
-                current_second().saturating_add(UPSTREAM_HALF_OPEN_PROBE_INTERVAL_SECONDS),
+                current_second().saturating_add(UPSTREAM_RESOLUTION_RETRY_INTERVAL_SECONDS),
                 Ordering::Relaxed,
             );
             if let Ok(mut client) = upstream.doh_client.lock() {
@@ -651,24 +663,27 @@ fn select_available_upstreams(
         return healthy;
     }
 
-    // 全部上游都在退避时，仅允许一个上游按固定间隔进行半开探测。
-    // 这样网络恢复后无需等待完整退避期，同时避免故障期间形成请求风暴。
-    (0..upstream_servers.len())
-        .map(|offset| &upstream_servers[(start + offset) % upstream_servers.len()])
-        .find(|upstream| try_claim_half_open_probe(upstream, now))
-        .cloned()
-        .into_iter()
-        .collect()
+    // 全部上游都在退避时，整体只放行一个半开探测，并在上游之间轮转。
+    // 探测要等满超时才知道结果，所以名额必须全局共享：否则每个上游各放行一个，
+    // 故障期间几乎每个查询都会被拖满超时，退避等于没有生效。
+    // 拿不到名额的查询立刻返回“所有上游 DNS 暂不可用”，不再空等。
+    if !try_claim_half_open_probe(now) {
+        return Vec::new();
+    }
+    // 正常请求的 start 自身也会随每次查询递增，不能再与探测游标叠加，
+    // 否则固定查询频率下两个游标可能形成步长公因数，永久跳过部分上游。
+    let index = HALF_OPEN_PROBE_CURSOR.fetch_add(1, Ordering::Relaxed) % upstream_servers.len();
+    vec![upstream_servers[index].clone()]
 }
 
-fn try_claim_half_open_probe(upstream: &RuntimeUpstream, now: u64) -> bool {
+fn try_claim_half_open_probe(now: u64) -> bool {
     let next_probe = now.saturating_add(UPSTREAM_HALF_OPEN_PROBE_INTERVAL_SECONDS);
-    let mut probe_after = upstream.half_open_probe_after.load(Ordering::Acquire);
+    let mut probe_after = HALF_OPEN_PROBE_AFTER.load(Ordering::Acquire);
     loop {
         if probe_after > now {
             return false;
         }
-        match upstream.half_open_probe_after.compare_exchange_weak(
+        match HALF_OPEN_PROBE_AFTER.compare_exchange_weak(
             probe_after,
             next_probe,
             Ordering::AcqRel,
@@ -678,6 +693,11 @@ fn try_claim_half_open_probe(upstream: &RuntimeUpstream, now: u64) -> bool {
             Err(current) => probe_after = current,
         }
     }
+}
+
+/// 上游恢复后立刻清掉探测节流，让下一次故障能第一时间探测。
+fn reset_half_open_probe() {
+    HALF_OPEN_PROBE_AFTER.store(0, Ordering::Release);
 }
 
 fn fastest_response_index(
@@ -905,18 +925,13 @@ pub(crate) fn is_upstream_temporarily_unhealthy(upstream: &RuntimeUpstream, now:
 
 pub(crate) fn mark_upstream_available(upstream: &RuntimeUpstream) {
     upstream.unhealthy_until.store(0, Ordering::Relaxed);
-    upstream.half_open_probe_after.store(0, Ordering::Release);
+    reset_half_open_probe();
 }
 
 pub(crate) fn mark_upstream_unhealthy(upstream: &RuntimeUpstream) {
-    let now = current_second();
     upstream.unhealthy_until.store(
-        now.saturating_add(UPSTREAM_FAILURE_BACKOFF_SECONDS),
+        current_second().saturating_add(UPSTREAM_FAILURE_BACKOFF_SECONDS),
         Ordering::Relaxed,
-    );
-    upstream.half_open_probe_after.store(
-        now.saturating_add(UPSTREAM_HALF_OPEN_PROBE_INTERVAL_SECONDS),
-        Ordering::Release,
     );
 }
 
@@ -1413,15 +1428,15 @@ mod tests {
 
     #[test]
     fn all_unhealthy_load_balanced_upstreams_fail_without_retrying() {
+        let _guard = lock_half_open_probe();
         let upstreams = [5301, 5302, 5303].map(|port| {
             RuntimeUpstream::new(UpstreamServer::Udp(([127, 0, 0, 1], port).into()), &[])
         });
         for upstream in &upstreams {
             upstream.unhealthy_until.store(u64::MAX, Ordering::Relaxed);
-            upstream
-                .half_open_probe_after
-                .store(u64::MAX, Ordering::Relaxed);
         }
+        // 占掉全局探测名额，确保这一轮不会有查询被放行去等超时
+        HALF_OPEN_PROBE_AFTER.store(u64::MAX, Ordering::Relaxed);
 
         let error = match forward_load_balanced(
             &example_a_query(),
@@ -1467,12 +1482,21 @@ mod tests {
         third_handle.join().unwrap();
     }
 
+    fn lock_half_open_probe() -> std::sync::MutexGuard<'static, ()> {
+        let guard = HALF_OPEN_PROBE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        HALF_OPEN_PROBE_AFTER.store(0, Ordering::Relaxed);
+        HALF_OPEN_PROBE_CURSOR.store(0, Ordering::Relaxed);
+        guard
+    }
+
     #[test]
     fn unhealthy_upstream_allows_bounded_half_open_probe() {
+        let _guard = lock_half_open_probe();
         let upstream =
             RuntimeUpstream::new(UpstreamServer::Udp("127.0.0.1:5301".parse().unwrap()), &[]);
         upstream.unhealthy_until.store(u64::MAX, Ordering::Relaxed);
-        upstream.half_open_probe_after.store(0, Ordering::Relaxed);
 
         assert_eq!(
             select_parallel_upstreams(std::slice::from_ref(&upstream), 0).len(),
@@ -1482,6 +1506,130 @@ mod tests {
 
         mark_upstream_available(&upstream);
         assert_eq!(select_parallel_upstreams(&[upstream], 0).len(), 1);
+    }
+
+    /// 模拟上游完全不可达的时段，量化用户查询的实际等待。默认跳过：
+    ///   cargo test --release --lib measures_outage -- --ignored --nocapture
+    /// 对照组用每上游独立计时（修复前的行为）复现旧的探测放行方式。
+    #[test]
+    #[ignore]
+    fn measures_outage_query_latency() {
+        let _guard = lock_half_open_probe();
+        // 绑住端口但从不回复，等价于上游“收得到、不响应”的真实中断
+        // （指向未监听端口会立刻收到 ICMP 端口不可达，测不出等待）
+        let blackholes: Vec<UdpSocket> = (0..4)
+            .map(|_| UdpSocket::bind("127.0.0.1:0").expect("blackhole should bind"))
+            .collect();
+        let upstreams: Vec<_> = blackholes
+            .iter()
+            .map(|socket| {
+                RuntimeUpstream::new(
+                    UpstreamServer::Udp(socket.local_addr().expect("addr should read")),
+                    &[],
+                )
+            })
+            .collect();
+
+        // 按实测的查询速率（约 1.7 次/秒）铺满 10 秒
+        const QUERIES: usize = 17;
+        const GAP: Duration = Duration::from_millis(600);
+        let run = |legacy: bool| {
+            for upstream in &upstreams {
+                mark_upstream_unhealthy(upstream);
+            }
+            HALF_OPEN_PROBE_AFTER.store(0, Ordering::Relaxed);
+            let next = AtomicUsize::new(0);
+            let mut waits = Vec::new();
+            for _ in 0..QUERIES {
+                if legacy {
+                    // 复现修复前的效果：每个上游各有一个探测名额，
+                    // 该查询速率下每次查询都能拿到，于是每次都等满超时。
+                    HALF_OPEN_PROBE_AFTER.store(0, Ordering::Relaxed);
+                }
+                let started = Instant::now();
+                let _ = forward_parallel(
+                    &example_a_query(),
+                    &upstreams,
+                    &next,
+                    Instant::now() + Duration::from_secs(2),
+                    None,
+                );
+                waits.push(started.elapsed().as_millis());
+                std::thread::sleep(GAP);
+            }
+            waits
+        };
+
+        let legacy = run(true);
+        let fixed = run(false);
+        let summarize = |label: &str, waits: &[u128]| {
+            let slow = waits.iter().filter(|w| **w >= 100).count();
+            let total: u128 = waits.iter().sum();
+            println!("  {label}");
+            println!(
+                "     等满超时 {slow} 次 / 立即失败 {} 次   平均 {:.0} ms",
+                waits.len() - slow,
+                total as f64 / waits.len() as f64
+            );
+            println!("     逐次(ms) {waits:?}");
+        };
+        println!("\n===== 上游完全不可达时的查询等待（{QUERIES} 次 / 10 秒窗口，4 个上游）=====");
+        summarize("修复前（每上游各一个探测名额）：", &legacy);
+        summarize("修复后（全局共享名额，5 秒一次）：", &fixed);
+    }
+
+    /// 探测名额必须是全局的：多个上游同时退避时，一轮里也只放行一个探测。
+    /// 否则每个上游各放行一个，故障期间的查询会挨个等满超时。
+    #[test]
+    fn half_open_probe_budget_is_shared_across_upstreams() {
+        let _guard = lock_half_open_probe();
+        let upstreams = [5311, 5312, 5313, 5314].map(|port| {
+            RuntimeUpstream::new(UpstreamServer::Udp(([127, 0, 0, 1], port).into()), &[])
+        });
+        for upstream in &upstreams {
+            upstream.unhealthy_until.store(u64::MAX, Ordering::Relaxed);
+        }
+
+        assert_eq!(
+            select_parallel_upstreams(&upstreams, 0).len(),
+            1,
+            "第一次应放行一个探测"
+        );
+        for _ in 0..upstreams.len() * 3 {
+            assert!(
+                select_parallel_upstreams(&upstreams, 0).is_empty(),
+                "同一节流窗口内不应再放行任何探测"
+            );
+        }
+    }
+
+    /// 连续的探测应轮流落到不同上游，避免死盯一个已经彻底不可用的上游。
+    #[test]
+    fn half_open_probe_rotates_across_upstreams() {
+        let _guard = lock_half_open_probe();
+        // 偶数个上游可复现旧实现中 (start + cursor) 步长为 2、只覆盖一半的问题。
+        let upstreams = [5321, 5322, 5323, 5324].map(|port| {
+            RuntimeUpstream::new(UpstreamServer::Udp(([127, 0, 0, 1], port).into()), &[])
+        });
+        for upstream in &upstreams {
+            upstream.unhealthy_until.store(u64::MAX, Ordering::Relaxed);
+        }
+
+        let mut probed = Vec::new();
+        for start in 0..upstreams.len() {
+            HALF_OPEN_PROBE_AFTER.store(0, Ordering::Relaxed);
+            // 真实调用里的 start 同样会随查询前进；轮转不能依赖它保持不变。
+            let selected = select_parallel_upstreams(&upstreams, start);
+            assert_eq!(selected.len(), 1);
+            probed.push(selected[0].label.clone());
+        }
+        probed.sort();
+        probed.dedup();
+        assert_eq!(
+            probed.len(),
+            upstreams.len(),
+            "连续探测应覆盖到每个上游，实际只覆盖了 {probed:?}"
+        );
     }
 
     #[test]

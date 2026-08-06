@@ -1,11 +1,12 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleSummary {
     pub block_rules: usize,
     pub allow_rules: usize,
@@ -23,6 +24,13 @@ pub(crate) struct CompiledRules {
     /// 清单名称表：规则条目里只存索引，避免几百万条规则各克隆一份清单名
     sources: Vec<Box<str>>,
     summary: RuleSummary,
+    /// 本次编译收集到的 badfilter 禁用目标。增量合并自定义规则时要继续尊重它，
+    /// 否则被清单 badfilter 禁掉的规则会从自定义规则那边重新生效。
+    disabled: HashSet<Box<str>>,
+    /// 自定义规则只保存很小的增量层，并共享只读的远程清单索引。
+    /// 纯清单缓存落盘时该字段始终为空，不改变 postcard 格式。
+    #[serde(skip)]
+    base: Option<Arc<CompiledRules>>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -123,7 +131,18 @@ const DEFAULT_SOURCE: &str = "自定义规则";
 
 /// 逐行扫描规则文本，统一处理来源标记与 badfilter 禁用行，
 /// 保证 summarize 与 compile 对每一行的判定完全一致。
-fn scan_rules<'a>(raw: &'a str, mut handle: impl FnMut(ScanEvent<'a>)) {
+fn scan_rules<'a>(raw: &'a str, handle: impl FnMut(ScanEvent<'a>)) {
+    let empty = HashSet::new();
+    scan_rules_with_disabled(raw, &empty, handle);
+}
+
+/// extra_disabled 承载另一段规则里的 badfilter 目标，用于把自定义规则增量合并进
+/// 已编译的清单结果时仍然尊重清单的禁用。返回本段自己收集到的禁用目标。
+fn scan_rules_with_disabled<'a>(
+    raw: &'a str,
+    extra_disabled: &HashSet<Box<str>>,
+    mut handle: impl FnMut(ScanEvent<'a>),
+) -> HashSet<String> {
     let disabled = raw
         .lines()
         .filter_map(badfilter_target)
@@ -137,7 +156,7 @@ fn scan_rules<'a>(raw: &'a str, mut handle: impl FnMut(ScanEvent<'a>)) {
             }
             continue;
         }
-        if disabled.contains(trimmed) {
+        if disabled.contains(trimmed) || extra_disabled.contains(trimmed) {
             continue;
         }
         if let Some((kind, domains)) = parse_hosts_rules(trimmed) {
@@ -168,6 +187,7 @@ fn scan_rules<'a>(raw: &'a str, mut handle: impl FnMut(ScanEvent<'a>)) {
         }
         handle(ScanEvent::Rule(parse_rule(line)));
     }
+    disabled
 }
 
 enum ScanEvent<'a> {
@@ -187,6 +207,10 @@ pub fn summarize_rules(raw: &str) -> RuleSummary {
 }
 
 pub fn compile_rules(raw: &str) -> CompiledRules {
+    compile_rules_with_disabled(raw, &HashSet::new())
+}
+
+fn compile_rules_with_disabled(raw: &str, extra_disabled: &HashSet<Box<str>>) -> CompiledRules {
     let capacities = estimate_rule_capacities(raw);
     let mut blocks = RuleSet::with_capacities(capacities.block_exact, capacities.block_suffix);
     let mut allows = RuleSet::with_capacities(capacities.allow_exact, capacities.allow_suffix);
@@ -194,7 +218,7 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
     let mut sources: Vec<Box<str>> = vec![DEFAULT_SOURCE.into()];
     let mut source_id: u16 = 0;
 
-    scan_rules(raw, |event| match event {
+    let own_disabled = scan_rules_with_disabled(raw, extra_disabled, |event| match event {
         ScanEvent::Source(name) => source_id = intern_source(&mut sources, &name),
         ScanEvent::Rule(parsed) => {
             count_rule(&mut summary, &parsed);
@@ -206,12 +230,22 @@ pub fn compile_rules(raw: &str) -> CompiledRules {
         }
     });
 
+    let mut disabled = extra_disabled.clone();
+    disabled.extend(own_disabled.into_iter().map(String::into_boxed_str));
     CompiledRules {
         blocks,
         allows,
         sources,
         summary,
+        disabled,
+        base: None,
     }
+}
+
+/// 自定义规则里的 badfilter 需要回溯禁用清单里已编译的规则，增量合并做不到，
+/// 命中时必须退回整体编译。
+pub(crate) fn custom_rules_have_badfilter(raw: &str) -> bool {
+    raw.lines().any(|line| badfilter_target(line).is_some())
 }
 
 #[derive(Default)]
@@ -298,41 +332,53 @@ impl CompiledRules {
         self.summary.clone()
     }
 
+    /// 在已编译的清单结果上原地追加自定义规则。插入顺序与整体编译一致（清单先、
+    /// 自定义后），因此与清单重复的规则仍然保留清单里的那一条。
+    /// 调用前需用 [`custom_rules_have_badfilter`] 排除自定义 badfilter。
+    #[cfg(test)]
+    pub(crate) fn merge_custom_rules(&mut self, custom: &str) {
+        let Self {
+            blocks,
+            allows,
+            sources,
+            summary,
+            disabled,
+            base: _,
+        } = self;
+        let default_id = intern_source(sources, DEFAULT_SOURCE);
+        let mut source_id = default_id;
+        scan_rules_with_disabled(custom, &*disabled, |event| match event {
+            ScanEvent::Source(name) => source_id = intern_source(sources, &name),
+            ScanEvent::Rule(parsed) => {
+                count_rule(summary, &parsed);
+                match parsed {
+                    ParsedRule::Block(rule) => blocks.insert(rule, source_id, false),
+                    ParsedRule::Allow(rule) => allows.insert(rule, source_id, true),
+                    ParsedRule::Ignored(_) | ParsedRule::Disable => {}
+                }
+            }
+        });
+    }
+
+    /// 只编译自定义规则这一小层，并共享远程清单的数百万条索引。
+    /// 查询时按原有的域名优先级跨层匹配，效果与原地合入保持一致。
+    pub(crate) fn with_custom_layer(base: Arc<Self>, custom: &str) -> Self {
+        let mut overlay = compile_rules_with_disabled(custom, &base.disabled);
+        overlay.summary = combined_summary(&base.summary, &overlay.summary);
+        overlay.base = Some(base);
+        overlay
+    }
+
     #[cfg(test)]
     pub(crate) fn is_blocked(&self, domain: &str, qtype: u16) -> bool {
         self.blocking_match(domain, qtype).is_some()
     }
 
     pub(crate) fn blocking_match(&self, domain: &str, qtype: u16) -> Option<BlockMatch> {
-        let important_allow = self.allows.find_match(domain, qtype, true);
-        if important_allow.is_some() {
-            return None;
-        }
-        if let Some(block) = self.blocks.find_match(domain, qtype, true) {
-            let allow = self.allows.find_match(domain, qtype, false);
-            let important_overrode = allow.is_some();
-            return Some(self.build_block_match(block, allow, important_overrode));
-        }
-        if self.allows.find_match(domain, qtype, false).is_some() {
-            return None;
-        }
-        self.blocks
-            .find_match(domain, qtype, false)
-            .map(|block| self.build_block_match(block, None, false))
-    }
-
-    fn build_block_match(
-        &self,
-        block: MatchedRule<'_>,
-        allow: Option<MatchedRule<'_>>,
-        important_overrode: bool,
-    ) -> BlockMatch {
-        BlockMatch {
-            rule: block.raw_text(false),
-            source: self.source_name(block.source_id),
-            rule_type: format!("{} block", block.rule_type.as_str()),
-            important_overrode,
-            allowlist_rule: allow.map(|rule| rule.raw_text(true)),
+        if let Some(base) = self.base.as_deref() {
+            blocking_match_layers(&[base, self], domain, qtype)
+        } else {
+            blocking_match_layers(&[self], domain, qtype)
         }
     }
 
@@ -341,6 +387,119 @@ impl CompiledRules {
             .get(usize::from(source_id))
             .map(|name| name.to_string())
             .unwrap_or_else(|| DEFAULT_SOURCE.to_string())
+    }
+}
+
+fn combined_summary(base: &RuleSummary, overlay: &RuleSummary) -> RuleSummary {
+    RuleSummary {
+        block_rules: base.block_rules + overlay.block_rules,
+        allow_rules: base.allow_rules + overlay.allow_rules,
+        ignored_rules: base.ignored_rules + overlay.ignored_rules,
+        ignored_comment_rules: base.ignored_comment_rules + overlay.ignored_comment_rules,
+        ignored_regex_rules: base.ignored_regex_rules + overlay.ignored_regex_rules,
+        ignored_unsupported_rules: base.ignored_unsupported_rules
+            + overlay.ignored_unsupported_rules,
+        ignored_invalid_rules: base.ignored_invalid_rules + overlay.ignored_invalid_rules,
+    }
+}
+
+struct RuleCandidate {
+    raw: String,
+    source: String,
+    rule_type: RuleType,
+}
+
+fn blocking_match_layers(
+    layers: &[&CompiledRules],
+    domain: &str,
+    qtype: u16,
+) -> Option<BlockMatch> {
+    if find_layered_match(layers, domain, qtype, true, true).is_some() {
+        return None;
+    }
+    if let Some(block) = find_layered_match(layers, domain, qtype, true, false) {
+        let allow = find_layered_match(layers, domain, qtype, false, true);
+        let important_overrode = allow.is_some();
+        return Some(build_block_match(block, allow, important_overrode));
+    }
+    if find_layered_match(layers, domain, qtype, false, true).is_some() {
+        return None;
+    }
+    find_layered_match(layers, domain, qtype, false, false)
+        .map(|block| build_block_match(block, None, false))
+}
+
+fn find_layered_match(
+    layers: &[&CompiledRules],
+    domain: &str,
+    qtype: u16,
+    important: bool,
+    allow: bool,
+) -> Option<RuleCandidate> {
+    if let Some(found) = lookup_layers(layers, domain, domain, qtype, important, allow, true) {
+        return Some(found);
+    }
+    if let Some(found) = lookup_layers(layers, domain, domain, qtype, important, allow, false) {
+        return Some(found);
+    }
+
+    let mut offset = 0;
+    while let Some(dot_index) = domain[offset..].find('.') {
+        offset += dot_index + 1;
+        if let Some(found) = lookup_layers(
+            layers,
+            &domain[offset..],
+            domain,
+            qtype,
+            important,
+            allow,
+            false,
+        ) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lookup_layers(
+    layers: &[&CompiledRules],
+    lookup: &str,
+    query_domain: &str,
+    qtype: u16,
+    important: bool,
+    allow: bool,
+    exact: bool,
+) -> Option<RuleCandidate> {
+    for rules in layers {
+        let rule_set = if allow { &rules.allows } else { &rules.blocks };
+        let entries = if exact {
+            &rule_set.exact
+        } else {
+            &rule_set.suffix
+        };
+        if let Some(matched) = lookup_entry(entries, lookup, query_domain, qtype, important) {
+            return Some(RuleCandidate {
+                raw: matched.raw_text(allow),
+                source: rules.source_name(matched.source_id),
+                rule_type: matched.rule_type,
+            });
+        }
+    }
+    None
+}
+
+fn build_block_match(
+    block: RuleCandidate,
+    allow: Option<RuleCandidate>,
+    important_overrode: bool,
+) -> BlockMatch {
+    BlockMatch {
+        rule: block.raw,
+        source: block.source,
+        rule_type: format!("{} block", block.rule_type.as_str()),
+        important_overrode,
+        allowlist_rule: allow.map(|rule| rule.raw),
     }
 }
 
@@ -402,27 +561,6 @@ impl RuleSet {
             }])),
         };
         map.insert(domain.into_owned().into_boxed_str(), value);
-    }
-
-    fn find_match(&self, domain: &str, qtype: u16, important: bool) -> Option<MatchedRule<'_>> {
-        if let Some(found) = lookup_entry(&self.exact, domain, domain, qtype, important) {
-            return Some(found);
-        }
-        if let Some(found) = lookup_entry(&self.suffix, domain, domain, qtype, important) {
-            return Some(found);
-        }
-
-        let mut offset = 0;
-        while let Some(dot_index) = domain[offset..].find('.') {
-            offset += dot_index + 1;
-            if let Some(found) =
-                lookup_entry(&self.suffix, &domain[offset..], domain, qtype, important)
-            {
-                return Some(found);
-            }
-        }
-
-        None
     }
 }
 
