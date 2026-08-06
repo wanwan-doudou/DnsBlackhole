@@ -5,7 +5,7 @@ use std::{
     net::{SocketAddr, UdpSocket},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -35,6 +35,7 @@ use super::{
     },
     task_pool,
     upstream::{RuntimeUpstream, UpstreamForwardResponse, forward_query},
+    upstream_routes::{RouteUpstreamPool, UpstreamRoutes},
 };
 
 const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
@@ -78,11 +79,13 @@ pub(crate) enum DnsResponseTarget {
 pub(crate) struct DnsWorkerContext {
     pub(crate) upstream_servers: Arc<Vec<RuntimeUpstream>>,
     pub(crate) fallback_upstream_servers: Arc<Vec<RuntimeUpstream>>,
+    pub(crate) upstream_routes: Arc<UpstreamRoutes>,
     pub(crate) upstream_mode: UpstreamMode,
     pub(crate) next_upstream: AtomicUsize,
     pub(crate) fallback_next_upstream: AtomicUsize,
     pub(crate) access: Arc<ClientAccess>,
     pub(crate) refuse_any: bool,
+    pub(crate) protection_paused_until: Arc<AtomicU64>,
     pub(crate) filter_runtime: SharedFilterRuntime,
     pub(crate) stats: Arc<Mutex<DnsStats>>,
     pub(crate) dns_cache: Option<Arc<DnsCacheStore>>,
@@ -393,9 +396,10 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         return;
     }
 
-    if let Some(rule_match) = filter
-        .rules
-        .blocking_match(&question.domain, question.qtype)
+    if !protection_is_paused(&context.protection_paused_until)
+        && let Some(rule_match) = filter
+            .rules
+            .blocking_match(&question.domain, question.qtype)
     {
         let response = build_block_response(query, question, &filter.blocking);
         if let Err(error) = send_dns_response(response_target, query, &response) {
@@ -445,7 +449,11 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         context.detailed_runtime_stats,
     );
 
-    let cache_key = QueryCacheKey::from_query(&parsed_query);
+    let routed_upstream = context
+        .upstream_routes
+        .select(&question.domain, client_addr.ip());
+    let cache_key = QueryCacheKey::from_query(&parsed_query)
+        .map(|key| key.with_route(routed_upstream.as_deref().map(RouteUpstreamPool::key)));
     if let Some(cache_key) = cache_key.as_ref()
         && let Some(cache_hit) =
             lookup_cached_response(&context.dns_cache, cache_key, query, current_second())
@@ -487,6 +495,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     cache_key.clone(),
                     Arc::clone(&context.upstream_servers),
                     Arc::clone(&context.fallback_upstream_servers),
+                    routed_upstream.clone(),
                     context.upstream_mode.clone(),
                     Arc::clone(&context.stats),
                     context.dns_cache.clone(),
@@ -524,8 +533,9 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         None
     };
 
-    let forward_result = forward_query_with_fallback(
+    let forward_result = forward_query_with_route(
         query,
+        routed_upstream.as_deref(),
         context.upstream_servers.as_ref(),
         context.fallback_upstream_servers.as_ref(),
         &context.upstream_mode,
@@ -600,6 +610,10 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             );
         }
     }
+}
+
+fn protection_is_paused(deadline: &AtomicU64) -> bool {
+    deadline.load(Ordering::Acquire) > current_second()
 }
 
 fn response_transport(response_target: &DnsResponseTarget) -> DnsTransport {
@@ -867,6 +881,39 @@ fn forward_query_with_fallback(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn forward_query_with_route(
+    query: &[u8],
+    route: Option<&RouteUpstreamPool>,
+    upstream_servers: &[RuntimeUpstream],
+    fallback_upstream_servers: &[RuntimeUpstream],
+    upstream_mode: &UpstreamMode,
+    next_upstream: &AtomicUsize,
+    fallback_next_upstream: &AtomicUsize,
+    stats: &Arc<Mutex<DnsStats>>,
+) -> Result<UpstreamForwardResponse, String> {
+    if let Some(route) = route {
+        return forward_query_with_fallback(
+            query,
+            &route.upstreams,
+            &[],
+            upstream_mode,
+            &route.next_upstream,
+            fallback_next_upstream,
+            stats,
+        );
+    }
+    forward_query_with_fallback(
+        query,
+        upstream_servers,
+        fallback_upstream_servers,
+        upstream_mode,
+        next_upstream,
+        fallback_next_upstream,
+        stats,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn forward_query_once_with_fallback(
     query: &[u8],
     upstream_servers: &[RuntimeUpstream],
@@ -929,6 +976,7 @@ fn refresh_expired_cache_async(
     cache_key: QueryCacheKey,
     upstream_servers: Arc<Vec<RuntimeUpstream>>,
     fallback_upstream_servers: Arc<Vec<RuntimeUpstream>>,
+    routed_upstream: Option<Arc<RouteUpstreamPool>>,
     upstream_mode: UpstreamMode,
     stats: Arc<Mutex<DnsStats>>,
     dns_cache: Option<Arc<DnsCacheStore>>,
@@ -951,8 +999,9 @@ fn refresh_expired_cache_async(
         }
         let next_upstream = AtomicUsize::new(0);
         let fallback_next_upstream = AtomicUsize::new(0);
-        match forward_query_with_fallback(
+        match forward_query_with_route(
             &query,
+            routed_upstream.as_deref(),
             upstream_servers.as_ref(),
             fallback_upstream_servers.as_ref(),
             &upstream_mode,
@@ -1211,7 +1260,10 @@ mod pending_query_tests {
         };
 
         // 登记立即返回，worker 不会阻塞在上游结果上
-        assert!(register_pending_follower(&follower_pending, test_follower()));
+        assert!(register_pending_follower(
+            &follower_pending,
+            test_follower()
+        ));
         assert_eq!(
             leader.followers.lock().unwrap().as_ref().map(Vec::len),
             Some(1),

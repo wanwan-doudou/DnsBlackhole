@@ -1,6 +1,6 @@
 [package]
 name = "dnsblackhole"
-version = "0.1.55"
+version = "0.1.56"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"
@@ -25,6 +25,14 @@ serde_json = "1"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 socket2 = "0.6"
 reqwest = { version = "0.13", features = ["blocking"] }
+hickory-client = { version = "0.25.2", features = [
+    "https-ring",
+    "quic-ring",
+    "tls-ring",
+    "webpki-roots",
+] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
