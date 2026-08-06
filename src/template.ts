@@ -13,23 +13,22 @@ export function renderAppTemplate(appIconUrl: string): string {
 
         <nav class="module-nav" aria-label="模块">
           <button class="nav-item active" data-view="dashboard" type="button">仪表盘</button>
-          <div class="nav-menu">
-            <button class="nav-item" data-view="settings" data-nav-group="settings" type="button">设置</button>
-            <div class="nav-dropdown" role="menu">
-              <button data-view="settings" type="button" role="menuitem">常规设置</button>
-              <button data-view="dns" type="button" role="menuitem">DNS 设置</button>
-              <button data-view="security" type="button" role="menuitem">安全防护</button>
-            </div>
-          </div>
-          <div class="nav-menu">
-            <button class="nav-item" data-view="filters" data-nav-group="filters" type="button">过滤器</button>
-            <div class="nav-dropdown" role="menu">
-              <button data-view="filters" type="button" role="menuitem">DNS 黑名单</button>
-              <button data-view="custom" type="button" role="menuitem">自定义过滤规则</button>
-            </div>
-          </div>
+          <button class="nav-item" data-view="settings" data-nav-group="settings" type="button">设置</button>
+          <button class="nav-item" data-view="filters" data-nav-group="filters" type="button">过滤器</button>
           <button class="nav-item" data-view="logs" type="button">查询日志</button>
           <button class="nav-item" data-view="about" type="button">关于</button>
+        </nav>
+      </div>
+
+      <div class="context-nav" id="context_nav">
+        <nav class="context-nav-inner" data-context-group="settings" aria-label="设置分类">
+          <button data-view="settings" type="button">常规与运行</button>
+          <button data-view="dns" type="button">DNS 设置</button>
+          <button data-view="security" type="button">安全防护</button>
+        </nav>
+        <nav class="context-nav-inner" data-context-group="filters" aria-label="过滤器分类">
+          <button data-view="filters" type="button">DNS 黑名单</button>
+          <button data-view="custom" type="button">自定义规则与重写</button>
         </nav>
       </div>
     </header>
@@ -39,6 +38,7 @@ export function renderAppTemplate(appIconUrl: string): string {
         <div class="dashboard-summary" aria-label="统计趋势">
           <article class="spark-card">
             <div class="spark-box">
+              <span class="spark-caption">DNS 查询</span>
               <strong id="queries">0</strong>
               <svg class="sparkline" data-tooltip="query_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
                 <defs>
@@ -57,11 +57,11 @@ export function renderAppTemplate(appIconUrl: string): string {
               </svg>
               <div class="spark-tooltip hidden" id="query_spark_tooltip"></div>
             </div>
-            <span class="spark-caption"><span>DNS 查询</span></span>
           </article>
 
           <article class="spark-card blocked-spark">
             <div class="spark-box">
+              <span class="spark-caption">已拦截查询</span>
               <strong id="blocked">0</strong>
               <small id="block_rate">0%</small>
               <svg class="sparkline" data-tooltip="blocked_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
@@ -81,7 +81,6 @@ export function renderAppTemplate(appIconUrl: string): string {
               </svg>
               <div class="spark-tooltip hidden" id="blocked_spark_tooltip"></div>
             </div>
-            <span class="spark-caption"><span>已被过滤器拦截</span></span>
           </article>
         </div>
 
@@ -248,7 +247,8 @@ export function renderAppTemplate(appIconUrl: string): string {
           <div class="panel-title with-actions">
             <h2>DNS 设置</h2>
             <div class="button-group">
-              <button class="primary" id="save_btn" type="button">保存</button>
+              <span class="save-state-label" aria-live="polite">正在读取配置</span>
+              <button class="primary" id="save_btn" type="button">保存更改</button>
               <button id="start_btn" type="button">启动</button>
               <button id="stop_btn" type="button">停止</button>
             </div>
@@ -410,7 +410,10 @@ export function renderAppTemplate(appIconUrl: string): string {
         <section class="panel module-panel">
           <div class="panel-title with-actions">
             <h2>安全防护</h2>
-            <button class="primary" id="save_security_btn" type="button">保存</button>
+            <div class="button-group">
+              <span class="save-state-label" aria-live="polite">正在读取配置</span>
+              <button class="primary" id="save_security_btn" type="button">保存更改</button>
+            </div>
           </div>
 
           <div class="settings-stack">
@@ -531,7 +534,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <small>按解压后的实际读取大小限制，超过后立即中断下载。</small>
                   <input id="filter_max_size_mb" type="number" min="1" max="256" step="1" />
                 </label>
-                <label class="field">
+                <div class="field">
                   <span>下载代理</span>
                   <small id="filter_proxy_status">自动读取当前用户的系统代理，并交给后台服务使用。</small>
                   <select id="filter_proxy_mode">
@@ -539,7 +542,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                     <option value="direct">直接连接</option>
                     <option value="custom">自定义代理</option>
                   </select>
-                </label>
+                </div>
                 <label class="field filter-proxy-url-field" id="filter_proxy_url_field">
                   <span>自定义代理地址</span>
                   <small>支持 HTTP/HTTPS 代理，例如 http://127.0.0.1:7897。</small>
@@ -559,14 +562,20 @@ export function renderAppTemplate(appIconUrl: string): string {
       </section>
 
       <section class="view" data-view-panel="settings">
-        <section class="panel module-panel">
+        <section class="panel module-panel settings-overview-panel">
           <div class="panel-title with-actions">
-            <h2>设置</h2>
-            <button class="primary" id="save_settings_btn" type="button">保存</button>
+            <div>
+              <h2>常规与运行</h2>
+              <p class="panel-subtitle">管理启动行为、后台服务、数据与隐私。</p>
+            </div>
+            <div class="button-group">
+              <span class="save-state-label" aria-live="polite">正在读取配置</span>
+              <button class="primary" id="save_settings_btn" type="button">保存更改</button>
+            </div>
           </div>
 
-          <div class="settings-stack">
-            <section class="settings-section">
+          <div class="settings-stack settings-overview-grid">
+            <section class="settings-section settings-section-first-row">
               <h3>常规设置</h3>
               <label class="check-row">
                 <input id="use_filters" type="checkbox" />
@@ -575,7 +584,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <small>你可以在 DNS 黑名单和自定义过滤规则中添加过滤规则。</small>
                 </span>
               </label>
-              <label class="field compact-select">
+              <div class="field compact-select">
                 <span>过滤器更新间隔</span>
                 <select id="filter_update_interval">
                   <option value="6">6 小时</option>
@@ -584,7 +593,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <option value="72">3 天</option>
                   <option value="168">7 天</option>
                 </select>
-              </label>
+              </div>
               <label class="toggle-row">
                 <input id="enabled" type="checkbox" />
                 <span>启动时自动运行 DNS 服务</span>
@@ -595,7 +604,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </label>
             </section>
 
-            <section class="settings-section runtime-watchdog-section">
+            <section class="settings-section settings-section-first-row settings-section-right runtime-watchdog-section">
               <div class="section-heading">
                 <h3>运行监控</h3>
               </div>
@@ -626,7 +635,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
-            <section class="settings-section background-service-section hidden" id="windows_system_dns_section">
+            <section class="settings-section settings-section-right background-service-section hidden" id="windows_system_dns_section">
               <div>
                 <h3>系统 DNS</h3>
                 <p id="windows_system_dns_status">正在读取系统 DNS 状态…</p>
@@ -675,7 +684,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </dialog>
 
-            <section class="settings-section background-service-section hidden" id="macos_service_section">
+            <section class="settings-section settings-section-wide background-service-section hidden" id="macos_service_section">
               <div>
                 <h3>macOS DNS 后台服务</h3>
                 <p id="macos_service_status">正在读取后台服务状态…</p>
@@ -688,7 +697,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
-            <section class="settings-section data-storage-section">
+            <section class="settings-section data-storage-section settings-section-wide">
               <div class="section-heading">
                 <h3>数据存储</h3>
                 <span>查询日志、统计数据库和过滤器数据会保存在此目录。可迁移到空目录，也可在重装系统后安全使用保留的现有数据。</span>
@@ -711,7 +720,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               <div class="data-storage-error hidden" id="data_storage_error"></div>
             </section>
 
-            <section class="settings-section cache-maintenance-section">
+            <section class="settings-section cache-maintenance-section settings-section-wide">
               <div>
                 <h3>磁盘缓存</h3>
                 <p>清理可重新生成的规则编译缓存，不会删除远程黑名单、当前生效规则、配置、查询日志和统计数据。</p>
@@ -756,12 +765,11 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <textarea id="query_log_ignored_domains" autocomplete="off" spellcheck="false" placeholder="example.com"></textarea>
               </label>
               <div class="button-group persistence-actions">
-                <button class="primary" id="save_query_log_settings_btn" type="button">保存</button>
                 <button id="clear_query_logs_btn" type="button">清除查询日志</button>
               </div>
             </section>
 
-            <section class="settings-section">
+            <section class="settings-section settings-section-right">
               <h3>统计配置</h3>
               <label class="check-row">
                 <input id="statistics_enabled" type="checkbox" />
@@ -793,7 +801,6 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <textarea id="statistics_ignored_domains" autocomplete="off" spellcheck="false" placeholder="example.com"></textarea>
               </label>
               <div class="button-group persistence-actions">
-                <button class="primary" id="save_statistics_settings_btn" type="button">保存</button>
                 <button id="clear_statistics_btn" type="button">清除统计数据</button>
               </div>
             </section>
@@ -913,6 +920,8 @@ export function renderAppTemplate(appIconUrl: string): string {
             <h2>DNS 黑名单</h2>
             <div class="button-group">
               <span class="filter-update-progress hidden" id="filter_update_progress" role="status"></span>
+              <span class="save-state-label" aria-live="polite">正在读取配置</span>
+              <button id="save_filters_btn" type="button">保存更改</button>
               <button id="add_filter_btn" type="button">添加黑名单</button>
               <button class="hidden" id="cancel_filter_update_btn" type="button">取消更新</button>
               <button class="primary" id="update_filters_btn" type="button">检查更新</button>
@@ -936,7 +945,10 @@ export function renderAppTemplate(appIconUrl: string): string {
         <section class="panel module-panel">
           <div class="panel-title with-actions">
             <h2>自定义过滤规则</h2>
-            <button class="primary" id="save_custom_btn" type="button">保存</button>
+            <div class="button-group">
+              <span class="save-state-label" aria-live="polite">正在读取配置</span>
+              <button class="primary" id="save_custom_btn" type="button">保存更改</button>
+            </div>
           </div>
           <textarea id="blacklist" spellcheck="false"></textarea>
 

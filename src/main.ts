@@ -154,6 +154,8 @@ let detectedSystemProxy: string | null = null;
 let savedSystemProxyUrl = "";
 let filterUpdateProgressTimer: number | undefined;
 let filterUpdateProgressInFlight = false;
+let savedConfigFingerprint = "";
+let configDirty = false;
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
@@ -168,8 +170,8 @@ const QUERY_LOG_PAGE_SIZE = 50;
 const QUERY_LOG_SEARCH_DEBOUNCE_MS = 800;
 const BACKGROUND_REFRESH_INTERVAL_MS = 5_000;
 const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 30_000;
-// 排行卡片渲染上限：超出可视高度的部分在卡片内滚动查看
-const RANK_ROW_LIMIT = 50;
+// 仪表盘只展示最有价值的前几项，避免页面和卡片同时出现滚动条。
+const RANK_ROW_LIMIT = 8;
 const CHECK_RETRY_DELAYS_MS = [800, 2_000, 5_000];
 const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 2_500, 5_000];
 const CHECK_TIMEOUT_MS = 20_000;
@@ -178,6 +180,7 @@ const WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS = [150, 250, 400, 700, 1_100, 1_80
 const WINDOWS_SERVICE_ERROR_GRACE_MS = 10_000;
 
 const contentElement = query<HTMLDivElement>(".content");
+const contextNav = query<HTMLElement>("#context_nav");
 const enabledInput = query<HTMLInputElement>("#enabled");
 const launchAtStartupInput = query<HTMLInputElement>("#launch_at_startup");
 const useFiltersInput = query<HTMLInputElement>("#use_filters");
@@ -241,16 +244,15 @@ const filtersBody = query<HTMLDivElement>("#filters_body");
 const saveButton = query<HTMLButtonElement>("#save_btn");
 const saveSettingsButton = query<HTMLButtonElement>("#save_settings_btn");
 const saveSecurityButton = query<HTMLButtonElement>("#save_security_btn");
+const saveFiltersButton = query<HTMLButtonElement>("#save_filters_btn");
 const saveCustomButton = query<HTMLButtonElement>("#save_custom_btn");
-const saveQueryLogSettingsButton = query<HTMLButtonElement>("#save_query_log_settings_btn");
-const saveStatisticsSettingsButton = query<HTMLButtonElement>("#save_statistics_settings_btn");
+const saveStateLabels = Array.from(document.querySelectorAll<HTMLElement>(".save-state-label"));
 const configSaveButtons = [
   saveButton,
   saveSettingsButton,
   saveSecurityButton,
+  saveFiltersButton,
   saveCustomButton,
-  saveQueryLogSettingsButton,
-  saveStatisticsSettingsButton,
 ];
 configSaveButtons.forEach((button) => {
   button.disabled = true;
@@ -337,17 +339,180 @@ const upstreamTaskQueueRejected = query<HTMLElement>("#upstream_task_queue_rejec
 const tcpConnectionRejected = query<HTMLElement>("#tcp_connection_rejected");
 const securityEventBody = query<HTMLDivElement>("#security_event_body");
 
-document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
-  button.addEventListener("click", () => {
-    // 有 data-nav-group 的按钮只作为下拉触发器，不直接导航
-    if (button.dataset.navGroup) {
+type CustomSelectElements = {
+  root: HTMLDivElement;
+  trigger: HTMLButtonElement;
+  valueLabel: HTMLSpanElement;
+  menu: HTMLDivElement;
+  options: HTMLButtonElement[];
+};
+
+const customSelects = new Map<HTMLSelectElement, CustomSelectElements>();
+
+function initializeCustomSelect(select: HTMLSelectElement): void {
+  const fieldLabel = select.parentElement?.querySelector<HTMLElement>(":scope > span");
+  const root = document.createElement("div");
+  const trigger = document.createElement("button");
+  const valueLabel = document.createElement("span");
+  const arrow = document.createElement("i");
+  const menu = document.createElement("div");
+  const menuId = `${select.id}_custom_options`;
+  const valueId = `${select.id}_custom_value`;
+
+  root.className = "custom-select";
+  trigger.className = "custom-select-trigger";
+  trigger.type = "button";
+  trigger.setAttribute("aria-haspopup", "listbox");
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.setAttribute("aria-controls", menuId);
+  valueLabel.id = valueId;
+  arrow.setAttribute("aria-hidden", "true");
+  trigger.append(valueLabel, arrow);
+
+  if (fieldLabel) {
+    fieldLabel.id ||= `${select.id}_field_label`;
+    trigger.setAttribute("aria-labelledby", `${fieldLabel.id} ${valueId}`);
+    menu.setAttribute("aria-labelledby", fieldLabel.id);
+  } else {
+    trigger.setAttribute("aria-label", select.getAttribute("aria-label") || select.id);
+  }
+
+  menu.className = "custom-select-options";
+  menu.id = menuId;
+  menu.setAttribute("role", "listbox");
+
+  const optionButtons = Array.from(select.options).map((option) => {
+    const button = document.createElement("button");
+    button.className = "custom-select-option";
+    button.type = "button";
+    button.dataset.value = option.value;
+    button.disabled = option.disabled;
+    button.textContent = option.textContent;
+    button.setAttribute("role", "option");
+    button.addEventListener("click", () => {
+      if (select.disabled || option.disabled) {
+        return;
+      }
+      const changed = select.value !== option.value;
+      select.value = option.value;
+      syncCustomSelect(select);
+      setCustomSelectOpen(select, false);
+      trigger.focus();
+      if (changed) {
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    });
+    button.addEventListener("keydown", (event) => {
+      const currentIndex = optionButtons.indexOf(button);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        focusCustomSelectOption(optionButtons, currentIndex + direction);
+      } else if (event.key === "Home" || event.key === "End") {
+        event.preventDefault();
+        focusCustomSelectOption(optionButtons, event.key === "Home" ? 0 : optionButtons.length - 1);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        setCustomSelectOpen(select, false);
+        trigger.focus();
+      } else if (event.key === "Tab") {
+        setCustomSelectOpen(select, false);
+      }
+    });
+    menu.append(button);
+    return button;
+  });
+
+  select.classList.add("custom-select-native");
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
+  select.insertAdjacentElement("afterend", root);
+  root.append(trigger, menu);
+  customSelects.set(select, { root, trigger, valueLabel, menu, options: optionButtons });
+
+  trigger.addEventListener("click", () => {
+    if (!select.disabled) {
+      setCustomSelectOpen(select, !root.classList.contains("open"));
+    }
+  });
+  trigger.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      setCustomSelectOpen(select, true);
+      const selectedIndex = Math.max(0, select.selectedIndex);
+      focusCustomSelectOption(optionButtons, event.key === "ArrowDown" ? selectedIndex : selectedIndex - 1);
+    } else if (event.key === "Escape") {
+      setCustomSelectOpen(select, false);
+    }
+  });
+  select.addEventListener("change", () => syncCustomSelect(select));
+  syncCustomSelect(select);
+}
+
+function focusCustomSelectOption(options: HTMLButtonElement[], requestedIndex: number): void {
+  if (options.length === 0) {
+    return;
+  }
+  let index = (requestedIndex + options.length) % options.length;
+  for (let attempt = 0; attempt < options.length; attempt += 1) {
+    if (!options[index].disabled) {
+      options[index].focus();
       return;
     }
+    index = (index + 1) % options.length;
+  }
+}
+
+function setCustomSelectOpen(select: HTMLSelectElement, open: boolean): void {
+  const elements = customSelects.get(select);
+  if (!elements) {
+    return;
+  }
+  if (open) {
+    closeCustomSelects(select);
+    const rect = elements.trigger.getBoundingClientRect();
+    const estimatedMenuHeight = Math.min(elements.options.length * 38 + 12, 240);
+    const spaceBelow = window.innerHeight - rect.bottom - 12;
+    elements.root.classList.toggle(
+      "open-upward",
+      spaceBelow < estimatedMenuHeight && rect.top > spaceBelow,
+    );
+  }
+  elements.root.classList.toggle("open", open);
+  elements.trigger.setAttribute("aria-expanded", String(open));
+}
+
+function closeCustomSelects(except?: HTMLSelectElement): void {
+  customSelects.forEach((elements, select) => {
+    if (select !== except) {
+      elements.root.classList.remove("open", "open-upward");
+      elements.trigger.setAttribute("aria-expanded", "false");
+    }
+  });
+}
+
+function syncCustomSelect(select: HTMLSelectElement): void {
+  const elements = customSelects.get(select);
+  if (!elements) {
+    return;
+  }
+  const selectedOption = select.selectedOptions[0] || select.options[0];
+  elements.valueLabel.textContent = selectedOption?.textContent || "请选择";
+  elements.trigger.disabled = select.disabled;
+  elements.options.forEach((button) => {
+    const selected = button.dataset.value === select.value;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-selected", String(selected));
+  });
+}
+
+[filterProxyModeInput, filterUpdateIntervalInput].forEach(initializeCustomSelect);
+
+document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
+  button.addEventListener("click", () => {
     const view = button.dataset.view as ViewName | undefined;
     if (view) {
       setActiveView(view);
-      // 点击下拉菜单项后关闭所有下拉框
-      closeAllDropdowns();
     }
   });
 });
@@ -365,39 +530,18 @@ document.querySelectorAll<HTMLButtonElement>("[data-about-link]").forEach((butto
   });
 });
 
-// 下拉菜单控制：点击触发，同时只显示一个
-const navMenus = document.querySelectorAll<HTMLDivElement>(".nav-menu");
-
-function closeAllDropdowns(): void {
-  navMenus.forEach((m) => m.classList.remove("open"));
-}
-
 function closeQueryLogFilter(): void {
   queryLogFilterMenu.classList.remove("open");
   queryLogFilterButton.setAttribute("aria-expanded", "false");
 }
 
-navMenus.forEach((menu) => {
-  const trigger = menu.querySelector<HTMLButtonElement>(".nav-item");
-  if (!trigger) return;
-  trigger.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const isOpen = menu.classList.contains("open");
-    closeAllDropdowns();
-    if (!isOpen) {
-      menu.classList.add("open");
-    }
-  });
-});
-
-// 点击页面其他区域时关闭下拉框
 document.addEventListener("click", (e) => {
   const target = e.target as HTMLElement;
-  if (!target.closest(".nav-dropdown")) {
-    closeAllDropdowns();
-  }
   if (!target.closest(".query-log-filter")) {
     closeQueryLogFilter();
+  }
+  if (!target.closest(".custom-select")) {
+    closeCustomSelects();
   }
 });
 
@@ -445,7 +589,6 @@ queryLogFilterButton.addEventListener("click", (event) => {
   if (queryLogFilterButton.disabled) {
     return;
   }
-  closeAllDropdowns();
   const open = !queryLogFilterMenu.classList.contains("open");
   queryLogFilterMenu.classList.toggle("open", open);
   queryLogFilterButton.setAttribute("aria-expanded", String(open));
@@ -529,6 +672,36 @@ statisticsRetentionInputs.forEach((input) => {
   });
 });
 
+const CONFIG_VIEW_SELECTOR = [
+  '[data-view-panel="settings"]',
+  '[data-view-panel="dns"]',
+  '[data-view-panel="security"]',
+  '[data-view-panel="filters"]',
+  '[data-view-panel="custom"]',
+].join(",");
+
+function handleConfigFieldChange(event: Event): void {
+  const target = event.target;
+  if (
+    !(
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target instanceof HTMLSelectElement
+    )
+  ) {
+    return;
+  }
+  const readOnly =
+    (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) && target.readOnly;
+  if (readOnly || !target.closest(CONFIG_VIEW_SELECTOR)) {
+    return;
+  }
+  window.queueMicrotask(updateConfigDirtyState);
+}
+
+app.addEventListener("input", handleConfigFieldChange);
+app.addEventListener("change", handleConfigFieldChange);
+
 saveButton.addEventListener("click", async () => {
   await saveConfig();
 });
@@ -541,15 +714,11 @@ saveSecurityButton.addEventListener("click", async () => {
   await saveConfig();
 });
 
+saveFiltersButton.addEventListener("click", async () => {
+  await saveConfig();
+});
+
 saveCustomButton.addEventListener("click", async () => {
-  await saveConfig();
-});
-
-saveQueryLogSettingsButton.addEventListener("click", async () => {
-  await saveConfig();
-});
-
-saveStatisticsSettingsButton.addEventListener("click", async () => {
   await saveConfig();
 });
 
@@ -596,6 +765,7 @@ addFilterButton.addEventListener("click", () => {
   ];
   editingFilterIds.add(id);
   renderFilters();
+  updateConfigDirtyState();
 });
 
 updateFiltersButton.addEventListener("click", async () => {
@@ -843,7 +1013,7 @@ installMacosServiceButton.addEventListener("click", async () => {
       await refreshAfterBackgroundServiceEnabled();
     } else if (status.needsRepair) {
       showMessage(
-        "后台服务已注册但暂未响应，可能仍在启动，将自动重试连接；若持续无响应请重启 Mac 后再试",
+        "后台服务已注册但暂未响应，请稍后重新进入本页检查；若持续无响应请重启 Mac 后再试",
         true,
       );
     }
@@ -936,8 +1106,11 @@ installWindowsServiceButton.addEventListener("click", async () => {
   installWindowsServiceButton.disabled = true;
   installWindowsServiceButton.classList.add("loading");
   try {
-    const status = requireWindowsServiceStatus(await installWindowsService());
+    let status = requireWindowsServiceStatus(await installWindowsService());
     renderWindowsServiceStatus(status);
+    if (shouldWaitForWindowsService(status)) {
+      status = (await waitForWindowsServiceReady(status)) ?? status;
+    }
     if (status.ready) {
       showMessage("Windows DNS 系统服务已安装并启动", false);
       await refreshAfterBackgroundServiceEnabled();
@@ -1106,6 +1279,7 @@ filtersBody.addEventListener("click", (event) => {
     filtersState = filtersState.filter((filter) => filter.id !== id);
     editingFilterIds.delete(id);
     renderFilters();
+    updateConfigDirtyState();
   }
   if (target.dataset.action === "edit") {
     editingFilterIds = toggleEditing(editingFilterIds, id);
@@ -1175,7 +1349,6 @@ function startBackgroundRefresh(): void {
     if (document.hidden) {
       return;
     }
-    refreshBackgroundServiceStatusIfNeeded();
     refreshActiveView();
   }, BACKGROUND_REFRESH_INTERVAL_MS);
 
@@ -1184,12 +1357,21 @@ function startBackgroundRefresh(): void {
       return;
     }
     refreshActiveView();
-    // 用户可能刚从系统设置批准完服务回来，切回窗口时同步最新授权状态
-    refreshBackgroundServiceStatusIfNeeded();
+    // 用户可能刚从系统设置批准完服务回来，仅在配置页重新同步一次运行状态。
+    if (activeView === "settings") {
+      void refreshSettingsRuntimeStatus();
+    }
   });
 }
 
 function refreshActiveView(): void {
+  if (activeView !== "logs" && activeView !== "dashboard") {
+    return;
+  }
+  if (isContentScrolling) {
+    queuedAutoRefresh = true;
+    return;
+  }
   if (activeView === "logs") {
     if (shouldAutoRefreshQueryLogs()) {
       void refreshQueryLogs({ auto: true });
@@ -1198,12 +1380,6 @@ function refreshActiveView(): void {
     if (shouldAutoRefreshDashboard()) {
       void refreshStatus({ auto: true });
     }
-  } else if (activeView === "security") {
-    void refreshStatus({ auto: true });
-  } else if (activeView === "filters") {
-    void refreshFilterUpdateMetadata();
-  } else if (activeView === "settings") {
-    void loadWindowsSystemDnsStatus();
   }
 }
 
@@ -1221,19 +1397,6 @@ function shouldAutoRefreshDashboard(): boolean {
     lastDashboardRefreshAt === null ||
     performance.now() - lastDashboardRefreshAt >= DASHBOARD_AUTO_REFRESH_INTERVAL_MS
   );
-}
-
-function refreshBackgroundServiceStatusIfNeeded(): void {
-  // 服务待批准或暂未响应时持续复查：daemon 启动慢或用户刚在系统设置中批准，
-  // 状态恢复后自动重新加载数据，避免用户被引导去反复“修复”。
-  if (currentMacosServiceStatus?.requiresApproval || currentMacosServiceStatus?.needsRepair) {
-    void loadMacosServiceStatus();
-  }
-  if (isWindows && (!currentWindowsServiceStatus || !currentWindowsServiceStatus.ready)) {
-    void loadWindowsServiceStatus().catch((error) => {
-      console.error("刷新 Windows 系统服务状态失败", error);
-    });
-  }
 }
 
 async function loadConfig(): Promise<boolean> {
@@ -1262,6 +1425,8 @@ async function loadConfig(): Promise<boolean> {
     filterUpdateIntervalInput.value = String(config.filter_update_interval_hours);
     filterMaxSizeInput.value = String(config.filter_max_size_mb);
     filterProxyModeInput.value = config.filter_proxy_mode;
+    syncCustomSelect(filterUpdateIntervalInput);
+    syncCustomSelect(filterProxyModeInput);
     filterProxyUrlInput.value = config.filter_proxy_url;
     savedSystemProxyUrl = config.filter_system_proxy_url;
     allowInsecureHttpInput.checked = config.allow_insecure_http;
@@ -1298,16 +1463,16 @@ async function loadConfig(): Promise<boolean> {
     filtersState = config.filters;
     renderFilters();
     configLoaded = true;
-    configSaveButtons.forEach((button) => {
-      button.disabled = false;
-    });
+    savedConfigFingerprint = configFingerprint(collectConfig());
+    configDirty = false;
+    updateConfigSaveState();
     succeeded = true;
     return true;
   } catch (error) {
     configLoaded = false;
-    configSaveButtons.forEach((button) => {
-      button.disabled = true;
-    });
+    savedConfigFingerprint = "";
+    configDirty = false;
+    updateConfigSaveState();
     showMessage(String(error), true);
     return false;
   } finally {
@@ -1343,6 +1508,16 @@ const MACOS_SERVICE_STATE_TEXT: Record<MacosServiceState, string> = {
   not_found: "未找到后台服务，可能已被系统移除，请重新安装。",
   unknown: "后台服务状态未知，可尝试“安装或修复”。",
 };
+
+async function refreshSettingsRuntimeStatus(): Promise<void> {
+  const [, windowsStatus] = await Promise.all([
+    loadMacosServiceStatus(),
+    loadWindowsServiceStatus(),
+  ]);
+  if (windowsStatus?.ready) {
+    await loadWindowsSystemDnsStatus();
+  }
+}
 
 async function loadMacosServiceStatus(): Promise<void> {
   if (!isMacOS) {
@@ -1401,7 +1576,7 @@ function renderMacosServiceStatus(status: MacosServiceStatus): void {
       ? ` 当前服务版本 v${status.serviceVersion}。`
       : "";
   macosServiceStatusElement.textContent = status.needsRepair
-    ? "后台服务已启用但暂未响应，可能正在启动，将自动重试连接；持续无响应时点击“安装或修复”。"
+    ? "后台服务已启用但暂未响应，可稍后重新进入本页检查；持续无响应时点击“安装或修复”。"
     : `${stateText}${versionText}`;
   openMacosServiceSettingsButton.classList.toggle("hidden", !status.requiresApproval);
   uninstallMacosServiceButton.disabled =
@@ -1804,7 +1979,11 @@ async function saveConfigOnly(): Promise<RuntimeStatus> {
   const previousStatisticsRetentionHours = currentStatisticsRetentionHours;
   currentStatisticsRetentionHours = config.statistics_retention_hours;
   try {
-    return await saveConfigCommand(config);
+    const status = await saveConfigCommand(config);
+    savedConfigFingerprint = configFingerprint(config);
+    configDirty = false;
+    updateConfigSaveState();
+    return status;
   } catch (error) {
     currentStatisticsRetentionHours = previousStatisticsRetentionHours;
     throw error;
@@ -1862,8 +2041,41 @@ function collectConfig(): AppConfig {
   };
 }
 
+function configFingerprint(config: AppConfig): string {
+  return JSON.stringify(
+    {
+      ...config,
+      filters: config.filters.map(({ id, name, url, enabled }) => ({ id, name, url, enabled })),
+    },
+    (key, value) => (key === "filter_system_proxy_url" ? undefined : value),
+  );
+}
+
+function updateConfigDirtyState(): void {
+  if (!configLoaded) {
+    return;
+  }
+  configDirty = configFingerprint(collectConfig()) !== savedConfigFingerprint;
+  updateConfigSaveState();
+}
+
+function updateConfigSaveState(): void {
+  const label = !configLoaded
+    ? "配置不可用"
+    : configDirty
+      ? "有未保存的更改"
+      : "所有更改已保存";
+  saveStateLabels.forEach((element) => {
+    element.textContent = label;
+    element.classList.toggle("dirty", configLoaded && configDirty);
+  });
+  configSaveButtons.forEach((button) => {
+    button.disabled = !configLoaded || !configDirty;
+  });
+}
+
 async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
-  if (options.auto && activeView === "dashboard" && isContentScrolling) {
+  if (options.auto && isContentScrolling) {
     queuedAutoRefresh = true;
     return;
   }
@@ -1878,6 +2090,10 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
   try {
     const renderDashboard = activeView === "dashboard";
     const status = await getStatus(options.auto !== true, renderDashboard);
+    if (options.auto && isContentScrolling) {
+      queuedAutoRefresh = true;
+      return;
+    }
     renderStatus(status, { renderDashboard });
     if (renderDashboard) {
       lastDashboardRefreshAt = performance.now();
@@ -1914,6 +2130,10 @@ function scheduleQueryLogSearch(): void {
 }
 
 async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
+  if (options.auto && isContentScrolling) {
+    queuedAutoRefresh = true;
+    return;
+  }
   if (queryLogRefreshInFlight) {
     queryLogRefreshQueued = true;
     return;
@@ -1932,6 +2152,10 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
       page: requestedPage,
       pageSize: QUERY_LOG_PAGE_SIZE,
     });
+    if (options.auto && isContentScrolling) {
+      queuedAutoRefresh = true;
+      return;
+    }
     if (
       requestedFilter !== queryLogFilterInput.value ||
       requestedSearch !== queryLogSearchInput.value.trim() ||
@@ -1980,8 +2204,17 @@ async function runStatusAction(
 
 function setActiveView(view: ViewName): void {
   const viewChanged = activeView !== view;
+  if (viewChanged) {
+    isContentScrolling = false;
+    queuedAutoRefresh = false;
+    if (scrollIdleTimer !== undefined) {
+      window.clearTimeout(scrollIdleTimer);
+      scrollIdleTimer = undefined;
+    }
+  }
   activeView = view;
   showMessage("", false);
+  updateContextNavigation(view);
   document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
     const isFilterGroup =
       button.dataset.navGroup === "filters" && (view === "filters" || view === "custom");
@@ -2005,13 +2238,26 @@ function setActiveView(view: ViewName): void {
   if (view === "filters" && viewChanged) {
     void refreshFilterUpdateMetadata();
   }
-  if (view === "security") {
+  if (view === "security" && viewChanged) {
     void refreshStatus({ auto: true });
   }
   if (view === "settings" && viewChanged) {
-    void loadMacosServiceStatus();
-    void loadWindowsSystemDnsStatus();
+    void refreshSettingsRuntimeStatus();
   }
+}
+
+function updateContextNavigation(view: ViewName): void {
+  const group =
+    view === "settings" || view === "dns" || view === "security"
+      ? "settings"
+      : view === "filters" || view === "custom"
+        ? "filters"
+        : null;
+
+  contextNav.classList.toggle("visible", group !== null);
+  contextNav.querySelectorAll<HTMLElement>("[data-context-group]").forEach((navigation) => {
+    navigation.classList.toggle("active", navigation.dataset.contextGroup === group);
+  });
 }
 
 function renderFilters(): void {
@@ -3167,6 +3413,7 @@ function updateFilterField(id: string, target: HTMLInputElement): void {
     }
     return filter;
   });
+  updateConfigDirtyState();
 }
 
 function renderRankTable(
@@ -3312,14 +3559,16 @@ function setBusy(busy: boolean): void {
   if (!busy && currentStorageInfo) {
     renderStorageInfo(currentStorageInfo);
   }
+  if (!busy) {
+    updateConfigSaveState();
+  }
 }
 
 function markContentScrolling(): void {
-  if (activeView !== "dashboard") {
-    return;
+  if (!isContentScrolling) {
+    isContentScrolling = true;
+    closeCustomSelects();
   }
-
-  isContentScrolling = true;
   if (scrollIdleTimer !== undefined) {
     window.clearTimeout(scrollIdleTimer);
   }
@@ -3328,9 +3577,9 @@ function markContentScrolling(): void {
     isContentScrolling = false;
     if (queuedAutoRefresh) {
       queuedAutoRefresh = false;
-      void refreshStatus({ auto: true });
+      refreshActiveView();
     }
-  }, 180);
+  }, 240);
 }
 
 function setRefreshButtonState(button: HTMLButtonElement | undefined, refreshing: boolean): void {
