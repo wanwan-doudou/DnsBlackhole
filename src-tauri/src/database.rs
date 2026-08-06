@@ -114,8 +114,6 @@ const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const HOURLY_STATISTICS_INITIALIZED_KEY: &str = "hourly_statistics_initialized_v1";
 const LIFETIME_STATISTICS_INITIALIZED_KEY: &str = "lifetime_statistics_initialized_v1";
 const QUERY_LOG_SEARCH_INITIALIZED_KEY: &str = "query_log_search_initialized_v1";
-/// 每次日志滚动清理最多合并约 1 MiB 的 FTS 页，限制交互路径上的维护延迟。
-const FTS_MERGE_PAGE_BUDGET: i64 = 256;
 /// 结构迁移把旧页留在 freelist 时打上此标记，启动流程随后显式压缩一次。
 /// 压缩成功才清除，压缩失败或中途退出都会在下次启动重试。
 const PENDING_COMPACTION_KEY: &str = "pending_storage_compaction_v1";
@@ -553,11 +551,13 @@ impl Database {
         .map_err(|e| format!("清理黑名单统计失败：{e}"))?;
         tx.commit()
             .map_err(|e| format!("提交查询数据清理失败：{e}"))?;
-        // external content 的 FTS 删除会留下旧倒排段。按小时滚动清理时做一次有页数
-        // 上限的 merge，让碎片逐步回收，同时避免 optimize 重写整个 FTS、阻塞日志页面。
-        // 用户主动清空或数据库膨胀触发 VACUUM 时仍会执行完整 optimize。
-        if pruned_logs > 0 {
-            merge_query_log_search(&conn);
+        // external content 的 FTS 删除会留下旧倒排段。正数 merge 可能因没有足够
+        // 同层段而空转；维护已移到后台线程，因此直接 optimize，确保删除记录回收，
+        // 同时不再由日志分页或状态查询触发这项重写工作。
+        if pruned_logs > 0
+            && let Err(error) = optimize_query_log_search(&conn)
+        {
+            eprintln!("压缩查询日志搜索索引失败：{error}");
         }
         self.truncate_oversized_wal(&conn);
         Ok(())
@@ -904,11 +904,7 @@ impl Database {
             .map_err(|_| "数据库读取门闩已损坏".to_string())?;
         // VACUUM 不会合并 FTS5 的删除记录；大量日志清理后先压缩倒排段，
         // 避免搜索已删除关键词时仍遍历旧 posting list。
-        conn.execute(
-            "INSERT INTO query_logs_search(query_logs_search) VALUES('optimize')",
-            [],
-        )
-        .map_err(|e| format!("压缩查询日志搜索索引失败：{e}"))?;
+        optimize_query_log_search(&conn)?;
         conn.execute_batch("VACUUM")
             .map_err(|e| format!("压缩数据库失败：{e}"))?;
         // VACUUM 经由 WAL 重写数据，随后显式检查点并截断，确保 -wal 文件占用同步下降
@@ -1778,15 +1774,13 @@ fn mark_pending_compaction(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("标记待压缩状态失败：{e}"))
 }
 
-/// 对 FTS 倒排段执行有界合并。正数预算只处理满足 usermerge 条件或已经开始的合并，
-/// 单次大约写入指定页数；失败不影响日志清理和搜索正确性。
-fn merge_query_log_search(conn: &Connection) {
-    if let Err(error) = conn.execute(
-        "INSERT INTO query_logs_search(query_logs_search, rank) VALUES('merge', ?1)",
-        params![FTS_MERGE_PAGE_BUDGET],
-    ) {
-        eprintln!("合并查询日志搜索索引失败：{error}");
-    }
+fn optimize_query_log_search(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO query_logs_search(query_logs_search) VALUES('optimize')",
+        [],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("压缩查询日志搜索索引失败：{e}"))
 }
 
 fn initialize_query_log_search(
@@ -3536,15 +3530,21 @@ mod tests {
         );
     }
 
-    /// 滚动清理会在 FTS 里留下 tombstone，清理后要合并倒排段。
-    /// 这里守的是合并不破坏索引正确性：过期项搜不到、保留项仍搜得到。
-    /// （实际压缩率依赖数据规模，不在单测里断言。）
+    /// 滚动清理会在 FTS 里留下 tombstone，清理后必须完整压缩倒排段。
+    /// 除了搜索正确性，也守住删除记录确实被回收，避免再次退化成空转 merge。
     #[test]
     fn pruning_expired_logs_keeps_search_index_consistent() {
         let db = Database::open_in_memory().expect("db should open");
         let stale = unix_now().saturating_sub(48 * 3600);
-        let stale_entries: Vec<_> = (0..200)
-            .map(|i| (sample_query_log(&format!("stale-{i}.example.org")), false))
+        let stale_entries: Vec<_> = (0..2_000)
+            .map(|i| {
+                (
+                    sample_query_log(&format!(
+                        "stale-{i:05}-unique-search-payload-{i:05}.example.org"
+                    )),
+                    false,
+                )
+            })
             .collect();
         db.insert_query_logs(&stale_entries)
             .expect("stale logs should insert");
@@ -3561,6 +3561,10 @@ mod tests {
         // 这批在保留窗口内，清理后必须完好
         db.insert_query_logs(&[(sample_query_log("fresh.example.org"), false)])
             .expect("fresh log should insert");
+        {
+            let conn = db.lock().expect("db should lock");
+            optimize_query_log_search(&conn).expect("baseline FTS should optimize");
+        }
 
         db.prune_expired(1, 0).expect("prune should succeed");
 
@@ -3585,6 +3589,14 @@ mod tests {
             )
             .expect("search should run");
         assert_eq!(fresh_hits, 1, "保留的日志仍应可被搜索命中");
+        let segments: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT segid) FROM query_logs_search_idx",
+                [],
+                |row| row.get(0),
+            )
+            .expect("search segments should count");
+        assert_eq!(segments, 1, "optimize 后搜索索引应只剩一个段");
     }
 
     #[test]

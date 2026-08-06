@@ -13,7 +13,7 @@ const TASK_POOL_MIN_THREADS: usize = 8;
 // MAX_PARALLEL_UPSTREAMS_PER_QUERY 个），突发时允许扩到 worker 数 × 单查询并行度；
 // 空闲后收回额外线程，避免日常低负载也永久承担峰值线程数。
 const TASK_POOL_MAX_THREADS: usize = 128;
-const TASK_POOL_MAX_THREADS_PER_CORE: usize = 4;
+const TASK_POOL_MAX_THREADS_PER_CORE: usize = 8;
 const TASK_POOL_QUEUE_CAPACITY: usize = 4096;
 const COORDINATION_POOL_THREADS: usize = 4;
 const COORDINATION_POOL_QUEUE_CAPACITY: usize = 256;

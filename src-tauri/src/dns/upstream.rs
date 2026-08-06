@@ -1239,6 +1239,37 @@ mod tests {
         (upstream, received_receiver, handle)
     }
 
+    fn spawn_blocked_udp_upstream() -> (
+        RuntimeUpstream,
+        mpsc::Receiver<Instant>,
+        mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("测试 UDP 上游应可绑定");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("应可设置测试 UDP 上游超时");
+        let address = socket.local_addr().unwrap();
+        let upstream = RuntimeUpstream::new(UpstreamServer::Udp(address), &[]);
+        let (received_sender, received_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut buffer = [0_u8; MAX_DNS_PACKET_SIZE];
+            let (len, client) = socket
+                .recv_from(&mut buffer)
+                .expect("测试 UDP 上游应收到查询");
+            let _ = received_sender.send(Instant::now());
+            release_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("测试应释放被阻塞的主上游");
+            buffer[2] |= 0x80;
+            socket
+                .send_to(&buffer[..len], client)
+                .expect("测试 UDP 上游应可返回响应");
+        });
+        (upstream, received_receiver, release_sender, handle)
+    }
+
     #[test]
     fn unavailable_hostname_upstream_does_not_abort_runtime_build() {
         let upstreams = build_runtime_upstreams(
@@ -1659,36 +1690,38 @@ mod tests {
 
     #[test]
     fn parallel_requests_hedge_only_after_primary_wait() {
-        let (slow, slow_received, slow_handle) =
-            spawn_udp_upstream(Duration::from_millis(150), true);
+        // 完整测试套件会共享弹性 I/O 线程池。低核数 runner 上任务可能排队超过
+        // 固定的模拟延迟，所以由测试显式阻塞主上游，避免把调度快慢误判为逻辑失败。
+        let (slow, slow_received, slow_release, slow_handle) = spawn_blocked_udp_upstream();
         let (fast, fast_received, fast_handle) = spawn_udp_upstream(Duration::ZERO, true);
         let fast_label = fast.label.clone();
         let upstreams = vec![slow, fast];
 
+        let forward_started_at = Instant::now();
         let response = forward_parallel(
             &example_a_query(),
             &upstreams,
             &AtomicUsize::new(0),
-            Instant::now() + Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(3),
             None,
-        )
-        .expect("hedged 上游应成功响应");
-        let primary_received_at = slow_received
-            .recv_timeout(Duration::from_secs(1))
-            .expect("主上游应收到请求");
-        let hedge_received_at = fast_received
-            .recv_timeout(Duration::from_secs(1))
-            .expect("备用上游应收到 hedged 请求");
+        );
+        let primary_received_at = slow_received.recv_timeout(Duration::from_secs(1));
+        let hedge_received_at = fast_received.recv_timeout(Duration::from_secs(1));
+        let _ = slow_release.send(());
+
+        slow_handle.join().unwrap();
+        fast_handle.join().unwrap();
+
+        let response = response.expect("hedged 上游应成功响应");
+        primary_received_at.expect("主上游应收到请求");
+        let hedge_received_at = hedge_received_at.expect("备用上游应收到 hedged 请求");
 
         assert_eq!(response.upstream, fast_label);
         assert!(
             hedge_received_at
-                .checked_duration_since(primary_received_at)
+                .checked_duration_since(forward_started_at)
                 .is_some_and(|delay| delay >= Duration::from_millis(10)),
             "备用请求不应与主请求同时投递"
         );
-
-        slow_handle.join().unwrap();
-        fast_handle.join().unwrap();
     }
 }
