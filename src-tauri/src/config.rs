@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 13;
 pub(crate) const MAX_STATISTICS_RETENTION_HOURS: u32 = 24 * 365;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
@@ -48,6 +48,12 @@ pub struct AppConfig {
     pub bootstrap_dns: String,
     #[serde(default)]
     pub upstream_mode: UpstreamMode,
+    #[serde(default)]
+    pub dnssec_enabled: bool,
+    #[serde(default)]
+    pub domain_upstream_rules: String,
+    #[serde(default)]
+    pub client_upstream_rules: String,
     #[serde(default = "default_allowed_clients")]
     pub allowed_clients: String,
     #[serde(default)]
@@ -147,6 +153,21 @@ pub enum UpstreamServer {
     Udp(SocketAddr),
     UdpHostname { hostname: String, port: u16 },
     Doh(String),
+    Tls { hostname: String, port: u16 },
+    Quic { hostname: String, port: u16 },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DomainUpstreamRuleSpec {
+    pub(crate) pattern: String,
+    pub(crate) include_subdomains: bool,
+    pub(crate) upstreams: Vec<UpstreamServer>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClientUpstreamRuleSpec {
+    pub(crate) network: String,
+    pub(crate) upstreams: Vec<UpstreamServer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,6 +230,9 @@ impl Default for AppConfig {
             fallback_dns: default_fallback_dns(),
             bootstrap_dns: default_bootstrap_dns(),
             upstream_mode: UpstreamMode::default(),
+            dnssec_enabled: false,
+            domain_upstream_rules: String::new(),
+            client_upstream_rules: String::new(),
             allowed_clients: default_allowed_clients(),
             blocked_clients: String::new(),
             rate_limit_per_second: default_rate_limit_per_second(),
@@ -288,10 +312,30 @@ impl AppConfig {
         parse_bootstrap_servers(&self.bootstrap_dns)
     }
 
+    pub(crate) fn domain_upstream_rule_specs(&self) -> Result<Vec<DomainUpstreamRuleSpec>, String> {
+        parse_domain_upstream_rules(&self.domain_upstream_rules, self.allow_insecure_http)
+    }
+
+    pub(crate) fn client_upstream_rule_specs(&self) -> Result<Vec<ClientUpstreamRuleSpec>, String> {
+        parse_client_upstream_rules(&self.client_upstream_rules, self.allow_insecure_http)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.listen_socket_addrs()?;
-        self.upstream_servers()?;
-        self.fallback_servers()?;
+        let upstreams = self.upstream_servers()?;
+        let fallbacks = self.fallback_servers()?;
+        let domain_rules = self.domain_upstream_rule_specs()?;
+        let client_rules = self.client_upstream_rule_specs()?;
+        if self.dnssec_enabled
+            && upstreams
+                .iter()
+                .chain(fallbacks.iter())
+                .chain(domain_rules.iter().flat_map(|rule| rule.upstreams.iter()))
+                .chain(client_rules.iter().flat_map(|rule| rule.upstreams.iter()))
+                .any(is_insecure_doh)
+        {
+            return Err("启用 DNSSEC 后不能使用不安全的 HTTP DoH 上游".into());
+        }
         parse_bootstrap_servers(&self.bootstrap_dns)?;
         if !(10..=3600).contains(&self.runtime_watchdog_interval_seconds) {
             return Err("自恢复检查间隔必须在 10 到 3600 秒之间".into());
@@ -342,6 +386,10 @@ impl AppConfig {
         validate_ignored_domains(&self.statistics_ignored_domains)?;
         Ok(())
     }
+}
+
+fn is_insecure_doh(server: &UpstreamServer) -> bool {
+    matches!(server, UpstreamServer::Doh(url) if url.starts_with("http://"))
 }
 
 fn validate_filter_proxy(config: &AppConfig) -> Result<(), String> {
@@ -710,6 +758,18 @@ fn parse_optional_upstream_servers(
 }
 
 fn parse_upstream_server(value: &str, allow_insecure_http: bool) -> Result<UpstreamServer, String> {
+    if value.starts_with("tls://") {
+        return parse_encrypted_upstream(value, "tls", |hostname, port| UpstreamServer::Tls {
+            hostname,
+            port,
+        });
+    }
+    if value.starts_with("quic://") {
+        return parse_encrypted_upstream(value, "quic", |hostname, port| UpstreamServer::Quic {
+            hostname,
+            port,
+        });
+    }
     if value.starts_with("https://") {
         return parse_doh_upstream(value);
     }
@@ -724,6 +784,116 @@ fn parse_upstream_server(value: &str, allow_insecure_http: bool) -> Result<Upstr
     }
 
     parse_dns_upstream(value)
+}
+
+fn parse_encrypted_upstream(
+    value: &str,
+    expected_scheme: &str,
+    build: impl FnOnce(String, u16) -> UpstreamServer,
+) -> Result<UpstreamServer, String> {
+    let url = reqwest::Url::parse(value).map_err(|error| format!("加密 DNS 地址无效：{error}"))?;
+    if url.scheme() != expected_scheme
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(format!(
+            "{} 上游格式必须是 {expected_scheme}://主机名[:端口]",
+            expected_scheme.to_uppercase()
+        ));
+    }
+    let hostname = url
+        .host_str()
+        .and_then(normalize_hostname)
+        .ok_or_else(|| "加密 DNS 上游必须包含有效主机名".to_string())?;
+    if hostname.parse::<IpAddr>().is_ok() {
+        return Err("加密 DNS 上游必须使用证书对应的主机名，不能直接填写 IP".into());
+    }
+    Ok(build(hostname, url.port().unwrap_or(853)))
+}
+
+fn parse_domain_upstream_rules(
+    value: &str,
+    allow_insecure_http: bool,
+) -> Result<Vec<DomainUpstreamRuleSpec>, String> {
+    value
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| parse_route_line(index, line))
+        .map(|result| {
+            let (index, pattern, upstreams) = result?;
+            let (pattern, include_subdomains) = if let Some(pattern) = pattern.strip_prefix("*.") {
+                (pattern, true)
+            } else {
+                (pattern, false)
+            };
+            let pattern = normalize_hostname(pattern)
+                .ok_or_else(|| format!("域名分流第 {} 行的域名模式无效：{pattern}", index + 1))?;
+            Ok(DomainUpstreamRuleSpec {
+                pattern,
+                include_subdomains,
+                upstreams: parse_route_upstreams(index, upstreams, allow_insecure_http)?,
+            })
+        })
+        .collect()
+}
+
+fn parse_client_upstream_rules(
+    value: &str,
+    allow_insecure_http: bool,
+) -> Result<Vec<ClientUpstreamRuleSpec>, String> {
+    value
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| parse_route_line(index, line))
+        .map(|result| {
+            let (index, network, upstreams) = result?;
+            validate_ip_or_cidr(network).map_err(|_| {
+                format!(
+                    "客户端上游策略第 {} 行必须是 IP 或 CIDR：{network}",
+                    index + 1
+                )
+            })?;
+            Ok(ClientUpstreamRuleSpec {
+                network: network.to_string(),
+                upstreams: parse_route_upstreams(index, upstreams, allow_insecure_http)?,
+            })
+        })
+        .collect()
+}
+
+fn parse_route_line(index: usize, line: &str) -> Option<Result<(usize, &str, &str), String>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+        return None;
+    }
+    Some(
+        trimmed
+            .split_once("=>")
+            .map(|(selector, upstreams)| (index, selector.trim(), upstreams.trim()))
+            .filter(|(_, selector, upstreams)| !selector.is_empty() && !upstreams.is_empty())
+            .ok_or_else(|| format!("上游分流第 {} 行格式必须是“匹配项 => 上游”", index + 1)),
+    )
+}
+
+fn parse_route_upstreams(
+    index: usize,
+    value: &str,
+    allow_insecure_http: bool,
+) -> Result<Vec<UpstreamServer>, String> {
+    let upstreams = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_upstream_server(value, allow_insecure_http))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("上游分流第 {} 行无效：{error}", index + 1))?;
+    if upstreams.is_empty() {
+        return Err(format!("上游分流第 {} 行至少需要一个上游", index + 1));
+    }
+    Ok(upstreams)
 }
 
 fn parse_doh_upstream(value: &str) -> Result<UpstreamServer, String> {
@@ -757,7 +927,7 @@ fn parse_dns_upstream(value: &str) -> Result<UpstreamServer, String> {
         });
     }
 
-    Err("上游 DNS 必须是 IP、IP:端口、域名:端口 或 DoH 地址".to_string())
+    Err("上游 DNS 必须是 IP、IP:端口、域名:端口、DoH、DoT 或 DoQ 地址".to_string())
 }
 
 fn split_host_port(value: &str) -> Option<(&str, u16)> {
@@ -770,7 +940,7 @@ fn split_host_port(value: &str) -> Option<(&str, u16)> {
     normalize_hostname(value).map(|_| (value, 53))
 }
 
-fn normalize_hostname(value: &str) -> Option<String> {
+pub(crate) fn normalize_hostname(value: &str) -> Option<String> {
     let hostname = value.trim().trim_end_matches('.').to_ascii_lowercase();
     if hostname.is_empty() || hostname.len() > 253 {
         return None;
@@ -1369,6 +1539,39 @@ mod tests {
             UpstreamServer::UdpHostname { hostname, port }
                 if hostname == "dns.example.test" && port == 5353
         ));
+    }
+
+    #[test]
+    fn parses_dot_and_doq_upstreams_with_secure_defaults() {
+        let dot = parse_upstream_server("tls://dns.example.test", false)
+            .expect("DoT upstream should parse");
+        let doq = parse_upstream_server("quic://dns.example.test:8853", false)
+            .expect("DoQ upstream should parse");
+
+        assert!(matches!(
+            dot,
+            UpstreamServer::Tls { hostname, port }
+                if hostname == "dns.example.test" && port == 853
+        ));
+        assert!(matches!(
+            doq,
+            UpstreamServer::Quic { hostname, port }
+                if hostname == "dns.example.test" && port == 8853
+        ));
+        assert!(parse_upstream_server("tls://1.1.1.1", false).is_err());
+        assert!(parse_upstream_server("quic://dns.example.test/dns-query", false).is_err());
+    }
+
+    #[test]
+    fn dnssec_rejects_insecure_doh_upstreams() {
+        let config = AppConfig {
+            upstream_dns: "http://dns.example.test/dns-query".into(),
+            allow_insecure_http: true,
+            dnssec_enabled: true,
+            ..AppConfig::default()
+        };
+
+        assert!(config.validate().is_err());
     }
 
     #[test]
