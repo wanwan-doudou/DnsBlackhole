@@ -38,7 +38,6 @@ pub(crate) struct QueryCacheKey {
     checking_disabled: bool,
     dnssec_ok: bool,
     edns_udp_size: Option<u16>,
-    route: Option<String>,
 }
 
 struct CachedDnsResponse {
@@ -96,13 +95,7 @@ impl QueryCacheKey {
             checking_disabled: query.checking_disabled,
             dnssec_ok: query.dnssec_ok,
             edns_udp_size: query.edns_udp_size,
-            route: None,
         })
-    }
-
-    pub(crate) fn with_route(mut self, route: Option<&str>) -> Self {
-        self.route = route.map(str::to_string);
-        self
     }
 
     #[cfg(test)]
@@ -116,7 +109,6 @@ impl QueryCacheKey {
             checking_disabled: false,
             dnssec_ok: false,
             edns_udp_size: None,
-            route: None,
         }
     }
 }

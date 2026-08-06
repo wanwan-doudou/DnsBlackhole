@@ -100,8 +100,6 @@ pub struct UpstreamLatencyStat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub running: bool,
-    pub protection_paused: bool,
-    pub protection_paused_until: Option<u64>,
     pub listen_addr: String,
     pub upstream_dns: String,
     pub summary: RuleSummary,
@@ -112,7 +110,6 @@ pub struct RuntimeStatus {
 pub fn empty_status(
     config: &AppConfig,
     running: bool,
-    protection_paused_until: Option<u64>,
     summary: RuleSummary,
     stats: DnsStats,
     error: Option<String>,
@@ -130,8 +127,6 @@ pub fn empty_status(
 
     RuntimeStatus {
         running,
-        protection_paused: protection_paused_until.is_some(),
-        protection_paused_until,
         listen_addr,
         upstream_dns: config.upstream_dns.clone(),
         summary,

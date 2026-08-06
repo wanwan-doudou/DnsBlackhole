@@ -2,15 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   AppConfig,
-  DnsDiagnosticReport,
   FilterCacheClearResult,
   FilterUpdateProgress,
   FilterUpdateResult,
   MacosServiceStatus,
   QueryLogFilter,
   QueryLogPage,
-  QueryLogRuleAction,
-  QueryLogRuleActionResult,
   RuntimeStatus,
   StorageInfo,
   StorageTargetInfo,
@@ -63,25 +60,6 @@ export function clearQueryLogs(): Promise<RuntimeStatus> {
   return timedInvoke<RuntimeStatus>("clear_query_logs");
 }
 
-export function applyQueryLogRule(
-  domain: string,
-  action: QueryLogRuleAction,
-  target?: string,
-): Promise<QueryLogRuleActionResult> {
-  return timedInvoke<QueryLogRuleActionResult>("apply_query_log_rule", {
-    domain,
-    action,
-    target,
-  });
-}
-
-export function runDnsDiagnostic(
-  domain: string,
-  queryType: string,
-): Promise<DnsDiagnosticReport> {
-  return timedInvoke<DnsDiagnosticReport>("run_dns_diagnostic", { domain, queryType });
-}
-
 export function clearStatistics(): Promise<RuntimeStatus> {
   return timedInvoke<RuntimeStatus>("clear_statistics");
 }
@@ -108,26 +86,6 @@ export function startDns(): Promise<RuntimeStatus> {
 
 export function stopDns(): Promise<RuntimeStatus> {
   return timedInvoke<RuntimeStatus>("stop_dns");
-}
-
-export function pauseProtection(durationSeconds: number): Promise<RuntimeStatus> {
-  return timedInvoke<RuntimeStatus>("pause_protection", { durationSeconds });
-}
-
-export function resumeProtection(): Promise<RuntimeStatus> {
-  return timedInvoke<RuntimeStatus>("resume_protection");
-}
-
-export function setTrayRuntimeStatus(
-  running: boolean,
-  protectionPaused: boolean,
-  pausedUntil: number | null,
-): Promise<void> {
-  return invoke<void>("set_tray_runtime_status", {
-    running,
-    protectionPaused,
-    pausedUntil,
-  });
 }
 
 export function clearDnsCache(): Promise<RuntimeStatus> {

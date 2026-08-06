@@ -5,7 +5,6 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
-  applyQueryLogRule,
   cancelFilterUpdate,
   clearQueryLogs as clearQueryLogsCommand,
   clearStatistics as clearStatisticsCommand,
@@ -27,13 +26,9 @@ import {
   installMacosService,
   installWindowsService,
   openMacosServiceSettings,
-  pauseProtection,
   recordFrontendTiming,
   replaceUnmanagedWindowsSystemDns,
   restoreWindowsSystemDnsWithFallback,
-  resumeProtection,
-  runDnsDiagnostic,
-  setTrayRuntimeStatus,
   startDns,
   stopDns,
   takeOverWindowsSystemDns,
@@ -59,7 +54,6 @@ import { renderAppTemplate } from "./template";
 import type {
   AppConfig,
   BlockingMode,
-  DnsDiagnosticReport,
   FilterSubscription,
   FilterProxyMode,
   FilterUpdateProgress,
@@ -68,7 +62,6 @@ import type {
   QueryLogFilter,
   QueryLogPage,
   QueryLogRecord,
-  QueryLogRuleAction,
   RefreshOptions,
   RenderStatusOptions,
   RuntimeStatus,
@@ -87,7 +80,7 @@ import type {
 import "./style.css";
 
 const frontendStartedAt = performance.now();
-const CURRENT_CONFIG_SCHEMA_VERSION = 13;
+const CURRENT_CONFIG_SCHEMA_VERSION = 11;
 
 function logLoadTime(
   module: string,
@@ -163,9 +156,6 @@ let filterUpdateProgressTimer: number | undefined;
 let filterUpdateProgressInFlight = false;
 let savedConfigFingerprint = "";
 let configDirty = false;
-let latestRuntimeStatus: RuntimeStatus | null = null;
-let pauseExpiryTimer: number | undefined;
-let lastTrayRuntimeSignature = "";
 
 const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
@@ -191,20 +181,12 @@ const WINDOWS_SERVICE_ERROR_GRACE_MS = 10_000;
 
 const contentElement = query<HTMLDivElement>(".content");
 const contextNav = query<HTMLElement>("#context_nav");
-const headerRuntime = query<HTMLElement>("#header_runtime");
-const runtimeStatusButton = query<HTMLButtonElement>("#runtime_status_btn");
-const runtimeStatusLabel = query<HTMLElement>("#runtime_status_label");
-const runtimeStatusDetail = query<HTMLElement>("#runtime_status_detail");
-const runtimeStatusMenu = query<HTMLElement>("#runtime_status_menu");
 const enabledInput = query<HTMLInputElement>("#enabled");
 const launchAtStartupInput = query<HTMLInputElement>("#launch_at_startup");
 const useFiltersInput = query<HTMLInputElement>("#use_filters");
 const upstreamInput = query<HTMLTextAreaElement>("#upstream_dns");
 const fallbackInput = query<HTMLTextAreaElement>("#fallback_dns");
 const bootstrapInput = query<HTMLTextAreaElement>("#bootstrap_dns");
-const domainUpstreamRulesInput = query<HTMLTextAreaElement>("#domain_upstream_rules");
-const clientUpstreamRulesInput = query<HTMLTextAreaElement>("#client_upstream_rules");
-const dnssecEnabledInput = query<HTMLInputElement>("#dnssec_enabled");
 const listenHostInput = query<HTMLInputElement>("#listen_host");
 const listenPortInput = query<HTMLInputElement>("#listen_port");
 const listenIpv6Input = query<HTMLInputElement>("#listen_ipv6");
@@ -347,13 +329,6 @@ const queryLogBody = query<HTMLDivElement>("#query_log_body");
 const queryLogPageInfo = query<HTMLElement>("#query_log_page_info");
 const queryLogPrevButton = query<HTMLButtonElement>("#query_log_prev_btn");
 const queryLogNextButton = query<HTMLButtonElement>("#query_log_next_btn");
-const queryRuleDialog = query<HTMLDialogElement>("#query_rule_dialog");
-const queryRuleForm = query<HTMLFormElement>("#query_rule_form");
-const queryRuleDomain = query<HTMLElement>("#query_rule_domain");
-const queryRuleTarget = query<HTMLInputElement>("#query_rule_target");
-const queryRuleDialogCloseButton = query<HTMLButtonElement>("#query_rule_dialog_close_btn");
-const queryRuleDialogCancelButton = query<HTMLButtonElement>("#query_rule_dialog_cancel_btn");
-let pendingQueryRuleDomain = "";
 const securityAccessDenied = query<HTMLElement>("#security_access_denied");
 const securityRateLimited = query<HTMLElement>("#security_rate_limited");
 const securityDroppedUdp = query<HTMLElement>("#security_dropped_udp");
@@ -363,10 +338,6 @@ const persistenceQueueDropped = query<HTMLElement>("#persistence_queue_dropped")
 const upstreamTaskQueueRejected = query<HTMLElement>("#upstream_task_queue_rejected");
 const tcpConnectionRejected = query<HTMLElement>("#tcp_connection_rejected");
 const securityEventBody = query<HTMLDivElement>("#security_event_body");
-const diagnosticDomainInput = query<HTMLInputElement>("#diagnostic_domain");
-const diagnosticQueryTypeInput = query<HTMLSelectElement>("#diagnostic_query_type");
-const runDiagnosticButton = query<HTMLButtonElement>("#run_diagnostic_btn");
-const diagnosticResults = query<HTMLDivElement>("#diagnostic_results");
 
 type CustomSelectElements = {
   root: HTMLDivElement;
@@ -535,9 +506,7 @@ function syncCustomSelect(select: HTMLSelectElement): void {
   });
 }
 
-[filterProxyModeInput, filterUpdateIntervalInput, diagnosticQueryTypeInput].forEach(
-  initializeCustomSelect,
-);
+[filterProxyModeInput, filterUpdateIntervalInput].forEach(initializeCustomSelect);
 
 document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -574,38 +543,6 @@ document.addEventListener("click", (e) => {
   if (!target.closest(".custom-select")) {
     closeCustomSelects();
   }
-  if (!target.closest(".header-runtime")) {
-    closeRuntimeStatusMenu();
-  }
-});
-
-runtimeStatusButton.addEventListener("click", (event) => {
-  event.stopPropagation();
-  const open = !headerRuntime.classList.contains("open");
-  headerRuntime.classList.toggle("open", open);
-  runtimeStatusButton.setAttribute("aria-expanded", String(open));
-});
-
-runtimeStatusButton.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    closeRuntimeStatusMenu();
-  }
-});
-
-runtimeStatusMenu.addEventListener("click", (event) => {
-  const button = (event.target as HTMLElement).closest<HTMLButtonElement>(
-    "[data-protection-action]",
-  );
-  if (!button || button.disabled) {
-    return;
-  }
-  closeRuntimeStatusMenu();
-  void runProtectionAction(
-    button.dataset.protectionAction === "resume"
-      ? "resume"
-      : "pause",
-    Number(button.dataset.duration || 0),
-  );
 });
 
 document.querySelectorAll<HTMLButtonElement>("[data-refresh-dashboard]").forEach((button) => {
@@ -733,58 +670,6 @@ statisticsRetentionInputs.forEach((input) => {
       statisticsRetentionCustomInput.focus();
     }
   });
-});
-
-runDiagnosticButton.addEventListener("click", () => {
-  void runDiagnostic();
-});
-
-diagnosticDomainInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    void runDiagnostic();
-  }
-});
-
-queryLogBody.addEventListener("click", (event) => {
-  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-log-rule-action]");
-  if (!button || button.disabled) {
-    return;
-  }
-  const action = button.dataset.logRuleAction as QueryLogRuleAction | undefined;
-  const domain = button.dataset.domain;
-  if (!action || !domain) {
-    return;
-  }
-  if (configDirty) {
-    showMessage("请先保存当前配置更改，再从查询日志添加规则", true);
-    return;
-  }
-  if (action === "rewrite") {
-    openQueryRuleDialog(domain);
-    return;
-  }
-  void runQueryLogRuleAction(domain, action);
-});
-
-queryRuleDialogCloseButton.addEventListener("click", closeQueryRuleDialog);
-queryRuleDialogCancelButton.addEventListener("click", closeQueryRuleDialog);
-queryRuleDialog.addEventListener("cancel", () => {
-  pendingQueryRuleDomain = "";
-});
-queryRuleForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  const target = queryRuleTarget.value.trim();
-  if (!target) {
-    queryRuleTarget.focus();
-    showMessage("请填写 DNS 重写目标 IP", true);
-    return;
-  }
-  const domain = pendingQueryRuleDomain;
-  closeQueryRuleDialog();
-  if (domain) {
-    void runQueryLogRuleAction(domain, "rewrite", target);
-  }
 });
 
 const CONFIG_VIEW_SELECTOR = [
@@ -1437,23 +1322,6 @@ async function bootstrapApplication(): Promise<void> {
   }).catch((error) => {
     console.error("监听过滤器更新失败", error);
   });
-  void listen<string>("tray-protection-action", ({ payload }) => {
-    if (payload === "resume") {
-      void runProtectionAction("resume");
-      return;
-    }
-    const durations: Record<string, number> = {
-      pause_5m: 300,
-      pause_30m: 1800,
-      pause_1h: 3600,
-    };
-    const duration = durations[payload];
-    if (duration) {
-      void runProtectionAction("pause", duration);
-    }
-  }).catch((error) => {
-    console.error("监听托盘过滤控制失败", error);
-  });
   if (configReady) {
     await refreshStatus();
   }
@@ -1547,9 +1415,6 @@ async function loadConfig(): Promise<boolean> {
     upstreamInput.value = config.upstream_dns;
     fallbackInput.value = config.fallback_dns;
     bootstrapInput.value = config.bootstrap_dns;
-    domainUpstreamRulesInput.value = config.domain_upstream_rules;
-    clientUpstreamRulesInput.value = config.client_upstream_rules;
-    dnssecEnabledInput.checked = config.dnssec_enabled;
     listenHostInput.value = config.listen_host;
     listenPortInput.value = String(config.listen_port);
     listenIpv6Input.checked = config.listen_ipv6;
@@ -2135,9 +2000,6 @@ function collectConfig(): AppConfig {
     fallback_dns: fallbackInput.value.trim(),
     bootstrap_dns: bootstrapInput.value.trim(),
     upstream_mode: selectedRadioValue(upstreamModeInputs, "load_balance") as UpstreamMode,
-    domain_upstream_rules: domainUpstreamRulesInput.value.trim(),
-    client_upstream_rules: clientUpstreamRulesInput.value.trim(),
-    dnssec_enabled: dnssecEnabledInput.checked,
     allowed_clients: allowedClientsInput.value.trim(),
     blocked_clients: blockedClientsInput.value.trim(),
     rate_limit_per_second: Number(rateLimitPerSecondInput.value || 0),
@@ -2358,7 +2220,7 @@ function setActiveView(view: ViewName): void {
       button.dataset.navGroup === "filters" && (view === "filters" || view === "custom");
     const isSettingsGroup =
       button.dataset.navGroup === "settings" &&
-      (view === "settings" || view === "dns" || view === "security" || view === "diagnostics");
+      (view === "settings" || view === "dns" || view === "security");
     button.classList.toggle(
       "active",
       button.dataset.view === view || isFilterGroup || isSettingsGroup,
@@ -2386,7 +2248,7 @@ function setActiveView(view: ViewName): void {
 
 function updateContextNavigation(view: ViewName): void {
   const group =
-    view === "settings" || view === "dns" || view === "security" || view === "diagnostics"
+    view === "settings" || view === "dns" || view === "security"
       ? "settings"
       : view === "filters" || view === "custom"
         ? "filters"
@@ -2396,103 +2258,6 @@ function updateContextNavigation(view: ViewName): void {
   contextNav.querySelectorAll<HTMLElement>("[data-context-group]").forEach((navigation) => {
     navigation.classList.toggle("active", navigation.dataset.contextGroup === group);
   });
-}
-
-async function runDiagnostic(): Promise<void> {
-  const domain = diagnosticDomainInput.value.trim();
-  if (!domain) {
-    diagnosticDomainInput.focus();
-    showMessage("请输入要诊断的域名", true);
-    return;
-  }
-  runDiagnosticButton.classList.add("loading");
-  runDiagnosticButton.textContent = "诊断中";
-  runDiagnosticButton.disabled = true;
-  diagnosticResults.innerHTML = `
-    <div class="diagnostic-empty loading-state">
-      <strong>正在并行测试上游…</strong>
-      <span>不可用的服务器最多等待 3 秒。</span>
-    </div>
-  `;
-  try {
-    const report = await runDnsDiagnostic(domain, diagnosticQueryTypeInput.value);
-    renderDiagnosticReport(report);
-  } catch (error) {
-    diagnosticResults.innerHTML = `
-      <div class="diagnostic-empty error-state">
-        <strong>诊断失败</strong>
-        <span>${escapeHtml(String(error))}</span>
-      </div>
-    `;
-    showMessage(String(error), true);
-  } finally {
-    runDiagnosticButton.classList.remove("loading");
-    runDiagnosticButton.textContent = "开始诊断";
-    runDiagnosticButton.disabled = false;
-  }
-}
-
-function renderDiagnosticReport(report: DnsDiagnosticReport): void {
-  const localLabels: Record<DnsDiagnosticReport["local_status"], string> = {
-    allowed: "本地判定：允许",
-    blocked: "本地判定：已拦截",
-    rewrite: "本地判定：DNS 重写",
-    paused: "本地判定：保护已暂停",
-    stopped: "本地判定：服务未运行",
-  };
-  const upstreamRows = report.upstreams.length > 0
-    ? report.upstreams.map((result) => {
-        const answers = result.answers.length > 0
-          ? result.answers
-              .map((answer) => `${dnsQueryTypeLabel(answer.record_type)} ${answer.value}`)
-              .join(" · ")
-          : result.success
-            ? "响应中没有可展示的记录"
-            : result.error || "上游无响应";
-        return `
-          <div class="diagnostic-upstream ${result.success ? "success" : "failed"}">
-            <i aria-hidden="true"></i>
-            <div>
-              <strong title="${escapeHtml(result.upstream)}">${escapeHtml(result.upstream)}</strong>
-              <span title="${escapeHtml(answers)}">${escapeHtml(answers)}</span>
-            </div>
-            <div class="diagnostic-upstream-meta">
-              <strong>${result.success ? `${dnsResponseCodeShortLabel(result.response_code)}${result.authenticated_data ? " · DNSSEC" : ""}` : "失败"}</strong>
-              <span>${result.latency_ms === null ? "-" : formatElapsedMs(result.latency_ms)}</span>
-            </div>
-          </div>
-        `;
-      }).join("")
-    : `<div class="diagnostic-empty"><strong>没有已配置的上游</strong></div>`;
-  diagnosticResults.innerHTML = `
-    <section class="diagnostic-local ${report.local_status}">
-      <div>
-        <span>${escapeHtml(report.domain)} · ${escapeHtml(report.query_type)}</span>
-        <strong>${localLabels[report.local_status]}</strong>
-      </div>
-      <p>${escapeHtml(report.local_detail)}</p>
-    </section>
-    <section class="diagnostic-upstream-list">
-      <div class="diagnostic-result-heading">
-        <h3>上游测试</h3>
-        <span>${report.upstreams.filter((result) => result.success).length}/${report.upstreams.length} 个可用</span>
-      </div>
-      ${upstreamRows}
-    </section>
-  `;
-}
-
-function dnsResponseCodeShortLabel(code: number | null): string {
-  if (code === null) {
-    return "已响应";
-  }
-  const labels: Record<number, string> = {
-    0: "NOERROR",
-    2: "SERVFAIL",
-    3: "NXDOMAIN",
-    5: "REFUSED",
-  };
-  return labels[code] || `RCODE ${code}`;
 }
 
 function renderFilters(): void {
@@ -2621,9 +2386,6 @@ function renderFilter(filter: FilterSubscription): string {
 
 function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}): void {
   const renderDashboard = options.renderDashboard ?? true;
-
-  latestRuntimeStatus = status;
-  renderRuntimeStatus(status);
 
   const lastError = status.error ?? status.stats.last_error;
   const statusErrorKey = status.error
@@ -2799,10 +2561,6 @@ function renderQueryLogRow(record: QueryLogRecord): string {
         <div>
           <strong title="${escapeHtml(record.domain)}">${escapeHtml(record.domain)}</strong>
           <span>${escapeHtml(requestMeta.join(" · "))}</span>
-          <div class="log-rule-actions">
-            <button data-log-rule-action="${record.blocked ? "allow" : "block"}" data-domain="${escapeHtml(record.domain)}" type="button">${record.blocked ? "放行" : "拦截"}</button>
-            <button data-log-rule-action="rewrite" data-domain="${escapeHtml(record.domain)}" type="button">重写</button>
-          </div>
         </div>
       </div>
       <div class="log-response">
@@ -3658,134 +3416,6 @@ function updateFilterField(id: string, target: HTMLInputElement): void {
   updateConfigDirtyState();
 }
 
-function openQueryRuleDialog(domain: string): void {
-  pendingQueryRuleDomain = domain;
-  queryRuleDomain.textContent = domain;
-  queryRuleTarget.value = "";
-  queryRuleDialog.showModal();
-  window.setTimeout(() => queryRuleTarget.focus(), 0);
-}
-
-function closeQueryRuleDialog(): void {
-  pendingQueryRuleDomain = "";
-  queryRuleDialog.close();
-}
-
-async function runQueryLogRuleAction(
-  domain: string,
-  action: QueryLogRuleAction,
-  target?: string,
-): Promise<void> {
-  setBusy(true);
-  try {
-    const result = await applyQueryLogRule(domain, action, target);
-    renderStatus(result.status, { renderDashboard: false });
-    await loadConfig();
-    showMessage(result.message, false);
-    await refreshQueryLogs({ auto: true });
-  } catch (error) {
-    showMessage(String(error), true);
-  } finally {
-    setBusy(false);
-  }
-}
-
-function closeRuntimeStatusMenu(): void {
-  headerRuntime.classList.remove("open");
-  runtimeStatusButton.setAttribute("aria-expanded", "false");
-}
-
-function renderRuntimeStatus(status: RuntimeStatus): void {
-  const state = !status.running
-    ? "stopped"
-    : status.protection_paused
-      ? "paused"
-      : status.error
-        ? "error"
-        : "running";
-  const label = state === "running"
-    ? "保护运行中"
-    : state === "paused"
-      ? "过滤已暂停"
-      : state === "error"
-        ? "运行异常"
-        : "服务已停止";
-  runtimeStatusButton.className = `runtime-status-trigger ${state}`;
-  runtimeStatusLabel.textContent = label;
-  runtimeStatusDetail.textContent = state === "paused"
-    ? `DNS 仍在运行，黑名单过滤将在${formatPauseRemaining(status.protection_paused_until)}后自动恢复。`
-    : state === "running"
-      ? `正在监听 ${status.listen_addr}，可临时暂停黑名单过滤。`
-      : state === "error"
-        ? status.error || "DNS 运行时出现异常"
-        : "请先启动 DNS 服务，再使用临时暂停。";
-
-  runtimeStatusMenu.querySelectorAll<HTMLButtonElement>('[data-protection-action="pause"]')
-    .forEach((button) => {
-      button.disabled = !status.running || status.protection_paused;
-    });
-  const resumeButton = runtimeStatusMenu.querySelector<HTMLButtonElement>(
-    '[data-protection-action="resume"]',
-  );
-  if (resumeButton) {
-    resumeButton.disabled = !status.running || !status.protection_paused;
-  }
-
-  window.clearTimeout(pauseExpiryTimer);
-  pauseExpiryTimer = undefined;
-  if (status.protection_paused_until) {
-    const remainingMs = Math.max(0, status.protection_paused_until * 1000 - Date.now());
-    pauseExpiryTimer = window.setTimeout(() => {
-      void refreshStatus({ auto: true });
-    }, Math.min(remainingMs + 250, 2_147_000_000));
-  }
-
-  const traySignature = `${status.running}:${status.protection_paused}:${status.protection_paused_until ?? 0}`;
-  if (traySignature !== lastTrayRuntimeSignature) {
-    lastTrayRuntimeSignature = traySignature;
-    void setTrayRuntimeStatus(
-      status.running,
-      status.protection_paused,
-      status.protection_paused_until,
-    ).catch((error) => console.warn("同步托盘运行状态失败", error));
-  }
-}
-
-function formatPauseRemaining(deadline: number | null): string {
-  if (!deadline) {
-    return "稍后";
-  }
-  const seconds = Math.max(0, deadline - Math.floor(Date.now() / 1000));
-  if (seconds >= 3600) {
-    return `${Math.ceil(seconds / 3600)} 小时`;
-  }
-  return `${Math.max(1, Math.ceil(seconds / 60))} 分钟`;
-}
-
-async function runProtectionAction(
-  action: "pause" | "resume",
-  durationSeconds = 0,
-): Promise<void> {
-  setBusy(true);
-  try {
-    const status = action === "resume"
-      ? await resumeProtection()
-      : await pauseProtection(durationSeconds);
-    renderStatus(status, { renderDashboard: activeView === "dashboard" });
-    showMessage(
-      action === "resume"
-        ? "过滤保护已恢复"
-        : `过滤保护已暂停 ${formatPauseRemaining(status.protection_paused_until)}`,
-      false,
-    );
-  } catch (error) {
-    showMessage(String(error), true);
-    await refreshStatus({ auto: true });
-  } finally {
-    setBusy(false);
-  }
-}
-
 function renderRankTable(
   selector: string,
   counts: Record<string, number>,
@@ -3931,9 +3561,6 @@ function setBusy(busy: boolean): void {
   }
   if (!busy) {
     updateConfigSaveState();
-    if (latestRuntimeStatus) {
-      renderRuntimeStatus(latestRuntimeStatus);
-    }
   }
 }
 

@@ -2,7 +2,6 @@ export type ViewName =
   | "dashboard"
   | "dns"
   | "security"
-  | "diagnostics"
   | "filters"
   | "custom"
   | "logs"
@@ -91,9 +90,6 @@ export type AppConfig = {
   fallback_dns: string;
   bootstrap_dns: string;
   upstream_mode: UpstreamMode;
-  dnssec_enabled: boolean;
-  domain_upstream_rules: string;
-  client_upstream_rules: string;
   allowed_clients: string;
   blocked_clients: string;
   rate_limit_per_second: number;
@@ -195,8 +191,6 @@ export type SecurityEvent = {
 
 export type RuntimeStatus = {
   running: boolean;
-  protection_paused: boolean;
-  protection_paused_until: number | null;
   listen_addr: string;
   upstream_dns: string;
   summary: RuleSummary;
@@ -254,33 +248,6 @@ export type FilterUpdateResult = {
   failed: number;
   cancelled: number;
   message: string;
-};
-
-export type QueryLogRuleAction = "block" | "allow" | "rewrite";
-
-export type QueryLogRuleActionResult = {
-  status: RuntimeStatus;
-  config: AppConfig;
-  changed: boolean;
-  message: string;
-};
-
-export type UpstreamDiagnosticResult = {
-  upstream: string;
-  success: boolean;
-  latency_ms: number | null;
-  response_code: number | null;
-  authenticated_data: boolean;
-  answers: QueryLogResponseAnswer[];
-  error: string | null;
-};
-
-export type DnsDiagnosticReport = {
-  domain: string;
-  query_type: string;
-  local_status: "allowed" | "blocked" | "rewrite" | "paused" | "stopped";
-  local_detail: string;
-  upstreams: UpstreamDiagnosticResult[];
 };
 
 export type FilterUpdateProgress = {

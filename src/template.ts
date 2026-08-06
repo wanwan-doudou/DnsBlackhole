@@ -9,20 +9,6 @@ export function renderAppTemplate(appIconUrl: string): string {
             <h1>DnsBlackhole</h1>
             <span>DNS sinkhole</span>
           </div>
-          <div class="header-runtime" id="header_runtime">
-            <button class="runtime-status-trigger connecting" id="runtime_status_btn" type="button" aria-haspopup="menu" aria-expanded="false">
-              <i aria-hidden="true"></i>
-              <span id="runtime_status_label">正在连接</span>
-              <b aria-hidden="true"></b>
-            </button>
-            <div class="runtime-status-menu" id="runtime_status_menu" role="menu" aria-label="过滤保护控制">
-              <strong id="runtime_status_detail">正在读取 DNS 运行状态…</strong>
-              <button data-protection-action="pause" data-duration="300" type="button" role="menuitem">暂停 5 分钟</button>
-              <button data-protection-action="pause" data-duration="1800" type="button" role="menuitem">暂停 30 分钟</button>
-              <button data-protection-action="pause" data-duration="3600" type="button" role="menuitem">暂停 1 小时</button>
-              <button class="resume-action" data-protection-action="resume" type="button" role="menuitem">立即恢复过滤</button>
-            </div>
-          </div>
         </div>
 
         <nav class="module-nav" aria-label="模块">
@@ -39,7 +25,6 @@ export function renderAppTemplate(appIconUrl: string): string {
           <button data-view="settings" type="button">常规与运行</button>
           <button data-view="dns" type="button">DNS 设置</button>
           <button data-view="security" type="button">安全防护</button>
-          <button data-view="diagnostics" type="button">DNS 诊断</button>
         </nav>
         <nav class="context-nav-inner" data-context-group="filters" aria-label="过滤器分类">
           <button data-view="filters" type="button">DNS 黑名单</button>
@@ -255,30 +240,6 @@ export function renderAppTemplate(appIconUrl: string): string {
             </div>
           </div>
         </section>
-
-        <dialog class="update-dialog query-rule-dialog" id="query_rule_dialog">
-          <form class="update-dialog-panel" method="dialog" id="query_rule_form">
-            <div class="update-dialog-header">
-              <div>
-                <span class="update-dialog-kicker">查询日志快捷操作</span>
-                <h3>添加 DNS 重写</h3>
-              </div>
-              <button class="update-dialog-close" id="query_rule_dialog_close_btn" type="button" aria-label="关闭">×</button>
-            </div>
-            <div class="update-dialog-body">
-              <p class="query-rule-domain">域名：<strong id="query_rule_domain">-</strong></p>
-              <label class="field">
-                <span>重写目标 IP</span>
-                <small>填写有效的 IPv4 或 IPv6 地址；保存后会立即热更新，无需重启 DNS。</small>
-                <input id="query_rule_target" autocomplete="off" spellcheck="false" placeholder="例如 192.168.1.10" />
-              </label>
-            </div>
-            <div class="update-dialog-footer">
-              <button id="query_rule_dialog_cancel_btn" type="button">取消</button>
-              <button class="primary" id="query_rule_dialog_confirm_btn" type="submit">保存重写</button>
-            </div>
-          </form>
-        </dialog>
       </section>
 
       <section class="view" data-view-panel="dns">
@@ -299,7 +260,6 @@ export function renderAppTemplate(appIconUrl: string): string {
               <div class="dns-settings">
                 <label class="field upstream-field">
                   <span>上游 DNS 服务器</span>
-                  <small>每行一个上游：普通 DNS、https://（DoH）、tls://（DoT）或 quic://（DoQ）。DoT / DoQ 必须填写证书对应的主机名。</small>
                   <textarea id="upstream_dns" autocomplete="off" spellcheck="false"></textarea>
                 </label>
                 <div class="listen-settings">
@@ -332,13 +292,6 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <textarea id="bootstrap_dns" autocomplete="off" spellcheck="false" placeholder="223.5.5.5"></textarea>
                 </label>
               </div>
-              <label class="check-row dnssec-row">
-                <input id="dnssec_enabled" type="checkbox" />
-                <span>
-                  <strong>验证 DNSSEC</strong>
-                  <small>请求 DNSSEC 记录并要求上游执行验证；验证失败的 SERVFAIL 响应会被拒绝。建议搭配可信的 DoH、DoT 或 DoQ 上游。</small>
-                </span>
-              </label>
               <div class="radio-stack upstream-mode">
                 <label class="radio-row">
                   <input name="upstream_mode" type="radio" value="load_balance" />
@@ -360,25 +313,6 @@ export function renderAppTemplate(appIconUrl: string): string {
                     <strong>最快的 IP 地址</strong>
                     <small>等待上游服务器响应，测速返回的 IP 地址，并优先采用最快的可用结果。</small>
                   </span>
-                </label>
-              </div>
-            </section>
-
-            <section class="settings-section upstream-routing-section">
-              <div class="section-heading">
-                <h3>DNS 分流与客户端上游策略</h3>
-                <span>匹配后只使用指定上游，不回退到全局服务器。客户端策略优先于域名分流；保存后会安全重启 DNS 运行时。</span>
-              </div>
-              <div class="upstream-routing-grid">
-                <label class="field">
-                  <span>域名分流</span>
-                  <small>每行“域名模式 => 上游”。使用 *.example.com 同时匹配主域和子域；多个上游用逗号分隔。</small>
-                  <textarea id="domain_upstream_rules" autocomplete="off" spellcheck="false" placeholder="*.home.arpa => 192.168.1.1&#10;example.com => https://dns.example/dns-query, 1.1.1.1"></textarea>
-                </label>
-                <label class="field">
-                  <span>客户端上游策略</span>
-                  <small>每行“IP/CIDR => 上游”。更精确的网段优先，可让指定设备或网段使用独立 DNS。</small>
-                  <textarea id="client_upstream_rules" autocomplete="off" spellcheck="false" placeholder="192.168.1.20 => 223.5.5.5&#10;192.168.2.0/24 => https://doh.pub/dns-query"></textarea>
                 </label>
               </div>
             </section>
@@ -468,39 +402,6 @@ export function renderAppTemplate(appIconUrl: string): string {
               </label>
               <button id="clear_dns_cache_btn" type="button">清除缓存</button>
             </section>
-          </div>
-        </section>
-      </section>
-
-      <section class="view" data-view-panel="diagnostics">
-        <section class="panel module-panel diagnostic-panel">
-          <div class="panel-title with-actions">
-            <div>
-              <h2>DNS 诊断中心</h2>
-              <p>检查本地过滤判定，并并行测试每个已配置上游的响应、延迟与返回记录。</p>
-            </div>
-            <button class="primary" id="run_diagnostic_btn" type="button">开始诊断</button>
-          </div>
-          <div class="diagnostic-form">
-            <label class="field">
-              <span>测试域名</span>
-              <input id="diagnostic_domain" autocomplete="off" spellcheck="false" value="example.com" placeholder="example.com" />
-            </label>
-            <label class="field compact-select">
-              <span>查询类型</span>
-              <select id="diagnostic_query_type">
-                <option value="A">A（IPv4）</option>
-                <option value="AAAA">AAAA（IPv6）</option>
-                <option value="HTTPS">HTTPS</option>
-                <option value="TXT">TXT</option>
-              </select>
-            </label>
-          </div>
-          <div class="diagnostic-results" id="diagnostic_results">
-            <div class="diagnostic-empty">
-              <strong>尚未运行诊断</strong>
-              <span>输入域名后开始测试；不会修改配置，也不会写入查询日志。</span>
-            </div>
           </div>
         </section>
       </section>

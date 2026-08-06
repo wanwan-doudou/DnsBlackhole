@@ -2,11 +2,10 @@
 //! 不依赖任何 Tauri 窗口能力；Windows 和 macOS 由系统后台服务承载。
 
 use std::{
-    net::IpAddr,
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -18,8 +17,8 @@ use crate::{
     config::{self, AppConfig},
     database::{Database, LogStats, QueryLogPage},
     dns::{
-        self, DnsDiagnosticReport, DnsServer, DnsStats, FilterRuntime, RuleLoadSource, RuleSummary,
-        RuntimeStatus, build_filter_runtime_with_rules, clear_rule_cache, current_filter_runtime,
+        self, DnsServer, DnsStats, FilterRuntime, RuleLoadSource, RuleSummary, RuntimeStatus,
+        build_filter_runtime_with_rules, clear_rule_cache, current_filter_runtime,
         load_or_compile_rules, replace_filter_runtime,
     },
     filters,
@@ -47,7 +46,6 @@ pub(crate) struct AppState {
     filter_update_lock: Mutex<()>,
     filter_update_progress: Mutex<FilterUpdateProgressState>,
     filter_update_cancel: AtomicBool,
-    protection_paused_until: Arc<AtomicU64>,
     // 启停、配置保存和规则热替换串行执行，避免后台初始化与用户操作互相覆盖
     pub(crate) runtime_update_lock: Mutex<()>,
 }
@@ -86,14 +84,6 @@ pub(crate) struct FilterCacheClearResult {
     pub(crate) message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct QueryLogRuleActionResult {
-    pub(crate) status: RuntimeStatus,
-    pub(crate) config: AppConfig,
-    pub(crate) changed: bool,
-    pub(crate) message: String,
-}
-
 #[derive(Clone, Copy)]
 enum FilterUpdateScope {
     ManualAll,
@@ -122,7 +112,6 @@ impl AppState {
             filter_update_lock: Mutex::new(()),
             filter_update_progress: Mutex::new(FilterUpdateProgressState::default()),
             filter_update_cancel: AtomicBool::new(false),
-            protection_paused_until: Arc::new(AtomicU64::new(0)),
             runtime_update_lock: Mutex::new(()),
         }
     }
@@ -226,7 +215,6 @@ impl AppState {
             filter_runtime,
             Arc::clone(&self.stats),
             Arc::clone(&self.database),
-            Arc::clone(&self.protection_paused_until),
         )?;
         crate::performance::log_service("DNS 核心启动", "DNS 服务实例", server_started);
         let summary = server.rule_summary();
@@ -374,8 +362,7 @@ impl AppState {
             .and_then(|server| server.as_ref().map(|server| !server.has_finished_threads()))
             .unwrap_or(false);
 
-        let paused_until = active_pause_deadline(&self.protection_paused_until, unix_now());
-        let status = dns::empty_status(&config, running, paused_until, summary, stats, error);
+        let status = dns::empty_status(&config, running, summary, stats, error);
         if force_log_stats {
             crate::performance::log_service("首页数据", "状态快照总计", total_started);
         }
@@ -545,9 +532,6 @@ pub(crate) fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool 
         || previous.fallback_dns != next.fallback_dns
         || previous.bootstrap_dns != next.bootstrap_dns
         || previous.upstream_mode != next.upstream_mode
-        || previous.dnssec_enabled != next.dnssec_enabled
-        || previous.domain_upstream_rules != next.domain_upstream_rules
-        || previous.client_upstream_rules != next.client_upstream_rules
         || previous.allow_insecure_http != next.allow_insecure_http
         || previous.allowed_clients != next.allowed_clients
         || previous.blocked_clients != next.blocked_clients
@@ -661,103 +645,6 @@ pub(crate) fn clear_statistics_blocking(state: &AppState) -> Result<RuntimeStatu
     Ok(state.status_with_log_stats(true, true))
 }
 
-pub(crate) fn apply_query_log_rule_blocking(
-    state: Arc<AppState>,
-    domain: String,
-    action: String,
-    target: Option<String>,
-) -> Result<QueryLogRuleActionResult, String> {
-    let domain = config::normalize_hostname(&domain)
-        .ok_or_else(|| "查询日志中的域名无效，无法创建规则".to_string())?;
-    let mut next = state.current_config()?;
-    let previous_blacklist = next.blacklist.clone();
-    let previous_rewrites = next.dns_rewrites.clone();
-
-    next.blacklist = remove_exact_domain_rules(&next.blacklist, &domain);
-    next.dns_rewrites = remove_exact_dns_rewrites(&next.dns_rewrites, &domain);
-    let message = match action.as_str() {
-        "block" => {
-            append_config_line(&mut next.blacklist, &format!("||{domain}^"));
-            format!("已拦截 {domain}")
-        }
-        "allow" => {
-            append_config_line(&mut next.blacklist, &format!("@@||{domain}^"));
-            format!("已放行 {domain}")
-        }
-        "rewrite" => {
-            let target = target.unwrap_or_default();
-            let target = target.trim();
-            target
-                .parse::<IpAddr>()
-                .map_err(|_| "DNS 重写目标必须是有效的 IPv4 或 IPv6 地址".to_string())?;
-            append_config_line(&mut next.dns_rewrites, &format!("{domain} {target}"));
-            format!("已将 {domain} 重写到 {target}")
-        }
-        _ => return Err("不支持的查询日志快捷操作".to_string()),
-    };
-
-    let changed = next.blacklist != previous_blacklist || next.dns_rewrites != previous_rewrites;
-    let status = if changed {
-        save_config_blocking(Arc::clone(&state), next.clone())?
-    } else {
-        state.status(false)
-    };
-    Ok(QueryLogRuleActionResult {
-        status,
-        config: next,
-        changed,
-        message,
-    })
-}
-
-pub(crate) fn run_dns_diagnostic_blocking(
-    state: &AppState,
-    domain: String,
-    query_type: String,
-) -> Result<DnsDiagnosticReport, String> {
-    let config = state.current_config()?;
-    let filter = state.active_filter_runtime();
-    let protection_paused =
-        active_pause_deadline(&state.protection_paused_until, unix_now()).is_some();
-    dns::run_dns_diagnostic(
-        &config,
-        filter.as_deref(),
-        protection_paused,
-        &domain,
-        &query_type,
-    )
-}
-
-fn remove_exact_domain_rules(raw: &str, domain: &str) -> String {
-    let block = format!("||{domain}^");
-    let allow = format!("@@||{domain}^");
-    raw.lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !trimmed.eq_ignore_ascii_case(&block) && !trimmed.eq_ignore_ascii_case(&allow)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn remove_exact_dns_rewrites(raw: &str, domain: &str) -> String {
-    raw.lines()
-        .filter(|line| {
-            line.split_whitespace()
-                .next()
-                .is_none_or(|candidate| !candidate.eq_ignore_ascii_case(domain))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn append_config_line(raw: &mut String, line: &str) {
-    if !raw.is_empty() && !raw.ends_with('\n') {
-        raw.push('\n');
-    }
-    raw.push_str(line);
-}
-
 /// 更新启用的远程清单并应用。前端事件通知由调用方处理。
 pub(crate) fn update_filters_blocking(
     state: Arc<AppState>,
@@ -865,33 +752,6 @@ pub(crate) fn stop_dns_blocking(state: Arc<AppState>) -> Result<RuntimeStatus, S
     state.set_error(None);
     state.invalidate_log_stats_cache();
     Ok(state.status(true))
-}
-
-pub(crate) fn pause_protection_blocking(
-    state: &AppState,
-    duration_seconds: u64,
-) -> Result<RuntimeStatus, String> {
-    if !(60..=24 * 3600).contains(&duration_seconds) {
-        return Err("暂停时长必须在 1 分钟到 24 小时之间".to_string());
-    }
-    if !state.status(false).running {
-        return Err("DNS 服务未运行，无法暂停过滤保护".to_string());
-    }
-    state.protection_paused_until.store(
-        unix_now().saturating_add(duration_seconds),
-        Ordering::Release,
-    );
-    Ok(state.status(false))
-}
-
-pub(crate) fn resume_protection_blocking(state: &AppState) -> Result<RuntimeStatus, String> {
-    state.protection_paused_until.store(0, Ordering::Release);
-    Ok(state.status(false))
-}
-
-fn active_pause_deadline(deadline: &AtomicU64, now: u64) -> Option<u64> {
-    let deadline = deadline.load(Ordering::Acquire);
-    (deadline > now).then_some(deadline)
 }
 
 pub(crate) fn clear_dns_cache_blocking(state: &AppState) -> Result<RuntimeStatus, String> {

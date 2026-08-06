@@ -14,12 +14,10 @@ use crate::{
     config::AppConfig,
     database::Database,
     service_core::{
-        AppState, apply_query_log_rule_blocking, clear_dns_cache_blocking,
-        clear_filter_cache_blocking, clear_query_logs_blocking, clear_statistics_blocking,
-        pause_protection_blocking, query_logs_blocking, resume_protection_blocking,
-        run_dns_diagnostic_blocking, save_config_blocking, spawn_database_maintenance,
-        spawn_filter_auto_update, spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking,
-        update_filters_blocking,
+        AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, clear_query_logs_blocking,
+        clear_statistics_blocking, query_logs_blocking, save_config_blocking,
+        spawn_database_maintenance, spawn_filter_auto_update, spawn_runtime_watchdog,
+        start_dns_blocking, stop_dns_blocking, update_filters_blocking,
     },
     storage,
 };
@@ -50,24 +48,6 @@ struct QueryLogsParams {
 #[derive(Debug, Deserialize)]
 struct ConfigParams {
     config: AppConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct PauseProtectionParams {
-    duration_seconds: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct QueryLogRuleParams {
-    domain: String,
-    action: String,
-    target: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DnsDiagnosticParams {
-    domain: String,
-    query_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,23 +233,6 @@ fn dispatch_request(
                 params.page_size,
             )?)?
         }
-        "apply_query_log_rule" => {
-            let params: QueryLogRuleParams = parse_params(params)?;
-            to_value(apply_query_log_rule_blocking(
-                Arc::clone(state),
-                params.domain,
-                params.action,
-                params.target,
-            )?)?
-        }
-        "run_dns_diagnostic" => {
-            let params: DnsDiagnosticParams = parse_params(params)?;
-            to_value(run_dns_diagnostic_blocking(
-                state,
-                params.domain,
-                params.query_type,
-            )?)?
-        }
         "clear_query_logs" => to_value(clear_query_logs_blocking(state)?)?,
         "clear_statistics" => to_value(clear_statistics_blocking(state)?)?,
         "update_filters" => {
@@ -279,11 +242,6 @@ fn dispatch_request(
         "get_filter_update_progress" => to_value(state.filter_update_progress()?)?,
         "cancel_filter_update" => to_value(state.request_filter_update_cancel()?)?,
         "start_dns" => to_value(start_dns_blocking(Arc::clone(state))?)?,
-        "pause_protection" => {
-            let params: PauseProtectionParams = parse_params(params)?;
-            to_value(pause_protection_blocking(state, params.duration_seconds)?)?
-        }
-        "resume_protection" => to_value(resume_protection_blocking(state)?)?,
         "stop_dns" => {
             #[cfg(windows)]
             ensure_system_dns_not_managed(state)?;

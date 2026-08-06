@@ -15,19 +15,6 @@ use crate::config::{
     UpstreamMode, UpstreamServer, resolve_hostname_socket_addrs,
     resolve_hostname_socket_addrs_until,
 };
-use futures_util::StreamExt;
-use hickory_client::{
-    client::Client as HickoryClient,
-    proto::{
-        DnsHandle,
-        h2::HttpsClientStreamBuilder,
-        op::{Edns, Message},
-        quic::QuicClientStreamBuilder,
-        runtime::TokioRuntimeProvider,
-        rustls::{client_config as hickory_tls_client_config, tls_client_connect},
-        udp::UdpClientStream,
-    },
-};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 
 use super::{
@@ -53,7 +40,6 @@ const UPSTREAM_HALF_OPEN_PROBE_INTERVAL_SECONDS: u64 = 5;
 static HALF_OPEN_PROBE_AFTER: AtomicU64 = AtomicU64::new(0);
 /// 轮流由不同上游承担探测，避免始终探测同一个已经彻底不可用的上游。
 static HALF_OPEN_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
-static HICKORY_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 /// 探测节流是进程级单例，触碰它的测试需要串行执行。
 #[cfg(test)]
 pub(crate) static HALF_OPEN_PROBE_TEST_GUARD: Mutex<()> = Mutex::new(());
@@ -81,9 +67,6 @@ pub(crate) struct RuntimeUpstream {
     resolution_retry_at: Arc<AtomicU64>,
     udp_state: Arc<Mutex<Option<UdpRuntimeState>>>,
     doh_client: Arc<Mutex<Option<reqwest::blocking::Client>>>,
-    hickory_client: Arc<Mutex<Option<HickoryClient>>>,
-    hickory_addresses: Arc<Mutex<Option<Vec<SocketAddr>>>>,
-    dnssec_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -135,18 +118,9 @@ impl ParallelRequestControl {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn build_runtime_upstreams(
     upstream_servers: Vec<UpstreamServer>,
     bootstrap_servers: &[SocketAddr],
-) -> Vec<RuntimeUpstream> {
-    build_runtime_upstreams_with_dnssec(upstream_servers, bootstrap_servers, false)
-}
-
-pub(crate) fn build_runtime_upstreams_with_dnssec(
-    upstream_servers: Vec<UpstreamServer>,
-    bootstrap_servers: &[SocketAddr],
-    dnssec_enabled: bool,
 ) -> Vec<RuntimeUpstream> {
     let worker_count = thread::available_parallelism()
         .map(usize::from)
@@ -162,11 +136,7 @@ pub(crate) fn build_runtime_upstreams_with_dnssec(
         let mut batch = thread::scope(|scope| {
             batch
                 .into_iter()
-                .map(|server| {
-                    scope.spawn(move || {
-                        RuntimeUpstream::new_with_dnssec(server, bootstrap_servers, dnssec_enabled)
-                    })
-                })
+                .map(|server| scope.spawn(move || RuntimeUpstream::new(server, bootstrap_servers)))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|worker| worker.join().expect("上游初始化线程不应异常退出"))
@@ -178,42 +148,18 @@ pub(crate) fn build_runtime_upstreams_with_dnssec(
 }
 
 impl RuntimeUpstream {
-    #[cfg(test)]
     pub(crate) fn new(server: UpstreamServer, bootstrap_servers: &[SocketAddr]) -> Self {
-        Self::new_with_dnssec(server, bootstrap_servers, false)
-    }
-
-    pub(crate) fn new_with_dnssec(
-        server: UpstreamServer,
-        bootstrap_servers: &[SocketAddr],
-        dnssec_enabled: bool,
-    ) -> Self {
         let label = format_upstream_server(&server);
-        let initial_udp_state = (!dnssec_enabled)
-            .then(|| resolve_udp_state(&server, bootstrap_servers).ok().flatten())
-            .flatten();
-        let initial_doh_client = match (&server, dnssec_enabled) {
-            (UpstreamServer::Doh(url), false) => build_doh_client(url, bootstrap_servers).ok(),
-            _ => None,
+        let initial_udp_state = resolve_udp_state(&server, bootstrap_servers).ok().flatten();
+        let initial_doh_client = match &server {
+            UpstreamServer::Doh(url) => build_doh_client(url, bootstrap_servers).ok(),
+            UpstreamServer::Udp(_) | UpstreamServer::UdpHostname { .. } => None,
         };
-        let uses_hickory = dnssec_enabled
-            || matches!(
-                server,
-                UpstreamServer::Tls { .. } | UpstreamServer::Quic { .. }
-            );
-        let initial_hickory_addresses = uses_hickory
-            .then(|| resolve_hickory_addresses_at_startup(&server, bootstrap_servers).ok())
-            .flatten();
-        let resolution_available = initial_hickory_addresses.is_some()
-            || initial_udp_state.is_some()
-            || initial_doh_client.is_some();
+        let resolution_available = initial_udp_state.is_some() || initial_doh_client.is_some();
         let resolution_retry_at = if !resolution_available
             && matches!(
                 server,
-                UpstreamServer::UdpHostname { .. }
-                    | UpstreamServer::Doh(_)
-                    | UpstreamServer::Tls { .. }
-                    | UpstreamServer::Quic { .. }
+                UpstreamServer::UdpHostname { .. } | UpstreamServer::Doh(_)
             ) {
             current_second().saturating_add(UPSTREAM_RESOLUTION_RETRY_INTERVAL_SECONDS)
         } else {
@@ -228,14 +174,7 @@ impl RuntimeUpstream {
             resolution_retry_at: Arc::new(AtomicU64::new(resolution_retry_at)),
             udp_state: Arc::new(Mutex::new(initial_udp_state)),
             doh_client: Arc::new(Mutex::new(initial_doh_client)),
-            hickory_client: Arc::new(Mutex::new(None)),
-            hickory_addresses: Arc::new(Mutex::new(initial_hickory_addresses)),
-            dnssec_enabled,
         }
-    }
-
-    pub(crate) fn label(&self) -> &str {
-        &self.label
     }
 }
 
@@ -248,9 +187,7 @@ fn resolve_udp_state(
         UpstreamServer::UdpHostname { hostname, port } => {
             resolve_hostname_socket_addrs(hostname, *port, bootstrap_servers)?
         }
-        UpstreamServer::Doh(_) | UpstreamServer::Tls { .. } | UpstreamServer::Quic { .. } => {
-            return Ok(None);
-        }
+        UpstreamServer::Doh(_) => return Ok(None),
     };
     Ok(Some(build_udp_runtime_state(addresses)))
 }
@@ -265,9 +202,7 @@ fn resolve_udp_state_until(
         UpstreamServer::UdpHostname { hostname, port } => {
             resolve_hostname_socket_addrs_until(hostname, *port, bootstrap_servers, deadline)?
         }
-        UpstreamServer::Doh(_) | UpstreamServer::Tls { .. } | UpstreamServer::Quic { .. } => {
-            return Ok(None);
-        }
+        UpstreamServer::Doh(_) => return Ok(None),
     };
     Ok(Some(build_udp_runtime_state(addresses)))
 }
@@ -380,273 +315,6 @@ fn current_doh_client(
     Ok(client)
 }
 
-fn hickory_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
-    if let Some(runtime) = HICKORY_RUNTIME.get() {
-        return Ok(runtime);
-    }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("dns-secure-upstream")
-        .enable_all()
-        .build()
-        .map_err(|error| format!("创建加密 DNS 运行时失败：{error}"))?;
-    let _ = HICKORY_RUNTIME.set(runtime);
-    HICKORY_RUNTIME
-        .get()
-        .ok_or_else(|| "创建加密 DNS 运行时失败".to_string())
-}
-
-fn current_hickory_client(
-    upstream: &RuntimeUpstream,
-    deadline: Instant,
-) -> Result<HickoryClient, String> {
-    {
-        let current = lock_until(
-            &upstream.hickory_client,
-            deadline,
-            "读取加密 DNS 客户端状态失败",
-        )?;
-        ensure_resolution_retry_due(upstream)?;
-        if let Some(client) = current.clone() {
-            return Ok(client);
-        }
-    }
-
-    let addresses = current_hickory_addresses(upstream, deadline)?;
-    let runtime = hickory_runtime()?;
-    let mut last_error = None;
-    for address in addresses {
-        let remaining = remaining_upstream_timeout(deadline)?;
-        let result = runtime.block_on(async {
-            tokio::time::timeout(remaining, build_hickory_client(&upstream.server, address)).await
-        });
-        match result {
-            Ok(Ok(client)) => {
-                let mut current = lock_until(
-                    &upstream.hickory_client,
-                    deadline,
-                    "更新加密 DNS 客户端状态失败",
-                )?;
-                if let Some(current) = current.clone() {
-                    return Ok(current);
-                }
-                upstream.resolution_retry_at.store(0, Ordering::Relaxed);
-                *current = Some(client.clone());
-                return Ok(client);
-            }
-            Ok(Err(error)) => last_error = Some(format!("{address}：{error}")),
-            Err(_) => last_error = Some(format!("连接 {address} 超时")),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| "加密 DNS 上游没有可用地址".to_string()))
-}
-
-fn current_hickory_addresses(
-    upstream: &RuntimeUpstream,
-    deadline: Instant,
-) -> Result<Vec<SocketAddr>, String> {
-    {
-        let current = lock_until(
-            &upstream.hickory_addresses,
-            deadline,
-            "读取加密 DNS 地址状态失败",
-        )?;
-        if let Some(addresses) = current.clone() {
-            return Ok(addresses);
-        }
-    }
-    let addresses = resolve_hickory_addresses(upstream, deadline)?;
-    let mut current = lock_until(
-        &upstream.hickory_addresses,
-        deadline,
-        "更新加密 DNS 地址状态失败",
-    )?;
-    if let Some(current) = current.clone() {
-        return Ok(current);
-    }
-    *current = Some(addresses.clone());
-    Ok(addresses)
-}
-
-fn resolve_hickory_addresses_at_startup(
-    server: &UpstreamServer,
-    bootstrap_servers: &[SocketAddr],
-) -> Result<Vec<SocketAddr>, String> {
-    match server {
-        UpstreamServer::Udp(address) => Ok(vec![*address]),
-        UpstreamServer::UdpHostname { hostname, port }
-        | UpstreamServer::Tls { hostname, port }
-        | UpstreamServer::Quic { hostname, port } => {
-            resolve_hostname_socket_addrs(hostname, *port, bootstrap_servers)
-        }
-        UpstreamServer::Doh(url) => {
-            let parsed =
-                reqwest::Url::parse(url).map_err(|error| format!("DoH 地址无效：{error}"))?;
-            let hostname = parsed
-                .host_str()
-                .ok_or_else(|| "DoH 地址缺少主机名".to_string())?;
-            let port = parsed
-                .port_or_known_default()
-                .ok_or_else(|| "DoH 地址缺少有效端口".to_string())?;
-            if let Ok(ip) = hostname.parse::<IpAddr>() {
-                Ok(vec![SocketAddr::new(ip, port)])
-            } else {
-                resolve_hostname_socket_addrs(hostname, port, bootstrap_servers)
-            }
-        }
-    }
-}
-
-fn resolve_hickory_addresses(
-    upstream: &RuntimeUpstream,
-    deadline: Instant,
-) -> Result<Vec<SocketAddr>, String> {
-    match &upstream.server {
-        UpstreamServer::Udp(address) => Ok(vec![*address]),
-        UpstreamServer::UdpHostname { hostname, port }
-        | UpstreamServer::Tls { hostname, port }
-        | UpstreamServer::Quic { hostname, port } => resolve_hostname_socket_addrs_until(
-            hostname,
-            *port,
-            &upstream.bootstrap_servers,
-            deadline,
-        ),
-        UpstreamServer::Doh(url) => {
-            let parsed =
-                reqwest::Url::parse(url).map_err(|error| format!("DoH 地址无效：{error}"))?;
-            if parsed.scheme() != "https" {
-                return Err("启用 DNSSEC 时不支持不安全的 HTTP DoH 上游".into());
-            }
-            let hostname = parsed
-                .host_str()
-                .ok_or_else(|| "DoH 地址缺少主机名".to_string())?;
-            let port = parsed
-                .port_or_known_default()
-                .ok_or_else(|| "DoH 地址缺少有效端口".to_string())?;
-            if let Ok(ip) = hostname.parse::<IpAddr>() {
-                Ok(vec![SocketAddr::new(ip, port)])
-            } else {
-                resolve_hostname_socket_addrs_until(
-                    hostname,
-                    port,
-                    &upstream.bootstrap_servers,
-                    deadline,
-                )
-            }
-        }
-    }
-}
-
-async fn build_hickory_client(
-    server: &UpstreamServer,
-    address: SocketAddr,
-) -> Result<HickoryClient, String> {
-    let provider = TokioRuntimeProvider::new();
-    let client = match server {
-        UpstreamServer::Udp(_) | UpstreamServer::UdpHostname { .. } => {
-            let connect = UdpClientStream::builder(address, provider)
-                .with_timeout(Some(UPSTREAM_TIMEOUT))
-                .build();
-            let (client, background) = HickoryClient::connect(connect)
-                .await
-                .map_err(|error| format!("创建 DNS 客户端失败：{error}"))?;
-            let _background = tokio::spawn(background);
-            client
-        }
-        UpstreamServer::Doh(url) => {
-            let parsed =
-                reqwest::Url::parse(url).map_err(|error| format!("DoH 地址无效：{error}"))?;
-            let hostname = parsed
-                .host_str()
-                .ok_or_else(|| "DoH 地址缺少主机名".to_string())?;
-            let mut endpoint = parsed.path().to_string();
-            if let Some(query) = parsed.query() {
-                endpoint.push('?');
-                endpoint.push_str(query);
-            }
-            let connect = HttpsClientStreamBuilder::with_client_config(
-                Arc::new(hickory_tls_client_config()),
-                provider,
-            )
-            .build(address, hostname.to_string(), endpoint);
-            let (client, background) = HickoryClient::connect(connect)
-                .await
-                .map_err(|error| format!("创建 DoH 客户端失败：{error}"))?;
-            let _background = tokio::spawn(background);
-            client
-        }
-        UpstreamServer::Tls { hostname, .. } => {
-            let (stream, sender) = tls_client_connect(
-                address,
-                hostname.clone(),
-                Arc::new(hickory_tls_client_config()),
-                provider,
-            );
-            let (client, background) =
-                HickoryClient::with_timeout(stream, sender, UPSTREAM_TIMEOUT, None)
-                    .await
-                    .map_err(|error| format!("创建 DoT 客户端失败：{error}"))?;
-            let _background = tokio::spawn(background);
-            client
-        }
-        UpstreamServer::Quic { hostname, .. } => {
-            let connect = QuicClientStreamBuilder::default().build(address, hostname.clone());
-            let (client, background) = HickoryClient::connect(connect)
-                .await
-                .map_err(|error| format!("创建 DoQ 客户端失败：{error}"))?;
-            let _background = tokio::spawn(background);
-            client
-        }
-    };
-    Ok(client)
-}
-
-fn forward_hickory(
-    query: &[u8],
-    upstream: &RuntimeUpstream,
-    deadline: Instant,
-) -> Result<Vec<u8>, String> {
-    let query_id = query
-        .get(..2)
-        .ok_or_else(|| "DNS 查询报文过短".to_string())?
-        .try_into()
-        .map(u16::from_be_bytes)
-        .map_err(|_| "DNS 查询报文过短".to_string())?;
-    let mut message =
-        Message::from_vec(query).map_err(|error| format!("DNS 查询报文无效：{error}"))?;
-    if upstream.dnssec_enabled {
-        message
-            .extensions_mut()
-            .get_or_insert_with(Edns::new)
-            .set_dnssec_ok(true);
-        message.set_authentic_data(true);
-        message.set_checking_disabled(false);
-    }
-    let client = current_hickory_client(upstream, deadline)?;
-    let remaining = remaining_upstream_timeout(deadline)?;
-    let runtime = hickory_runtime()?;
-    let response = runtime
-        .block_on(async {
-            tokio::time::timeout(remaining, async move {
-                client
-                    .send(message)
-                    .next()
-                    .await
-                    .ok_or_else(|| "上游未返回 DNS 响应".to_string())?
-                    .map_err(|error| format!("DNS 查询失败：{error}"))
-            })
-            .await
-        })
-        .map_err(|_| "加密 DNS 查询超时".to_string())??;
-    let mut response = response
-        .to_vec()
-        .map_err(|error| format!("编码 DNS 响应失败：{error}"))?;
-    if response.len() >= 2 {
-        response[..2].copy_from_slice(&query_id.to_be_bytes());
-    }
-    Ok(response)
-}
-
 fn lock_until<'a, T>(
     mutex: &'a Mutex<T>,
     deadline: Instant,
@@ -674,12 +342,6 @@ fn ensure_resolution_retry_due(upstream: &RuntimeUpstream) -> Result<(), String>
 }
 
 fn invalidate_resolved_endpoint(upstream: &RuntimeUpstream) {
-    if let Ok(mut client) = upstream.hickory_client.lock() {
-        *client = None;
-    }
-    if let Ok(mut addresses) = upstream.hickory_addresses.lock() {
-        *addresses = None;
-    }
     match &upstream.server {
         UpstreamServer::UdpHostname { .. } => {
             upstream.resolution_retry_at.store(
@@ -690,7 +352,7 @@ fn invalidate_resolved_endpoint(upstream: &RuntimeUpstream) {
                 *state = None;
             }
         }
-        UpstreamServer::Doh(_) | UpstreamServer::Tls { .. } | UpstreamServer::Quic { .. } => {
+        UpstreamServer::Doh(_) => {
             upstream.resolution_retry_at.store(
                 current_second().saturating_add(UPSTREAM_RESOLUTION_RETRY_INTERVAL_SECONDS),
                 Ordering::Relaxed,
@@ -806,7 +468,7 @@ fn forward_parallel(
         match spawn_parallel_forward_task(&shared_query, upstream, &sender, &control, true, stats) {
             Ok(()) => pending += 1,
             Err(upstream) => {
-                synchronous_fallback = Some(*upstream);
+                synchronous_fallback = Some(upstream);
                 break;
             }
         }
@@ -920,7 +582,7 @@ fn spawn_parallel_forwards(
         ) {
             Ok(()) => scheduled += 1,
             Err(upstream) => {
-                synchronous_fallback = Some(*upstream);
+                synchronous_fallback = Some(upstream);
                 break;
             }
         }
@@ -940,7 +602,7 @@ fn spawn_parallel_forward_task(
     control: &Arc<ParallelRequestControl>,
     cancel_on_success: bool,
     stats: Option<&Arc<Mutex<DnsStats>>>,
-) -> Result<(), Box<RuntimeUpstream>> {
+) -> Result<(), RuntimeUpstream> {
     let fallback = upstream.clone();
     let sender = sender.clone();
     let query = Arc::clone(query);
@@ -961,7 +623,7 @@ fn spawn_parallel_forward_task(
         if let Some(stats) = stats {
             record_upstream_task_queue_rejected(stats);
         }
-        Err(Box::new(fallback))
+        Err(fallback)
     }
 }
 
@@ -1220,42 +882,26 @@ fn forward_to_upstream(
 ) -> Result<UpstreamForwardResponse, String> {
     remaining_upstream_timeout(deadline)?;
     let started = Instant::now();
-    let response = if upstream.dnssec_enabled
-        || matches!(
-            upstream.server,
-            UpstreamServer::Tls { .. } | UpstreamServer::Quic { .. }
-        ) {
-        forward_hickory(query, upstream, deadline)
-    } else {
-        match &upstream.server {
-            UpstreamServer::Udp(_) | UpstreamServer::UdpHostname { .. } => {
-                current_udp_state(upstream, deadline).and_then(|state| {
-                    forward_udp_addresses(
-                        query,
-                        &state.addresses,
-                        &state.socket_pools,
-                        &state.next_address,
-                        deadline,
-                    )
-                })
-            }
-            UpstreamServer::Doh(url) => current_doh_client(upstream, url, deadline)
-                .and_then(|client| forward_doh(query, url, &client, deadline)),
-            UpstreamServer::Tls { .. } | UpstreamServer::Quic { .. } => unreachable!(),
+    let response = match &upstream.server {
+        UpstreamServer::Udp(_) | UpstreamServer::UdpHostname { .. } => {
+            current_udp_state(upstream, deadline).and_then(|state| {
+                forward_udp_addresses(
+                    query,
+                    &state.addresses,
+                    &state.socket_pools,
+                    &state.next_address,
+                    deadline,
+                )
+            })
         }
+        UpstreamServer::Doh(url) => current_doh_client(upstream, url, deadline)
+            .and_then(|client| forward_doh(query, url, &client, deadline)),
     };
     let response = match response {
         Ok(response) => {
             if let Err(error) = validate_response_for_query(query, &response) {
                 mark_upstream_unhealthy(upstream);
                 return Err(format!("上游 {} 响应无效：{error}", upstream.label));
-            }
-            if upstream.dnssec_enabled && response.get(3).is_some_and(|flags| flags & 0x0f == 2) {
-                mark_upstream_unhealthy(upstream);
-                return Err(format!(
-                    "上游 {} 的 DNSSEC 验证失败（SERVFAIL）",
-                    upstream.label
-                ));
             }
             mark_upstream_available(upstream);
             response
@@ -1298,8 +944,6 @@ fn format_upstream_server(server: &UpstreamServer) -> String {
         UpstreamServer::Udp(addr) => addr.to_string(),
         UpstreamServer::UdpHostname { hostname, port } => format!("{hostname}:{port}"),
         UpstreamServer::Doh(url) => normalize_doh_upstream_label(url),
-        UpstreamServer::Tls { hostname, port } => format!("tls://{hostname}:{port}"),
-        UpstreamServer::Quic { hostname, port } => format!("quic://{hostname}:{port}"),
     }
 }
 
@@ -1772,146 +1416,6 @@ mod tests {
             (MAX_DNS_PACKET_SIZE + 1).to_string().parse().unwrap(),
         );
         assert!(validate_doh_response_headers(&headers).is_err());
-    }
-
-    #[test]
-    fn hickory_transport_restores_client_query_id() {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("测试 UDP 上游应可绑定");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("应可设置测试 UDP 上游超时");
-        let address = socket.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let mut buffer = [0_u8; MAX_DNS_PACKET_SIZE];
-            let (len, client) = socket.recv_from(&mut buffer).expect("应收到 Hickory 查询");
-            buffer[2] |= 0x80;
-            socket
-                .send_to(&buffer[..len], client)
-                .expect("应返回 Hickory 响应");
-        });
-        let upstream = RuntimeUpstream::new(UpstreamServer::Udp(address), &[]);
-        let query = example_a_query();
-
-        let response = forward_hickory(&query, &upstream, Instant::now() + Duration::from_secs(2))
-            .expect("Hickory UDP 转发应成功");
-
-        assert_eq!(&response[..2], &query[..2]);
-        assert_ne!(response[2] & 0x80, 0);
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn dnssec_mode_sets_do_and_ad_bits() {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("测试 UDP 上游应可绑定");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("应可设置测试 UDP 上游超时");
-        let address = socket.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let mut buffer = [0_u8; MAX_DNS_PACKET_SIZE];
-            let (len, client) = socket.recv_from(&mut buffer).expect("应收到 DNSSEC 查询");
-            let request = Message::from_vec(&buffer[..len]).expect("DNSSEC 查询应可解析");
-            assert!(request.authentic_data(), "请求应设置 AD 位");
-            assert!(
-                request
-                    .extensions()
-                    .as_ref()
-                    .is_some_and(|edns| edns.flags().dnssec_ok),
-                "请求应设置 EDNS DO 位"
-            );
-            buffer[2] |= 0x80;
-            buffer[3] |= 0x20;
-            socket
-                .send_to(&buffer[..len], client)
-                .expect("应返回 DNSSEC 响应");
-        });
-        let upstream = RuntimeUpstream::new_with_dnssec(UpstreamServer::Udp(address), &[], true);
-        let query = example_a_query();
-
-        let response = forward_hickory(&query, &upstream, Instant::now() + Duration::from_secs(2))
-            .expect("DNSSEC 模式转发应成功");
-
-        assert_ne!(response[3] & 0x20, 0, "应保留上游 DNSSEC AD 标记");
-        server.join().unwrap();
-    }
-
-    #[test]
-    #[ignore = "需要访问公共 DoT 服务"]
-    fn live_dot_query() {
-        let upstream = RuntimeUpstream::new_with_dnssec(
-            UpstreamServer::Tls {
-                hostname: "dns.alidns.com".into(),
-                port: 853,
-            },
-            &["223.5.5.5:53".parse().unwrap()],
-            false,
-        );
-        let response = forward_to_upstream(
-            &example_a_query(),
-            &upstream,
-            Instant::now() + Duration::from_secs(8),
-        )
-        .expect("公共 DoT 查询应成功");
-        assert_eq!(&response.response[..2], &[0x12, 0x34]);
-    }
-
-    #[test]
-    #[ignore = "需要访问公共 DoQ 服务"]
-    fn live_doq_query() {
-        let upstream = RuntimeUpstream::new_with_dnssec(
-            UpstreamServer::Quic {
-                hostname: "dns.adguard-dns.com".into(),
-                port: 853,
-            },
-            &["94.140.14.14:53".parse().unwrap()],
-            false,
-        );
-        let response = forward_to_upstream(
-            &example_a_query(),
-            &upstream,
-            Instant::now() + Duration::from_secs(8),
-        )
-        .expect("公共 DoQ 查询应成功");
-        assert_eq!(&response.response[..2], &[0x12, 0x34]);
-    }
-
-    #[test]
-    fn dnssec_mode_sets_do_bit_and_rejects_servfail() {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("测试 UDP 上游应可绑定");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("应可设置测试 UDP 上游超时");
-        let address = socket.local_addr().unwrap();
-        let (query_sender, query_receiver) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let mut buffer = [0_u8; MAX_DNS_PACKET_SIZE];
-            let (len, client) = socket.recv_from(&mut buffer).expect("应收到 DNSSEC 查询");
-            query_sender.send(buffer[..len].to_vec()).unwrap();
-            buffer[2] |= 0x80;
-            buffer[3] = (buffer[3] & 0xf0) | 0x02;
-            socket
-                .send_to(&buffer[..len], client)
-                .expect("应返回 SERVFAIL 响应");
-        });
-        let upstream = RuntimeUpstream::new_with_dnssec(UpstreamServer::Udp(address), &[], true);
-
-        let error = match forward_to_upstream(
-            &example_a_query(),
-            &upstream,
-            Instant::now() + Duration::from_secs(2),
-        ) {
-            Ok(_) => panic!("DNSSEC 模式必须拒绝 SERVFAIL"),
-            Err(error) => error,
-        };
-        let sent = Message::from_vec(&query_receiver.recv().unwrap()).unwrap();
-
-        assert!(
-            sent.extensions()
-                .as_ref()
-                .is_some_and(|edns| edns.flags().dnssec_ok)
-        );
-        assert!(error.contains("DNSSEC 验证失败"));
-        server.join().unwrap();
     }
 
     #[test]

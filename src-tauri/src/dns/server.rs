@@ -3,7 +3,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -26,8 +26,7 @@ use super::{
         DnsStats, record_error, record_tcp_connection_rejected, record_worker_queue_drop,
         reset_stats,
     },
-    upstream::build_runtime_upstreams_with_dnssec,
-    upstream_routes::UpstreamRoutes,
+    upstream::build_runtime_upstreams,
     worker::{
         DnsResponseTarget, DnsWorkItem, DnsWorkerContext, PENDING_QUERY_SHARDS, PendingQueries,
         dns_worker_loop,
@@ -71,13 +70,7 @@ impl DnsServer {
         database: Arc<Database>,
     ) -> Result<Self, String> {
         let filter_runtime = build_filter_runtime(&config, rules_text);
-        Self::start_with_filter_runtime(
-            config,
-            filter_runtime,
-            stats,
-            database,
-            Arc::new(AtomicU64::new(0)),
-        )
+        Self::start_with_filter_runtime(config, filter_runtime, stats, database)
     }
 
     pub(crate) fn start_with_filter_runtime(
@@ -85,7 +78,6 @@ impl DnsServer {
         filter_runtime: FilterRuntime,
         stats: Arc<Mutex<DnsStats>>,
         database: Arc<Database>,
-        protection_paused_until: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let total_started = Instant::now();
         let config_started = Instant::now();
@@ -97,19 +89,12 @@ impl DnsServer {
         let fallback_config = config.fallback_servers()?;
         crate::performance::log_service("DNS 服务实例", "配置解析与校验", config_started);
         let upstream_started = Instant::now();
-        let upstream_servers = Arc::new(build_runtime_upstreams_with_dnssec(
-            upstream_config,
-            &bootstrap_servers,
-            config.dnssec_enabled,
-        ));
+        let upstream_servers =
+            Arc::new(build_runtime_upstreams(upstream_config, &bootstrap_servers));
         crate::performance::log_service("DNS 服务实例", "主上游初始化", upstream_started);
         let fallback_started = Instant::now();
-        let fallback_upstream_servers = Arc::new(build_runtime_upstreams_with_dnssec(
-            fallback_config,
-            &bootstrap_servers,
-            config.dnssec_enabled,
-        ));
-        let upstream_routes = Arc::new(UpstreamRoutes::from_config(&config)?);
+        let fallback_upstream_servers =
+            Arc::new(build_runtime_upstreams(fallback_config, &bootstrap_servers));
         crate::performance::log_service("DNS 服务实例", "备用上游初始化", fallback_started);
         let runtime_state_started = Instant::now();
         let upstream_mode = config.upstream_mode.clone();
@@ -153,13 +138,11 @@ impl DnsServer {
         let worker_context = Arc::new(DnsWorkerContext {
             upstream_servers,
             fallback_upstream_servers,
-            upstream_routes,
             upstream_mode,
             next_upstream: AtomicUsize::new(0),
             fallback_next_upstream: AtomicUsize::new(0),
             access,
             refuse_any,
-            protection_paused_until,
             filter_runtime: Arc::clone(&filter_runtime),
             stats: Arc::clone(&stats),
             dns_cache: dns_cache.clone(),

@@ -16,16 +16,13 @@ use config::AppConfig;
 #[cfg(not(any(target_os = "macos", windows)))]
 use database::Database;
 use database::QueryLogPage;
-use dns::DnsDiagnosticReport;
 use dns::RuntimeStatus;
-use service_core::QueryLogRuleActionResult;
 #[cfg(not(any(target_os = "macos", windows)))]
 use service_core::{
     AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, clear_query_logs_blocking,
-    clear_statistics_blocking, pause_protection_blocking, query_logs_blocking,
-    resume_protection_blocking, save_config_blocking, spawn_database_maintenance,
-    spawn_filter_auto_update, spawn_initial_runtime, spawn_runtime_watchdog, start_dns_blocking,
-    stop_dns_blocking, update_filters_blocking,
+    clear_statistics_blocking, query_logs_blocking, save_config_blocking,
+    spawn_database_maintenance, spawn_filter_auto_update, spawn_initial_runtime,
+    spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking, update_filters_blocking,
 };
 use service_core::{FilterCacheClearResult, FilterUpdateProgressState, FilterUpdateResult};
 use storage::{StorageInfo, StorageTargetInfo};
@@ -572,65 +569,6 @@ async fn clear_query_logs(state: tauri::State<'_, Arc<GuiState>>) -> Result<Runt
 }
 
 #[tauri::command]
-async fn apply_query_log_rule(
-    state: tauri::State<'_, Arc<GuiState>>,
-    domain: String,
-    action: String,
-    target: Option<String>,
-) -> Result<QueryLogRuleActionResult, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "apply_query_log_rule",
-                &serde_json::json!({
-                    "domain": domain,
-                    "action": action,
-                    "target": target,
-                }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            service_core::apply_query_log_rule_blocking(state.local()?, domain, action, target)
-        }
-    })
-    .await
-    .map_err(|error| format!("应用查询日志规则任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn run_dns_diagnostic(
-    state: tauri::State<'_, Arc<GuiState>>,
-    domain: String,
-    query_type: String,
-) -> Result<DnsDiagnosticReport, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "run_dns_diagnostic",
-                &serde_json::json!({ "domain": domain, "query_type": query_type }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            service_core::run_dns_diagnostic_blocking(&state.local()?, domain, query_type)
-        }
-    })
-    .await
-    .map_err(|error| format!("DNS 诊断任务异常：{error}"))?
-}
-
-#[tauri::command]
 async fn clear_statistics(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
     #[cfg(any(target_os = "macos", windows))]
     let _ = state;
@@ -774,65 +712,6 @@ async fn stop_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatu
     })
     .await
     .map_err(|error| format!("停止 DNS 服务任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn pause_protection(
-    state: tauri::State<'_, Arc<GuiState>>,
-    duration_seconds: u64,
-) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "pause_protection",
-                &serde_json::json!({ "duration_seconds": duration_seconds }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            pause_protection_blocking(&state.local()?, duration_seconds)
-        }
-    })
-    .await
-    .map_err(|error| format!("暂停过滤保护任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn resume_protection(
-    state: tauri::State<'_, Arc<GuiState>>,
-) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("resume_protection", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            resume_protection_blocking(&state.local()?)
-        }
-    })
-    .await
-    .map_err(|error| format!("恢复过滤保护任务异常：{error}"))?
-}
-
-#[tauri::command]
-fn set_tray_runtime_status(
-    app: tauri::AppHandle,
-    running: bool,
-    protection_paused: bool,
-    paused_until: Option<u64>,
-) -> Result<(), String> {
-    tray::update_runtime_status(&app, running, protection_paused, paused_until)
-        .map_err(|error| format!("更新托盘运行状态失败：{error}"))
 }
 
 #[tauri::command]
@@ -1002,8 +881,6 @@ pub fn run() {
             save_config,
             get_status,
             get_query_logs,
-            apply_query_log_rule,
-            run_dns_diagnostic,
             clear_query_logs,
             clear_statistics,
             update_filters,
@@ -1011,9 +888,6 @@ pub fn run() {
             cancel_filter_update,
             start_dns,
             stop_dns,
-            pause_protection,
-            resume_protection,
-            set_tray_runtime_status,
             clear_dns_cache,
             clear_filter_cache
         ])

@@ -1,6 +1,5 @@
 mod access;
 mod cache;
-mod diagnostics;
 mod filter_runtime;
 mod protocol;
 mod rewrites;
@@ -10,10 +9,8 @@ mod server;
 mod stats;
 mod task_pool;
 mod upstream;
-mod upstream_routes;
 mod worker;
 
-pub(crate) use diagnostics::{DnsDiagnosticReport, run_dns_diagnostic};
 pub(crate) use filter_runtime::{
     FilterRuntime, build_filter_runtime_with_rules, current_filter_runtime, replace_filter_runtime,
 };
