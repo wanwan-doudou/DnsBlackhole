@@ -561,12 +561,15 @@ fn handle_tcp_connection(
         }
 
         match response_receiver.recv_timeout(TCP_RESPONSE_TIMEOUT) {
-            Ok(Some(response)) => {
-                if let Err(error) = write_tcp_dns_response(&mut stream, &response) {
+            Ok(Some(response)) => match write_tcp_dns_response(&mut stream, &response) {
+                Ok(()) => {}
+                // 客户端拿到答案或超时后提前中止连接是 TCP DNS 的常见收尾，静默关闭即可。
+                Err(TcpWriteError::ClientDisconnected) => break,
+                Err(TcpWriteError::Failed(error)) => {
                     record_error(&stats, format!("写入 TCP DNS 响应失败：{error}"));
                     break;
                 }
-            }
+            },
             Ok(None) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 record_error(&stats, "等待 TCP DNS 响应超时".to_string());
@@ -657,7 +660,7 @@ fn read_tcp_bytes_until(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+            Err(error) if is_client_disconnect(error.kind()) => {
                 return Ok(false);
             }
             Err(error) => return Err(error.to_string()),
@@ -666,13 +669,35 @@ fn read_tcp_bytes_until(
     Ok(true)
 }
 
-fn write_tcp_dns_response(stream: &mut TcpStream, response: &[u8]) -> Result<(), String> {
-    let response_len =
-        u16::try_from(response.len()).map_err(|_| "TCP DNS 响应长度超过 65535 字节".to_string())?;
+/// 客户端在服务端读写完成前主动断开，在 TCP DNS 中属于常见收尾，不应记为服务端故障。
+fn is_client_disconnect(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+enum TcpWriteError {
+    ClientDisconnected,
+    Failed(String),
+}
+
+fn write_tcp_dns_response(stream: &mut TcpStream, response: &[u8]) -> Result<(), TcpWriteError> {
+    let response_len = u16::try_from(response.len())
+        .map_err(|_| TcpWriteError::Failed("TCP DNS 响应长度超过 65535 字节".to_string()))?;
     stream
         .write_all(&response_len.to_be_bytes())
         .and_then(|_| stream.write_all(response))
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            if is_client_disconnect(error.kind()) {
+                TcpWriteError::ClientDisconnected
+            } else {
+                TcpWriteError::Failed(error.to_string())
+            }
+        })
 }
 
 enum DispatchDnsWorkError {
@@ -803,6 +828,65 @@ mod tests {
             .expect_err("partial TCP query should report disconnect");
 
         assert!(error.contains("完整读取前关闭"));
+    }
+
+    #[test]
+    fn client_disconnect_kinds_are_not_treated_as_server_failure() {
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(is_client_disconnect(kind), "{kind:?} 应视为客户端断开");
+        }
+
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(!is_client_disconnect(kind), "{kind:?} 不应视为客户端断开");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_connection_abort_and_reset_are_client_disconnect() {
+        // 10053 WSAECONNABORTED 与 10054 WSAECONNRESET 都来自客户端提前中止连接。
+        for raw in [10053, 10054] {
+            let error = std::io::Error::from_raw_os_error(raw);
+            assert!(
+                is_client_disconnect(error.kind()),
+                "os error {raw} 应视为客户端断开"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_write_reports_client_disconnect_instead_of_failure() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        // linger 归零让客户端断开时直接发 RST，稳定复现客户端中止已建立连接的场景。
+        SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .expect("应可设置测试连接的 linger");
+        drop(client);
+
+        let response = vec![0_u8; 64];
+        for _ in 0..50 {
+            match write_tcp_dns_response(&mut server, &response) {
+                Ok(()) => thread::sleep(Duration::from_millis(10)),
+                Err(TcpWriteError::ClientDisconnected) => return,
+                Err(TcpWriteError::Failed(error)) => {
+                    panic!("客户端中止连接不应记为写入失败：{error}")
+                }
+            }
+        }
+
+        panic!("客户端中止连接后应返回 ClientDisconnected");
     }
 
     #[cfg(windows)]
