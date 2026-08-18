@@ -1,7 +1,7 @@
 # macOS 构建与测试（维护者无 Mac，本工作流是 macOS 产物的唯一构建途径）。
 # 产物使用仓库 Secret 中的自签名证书签名（应用与后台服务同一身份，macOS 26 启动约束要求；
-# 缺少 Secret 时回退 ad-hoc，此时后台服务无法通过 AMFI 校验），未经 Apple 公证：
-# 仅保存为 Actions artifact 或 Draft Release，按 MACOS_PORTING_PLAN.md 不得公开为正式版本。
+# 缺少 Secret 时回退 ad-hoc，此时后台服务无法通过 AMFI 校验），未经 Apple 公证。
+# 普通推送仅保存 Actions artifact；是否纳入正式版本按维护者本地发布流程完成实机核验后决定。
 name: macOS CI
 
 on:

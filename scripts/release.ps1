@@ -71,7 +71,7 @@ try {
 
     $latest = [ordered]@{
         version   = $version
-        notes     = "See the GitHub Release page for details."
+        notes     = "请查看 GitHub Release 中的本次更新内容。"
         pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         platforms = @{
             "windows-x86_64" = [ordered]@{

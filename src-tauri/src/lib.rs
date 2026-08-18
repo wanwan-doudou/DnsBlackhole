@@ -404,12 +404,20 @@ async fn restore_windows_system_dns() -> Result<serde_json::Value, String> {
 
 #[cfg(windows)]
 #[tauri::command]
-async fn replace_unmanaged_windows_system_dns(preset: String) -> Result<serde_json::Value, String> {
+async fn replace_unmanaged_windows_system_dns(
+    preset: String,
+    ipv4_servers: Vec<String>,
+    ipv6_servers: Vec<String>,
+) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let status: privileged_bridge::WindowsSystemDnsStatus =
             privileged_bridge::ServiceClient::call(
                 "replace_unmanaged_windows_system_dns",
-                &serde_json::json!({ "preset": preset }),
+                &serde_json::json!({
+                    "preset": preset,
+                    "ipv4Servers": ipv4_servers,
+                    "ipv6Servers": ipv6_servers,
+                }),
             )?;
         serde_json::to_value(status)
             .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
@@ -422,6 +430,8 @@ async fn replace_unmanaged_windows_system_dns(preset: String) -> Result<serde_js
 #[tauri::command]
 async fn replace_unmanaged_windows_system_dns(
     _preset: String,
+    _ipv4_servers: Vec<String>,
+    _ipv6_servers: Vec<String>,
 ) -> Result<serde_json::Value, String> {
     Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
 }
@@ -430,12 +440,18 @@ async fn replace_unmanaged_windows_system_dns(
 #[tauri::command]
 async fn restore_windows_system_dns_with_fallback(
     preset: String,
+    ipv4_servers: Vec<String>,
+    ipv6_servers: Vec<String>,
 ) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let status: privileged_bridge::WindowsSystemDnsStatus =
             privileged_bridge::ServiceClient::call(
                 "restore_windows_system_dns_with_fallback",
-                &serde_json::json!({ "preset": preset }),
+                &serde_json::json!({
+                    "preset": preset,
+                    "ipv4Servers": ipv4_servers,
+                    "ipv6Servers": ipv6_servers,
+                }),
             )?;
         serde_json::to_value(status)
             .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
@@ -448,6 +464,8 @@ async fn restore_windows_system_dns_with_fallback(
 #[tauri::command]
 async fn restore_windows_system_dns_with_fallback(
     _preset: String,
+    _ipv4_servers: Vec<String>,
+    _ipv6_servers: Vec<String>,
 ) -> Result<serde_json::Value, String> {
     Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
 }

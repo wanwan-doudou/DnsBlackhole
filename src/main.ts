@@ -305,6 +305,7 @@ const installWindowsServiceButton = query<HTMLButtonElement>("#install_windows_s
 const uninstallWindowsServiceButton = query<HTMLButtonElement>("#uninstall_windows_service_btn");
 const windowsSystemDnsSection = query<HTMLElement>("#windows_system_dns_section");
 const windowsSystemDnsStatusElement = query<HTMLElement>("#windows_system_dns_status");
+const windowsSystemDnsDetailElement = query<HTMLElement>("#windows_system_dns_detail");
 const takeOverWindowsSystemDnsButton = query<HTMLButtonElement>(
   "#take_over_windows_system_dns_btn",
 );
@@ -322,7 +323,10 @@ const dnsFallbackDialogConfirmButton = query<HTMLButtonElement>(
 const dnsFallbackDialogTitle = query<HTMLElement>("#dns_fallback_dialog_title");
 const dnsFallbackDialogIntro = query<HTMLElement>("#dns_fallback_dialog_intro");
 const dnsRestoreOriginalOption = query<HTMLElement>("#dns_restore_original_option");
-const dnsFallbackAutomaticOption = query<HTMLElement>("#dns_fallback_automatic_option");
+const dnsRestoreOriginalDetail = query<HTMLElement>("#dns_restore_original_detail");
+const dnsFallbackCustomOption = query<HTMLElement>("#dns_fallback_custom_option");
+const dnsCustomIpv4Input = query<HTMLInputElement>("#dns_custom_ipv4");
+const dnsCustomIpv6Input = query<HTMLInputElement>("#dns_custom_ipv6");
 const dnsFallbackInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="dns_fallback"]'),
 );
@@ -1263,8 +1267,11 @@ uninstallWindowsServiceButton.addEventListener("click", async () => {
 });
 
 takeOverWindowsSystemDnsButton.addEventListener("click", async () => {
+  const synchronizing = currentWindowsSystemDnsStatus?.managed === true;
   const confirmed = window.confirm(
-    "接管后，当前已连接的物理网卡将只使用 127.0.0.1 和 ::1 作为 DNS，不设置公共备用 DNS。原 DNS（包括自动获取）会先保存，可随时恢复。是否继续？",
+    synchronizing
+      ? "同步后，当前活动的有线或无线网卡会使用 127.0.0.1 和 ::1。每张网卡现有的自动获取或手动 DNS 都会分别保存；已在 Windows 中改过的配置会作为新的恢复配置。是否继续？"
+      : "接管后，当前已连接的物理网卡将只使用 127.0.0.1 和 ::1 作为 DNS，不设置公共备用 DNS。每张网卡的原 DNS（包括自动获取）会先分别保存，可随时恢复。是否继续？",
   );
   if (!confirmed) {
     return;
@@ -1274,7 +1281,11 @@ takeOverWindowsSystemDnsButton.addEventListener("click", async () => {
     const status = requireWindowsSystemDnsStatus(await takeOverWindowsSystemDns());
     renderWindowsSystemDnsStatus(status);
     showMessage(
-      status.inEffect ? "系统 DNS 已接管，所有 DNS 查询将交给 DnsBlackhole" : "系统 DNS 备份已保存，但接管状态需要检查",
+      status.inEffect
+        ? synchronizing
+          ? "当前活动网卡已同步接管"
+          : "系统 DNS 已接管，所有 DNS 查询将交给 DnsBlackhole"
+        : "系统 DNS 备份已保存，但接管状态需要检查",
       !status.inEffect,
     );
   } catch (error) {
@@ -1290,27 +1301,8 @@ restoreWindowsSystemDnsButton.addEventListener("click", async () => {
   if (!statusBeforeAction) {
     return;
   }
-  if (!statusBeforeAction.managed && statusBeforeAction.inEffect) {
+  if (statusBeforeAction.managed || statusBeforeAction.inEffect) {
     showDnsFallbackDialog();
-    return;
-  }
-  if (!statusBeforeAction.managed) {
-    return;
-  }
-  if (statusBeforeAction.restoreIpv4Automatic) {
-    showDnsFallbackDialog();
-    return;
-  }
-  setWindowsSystemDnsBusy(true);
-  try {
-    const status = requireWindowsSystemDnsStatus(await restoreWindowsSystemDns());
-    renderWindowsSystemDnsStatus(status);
-    showMessage("已按备份恢复原 DNS 设置", false);
-  } catch (error) {
-    showMessage(String(error), true);
-    await loadWindowsSystemDnsStatus();
-  } finally {
-    setWindowsSystemDnsBusy(false);
   }
 });
 
@@ -1321,23 +1313,50 @@ dnsFallbackDialog.addEventListener("click", (event) => {
     closeDnsFallbackDialog();
   }
 });
+for (const input of [dnsCustomIpv4Input, dnsCustomIpv6Input]) {
+  input.addEventListener("focus", () => {
+    const customRadio = dnsFallbackCustomOption.querySelector<HTMLInputElement>(
+      'input[type="radio"]',
+    );
+    if (customRadio) {
+      customRadio.checked = true;
+    }
+  });
+}
 dnsFallbackDialogConfirmButton.addEventListener("click", async () => {
   const selection = dnsFallbackInputs.find((input) => input.checked)?.value ?? "dns114";
+  const ipv4Servers = parseDnsServerInput(dnsCustomIpv4Input.value);
+  const ipv6Servers = parseDnsServerInput(dnsCustomIpv6Input.value);
+  if (selection === "custom" && ipv4Servers.length === 0 && ipv6Servers.length === 0) {
+    showMessage("请至少填写一个自定义 DNS 服务器地址", true);
+    dnsCustomIpv4Input.focus();
+    return;
+  }
   const restoringManagedDns = currentWindowsSystemDnsStatus?.managed === true;
-  closeDnsFallbackDialog();
   setWindowsSystemDnsBusy(true);
+  dnsFallbackDialogConfirmButton.disabled = true;
+  dnsFallbackDialogConfirmButton.classList.add("loading");
   try {
     const result = restoringManagedDns
       ? selection === "original"
         ? await restoreWindowsSystemDns()
-        : await restoreWindowsSystemDnsWithFallback(selection as WindowsSystemDnsFallback)
-      : await replaceUnmanagedWindowsSystemDns(selection as WindowsSystemDnsFallback);
+        : await restoreWindowsSystemDnsWithFallback({
+            preset: selection as WindowsSystemDnsFallback,
+            ipv4Servers,
+            ipv6Servers,
+          })
+      : await replaceUnmanagedWindowsSystemDns({
+          preset: selection as WindowsSystemDnsFallback,
+          ipv4Servers,
+          ipv6Servers,
+        });
     const status = requireWindowsSystemDnsStatus(result);
     renderWindowsSystemDnsStatus(status);
+    closeDnsFallbackDialog();
     showMessage(
       restoringManagedDns
         ? selection === "original"
-          ? "已按备份恢复原 DNS 设置"
+          ? "已恢复仍由 DnsBlackhole 接管的 DNS；在 Windows 中另行修改的配置保持不变"
           : "已恢复为所选外部 DNS"
         : "已解除本机 DNS，现在可以重新接管并保存该恢复配置",
       false,
@@ -1346,6 +1365,8 @@ dnsFallbackDialogConfirmButton.addEventListener("click", async () => {
     showMessage(String(error), true);
     await loadWindowsSystemDnsStatus();
   } finally {
+    dnsFallbackDialogConfirmButton.disabled = false;
+    dnsFallbackDialogConfirmButton.classList.remove("loading");
     setWindowsSystemDnsBusy(false);
   }
 });
@@ -1856,26 +1877,42 @@ function renderWindowsSystemDnsStatus(status: WindowsSystemDnsStatus): void {
     "needs-repair",
     (status.managed && !status.inEffect) || (!status.managed && status.inEffect),
   );
-  const adapterText = status.adapters.length > 0 ? status.adapters.join("、") : "暂无已连接的物理网卡";
+  const activeAdapterNames = status.activeAdapters.map((adapter) => adapter.name).join("、");
+  const activeDnsText = formatActiveDnsAdapters(status);
+  const backupDnsText = formatBackupDnsAdapters(status);
   if (status.managed && status.inEffect) {
-    windowsSystemDnsStatusElement.textContent = `已接管 ${adapterText}，DNS 指向 127.0.0.1 和 ::1。`;
+    windowsSystemDnsStatusElement.textContent = `已接管当前活动网卡：${activeAdapterNames}。`;
+    windowsSystemDnsDetailElement.textContent = `当前 DNS 均指向 127.0.0.1 / ::1。接管前配置：${backupDnsText}。`;
   } else if (status.managed) {
-    windowsSystemDnsStatusElement.textContent = `已保存 ${adapterText} 的原 DNS，但当前系统设置已发生变化，可点击“恢复 DNS”。`;
+    windowsSystemDnsStatusElement.textContent = status.activeAdapters.length > 0
+      ? `当前活动网卡尚未全部接管：${activeAdapterNames}。`
+      : "已保留 DNS 接管备份，但当前没有活动的物理网卡。";
+    windowsSystemDnsDetailElement.textContent = `当前配置：${activeDnsText}。历史恢复配置：${backupDnsText}。可同步接管当前网卡，或选择恢复方式。`;
   } else if (status.inEffect) {
-    windowsSystemDnsStatusElement.textContent = `检测到 ${adapterText} 的 DNS 已指向 127.0.0.1 或 ::1，但没有 DnsBlackhole 原 DNS 备份。请选择解除后使用的 DNS。`;
+    const localAdapters = status.activeAdapters
+      .filter((adapter) => adapter.usesLocalDns)
+      .map((adapter) => adapter.name)
+      .join("、");
+    windowsSystemDnsStatusElement.textContent = `检测到 ${localAdapters} 使用本机 DNS，但没有原配置备份。`;
+    windowsSystemDnsDetailElement.textContent = `当前配置：${activeDnsText}。请选择自动获取、公共 DNS 或自定义 DNS 来解除。`;
   } else {
-    windowsSystemDnsStatusElement.textContent = status.adapters.length > 0
-      ? `尚未接管，可接管：${adapterText}。`
+    windowsSystemDnsStatusElement.textContent = status.activeAdapters.length > 0
+      ? `尚未接管，当前活动网卡：${activeAdapterNames}。`
       : "尚未接管，当前未检测到已连接的物理网卡。";
+    windowsSystemDnsDetailElement.textContent = status.activeAdapters.length > 0
+      ? `当前配置：${activeDnsText}。接管时会按网卡分别保存这些设置。`
+      : "连接有线或无线网络后，可将其 DNS 指向 DnsBlackhole。";
   }
-  takeOverWindowsSystemDnsButton.disabled =
-    status.managed || status.inEffect || !currentWindowsServiceStatus?.ready;
   const canReplaceUnmanagedLocalDns = !status.managed && status.inEffect;
   restoreWindowsSystemDnsButton.textContent = canReplaceUnmanagedLocalDns
     ? "解除本机 DNS"
     : "恢复 DNS";
-  restoreWindowsSystemDnsButton.disabled =
-    (!status.managed && !canReplaceUnmanagedLocalDns) || !currentWindowsServiceStatus?.ready;
+  takeOverWindowsSystemDnsButton.textContent = status.managed
+    ? status.inEffect
+      ? "已接管"
+      : "同步接管"
+    : "接管 DNS";
+  updateWindowsSystemDnsButtons();
 }
 
 function renderWindowsSystemDnsUnavailable(message: string): void {
@@ -1884,6 +1921,7 @@ function renderWindowsSystemDnsUnavailable(message: string): void {
   }
   windowsSystemDnsSection.classList.remove("hidden", "is-ready", "needs-repair");
   windowsSystemDnsStatusElement.textContent = message;
+  windowsSystemDnsDetailElement.textContent = "系统服务就绪后会读取当前活动网卡及每张网卡的 DNS 恢复配置。";
   takeOverWindowsSystemDnsButton.disabled = true;
   restoreWindowsSystemDnsButton.disabled = true;
 }
@@ -1896,41 +1934,80 @@ function setWindowsSystemDnsBusy(busy: boolean): void {
     restoreWindowsSystemDnsButton.disabled = true;
     return;
   }
+  updateWindowsSystemDnsButtons();
+}
+
+function updateWindowsSystemDnsButtons(): void {
+  const status = currentWindowsSystemDnsStatus;
+  const ready = currentWindowsServiceStatus?.ready === true;
+  const hasUnbackedLocalDns = status?.activeAdapters.some(
+    (adapter) => !adapter.backedUp && adapter.usesLocalDns,
+  );
   takeOverWindowsSystemDnsButton.disabled =
-    !currentWindowsServiceStatus?.ready ||
-    currentWindowsSystemDnsStatus?.managed !== false ||
-    currentWindowsSystemDnsStatus.inEffect;
+    !ready ||
+    !status ||
+    status.activeAdapters.length === 0 ||
+    status.inEffect ||
+    hasUnbackedLocalDns === true;
   restoreWindowsSystemDnsButton.disabled =
-    !currentWindowsServiceStatus?.ready ||
-    (currentWindowsSystemDnsStatus?.managed !== true &&
-      !(
-        currentWindowsSystemDnsStatus?.managed === false &&
-        currentWindowsSystemDnsStatus.inEffect
-      ));
+    !ready || !status || (!status.managed && !status.inEffect);
 }
 
 function showDnsFallbackDialog(): void {
-  const restoringAutomaticBackup =
-    currentWindowsSystemDnsStatus?.managed === true &&
-    currentWindowsSystemDnsStatus.restoreIpv4Automatic;
-  dnsRestoreOriginalOption.classList.toggle("hidden", !restoringAutomaticBackup);
-  dnsFallbackAutomaticOption.classList.toggle("hidden", restoringAutomaticBackup);
-  dnsFallbackDialogTitle.textContent = restoringAutomaticBackup
-    ? "选择恢复后的 DNS"
-    : "解除本机 DNS";
-  dnsFallbackDialogIntro.textContent = restoringAutomaticBackup
-    ? "原备份的 IPv4 DNS 为自动获取。如果网络使用静态 IPv4，原样恢复后可能没有 IPv4 DNS；建议改用公共 DNS。"
+  const restoringManagedDns = currentWindowsSystemDnsStatus?.managed === true;
+  dnsRestoreOriginalOption.classList.toggle("hidden", !restoringManagedDns);
+  dnsFallbackDialogTitle.textContent = restoringManagedDns ? "选择恢复后的 DNS" : "解除本机 DNS";
+  dnsFallbackDialogIntro.textContent = restoringManagedDns
+    ? "“按接管前配置恢复”只还原仍指向本机 DNS 的部分，保留你后来在 Windows 中做的修改；选择其他方式则会将历史备份中的网卡设置为所选 DNS。"
     : "当前没有原 DNS 备份，请选择解除后使用的 DNS。只会修改仍指向 127.0.0.1 或 ::1 的设置。";
-  dnsFallbackDialogConfirmButton.textContent = restoringAutomaticBackup
-    ? "确认恢复"
-    : "确认解除";
-  const recommended = dnsFallbackInputs.find((input) => input.value === "dns114");
+  dnsRestoreOriginalDetail.textContent = currentWindowsSystemDnsStatus
+    ? formatBackupDnsAdapters(currentWindowsSystemDnsStatus)
+    : "保留接管前的自动获取或手动 DNS 设置";
+  dnsFallbackDialogConfirmButton.textContent = restoringManagedDns ? "确认恢复" : "确认解除";
+  const recommended = dnsFallbackInputs.find((input) =>
+    restoringManagedDns ? input.value === "original" : input.value === "automatic",
+  );
   if (recommended) {
     recommended.checked = true;
   }
   if (!dnsFallbackDialog.open) {
     dnsFallbackDialog.showModal();
   }
+}
+
+function parseDnsServerInput(value: string): string[] {
+  return value
+    .split(/[\s,;]+/)
+    .map((server) => server.trim())
+    .filter(Boolean);
+}
+
+function formatDnsServers(servers: string[] | null): string {
+  return servers && servers.length > 0 ? servers.join(" / ") : "自动获取";
+}
+
+function formatActiveDnsAdapters(status: WindowsSystemDnsStatus): string {
+  if (status.activeAdapters.length === 0) {
+    return "无活动物理网卡";
+  }
+  return status.activeAdapters
+    .map(
+      (adapter) =>
+        `${adapter.name}（IPv4 ${formatDnsServers(adapter.ipv4Servers)}，IPv6 ${formatDnsServers(adapter.ipv6Servers)}）`,
+    )
+    .join("；");
+}
+
+function formatBackupDnsAdapters(status: WindowsSystemDnsStatus): string {
+  if (status.backupAdapters.length === 0) {
+    return "无历史备份";
+  }
+  return status.backupAdapters
+    .map(
+      (adapter) =>
+        `${adapter.name}（IPv4 ${formatDnsServers(adapter.ipv4Servers)}，IPv6 ${formatDnsServers(adapter.ipv6Servers)}）`,
+    )
+    .join("；");
 }
 
 function closeDnsFallbackDialog(): void {
@@ -1949,11 +2026,36 @@ function requireWindowsSystemDnsStatus(value: unknown): WindowsSystemDnsStatus {
     typeof status.inEffect !== "boolean" ||
     !Array.isArray(status.adapters) ||
     status.adapters.some((adapter) => typeof adapter !== "string") ||
+    !Array.isArray(status.activeAdapters) ||
+    status.activeAdapters.some(
+      (adapter) =>
+        !adapter ||
+        typeof adapter !== "object" ||
+        typeof adapter.name !== "string" ||
+        !isDnsServerList(adapter.ipv4Servers) ||
+        !isDnsServerList(adapter.ipv6Servers) ||
+        typeof adapter.backedUp !== "boolean" ||
+        typeof adapter.inEffect !== "boolean" ||
+        typeof adapter.usesLocalDns !== "boolean",
+    ) ||
+    !Array.isArray(status.backupAdapters) ||
+    status.backupAdapters.some(
+      (adapter) =>
+        !adapter ||
+        typeof adapter !== "object" ||
+        typeof adapter.name !== "string" ||
+        !isDnsServerList(adapter.ipv4Servers) ||
+        !isDnsServerList(adapter.ipv6Servers),
+    ) ||
     typeof status.restoreIpv4Automatic !== "boolean"
   ) {
     throw new Error("Windows 系统 DNS 状态接口返回格式无效");
   }
   return status as WindowsSystemDnsStatus;
+}
+
+function isDnsServerList(value: unknown): value is string[] | null {
+  return value === null || (Array.isArray(value) && value.every((server) => typeof server === "string"));
 }
 
 function shouldWaitForWindowsService(status: WindowsServiceStatus | null): boolean {
@@ -3476,7 +3578,26 @@ async function fetchGitHubReleaseWithRetry(version: string): Promise<GitHubRelea
 }
 
 function formatReleaseNotes(notes: string): string {
-  return notes
+  const visibleLines: string[] = [];
+  let hiddenSectionLevel: number | null = null;
+  for (const line of notes.trim().split(/\r?\n/)) {
+    const heading = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
+    if (heading) {
+      const level = heading[1].length;
+      if (hiddenSectionLevel !== null && level <= hiddenSectionLevel) {
+        hiddenSectionLevel = null;
+      }
+      if (/^(验证|测试|质量验证|构建与验证|下载说明|sha-?256|校验和|checksums?)$/i.test(heading[2])) {
+        hiddenSectionLevel = level;
+        continue;
+      }
+    }
+    if (hiddenSectionLevel === null) {
+      visibleLines.push(line);
+    }
+  }
+  return visibleLines
+    .join("\n")
     .trim()
     .replace(/^#{1,6}\s+/gm, "")
     .replace(/\*\*([^*]+)\*\*/g, "$1")

@@ -75,12 +75,6 @@ struct MigrationParams {
     target_path: String,
 }
 
-#[cfg(windows)]
-#[derive(Debug, Deserialize)]
-struct SystemDnsFallbackParams {
-    preset: windows_system_dns::WindowsSystemDnsFallback,
-}
-
 pub(crate) fn initialize_state(default_dir: PathBuf) -> Result<Arc<AppState>, String> {
     let total_started = Instant::now();
     let storage_started = Instant::now();
@@ -308,18 +302,18 @@ fn dispatch_request(
         )?)?,
         #[cfg(windows)]
         "replace_unmanaged_windows_system_dns" => {
-            let params: SystemDnsFallbackParams = parse_params(params)?;
+            let params: windows_system_dns::WindowsSystemDnsFallbackParams = parse_params(params)?;
             to_value(windows_system_dns::replace_unmanaged_local_dns(
                 &state.default_data_dir,
-                params.preset,
+                &params,
             )?)?
         }
         #[cfg(windows)]
         "restore_windows_system_dns_with_fallback" => {
-            let params: SystemDnsFallbackParams = parse_params(params)?;
+            let params: windows_system_dns::WindowsSystemDnsFallbackParams = parse_params(params)?;
             to_value(windows_system_dns::restore_system_dns_with_fallback(
                 &state.default_data_dir,
-                params.preset,
+                &params,
             )?)?
         }
         "restart_service" => return Ok((Value::Null, true)),

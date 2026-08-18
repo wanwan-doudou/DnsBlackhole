@@ -52,10 +52,33 @@ export type WindowsSystemDnsStatus = {
   managed: boolean;
   inEffect: boolean;
   adapters: string[];
+  activeAdapters: WindowsSystemDnsAdapterStatus[];
+  backupAdapters: WindowsSystemDnsBackupAdapter[];
   restoreIpv4Automatic: boolean;
 };
 
-export type WindowsSystemDnsFallback = "automatic" | "dns114" | "google";
+export type WindowsSystemDnsAdapterStatus = {
+  name: string;
+  ipv4Servers: string[] | null;
+  ipv6Servers: string[] | null;
+  backedUp: boolean;
+  inEffect: boolean;
+  usesLocalDns: boolean;
+};
+
+export type WindowsSystemDnsBackupAdapter = {
+  name: string;
+  ipv4Servers: string[] | null;
+  ipv6Servers: string[] | null;
+};
+
+export type WindowsSystemDnsFallback = "automatic" | "dns114" | "google" | "custom";
+
+export type WindowsSystemDnsFallbackSelection = {
+  preset: WindowsSystemDnsFallback;
+  ipv4Servers?: string[];
+  ipv6Servers?: string[];
+};
 
 export type FilterSubscription = {
   id: string;

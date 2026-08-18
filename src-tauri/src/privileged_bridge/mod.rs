@@ -90,9 +90,9 @@ pub fn handle_windows_service_command() -> Option<Result<(), String>> {
     )
 }
 
-// 协议 5：控制面 RPC，并由 Windows 服务负责系统 DNS 的接管、恢复与外部 DNS 选择。
+// 协议 6：系统 DNS 状态包含活动/备份网卡详情，并支持自定义恢复地址。
 // GUI 只通过本协议做配置、状态查询和日志读取，不再转发 DNS 查询。
-pub const BRIDGE_PROTOCOL_VERSION: u16 = 5;
+pub const BRIDGE_PROTOCOL_VERSION: u16 = 6;
 pub const BRIDGE_SOCKET_PATH: &str = "/var/run/dnsblackhole/service.sock";
 // 单帧上限：查询日志分页（最多 200 条记录）与统计快照都远小于该值
 const MAX_FRAME_SIZE: usize = 512 * 1024;

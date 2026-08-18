@@ -22,6 +22,7 @@ use windows_sys::{
             },
             Ndis::IfOperStatusUp,
         },
+        Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
         System::LibraryLoader::{GetProcAddress, LoadLibraryW},
     },
     core::GUID,
@@ -46,7 +47,28 @@ pub(crate) struct WindowsSystemDnsStatus {
     pub managed: bool,
     pub in_effect: bool,
     pub adapters: Vec<String>,
+    pub active_adapters: Vec<WindowsSystemDnsAdapterStatus>,
+    pub backup_adapters: Vec<WindowsSystemDnsBackupAdapter>,
     pub restore_ipv4_automatic: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WindowsSystemDnsAdapterStatus {
+    pub name: String,
+    pub ipv4_servers: Option<Vec<String>>,
+    pub ipv6_servers: Option<Vec<String>>,
+    pub backed_up: bool,
+    pub in_effect: bool,
+    pub uses_local_dns: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WindowsSystemDnsBackupAdapter {
+    pub name: String,
+    pub ipv4_servers: Option<Vec<String>>,
+    pub ipv6_servers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -57,6 +79,18 @@ pub(crate) enum WindowsSystemDnsFallback {
     Dns114,
     #[serde(rename = "google")]
     Google,
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WindowsSystemDnsFallbackParams {
+    pub preset: WindowsSystemDnsFallback,
+    #[serde(default)]
+    pub ipv4_servers: Vec<String>,
+    #[serde(default)]
+    pub ipv6_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +152,28 @@ pub(crate) fn system_dns_status(default_data_dir: &Path) -> Result<WindowsSystem
 }
 
 pub(crate) fn system_dns_is_managed(default_data_dir: &Path) -> bool {
-    backup_path(default_data_dir).exists()
+    let path = backup_path(default_data_dir);
+    if !path.exists() {
+        return false;
+    }
+    let backup_uses_local_dns = read_backup(&path)
+        .and_then(|backup| {
+            backup.adapters.iter().try_fold(false, |found, adapter| {
+                Ok(found || adapter_currently_uses_local_dns(adapter)?)
+            })
+        })
+        // 状态无法确认时保持保守，避免 DNS 仍指向本机却停止服务。
+        .unwrap_or(true);
+    if backup_uses_local_dns {
+        return true;
+    }
+    active_physical_adapters()
+        .and_then(|adapters| {
+            adapters.iter().try_fold(false, |found, adapter| {
+                Ok(found || adapter_backup_contains_local_dns(&snapshot_adapter(adapter)?))
+            })
+        })
+        .unwrap_or(true)
 }
 
 pub(crate) fn take_over_system_dns(
@@ -128,28 +183,50 @@ pub(crate) fn take_over_system_dns(
         .lock()
         .map_err(|_| "系统 DNS 操作锁已损坏".to_string())?;
     let backup_path = backup_path(default_data_dir);
-    if backup_path.exists() {
-        return Err("系统 DNS 已由 DnsBlackhole 接管，请先恢复原 DNS".to_string());
-    }
-
     let adapters = active_physical_adapters()?;
     if adapters.is_empty() {
         return Err("未找到已连接的物理网卡，无法接管系统 DNS".to_string());
     }
-    let backup = SystemDnsBackup {
-        version: BACKUP_VERSION,
-        adapters: adapters
-            .iter()
-            .map(snapshot_adapter)
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    if let Some(adapter) = backup
-        .adapters
+    let snapshots = adapters
         .iter()
-        .find(|adapter| adapter_backup_contains_local_dns(adapter))
-    {
+        .map(snapshot_adapter)
+        .collect::<Result<Vec<_>, _>>()?;
+    let previous_backup = if backup_path.exists() {
+        Some(read_backup(&backup_path)?)
+    } else {
+        None
+    };
+    let mut backup = previous_backup.clone().unwrap_or(SystemDnsBackup {
+        version: BACKUP_VERSION,
+        adapters: Vec::new(),
+    });
+    for snapshot in &snapshots {
+        let existing = backup.adapters.iter().position(|adapter| {
+            adapter
+                .interface_guid
+                .eq_ignore_ascii_case(&snapshot.interface_guid)
+        });
+        if existing.is_none() && adapter_backup_contains_local_dns(snapshot) {
+            return Err(format!(
+                "网卡“{}”已经指向 127.0.0.1 或 ::1，但没有该网卡的原 DNS 备份。请先解除本机 DNS，再执行接管",
+                snapshot.interface_name
+            ));
+        }
+        if let Some(index) = existing {
+            backup.adapters[index] = merge_takeover_backup(&backup.adapters[index], snapshot);
+        } else {
+            backup.adapters.push(snapshot.clone());
+        }
+    }
+    if let Some(adapter) = backup.adapters.iter().find(|adapter| {
+        snapshots.iter().any(|snapshot| {
+            snapshot
+                .interface_guid
+                .eq_ignore_ascii_case(&adapter.interface_guid)
+        }) && adapter_backup_contains_local_dns(adapter)
+    }) {
         return Err(format!(
-            "网卡“{}”已经指向 127.0.0.1 或 ::1，但 DnsBlackhole 没有原 DNS 备份。请先在 Windows 中恢复希望保留的 DNS，再执行接管",
+            "网卡“{}”的恢复配置仍包含本机 DNS，无法安全接管。请先解除本机 DNS",
             adapter.interface_name
         ));
     }
@@ -157,58 +234,53 @@ pub(crate) fn take_over_system_dns(
 
     let mut changes = Vec::new();
     let result: Result<(), String> = (|| {
-        for (adapter, original) in adapters.iter().zip(&backup.adapters) {
-            set_dns_settings(
-                adapter.guid,
-                AddressFamily::Ipv4,
-                &local_dns_settings(AddressFamily::Ipv4),
-            )
-            .map_err(|error| format!("设置网卡“{}”的 IPv4 DNS 失败：{error}", adapter.name))?;
-            changes.push(AppliedChange {
-                guid: adapter.guid,
-                name: adapter.name.clone(),
-                family: AddressFamily::Ipv4,
-                original_settings: backup_family_settings(original, AddressFamily::Ipv4),
-            });
-
-            set_dns_settings(
-                adapter.guid,
-                AddressFamily::Ipv6,
-                &local_dns_settings(AddressFamily::Ipv6),
-            )
-            .map_err(|error| format!("设置网卡“{}”的 IPv6 DNS 失败：{error}", adapter.name))?;
-            changes.push(AppliedChange {
-                guid: adapter.guid,
-                name: adapter.name.clone(),
-                family: AddressFamily::Ipv6,
-                original_settings: backup_family_settings(original, AddressFamily::Ipv6),
-            });
+        for (adapter, snapshot) in adapters.iter().zip(&snapshots) {
+            for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
+                let current = backup_family_settings(snapshot, family);
+                let local = local_dns_settings(family);
+                if current == local {
+                    continue;
+                }
+                set_dns_settings(adapter.guid, family, &local).map_err(|error| {
+                    format!(
+                        "设置网卡“{}”的 {} DNS 失败：{error}",
+                        adapter.name,
+                        family_name(family)
+                    )
+                })?;
+                changes.push(AppliedChange {
+                    guid: adapter.guid,
+                    name: adapter.name.clone(),
+                    family,
+                    original_settings: current,
+                });
+            }
         }
         Ok(())
     })();
 
     if let Err(error) = result {
         let rollback_errors = rollback_changes(&changes);
-        if rollback_errors.is_empty() {
-            if let Err(remove_error) = fs::remove_file(&backup_path) {
-                return Err(format!(
-                    "{error}。已恢复已修改的网卡，但删除 DNS 备份失败：{remove_error}"
-                ));
-            }
-            return Err(format!("{error}。已自动恢复原 DNS"));
+        let backup_error = match previous_backup {
+            Some(previous) => write_backup(default_data_dir, &previous).err(),
+            None => fs::remove_file(&backup_path)
+                .err()
+                .map(|error| error.to_string()),
+        };
+        let mut recovery_errors = rollback_errors;
+        if let Some(backup_error) = backup_error {
+            recovery_errors.push(format!("恢复 DNS 备份失败：{backup_error}"));
         }
-        return Err(format!(
-            "{error}。自动恢复未全部完成，请点击“恢复原 DNS”：{}",
-            rollback_errors.join("；")
-        ));
+        return if recovery_errors.is_empty() {
+            Err(format!("{error}。已自动恢复本次修改"))
+        } else {
+            Err(format!(
+                "{error}。自动恢复未全部完成：{}",
+                recovery_errors.join("；")
+            ))
+        };
     }
-
-    Ok(WindowsSystemDnsStatus {
-        managed: true,
-        in_effect: true,
-        adapters: adapters.into_iter().map(|adapter| adapter.name).collect(),
-        restore_ipv4_automatic: backup_restores_ipv4_automatically(&backup),
-    })
+    system_dns_status_unlocked(default_data_dir)
 }
 
 pub(crate) fn restore_system_dns(
@@ -222,7 +294,7 @@ pub(crate) fn restore_system_dns(
 
 pub(crate) fn replace_unmanaged_local_dns(
     default_data_dir: &Path,
-    preset: WindowsSystemDnsFallback,
+    params: &WindowsSystemDnsFallbackParams,
 ) -> Result<WindowsSystemDnsStatus, String> {
     let _guard = SYSTEM_DNS_OPERATION_LOCK
         .lock()
@@ -230,6 +302,7 @@ pub(crate) fn replace_unmanaged_local_dns(
     if backup_path(default_data_dir).exists() {
         return Err("已经存在原 DNS 备份，请直接恢复原 DNS".to_string());
     }
+    validate_fallback_params(params)?;
 
     let adapters = active_physical_adapters()?;
     if adapters.is_empty() {
@@ -247,7 +320,7 @@ pub(crate) fn replace_unmanaged_local_dns(
                 set_dns_settings(
                     adapter.guid,
                     AddressFamily::Ipv4,
-                    &fallback_dns_settings(preset, AddressFamily::Ipv4),
+                    &fallback_dns_settings(params, AddressFamily::Ipv4)?,
                 )
                 .map_err(|error| format!("设置网卡“{}”的 IPv4 DNS 失败：{error}", adapter.name))?;
                 changes.push(AppliedChange {
@@ -263,7 +336,7 @@ pub(crate) fn replace_unmanaged_local_dns(
                 set_dns_settings(
                     adapter.guid,
                     AddressFamily::Ipv6,
-                    &fallback_dns_settings(preset, AddressFamily::Ipv6),
+                    &fallback_dns_settings(params, AddressFamily::Ipv6)?,
                 )
                 .map_err(|error| format!("设置网卡“{}”的 IPv6 DNS 失败：{error}", adapter.name))?;
                 changes.push(AppliedChange {
@@ -296,7 +369,7 @@ pub(crate) fn replace_unmanaged_local_dns(
 
 pub(crate) fn restore_system_dns_with_fallback(
     default_data_dir: &Path,
-    preset: WindowsSystemDnsFallback,
+    params: &WindowsSystemDnsFallbackParams,
 ) -> Result<WindowsSystemDnsStatus, String> {
     let _guard = SYSTEM_DNS_OPERATION_LOCK
         .lock()
@@ -305,6 +378,7 @@ pub(crate) fn restore_system_dns_with_fallback(
     if !path.exists() {
         return Err("没有可替换的系统 DNS 备份".to_string());
     }
+    validate_fallback_params(params)?;
     let backup = read_backup(&path)?;
     let mut changes = Vec::new();
     let result: Result<(), String> = (|| {
@@ -312,7 +386,7 @@ pub(crate) fn restore_system_dns_with_fallback(
             let guid = parse_guid(&adapter.interface_guid)?;
             for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
                 let current = read_interface_dns_settings(guid, family)?;
-                set_dns_settings(guid, family, &fallback_dns_settings(preset, family)).map_err(
+                set_dns_settings(guid, family, &fallback_dns_settings(params, family)?).map_err(
                     |error| {
                         format!(
                             "设置网卡“{}”的 {} DNS 失败：{error}",
@@ -345,16 +419,7 @@ pub(crate) fn restore_system_dns_with_fallback(
 
     fs::remove_file(&path)
         .map_err(|error| format!("外部 DNS 已设置，但删除原 DNS 备份失败，可稍后重试：{error}"))?;
-    Ok(WindowsSystemDnsStatus {
-        managed: false,
-        in_effect: false,
-        adapters: backup
-            .adapters
-            .into_iter()
-            .map(|adapter| adapter.interface_name)
-            .collect(),
-        restore_ipv4_automatic: false,
-    })
+    system_dns_status_unlocked(default_data_dir)
 }
 
 pub(crate) fn restore_system_dns_if_managed(default_data_dir: &Path) -> Result<(), String> {
@@ -376,25 +441,31 @@ fn restore_system_dns_unlocked(default_data_dir: &Path) -> Result<WindowsSystemD
     let mut errors = Vec::new();
     for adapter in &backup.adapters {
         let guid = parse_guid(&adapter.interface_guid)?;
-        if let Err(error) = set_dns_settings(
-            guid,
-            AddressFamily::Ipv4,
-            &backup_family_settings(adapter, AddressFamily::Ipv4),
-        ) {
-            errors.push(format!(
-                "网卡“{}”的 IPv4 DNS：{error}",
-                adapter.interface_name
-            ));
-        }
-        if let Err(error) = set_dns_settings(
-            guid,
-            AddressFamily::Ipv6,
-            &backup_family_settings(adapter, AddressFamily::Ipv6),
-        ) {
-            errors.push(format!(
-                "网卡“{}”的 IPv6 DNS：{error}",
-                adapter.interface_name
-            ));
+        for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
+            let current = match read_interface_dns_settings(guid, family) {
+                Ok(current) => current,
+                Err(error) => {
+                    errors.push(format!(
+                        "网卡“{}”的 {} DNS：{error}",
+                        adapter.interface_name,
+                        family_name(family)
+                    ));
+                    continue;
+                }
+            };
+            // 用户在软件外修改过的地址优先，不用历史备份覆盖新配置。
+            if !should_restore_original(&current, family) {
+                continue;
+            }
+            if let Err(error) =
+                set_dns_settings(guid, family, &backup_family_settings(adapter, family))
+            {
+                errors.push(format!(
+                    "网卡“{}”的 {} DNS：{error}",
+                    adapter.interface_name,
+                    family_name(family)
+                ));
+            }
         }
     }
     if !errors.is_empty() {
@@ -404,54 +475,48 @@ fn restore_system_dns_unlocked(default_data_dir: &Path) -> Result<WindowsSystemD
         ));
     }
     fs::remove_file(&path).map_err(|error| format!("删除已恢复的系统 DNS 备份失败：{error}"))?;
-    Ok(WindowsSystemDnsStatus {
-        managed: false,
-        in_effect: false,
-        adapters: backup
-            .adapters
-            .into_iter()
-            .map(|adapter| adapter.interface_name)
-            .collect(),
-        restore_ipv4_automatic: false,
-    })
+    system_dns_status_unlocked(default_data_dir)
 }
 
 fn system_dns_status_unlocked(default_data_dir: &Path) -> Result<WindowsSystemDnsStatus, String> {
     let path = backup_path(default_data_dir);
-    if !path.exists() {
-        let active_adapters = active_physical_adapters()?;
-        let in_effect = active_adapters
+    let backup = path.exists().then(|| read_backup(&path)).transpose()?;
+    let active_adapters = active_physical_adapters()?;
+    let snapshots = active_adapters
+        .iter()
+        .map(snapshot_adapter)
+        .collect::<Result<Vec<_>, _>>()?;
+    let active_adapter_statuses = snapshots
+        .iter()
+        .map(|snapshot| active_adapter_status(snapshot, backup.as_ref()))
+        .collect::<Vec<_>>();
+    let managed = backup.is_some();
+    let in_effect = if managed {
+        !active_adapter_statuses.is_empty()
+            && active_adapter_statuses
+                .iter()
+                .all(|adapter| adapter.backed_up && adapter.in_effect)
+    } else {
+        active_adapter_statuses
             .iter()
-            .map(snapshot_adapter)
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .any(adapter_backup_contains_local_dns);
-        let adapters = active_adapters
+            .any(|adapter| adapter.uses_local_dns)
+    };
+    let backup_adapters = backup
+        .as_ref()
+        .map(|backup| backup.adapters.iter().map(backup_adapter_status).collect())
+        .unwrap_or_default();
+    let restore_ipv4_automatic = backup
+        .as_ref()
+        .is_some_and(backup_restores_ipv4_automatically);
+    Ok(WindowsSystemDnsStatus {
+        managed,
+        in_effect,
+        adapters: active_adapters
             .into_iter()
             .map(|adapter| adapter.name)
-            .collect();
-        return Ok(WindowsSystemDnsStatus {
-            managed: false,
-            in_effect,
-            adapters,
-            restore_ipv4_automatic: false,
-        });
-    }
-
-    let backup = read_backup(&path)?;
-    let in_effect = backup
-        .adapters
-        .iter()
-        .all(|adapter| adapter_dns_in_effect(adapter).unwrap_or(false));
-    let restore_ipv4_automatic = backup_restores_ipv4_automatically(&backup);
-    Ok(WindowsSystemDnsStatus {
-        managed: true,
-        in_effect,
-        adapters: backup
-            .adapters
-            .into_iter()
-            .map(|adapter| adapter.interface_name)
             .collect(),
+        active_adapters: active_adapter_statuses,
+        backup_adapters,
         restore_ipv4_automatic,
     })
 }
@@ -467,6 +532,75 @@ fn snapshot_adapter(adapter: &NetworkAdapter) -> Result<AdapterDnsBackup, String
         ipv6_servers: ipv6.name_servers,
         ipv6_profile_servers: ipv6.profile_name_servers,
     })
+}
+
+fn active_adapter_status(
+    snapshot: &AdapterDnsBackup,
+    backup: Option<&SystemDnsBackup>,
+) -> WindowsSystemDnsAdapterStatus {
+    let ipv4 = backup_family_settings(snapshot, AddressFamily::Ipv4);
+    let ipv6 = backup_family_settings(snapshot, AddressFamily::Ipv6);
+    WindowsSystemDnsAdapterStatus {
+        name: snapshot.interface_name.clone(),
+        ipv4_servers: configured_servers(&ipv4),
+        ipv6_servers: configured_servers(&ipv6),
+        backed_up: backup.is_some_and(|backup| {
+            backup.adapters.iter().any(|adapter| {
+                adapter
+                    .interface_guid
+                    .eq_ignore_ascii_case(&snapshot.interface_guid)
+            })
+        }),
+        in_effect: ipv4 == local_dns_settings(AddressFamily::Ipv4)
+            && ipv6 == local_dns_settings(AddressFamily::Ipv6),
+        uses_local_dns: ipv4.contains(IPV4_LOCAL_DNS) || ipv6.contains(IPV6_LOCAL_DNS),
+    }
+}
+
+fn backup_adapter_status(adapter: &AdapterDnsBackup) -> WindowsSystemDnsBackupAdapter {
+    WindowsSystemDnsBackupAdapter {
+        name: adapter.interface_name.clone(),
+        ipv4_servers: configured_servers(&backup_family_settings(adapter, AddressFamily::Ipv4)),
+        ipv6_servers: configured_servers(&backup_family_settings(adapter, AddressFamily::Ipv6)),
+    }
+}
+
+fn configured_servers(settings: &DnsFamilySettings) -> Option<Vec<String>> {
+    let mut servers = Vec::new();
+    for server in settings
+        .name_servers
+        .as_deref()
+        .into_iter()
+        .flatten()
+        .chain(
+            settings
+                .profile_name_servers
+                .as_deref()
+                .into_iter()
+                .flatten(),
+        )
+    {
+        if !servers.contains(server) {
+            servers.push(server.clone());
+        }
+    }
+    (!servers.is_empty()).then_some(servers)
+}
+
+fn merge_takeover_backup(
+    existing: &AdapterDnsBackup,
+    current: &AdapterDnsBackup,
+) -> AdapterDnsBackup {
+    let mut merged = current.clone();
+    if backup_family_settings(current, AddressFamily::Ipv4).contains(IPV4_LOCAL_DNS) {
+        merged.ipv4_servers = existing.ipv4_servers.clone();
+        merged.ipv4_profile_servers = existing.ipv4_profile_servers.clone();
+    }
+    if backup_family_settings(current, AddressFamily::Ipv6).contains(IPV6_LOCAL_DNS) {
+        merged.ipv6_servers = existing.ipv6_servers.clone();
+        merged.ipv6_profile_servers = existing.ipv6_profile_servers.clone();
+    }
+    merged
 }
 
 fn backup_family_settings(adapter: &AdapterDnsBackup, family: AddressFamily) -> DnsFamilySettings {
@@ -491,33 +625,68 @@ fn backup_restores_ipv4_automatically(backup: &SystemDnsBackup) -> bool {
 
 fn local_dns_settings(family: AddressFamily) -> DnsFamilySettings {
     DnsFamilySettings {
-        name_servers: Some(vec![
-            match family {
-                AddressFamily::Ipv4 => IPV4_LOCAL_DNS,
-                AddressFamily::Ipv6 => IPV6_LOCAL_DNS,
-            }
-            .to_string(),
-        ]),
+        name_servers: Some(vec![local_dns_server(family).to_string()]),
         profile_name_servers: None,
     }
 }
 
-fn fallback_dns_settings(
-    preset: WindowsSystemDnsFallback,
-    family: AddressFamily,
-) -> DnsFamilySettings {
-    let servers = match (preset, family) {
-        (WindowsSystemDnsFallback::Automatic, _) => None,
-        (WindowsSystemDnsFallback::Dns114, AddressFamily::Ipv4) => Some(&DNS114_IPV4[..]),
-        (WindowsSystemDnsFallback::Dns114, AddressFamily::Ipv6) => None,
-        (WindowsSystemDnsFallback::Google, AddressFamily::Ipv4) => Some(&GOOGLE_IPV4[..]),
-        (WindowsSystemDnsFallback::Google, AddressFamily::Ipv6) => Some(&GOOGLE_IPV6[..]),
-    };
-    DnsFamilySettings {
-        name_servers: servers
-            .map(|servers| servers.iter().map(|server| (*server).to_string()).collect()),
-        profile_name_servers: None,
+fn local_dns_server(family: AddressFamily) -> &'static str {
+    match family {
+        AddressFamily::Ipv4 => IPV4_LOCAL_DNS,
+        AddressFamily::Ipv6 => IPV6_LOCAL_DNS,
     }
+}
+
+fn should_restore_original(current: &DnsFamilySettings, family: AddressFamily) -> bool {
+    current.contains(local_dns_server(family))
+}
+
+fn fallback_dns_settings(
+    params: &WindowsSystemDnsFallbackParams,
+    family: AddressFamily,
+) -> Result<DnsFamilySettings, String> {
+    let servers = match (params.preset, family) {
+        (WindowsSystemDnsFallback::Automatic, _) => None,
+        (WindowsSystemDnsFallback::Dns114, AddressFamily::Ipv4) => {
+            Some(DNS114_IPV4.map(str::to_string).to_vec())
+        }
+        (WindowsSystemDnsFallback::Dns114, AddressFamily::Ipv6) => None,
+        (WindowsSystemDnsFallback::Google, AddressFamily::Ipv4) => {
+            Some(GOOGLE_IPV4.map(str::to_string).to_vec())
+        }
+        (WindowsSystemDnsFallback::Google, AddressFamily::Ipv6) => {
+            Some(GOOGLE_IPV6.map(str::to_string).to_vec())
+        }
+        (WindowsSystemDnsFallback::Custom, AddressFamily::Ipv4) => {
+            normalize_custom_servers(&params.ipv4_servers, family)?
+        }
+        (WindowsSystemDnsFallback::Custom, AddressFamily::Ipv6) => {
+            normalize_custom_servers(&params.ipv6_servers, family)?
+        }
+    };
+    Ok(DnsFamilySettings {
+        name_servers: servers,
+        profile_name_servers: None,
+    })
+}
+
+fn validate_fallback_params(params: &WindowsSystemDnsFallbackParams) -> Result<(), String> {
+    if !matches!(params.preset, WindowsSystemDnsFallback::Custom) {
+        return Ok(());
+    }
+    let ipv4 = normalize_custom_servers(&params.ipv4_servers, AddressFamily::Ipv4)?;
+    let ipv6 = normalize_custom_servers(&params.ipv6_servers, AddressFamily::Ipv6)?;
+    if ipv4.is_none() && ipv6.is_none() {
+        return Err("请至少填写一个自定义 DNS 服务器地址".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_custom_servers(
+    servers: &[String],
+    family: AddressFamily,
+) -> Result<Option<Vec<String>>, String> {
+    parse_nameservers(&servers.join(","), family)
 }
 
 fn adapter_backup_contains_local_dns(adapter: &AdapterDnsBackup) -> bool {
@@ -525,12 +694,12 @@ fn adapter_backup_contains_local_dns(adapter: &AdapterDnsBackup) -> bool {
         || backup_family_settings(adapter, AddressFamily::Ipv6).contains(IPV6_LOCAL_DNS)
 }
 
-fn adapter_dns_in_effect(adapter: &AdapterDnsBackup) -> Result<bool, String> {
+fn adapter_currently_uses_local_dns(adapter: &AdapterDnsBackup) -> Result<bool, String> {
     let guid = parse_guid(&adapter.interface_guid)?;
-    Ok(read_interface_dns_settings(guid, AddressFamily::Ipv4)?
-        == local_dns_settings(AddressFamily::Ipv4)
-        && read_interface_dns_settings(guid, AddressFamily::Ipv6)?
-            == local_dns_settings(AddressFamily::Ipv6))
+    Ok(
+        read_interface_dns_settings(guid, AddressFamily::Ipv4)?.contains(IPV4_LOCAL_DNS)
+            || read_interface_dns_settings(guid, AddressFamily::Ipv6)?.contains(IPV6_LOCAL_DNS),
+    )
 }
 
 impl DnsFamilySettings {
@@ -843,7 +1012,23 @@ fn write_backup(default_data_dir: &Path, backup: &SystemDnsBackup) -> Result<(),
         file.sync_all()
             .map_err(|error| format!("同步系统 DNS 临时备份失败：{error}"))?;
         drop(file);
-        fs::rename(&temporary, &path).map_err(|error| format!("启用系统 DNS 备份失败：{error}"))
+        let temporary_wide = wide(&temporary);
+        let path_wide = wide(&path);
+        let replaced = unsafe {
+            MoveFileExW(
+                temporary_wide.as_ptr(),
+                path_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            Err(format!(
+                "启用系统 DNS 备份失败：{}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(())
+        }
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -975,23 +1160,130 @@ mod tests {
 
     #[test]
     fn builds_automatic_and_public_dns_fallbacks() {
+        let automatic = WindowsSystemDnsFallbackParams {
+            preset: WindowsSystemDnsFallback::Automatic,
+            ipv4_servers: Vec::new(),
+            ipv6_servers: Vec::new(),
+        };
+        let dns114 = WindowsSystemDnsFallbackParams {
+            preset: WindowsSystemDnsFallback::Dns114,
+            ipv4_servers: Vec::new(),
+            ipv6_servers: Vec::new(),
+        };
+        let google = WindowsSystemDnsFallbackParams {
+            preset: WindowsSystemDnsFallback::Google,
+            ipv4_servers: Vec::new(),
+            ipv6_servers: Vec::new(),
+        };
         assert_eq!(
-            fallback_dns_settings(WindowsSystemDnsFallback::Automatic, AddressFamily::Ipv4),
+            fallback_dns_settings(&automatic, AddressFamily::Ipv4).unwrap(),
             DnsFamilySettings::default()
         );
         assert_eq!(
-            fallback_dns_settings(WindowsSystemDnsFallback::Dns114, AddressFamily::Ipv4)
+            fallback_dns_settings(&dns114, AddressFamily::Ipv4)
+                .unwrap()
                 .name_servers,
             Some(DNS114_IPV4.map(str::to_string).to_vec())
         );
         assert_eq!(
-            fallback_dns_settings(WindowsSystemDnsFallback::Dns114, AddressFamily::Ipv6),
+            fallback_dns_settings(&dns114, AddressFamily::Ipv6).unwrap(),
             DnsFamilySettings::default()
         );
         assert_eq!(
-            fallback_dns_settings(WindowsSystemDnsFallback::Google, AddressFamily::Ipv6)
+            fallback_dns_settings(&google, AddressFamily::Ipv6)
+                .unwrap()
                 .name_servers,
             Some(GOOGLE_IPV6.map(str::to_string).to_vec())
         );
+    }
+
+    #[test]
+    fn validates_and_normalizes_custom_dns() {
+        let custom = WindowsSystemDnsFallbackParams {
+            preset: WindowsSystemDnsFallback::Custom,
+            ipv4_servers: vec!["1.1.1.1 8.8.8.8".to_string()],
+            ipv6_servers: vec!["2606:4700:4700::1111".to_string()],
+        };
+        assert!(validate_fallback_params(&custom).is_ok());
+        assert_eq!(
+            fallback_dns_settings(&custom, AddressFamily::Ipv4)
+                .unwrap()
+                .name_servers,
+            Some(vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()])
+        );
+
+        let empty = WindowsSystemDnsFallbackParams {
+            preset: WindowsSystemDnsFallback::Custom,
+            ipv4_servers: Vec::new(),
+            ipv6_servers: Vec::new(),
+        };
+        assert!(validate_fallback_params(&empty).is_err());
+    }
+
+    #[test]
+    fn refreshes_only_externally_changed_family_when_synchronizing() {
+        let existing = AdapterDnsBackup {
+            interface_guid: "{12345678-9ABC-DEF0-1234-56789ABCDEF0}".to_string(),
+            interface_name: "WLAN".to_string(),
+            ipv4_servers: None,
+            ipv4_profile_servers: None,
+            ipv6_servers: None,
+            ipv6_profile_servers: None,
+        };
+        let current = AdapterDnsBackup {
+            interface_guid: existing.interface_guid.clone(),
+            interface_name: existing.interface_name.clone(),
+            ipv4_servers: Some(vec![IPV4_LOCAL_DNS.to_string()]),
+            ipv4_profile_servers: None,
+            ipv6_servers: Some(vec!["2001:4860:4860::8888".to_string()]),
+            ipv6_profile_servers: None,
+        };
+        let merged = merge_takeover_backup(&existing, &current);
+        assert_eq!(merged.ipv4_servers, None);
+        assert_eq!(
+            merged.ipv6_servers,
+            Some(vec!["2001:4860:4860::8888".to_string()])
+        );
+    }
+
+    #[test]
+    fn distinguishes_active_adapter_from_another_adapters_backup() {
+        let active = AdapterDnsBackup {
+            interface_guid: "{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}".to_string(),
+            interface_name: "WLAN".to_string(),
+            ipv4_servers: Some(vec!["114.114.114.114".to_string()]),
+            ipv4_profile_servers: None,
+            ipv6_servers: None,
+            ipv6_profile_servers: None,
+        };
+        let backup = SystemDnsBackup {
+            version: BACKUP_VERSION,
+            adapters: vec![AdapterDnsBackup {
+                interface_guid: "{11111111-2222-3333-4444-555555555555}".to_string(),
+                interface_name: "Ethernet".to_string(),
+                ipv4_servers: None,
+                ipv4_profile_servers: None,
+                ipv6_servers: None,
+                ipv6_profile_servers: None,
+            }],
+        };
+
+        let status = active_adapter_status(&active, Some(&backup));
+        assert_eq!(status.name, "WLAN");
+        assert_eq!(status.ipv4_servers, active.ipv4_servers);
+        assert!(!status.backed_up);
+        assert!(!status.in_effect);
+        assert!(!status.uses_local_dns);
+    }
+
+    #[test]
+    fn restore_original_preserves_external_dns_changes() {
+        let managed = local_dns_settings(AddressFamily::Ipv4);
+        let changed = DnsFamilySettings {
+            name_servers: Some(vec!["114.114.114.114".to_string()]),
+            profile_name_servers: None,
+        };
+        assert!(should_restore_original(&managed, AddressFamily::Ipv4));
+        assert!(!should_restore_original(&changed, AddressFamily::Ipv4));
     }
 }

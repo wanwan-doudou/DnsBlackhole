@@ -738,7 +738,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               <div>
                 <h3>系统 DNS</h3>
                 <p id="windows_system_dns_status">正在读取系统 DNS 状态…</p>
-                <small>接管时仅修改已连接的物理网卡，并先保存其原始 DNS（包括自动获取状态）；没有备份时，可选择自动获取或公共 DNS 来解除本机 DNS。</small>
+                <small id="windows_system_dns_detail">会按有线、无线网卡分别保存原始 DNS；切换网络后可将当前活动网卡同步纳入接管。</small>
               </div>
               <div class="button-group background-service-actions">
                 <button class="primary" id="take_over_windows_system_dns_btn" type="button">接管 DNS</button>
@@ -760,20 +760,36 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <div class="dns-fallback-options">
                     <label class="dns-fallback-option hidden" id="dns_restore_original_option">
                       <input type="radio" name="dns_fallback" value="original" />
-                      <span><strong>按原备份恢复</strong><small>恢复为自动获取；静态 IPv4 网络可能无法取得 DNS</small></span>
-                    </label>
-                    <label class="dns-fallback-option" id="dns_fallback_automatic_option">
-                      <input type="radio" name="dns_fallback" value="automatic" />
-                      <span><strong>自动获取</strong><small>仅适合能通过 DHCP 或路由器获得 DNS 的网络</small></span>
+                      <span><strong>按接管前配置恢复（推荐）</strong><small id="dns_restore_original_detail">保留接管前的自动获取或手动 DNS 设置</small></span>
                     </label>
                     <label class="dns-fallback-option">
-                      <input type="radio" name="dns_fallback" value="dns114" checked />
-                      <span><strong>114DNS（推荐）</strong><small>114.114.114.114 / 114.114.115.115</small></span>
+                      <input type="radio" name="dns_fallback" value="automatic" />
+                      <span><strong>自动获取（DHCP）</strong><small>适合 IP 也由 DHCP 分配的网络；静态 IP 建议使用自定义 DNS</small></span>
+                    </label>
+                    <label class="dns-fallback-option">
+                      <input type="radio" name="dns_fallback" value="dns114" />
+                      <span><strong>114DNS</strong><small>114.114.114.114 / 114.114.115.115</small></span>
                     </label>
                     <label class="dns-fallback-option">
                       <input type="radio" name="dns_fallback" value="google" />
                       <span><strong>Google DNS</strong><small>8.8.8.8 / 8.8.4.4，并配置 IPv6</small></span>
                     </label>
+                    <div class="dns-fallback-option dns-fallback-custom-option" id="dns_fallback_custom_option">
+                      <label>
+                        <input type="radio" name="dns_fallback" value="custom" />
+                        <span><strong>自定义 DNS</strong><small>填写希望在解除接管后使用的 DNS 服务器地址</small></span>
+                      </label>
+                      <div class="dns-custom-fields">
+                        <label class="field">
+                          <span>IPv4 DNS</span>
+                          <input id="dns_custom_ipv4" type="text" inputmode="decimal" placeholder="例如 1.1.1.1, 1.0.0.1" />
+                        </label>
+                        <label class="field">
+                          <span>IPv6 DNS（可选）</span>
+                          <input id="dns_custom_ipv6" type="text" placeholder="例如 2606:4700:4700::1111" />
+                        </label>
+                      </div>
+                    </div>
                   </div>
                 </div>
                 <div class="update-dialog-footer">

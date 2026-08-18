@@ -15,7 +15,7 @@ import type {
   StorageInfo,
   StorageTargetInfo,
   WindowsServiceStatus,
-  WindowsSystemDnsFallback,
+  WindowsSystemDnsFallbackSelection,
   WindowsSystemDnsStatus,
 } from "./types";
 
@@ -193,16 +193,22 @@ export function restoreWindowsSystemDns(): Promise<WindowsSystemDnsStatus> {
 }
 
 export function replaceUnmanagedWindowsSystemDns(
-  preset: WindowsSystemDnsFallback,
+  selection: WindowsSystemDnsFallbackSelection,
 ): Promise<WindowsSystemDnsStatus> {
-  return timedInvoke<WindowsSystemDnsStatus>("replace_unmanaged_windows_system_dns", { preset });
+  return timedInvoke<WindowsSystemDnsStatus>("replace_unmanaged_windows_system_dns", {
+    preset: selection.preset,
+    ipv4Servers: selection.ipv4Servers ?? [],
+    ipv6Servers: selection.ipv6Servers ?? [],
+  });
 }
 
 export function restoreWindowsSystemDnsWithFallback(
-  preset: WindowsSystemDnsFallback,
+  selection: WindowsSystemDnsFallbackSelection,
 ): Promise<WindowsSystemDnsStatus> {
   return timedInvoke<WindowsSystemDnsStatus>("restore_windows_system_dns_with_fallback", {
-    preset,
+    preset: selection.preset,
+    ipv4Servers: selection.ipv4Servers ?? [],
+    ipv6Servers: selection.ipv6Servers ?? [],
   });
 }
 
