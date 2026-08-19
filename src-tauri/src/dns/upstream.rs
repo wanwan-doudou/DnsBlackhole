@@ -396,6 +396,13 @@ fn hickory_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
         .ok_or_else(|| "创建加密 DNS 运行时失败".to_string())
 }
 
+fn encrypted_address_attempt_timeout(remaining: Duration, attempts_left: usize) -> Duration {
+    if attempts_left <= 1 {
+        return remaining;
+    }
+    remaining / u32::try_from(attempts_left).unwrap_or(u32::MAX)
+}
+
 fn current_hickory_client(
     upstream: &RuntimeUpstream,
     deadline: Instant,
@@ -415,10 +422,16 @@ fn current_hickory_client(
     let addresses = current_hickory_addresses(upstream, deadline)?;
     let runtime = hickory_runtime()?;
     let mut last_error = None;
-    for address in addresses {
+    let address_count = addresses.len();
+    for (index, address) in addresses.into_iter().enumerate() {
         let remaining = remaining_upstream_timeout(deadline)?;
+        let attempt_timeout = encrypted_address_attempt_timeout(remaining, address_count - index);
         let result = runtime.block_on(async {
-            tokio::time::timeout(remaining, build_hickory_client(&upstream.server, address)).await
+            tokio::time::timeout(
+                attempt_timeout,
+                build_hickory_client(&upstream.server, address),
+            )
+            .await
         });
         match result {
             Ok(Ok(client)) => {
@@ -1624,6 +1637,17 @@ mod tests {
                 .expect("测试 UDP 上游应可返回响应");
         });
         (upstream, received_receiver, release_sender, handle)
+    }
+
+    #[test]
+    fn encrypted_addresses_share_the_remaining_connection_deadline() {
+        let remaining = Duration::from_secs(9);
+
+        assert_eq!(
+            encrypted_address_attempt_timeout(remaining, 3),
+            Duration::from_secs(3)
+        );
+        assert_eq!(encrypted_address_attempt_timeout(remaining, 1), remaining);
     }
 
     #[test]

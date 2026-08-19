@@ -99,26 +99,6 @@ export function renderAppTemplate(appIconUrl: string): string {
           </article>
         </div>
 
-        <section class="panel cache-runtime-panel">
-          <div class="rank-title">
-            <div>
-              <h2>DNS 缓存运行状态</h2>
-              <span>本次 DNS 服务运行期间的内存缓存指标</span>
-            </div>
-            <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
-          </div>
-          <div class="security-stat-grid cache-stat-grid">
-            <div class="security-stat-card"><span>命中率</span><strong id="cache_hit_rate">0%</strong></div>
-            <div class="security-stat-card"><span>命中 / 未命中</span><strong id="cache_hit_miss">0 / 0</strong></div>
-            <div class="security-stat-card"><span>过期应答</span><strong id="cache_stale_hits">0</strong></div>
-            <div class="security-stat-card"><span>后台刷新（成功 / 失败）</span><strong id="cache_refreshes">0 / 0</strong></div>
-            <div class="security-stat-card"><span>热门预取（成功 / 失败）</span><strong id="cache_prefetches">0 / 0</strong></div>
-            <div class="security-stat-card"><span>淘汰条目</span><strong id="cache_evictions">0</strong></div>
-            <div class="security-stat-card"><span>当前条目</span><strong id="cache_entries">0</strong></div>
-            <div class="security-stat-card"><span>当前占用</span><strong id="cache_bytes">0 B</strong></div>
-          </div>
-        </section>
-
         <div class="dashboard-rank-grid">
           <section class="panel rank-panel">
             <div class="rank-title">
@@ -508,6 +488,25 @@ export function renderAppTemplate(appIconUrl: string): string {
                 </label>
               </div>
               <button id="clear_dns_cache_btn" type="button">清除缓存</button>
+              <div class="cache-runtime-summary">
+                <div class="cache-runtime-heading">
+                  <div>
+                    <h4>运行状态</h4>
+                    <span>本次 DNS 服务运行期间的内存缓存指标</span>
+                  </div>
+                  <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+                </div>
+                <div class="security-stat-grid cache-stat-grid">
+                  <div class="security-stat-card"><span>命中率</span><strong id="cache_hit_rate">0%</strong></div>
+                  <div class="security-stat-card"><span>命中 / 未命中</span><strong id="cache_hit_miss">0 / 0</strong></div>
+                  <div class="security-stat-card"><span>过期应答</span><strong id="cache_stale_hits">0</strong></div>
+                  <div class="security-stat-card"><span>后台刷新（成功 / 失败）</span><strong id="cache_refreshes">0 / 0</strong></div>
+                  <div class="security-stat-card"><span>热门预取（成功 / 失败）</span><strong id="cache_prefetches">0 / 0</strong></div>
+                  <div class="security-stat-card"><span>淘汰条目</span><strong id="cache_evictions">0</strong></div>
+                  <div class="security-stat-card"><span>当前条目</span><strong id="cache_entries">0</strong></div>
+                  <div class="security-stat-card"><span>当前占用</span><strong id="cache_bytes">0 B</strong></div>
+                </div>
+              </div>
             </section>
           </div>
         </section>

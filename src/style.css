@@ -478,15 +478,6 @@ button.refreshing:disabled {
   margin-bottom: 18px;
 }
 
-.cache-runtime-panel {
-  margin-bottom: 18px;
-  padding-bottom: 18px;
-}
-
-.cache-runtime-panel .security-stat-grid {
-  padding: 0 24px;
-}
-
 .dashboard-rank-grid + .dashboard-rank-grid {
   margin-top: 18px;
 }
@@ -2684,6 +2675,40 @@ select:focus {
 
 .dns-cache-section {
   max-width: none;
+}
+
+.cache-runtime-summary {
+  margin-top: 22px;
+  border-top: 1px solid #e7edf2;
+  padding-top: 20px;
+}
+
+.cache-runtime-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.cache-runtime-heading h4 {
+  margin: 0 0 5px;
+  color: #435466;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.cache-runtime-heading span {
+  color: #8a97a7;
+  font-size: 12px;
+}
+
+.cache-runtime-summary .security-stat-card {
+  padding: 11px 13px;
+}
+
+.cache-runtime-summary .security-stat-card strong {
+  font-size: 18px;
 }
 
 .runtime-watchdog-section {

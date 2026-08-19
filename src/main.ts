@@ -2518,6 +2518,7 @@ function setActiveView(view: ViewName): void {
   }
   if (view === "settings" && viewChanged) {
     void refreshSettingsRuntimeStatus();
+    void refreshStatus({ auto: true });
   }
 }
 
@@ -2773,6 +2774,7 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   }
   lastStatusErrorKey = statusErrorKey;
   renderSecurityEvents(status);
+  renderCacheStats(status);
 
   if (!renderDashboard) {
     return;
@@ -2781,7 +2783,6 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#queries"), formatCount(status.stats.queries));
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
-  renderCacheStats(status);
   renderDashboardSummaryWindow(status.stats.dashboard_started_at, status.stats.dashboard_ended_at);
   renderSparkline(
     "#query_sparkline",

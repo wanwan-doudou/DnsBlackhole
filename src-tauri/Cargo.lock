@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "dnsblackhole"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "futures-util",
  "hickory-client",
