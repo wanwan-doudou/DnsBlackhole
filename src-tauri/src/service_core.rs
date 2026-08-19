@@ -19,8 +19,8 @@ use crate::{
     database::{Database, LogStats, QueryLogPage},
     dns::{
         self, DnsDiagnosticReport, DnsServer, DnsStats, FilterRuntime, RuleLoadSource, RuleSummary,
-        RuntimeStatus, build_filter_runtime_with_rules, clear_rule_cache, current_filter_runtime,
-        load_or_compile_rules, replace_filter_runtime,
+        RuntimeStatus, apply_cache_stats, build_filter_runtime_with_rules, clear_rule_cache,
+        current_filter_runtime, load_or_compile_rules, replace_filter_runtime,
     },
     filters,
 };
@@ -367,12 +367,16 @@ impl AppState {
             }
         }
         let error = self.last_error.lock().ok().and_then(|error| error.clone());
-        let running = self
-            .server
-            .lock()
-            .ok()
-            .and_then(|server| server.as_ref().map(|server| !server.has_finished_threads()))
-            .unwrap_or(false);
+        let running = if let Ok(server) = self.server.lock() {
+            if let Some(server) = server.as_ref() {
+                apply_cache_stats(&mut stats, server.cache_stats());
+                !server.has_finished_threads()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let paused_until = active_pause_deadline(&self.protection_paused_until, unix_now());
         let status = dns::empty_status(&config, running, paused_until, summary, stats, error);
@@ -528,8 +532,12 @@ pub(crate) fn filter_runtime_changed(previous: &AppConfig, next: &AppConfig) -> 
             })
         || previous.blacklist != next.blacklist
         || previous.blocking_mode != next.blocking_mode
+        || previous.blocking_response_ttl != next.blocking_response_ttl
         || previous.blocking_custom_ipv4 != next.blocking_custom_ipv4
         || previous.blocking_custom_ipv6 != next.blocking_custom_ipv6
+        || previous.rebinding_protection_enabled != next.rebinding_protection_enabled
+        || previous.rebinding_allowed_domains != next.rebinding_allowed_domains
+        || previous.cname_cloaking_enabled != next.cname_cloaking_enabled
         || previous.dns_rewrites != next.dns_rewrites
         || previous.query_log_ignored_domains != next.query_log_ignored_domains
         || previous.statistics_ignored_domains != next.statistics_ignored_domains
@@ -561,6 +569,8 @@ pub(crate) fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool 
         || previous.dns_cache_min_ttl != next.dns_cache_min_ttl
         || previous.dns_cache_max_ttl != next.dns_cache_max_ttl
         || previous.dns_cache_optimistic != next.dns_cache_optimistic
+        || previous.dns_cache_prefetch_enabled != next.dns_cache_prefetch_enabled
+        || previous.dns_cache_prefetch_hit_threshold != next.dns_cache_prefetch_hit_threshold
 }
 
 /// 保存配置并按需热替换或重启 DNS。开机自启等 GUI 侧系统集成由调用方处理。

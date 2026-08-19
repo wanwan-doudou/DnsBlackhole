@@ -13,13 +13,17 @@ pub(crate) const MAX_DNS_PACKET_SIZE: usize = u16::MAX as usize;
 const MAX_UDP_DNS_PAYLOAD: usize = 65_507;
 const MAX_LOGGED_RESPONSE_ANSWERS: usize = 8;
 const MAX_LOGGED_RESPONSE_VALUE_CHARS: usize = 320;
-const BLOCK_RESPONSE_TTL: u32 = 60;
 const REWRITE_RESPONSE_TTL: u32 = 300;
+const BLOCKING_SOA_MNAME: &[u8] = b"\x0cdnsblackhole\x07invalid\x00";
+const BLOCKING_SOA_RNAME_PREFIX: &[u8] = b"\x0ahostmaster";
 pub(crate) const TYPE_A: u16 = 1;
 pub(crate) const TYPE_NS: u16 = 2;
+pub(crate) const TYPE_CNAME: u16 = 5;
 pub(crate) const TYPE_SOA: u16 = 6;
 pub(crate) const TYPE_AAAA: u16 = 28;
 pub(crate) const TYPE_OPT: u16 = 41;
+const TYPE_SVCB: u16 = 64;
+const TYPE_HTTPS: u16 = 65;
 pub(crate) const TYPE_ANY: u16 = 255;
 pub(crate) const RCODE_NOERROR: u8 = 0;
 pub(crate) const RCODE_REFUSED: u8 = 5;
@@ -208,6 +212,7 @@ pub(crate) fn build_error_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
 #[derive(Clone)]
 pub(crate) struct BlockingPolicy {
     mode: BlockingMode,
+    ttl: u32,
     custom_ipv4: Option<Ipv4Addr>,
     custom_ipv6: Option<Ipv6Addr>,
 }
@@ -216,6 +221,7 @@ impl Default for BlockingPolicy {
     fn default() -> Self {
         Self {
             mode: BlockingMode::NullIp,
+            ttl: 60,
             custom_ipv4: None,
             custom_ipv6: None,
         }
@@ -226,6 +232,7 @@ impl BlockingPolicy {
     pub(crate) fn from_config(config: &AppConfig) -> Self {
         Self {
             mode: config.blocking_mode.clone(),
+            ttl: config.blocking_response_ttl,
             custom_ipv4: config.blocking_custom_ipv4.trim().parse().ok(),
             custom_ipv6: config.blocking_custom_ipv6.trim().parse().ok(),
         }
@@ -244,7 +251,7 @@ pub(crate) fn build_block_response(
             RCODE_NOERROR,
             Some(Ipv4Addr::UNSPECIFIED),
             Some(Ipv6Addr::UNSPECIFIED),
-            BLOCK_RESPONSE_TTL,
+            policy.ttl,
         ),
         BlockingMode::CustomIp => build_ip_response(
             query,
@@ -252,11 +259,42 @@ pub(crate) fn build_block_response(
             RCODE_NOERROR,
             policy.custom_ipv4,
             policy.custom_ipv6,
-            BLOCK_RESPONSE_TTL,
+            policy.ttl,
         ),
-        BlockingMode::Nxdomain => build_ip_response(query, question, RCODE_NXDOMAIN, None, None, 0),
+        BlockingMode::Nxdomain => build_nxdomain_response(query, question, policy.ttl),
         BlockingMode::Refused => build_ip_response(query, question, RCODE_REFUSED, None, None, 0),
     }
+}
+
+fn build_nxdomain_response(query: &[u8], question: &Question, ttl: u32) -> Vec<u8> {
+    // SOA 让客户端按 RFC 2308 负缓存拦截结果，避免在短时间内重复查询同一域名。
+    let mut response = Vec::with_capacity(question.question_end + 80);
+    response.extend_from_slice(&query[0..2]);
+    response.push(0x80 | (query[2] & 0x01));
+    response.push(0x80 | RCODE_NXDOMAIN);
+    write_u16(&mut response, 1);
+    write_u16(&mut response, 0);
+    write_u16(&mut response, 1);
+    write_u16(&mut response, 0);
+    response.extend_from_slice(&query[DNS_HEADER_LEN..question.question_end]);
+
+    // authority owner 和 RNAME 后缀都复用 question，避免重复编码任意长度的查询域名。
+    response.extend_from_slice(&[0xC0, 0x0C]);
+    write_u16(&mut response, TYPE_SOA);
+    write_u16(&mut response, question.qclass);
+    response.extend_from_slice(&ttl.to_be_bytes());
+    let data_len =
+        BLOCKING_SOA_MNAME.len() + BLOCKING_SOA_RNAME_PREFIX.len() + 2 + 5 * size_of::<u32>();
+    write_u16(&mut response, data_len as u16);
+    response.extend_from_slice(BLOCKING_SOA_MNAME);
+    response.extend_from_slice(BLOCKING_SOA_RNAME_PREFIX);
+    response.extend_from_slice(&[0xC0, 0x0C]);
+    response.extend_from_slice(&1_u32.to_be_bytes());
+    response.extend_from_slice(&1800_u32.to_be_bytes());
+    response.extend_from_slice(&900_u32.to_be_bytes());
+    response.extend_from_slice(&604800_u32.to_be_bytes());
+    response.extend_from_slice(&ttl.to_be_bytes());
+    response
 }
 
 pub(crate) fn build_rewrite_response(
@@ -584,6 +622,110 @@ pub(crate) fn extract_response_ips(packet: &[u8]) -> Vec<IpAddr> {
     }
 
     ips
+}
+
+#[derive(Default)]
+pub(crate) struct ResponseSecurityData {
+    pub(crate) addresses: Vec<IpAddr>,
+    pub(crate) cname_targets: Vec<String>,
+}
+
+/// 读取响应各 section 中会影响客户端后续连接目标的记录。
+/// malformed 响应返回 None，由上游校验和缓存策略继续按原路径处理。
+pub(crate) fn response_security_data(packet: &[u8]) -> Option<ResponseSecurityData> {
+    if packet.len() < DNS_HEADER_LEN || packet[2] & 0x80 == 0 {
+        return None;
+    }
+
+    let question_count = read_u16(packet, 4)?;
+    let record_count = usize::from(read_u16(packet, 6)?)
+        .saturating_add(usize::from(read_u16(packet, 8)?))
+        .saturating_add(usize::from(read_u16(packet, 10)?));
+    let mut offset = DNS_HEADER_LEN;
+    for _ in 0..question_count {
+        offset = skip_dns_name(packet, offset)?.checked_add(4)?;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+
+    let mut result = ResponseSecurityData::default();
+    for _ in 0..record_count {
+        let record = read_dns_record(packet, offset)?;
+        if record.record_class == 1 {
+            match (record.record_type, record.data_len) {
+                (TYPE_A, 4) => result.addresses.push(IpAddr::V4(Ipv4Addr::new(
+                    packet[record.data_offset],
+                    packet[record.data_offset + 1],
+                    packet[record.data_offset + 2],
+                    packet[record.data_offset + 3],
+                ))),
+                (TYPE_AAAA, 16) => {
+                    let mut octets = [0_u8; 16];
+                    octets.copy_from_slice(&packet[record.data_offset..record.next_offset]);
+                    result.addresses.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                }
+                (TYPE_CNAME, _) => {
+                    let (target, next_offset) = decode_dns_name(packet, record.data_offset)?;
+                    if next_offset != record.next_offset {
+                        return None;
+                    }
+                    let target = target.trim_end_matches('.').to_ascii_lowercase();
+                    if !target.is_empty() {
+                        result.cname_targets.push(target);
+                    }
+                }
+                (TYPE_SVCB | TYPE_HTTPS, _) => {
+                    append_svcb_ip_hints(packet, &record, &mut result.addresses)?;
+                }
+                _ => {}
+            }
+        }
+        offset = record.next_offset;
+    }
+    Some(result)
+}
+
+fn append_svcb_ip_hints(
+    packet: &[u8],
+    record: &DnsRecordHeader,
+    addresses: &mut Vec<IpAddr>,
+) -> Option<()> {
+    let target_offset = record.data_offset.checked_add(2)?;
+    let (_, mut offset) = decode_dns_name(packet, target_offset)?;
+    if offset > record.next_offset {
+        return None;
+    }
+
+    while offset < record.next_offset {
+        let key = read_u16(packet, offset)?;
+        let length = usize::from(read_u16(packet, offset.checked_add(2)?)?);
+        let value_offset = offset.checked_add(4)?;
+        let value_end = value_offset.checked_add(length)?;
+        if value_end > record.next_offset {
+            return None;
+        }
+        let value = packet.get(value_offset..value_end)?;
+        match key {
+            4 if value.len() % 4 == 0 => {
+                for octets in value.chunks_exact(4) {
+                    addresses.push(IpAddr::V4(Ipv4Addr::new(
+                        octets[0], octets[1], octets[2], octets[3],
+                    )));
+                }
+            }
+            6 if value.len() % 16 == 0 => {
+                for octets in value.chunks_exact(16) {
+                    let mut address = [0_u8; 16];
+                    address.copy_from_slice(octets);
+                    addresses.push(IpAddr::V6(Ipv6Addr::from(address)));
+                }
+            }
+            _ => {}
+        }
+        offset = value_end;
+    }
+    Some(())
 }
 
 pub(crate) fn response_cache_ttl(packet: &[u8]) -> Option<u32> {

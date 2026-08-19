@@ -1236,6 +1236,40 @@ mod tests {
     }
 
     #[test]
+    fn response_protection_changes_are_hot_swapped() {
+        let previous = AppConfig::default();
+        for next in [
+            AppConfig {
+                blocking_response_ttl: 120,
+                ..previous.clone()
+            },
+            AppConfig {
+                rebinding_allowed_domains: "router.example".into(),
+                ..previous.clone()
+            },
+            AppConfig {
+                cname_cloaking_enabled: false,
+                ..previous.clone()
+            },
+        ] {
+            assert!(service_core::filter_runtime_changed(&previous, &next));
+            assert!(!service_core::needs_dns_restart(&previous, &next));
+        }
+    }
+
+    #[test]
+    fn cache_prefetch_changes_restart_dns_runtime() {
+        let previous = AppConfig::default();
+        let next = AppConfig {
+            dns_cache_prefetch_hit_threshold: 20,
+            ..previous.clone()
+        };
+
+        assert!(!service_core::filter_runtime_changed(&previous, &next));
+        assert!(service_core::needs_dns_restart(&previous, &next));
+    }
+
+    #[test]
     fn configured_summary_uses_filter_metadata_without_reading_cache() {
         let config = AppConfig {
             filters: vec![FilterSubscription {

@@ -99,6 +99,26 @@ export function renderAppTemplate(appIconUrl: string): string {
           </article>
         </div>
 
+        <section class="panel cache-runtime-panel">
+          <div class="rank-title">
+            <div>
+              <h2>DNS 缓存运行状态</h2>
+              <span>本次 DNS 服务运行期间的内存缓存指标</span>
+            </div>
+            <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+          </div>
+          <div class="security-stat-grid cache-stat-grid">
+            <div class="security-stat-card"><span>命中率</span><strong id="cache_hit_rate">0%</strong></div>
+            <div class="security-stat-card"><span>命中 / 未命中</span><strong id="cache_hit_miss">0 / 0</strong></div>
+            <div class="security-stat-card"><span>过期应答</span><strong id="cache_stale_hits">0</strong></div>
+            <div class="security-stat-card"><span>后台刷新（成功 / 失败）</span><strong id="cache_refreshes">0 / 0</strong></div>
+            <div class="security-stat-card"><span>热门预取（成功 / 失败）</span><strong id="cache_prefetches">0 / 0</strong></div>
+            <div class="security-stat-card"><span>淘汰条目</span><strong id="cache_evictions">0</strong></div>
+            <div class="security-stat-card"><span>当前条目</span><strong id="cache_entries">0</strong></div>
+            <div class="security-stat-card"><span>当前占用</span><strong id="cache_bytes">0 B</strong></div>
+          </div>
+        </section>
+
         <div class="dashboard-rank-grid">
           <section class="panel rank-panel">
             <div class="rank-title">
@@ -418,6 +438,13 @@ export function renderAppTemplate(appIconUrl: string): string {
                   </span>
                 </label>
               </div>
+              <div class="dns-cache-grid">
+                <label class="field">
+                  <span>拦截响应 TTL</span>
+                  <small>客户端缓存零地址、自定义 IP 或 NXDOMAIN 拦截结果的秒数；0 表示不缓存。</small>
+                  <input id="blocking_response_ttl" type="number" min="0" max="604800" step="1" />
+                </label>
+              </div>
               <div class="blocking-custom-grid" id="blocking_custom_fields">
                 <label class="field">
                   <span>自定义 IPv4</span>
@@ -466,6 +493,20 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <small>即使条目已过期，也先从缓存中响应，并在后台刷新它们。</small>
                 </span>
               </label>
+              <label class="check-row">
+                <input id="dns_cache_prefetch_enabled" type="checkbox" />
+                <span>
+                  <strong>热门域名预取</strong>
+                  <small>高频条目接近过期时在后台提前刷新，减少客户端遇到冷缓存的概率；同一条目只允许一个刷新任务。</small>
+                </span>
+              </label>
+              <div class="dns-cache-grid">
+                <label class="field">
+                  <span>预取命中阈值</span>
+                  <small>条目至少命中多少次后才允许预取，范围 2–10000。</small>
+                  <input id="dns_cache_prefetch_hit_threshold" type="number" min="2" max="10000" step="1" />
+                </label>
+              </div>
               <button id="clear_dns_cache_btn" type="button">清除缓存</button>
             </section>
           </div>
@@ -563,6 +604,34 @@ export function renderAppTemplate(appIconUrl: string): string {
 
             <section class="settings-section dns-security-section">
               <div class="section-heading">
+                <h3>响应安全防护</h3>
+                <span>检查上游返回的地址和 CNAME 链，阻止恶意域名绕过过滤器或访问局域网资源。</span>
+              </div>
+              <div class="dns-security-options">
+                <label class="check-row">
+                  <input id="rebinding_protection_enabled" type="checkbox" />
+                  <span>
+                    <strong>DNS Rebinding Protection</strong>
+                    <small>公共域名返回私有、回环、链路本地或组播地址时改为拦截响应；域名分流上游自动视为可信。</small>
+                  </span>
+                </label>
+                <label class="check-row">
+                  <input id="cname_cloaking_enabled" type="checkbox" />
+                  <span>
+                    <strong>CNAME cloaking 检测</strong>
+                    <small>解析响应中的 CNAME 目标，并用当前黑白名单再次判定，阻止首方别名隐藏被拦截域名。</small>
+                  </span>
+                </label>
+              </div>
+              <label class="field access-list-field">
+                <span>Rebinding 可信域名</span>
+                <small>每行一个域名；同时信任它的子域名。用于确实需要返回局域网地址的内部服务。</small>
+                <textarea id="rebinding_allowed_domains" autocomplete="off" spellcheck="false" placeholder="home.arpa&#10;router.example.com"></textarea>
+              </label>
+            </section>
+
+            <section class="settings-section dns-security-section">
+              <div class="section-heading">
                 <h3>安全事件</h3>
                 <span>UDP 拒绝仍保持静默丢弃；这里展示本次运行期间的拒绝与限速情况，最多保留最近 200 条聚合事件。</span>
               </div>
@@ -582,6 +651,14 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <div class="security-stat-card">
                   <span>ANY 拒绝</span>
                   <strong id="security_refused_any">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>Rebinding 拦截</span>
+                  <strong id="security_rebinding_blocked">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>CNAME cloaking 拦截</span>
+                  <strong id="security_cname_blocked">0</strong>
                 </div>
               </div>
               <div class="security-event-table">

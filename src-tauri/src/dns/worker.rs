@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     io,
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -19,19 +19,19 @@ use crate::{
 use super::{
     access::{ClientAccess, ClientAccessDecision},
     cache::{
-        DnsCacheConfig, DnsCacheStore, QueryCacheKey, insert_cached_response,
+        CacheRefreshReason, DnsCacheConfig, DnsCacheStore, QueryCacheKey, insert_cached_response,
         lookup_cached_response,
     },
     filter_runtime::{FilterRuntime, SharedFilterRuntime, current_filter_runtime},
     protocol::{
         Question, RCODE_REFUSED, TYPE_ANY, build_block_response, build_error_response,
-        build_rewrite_response, parse_query, prepare_response_for_query, summarize_response,
-        truncate_response_for_udp, udp_payload_size,
+        build_rewrite_response, parse_query, prepare_response_for_query, response_security_data,
+        summarize_response, truncate_response_for_udp, udp_payload_size,
     },
     stats::{
-        DnsStats, DnsTransport, current_second, record_access_denied, record_blocked_query,
-        record_error, record_forwarded, record_persistence_queue_drop, record_query,
-        record_rate_limited, record_refused_any,
+        DnsStats, DnsTransport, ResponseProtectionKind, current_second, record_access_denied,
+        record_blocked_query, record_error, record_forwarded, record_persistence_queue_drop,
+        record_query, record_rate_limited, record_refused_any, record_response_blocked,
     },
     task_pool,
     upstream::{RuntimeUpstream, UpstreamForwardResponse, forward_query},
@@ -130,6 +130,11 @@ struct QueryLogMetadata<'a> {
     query_class: u16,
     transport: &'static str,
     processing_started: Instant,
+}
+
+struct ResponseProtectionBlock {
+    kind: ResponseProtectionKind,
+    rule_match: super::rules::BlockMatch,
 }
 
 impl<'a> QueryLogMetadata<'a> {
@@ -458,7 +463,39 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         && let Some(cache_hit) =
             lookup_cached_response(&context.dns_cache, cache_key, query, current_second())
     {
+        if !protection_is_paused(&context.protection_paused_until)
+            && let Some(block) = response_protection_block(
+                &filter,
+                question,
+                &cache_hit.response,
+                routed_upstream.is_some(),
+            )
+        {
+            if cache_hit.refresh_reason.is_some()
+                && let Some(cache) = context.dns_cache.as_deref()
+            {
+                cache.finish_refresh(cache_key);
+            }
+            deliver_response_protection_block(
+                context,
+                &filter,
+                &log_metadata,
+                client_addr,
+                response_target,
+                query,
+                question,
+                &block,
+                None,
+                None,
+            );
+            return;
+        }
         if let Err(error) = send_dns_response(response_target, query, &cache_hit.response) {
+            if cache_hit.refresh_reason.is_some()
+                && let Some(cache) = context.dns_cache.as_deref()
+            {
+                cache.finish_refresh(cache_key);
+            }
             let message = format!("返回 DNS 缓存响应失败：{error}");
             record_error(&context.stats, message.clone());
             queue_query_log(
@@ -489,10 +526,11 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                 None,
                 Some(&cache_hit.response),
             );
-            if cache_hit.refresh {
-                refresh_expired_cache_async(
+            if let Some(refresh_reason) = cache_hit.refresh_reason {
+                refresh_cache_async(
                     work_item.query,
                     cache_key.clone(),
+                    refresh_reason,
                     Arc::clone(&context.upstream_servers),
                     Arc::clone(&context.fallback_upstream_servers),
                     routed_upstream.clone(),
@@ -500,6 +538,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     Arc::clone(&context.stats),
                     context.dns_cache.clone(),
                     context.dns_cache_config.clone(),
+                    Arc::clone(&context.filter_runtime),
                 );
             }
         }
@@ -543,6 +582,41 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         &context.fallback_next_upstream,
         &context.stats,
     );
+    if !protection_is_paused(&context.protection_paused_until)
+        && let Ok(forwarded) = &forward_result
+        && let Some(block) = response_protection_block(
+            &filter,
+            question,
+            &forwarded.response,
+            routed_upstream.is_some(),
+        )
+    {
+        if let (Some(cache_key), Some(pending_query)) = (cache_key.as_ref(), pending_query.as_ref())
+        {
+            finish_pending_protection_block(
+                context,
+                &filter,
+                cache_key,
+                pending_query,
+                &block,
+                Some(&forwarded.upstream),
+                Some(forwarded.duration_ms),
+            );
+        }
+        deliver_response_protection_block(
+            context,
+            &filter,
+            &log_metadata,
+            client_addr,
+            response_target,
+            query,
+            question,
+            &block,
+            Some(&forwarded.upstream),
+            Some(forwarded.duration_ms),
+        );
+        return;
+    }
     if let (Some(cache_key), Some(pending_query)) = (cache_key.as_ref(), pending_query.as_ref()) {
         finish_pending_query(context, &filter, cache_key, pending_query, &forward_result);
     }
@@ -614,6 +688,123 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
 
 fn protection_is_paused(deadline: &AtomicU64) -> bool {
     deadline.load(Ordering::Acquire) > current_second()
+}
+
+fn response_protection_block(
+    filter: &FilterRuntime,
+    question: &Question,
+    response: &[u8],
+    uses_routed_upstream: bool,
+) -> Option<ResponseProtectionBlock> {
+    let check_cname = filter.cname_cloaking_enabled;
+    let check_rebinding = filter.rebinding_protection_enabled
+        && !uses_routed_upstream
+        && !filter.rebinding_allowed_domains.contains(&question.domain);
+    if !check_cname && !check_rebinding {
+        return None;
+    }
+    let data = response_security_data(response)?;
+
+    if check_cname {
+        for target in data.cname_targets {
+            if let Some(rule_match) = filter.rules.blocking_match(&target, question.qtype) {
+                return Some(ResponseProtectionBlock {
+                    kind: ResponseProtectionKind::CnameCloaking,
+                    rule_match,
+                });
+            }
+        }
+    }
+
+    if check_rebinding
+        && let Some(address) = data
+            .addresses
+            .into_iter()
+            .find(|ip| is_rebinding_address(*ip))
+    {
+        return Some(ResponseProtectionBlock {
+            kind: ResponseProtectionKind::Rebinding,
+            rule_match: super::rules::BlockMatch {
+                rule: format!("private-address:{address}"),
+                source: "DNS Rebinding Protection".into(),
+                rule_type: "response protection".into(),
+                important_overrode: false,
+                allowlist_rule: None,
+            },
+        });
+    }
+
+    None
+}
+
+fn is_rebinding_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || address.is_multicast()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || octets[0] >= 240
+        }
+        IpAddr::V6(address) => {
+            address
+                .to_ipv4_mapped()
+                .is_some_and(|address| is_rebinding_address(IpAddr::V4(address)))
+                || address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_response_protection_block(
+    context: &DnsWorkerContext,
+    filter: &FilterRuntime,
+    metadata: &QueryLogMetadata<'_>,
+    client_addr: SocketAddr,
+    response_target: &DnsResponseTarget,
+    query: &[u8],
+    question: &Question,
+    block: &ResponseProtectionBlock,
+    upstream_server: Option<&str>,
+    upstream_duration_ms: Option<u64>,
+) {
+    record_response_blocked(
+        &context.stats,
+        metadata.domain,
+        &block.rule_match.source,
+        block.kind,
+        context.detailed_runtime_stats,
+    );
+    let response = build_block_response(query, question, &filter.blocking);
+    let error = send_dns_response(response_target, query, &response)
+        .err()
+        .map(|error| format!("返回响应安全拦截结果失败：{error}"));
+    if let Some(message) = &error {
+        record_error(&context.stats, message.clone());
+    }
+    queue_query_log_with_match(
+        context,
+        filter,
+        metadata,
+        client_addr,
+        QueryResponseSource::Blocked,
+        true,
+        false,
+        error.is_some(),
+        upstream_server,
+        upstream_duration_ms,
+        error,
+        Some(&response),
+        Some(&block.rule_match),
+    );
 }
 
 fn response_transport(response_target: &DnsResponseTarget) -> DnsTransport {
@@ -971,9 +1162,10 @@ pub(crate) fn prepare_forwarded_response(response: &[u8], query: &[u8]) -> Vec<u
 }
 
 #[allow(clippy::too_many_arguments)]
-fn refresh_expired_cache_async(
+fn refresh_cache_async(
     query: Vec<u8>,
     cache_key: QueryCacheKey,
+    refresh_reason: CacheRefreshReason,
     upstream_servers: Arc<Vec<RuntimeUpstream>>,
     fallback_upstream_servers: Arc<Vec<RuntimeUpstream>>,
     routed_upstream: Option<Arc<RouteUpstreamPool>>,
@@ -981,13 +1173,16 @@ fn refresh_expired_cache_async(
     stats: Arc<Mutex<DnsStats>>,
     dns_cache: Option<Arc<DnsCacheStore>>,
     dns_cache_config: Option<DnsCacheConfig>,
+    filter_runtime: SharedFilterRuntime,
 ) {
     let Some(cache) = dns_cache else {
         return;
     };
     let Some(cache_config) = dns_cache_config else {
+        cache.finish_refresh(&cache_key);
         return;
     };
+    cache.record_refresh_started(refresh_reason);
 
     let cache_on_reject = Arc::clone(&cache);
     let cache_key_on_reject = cache_key.clone();
@@ -995,6 +1190,7 @@ fn refresh_expired_cache_async(
     if !task_pool::spawn_coordination_task(move || {
         if queued_at.elapsed() > OPTIMISTIC_REFRESH_MAX_QUEUE_WAIT {
             cache.finish_refresh(&cache_key);
+            cache.record_refresh_failed(refresh_reason);
             return;
         }
         let next_upstream = AtomicUsize::new(0);
@@ -1010,21 +1206,87 @@ fn refresh_expired_cache_async(
             &stats,
         ) {
             Ok(forwarded) => {
+                let blocked = parse_query(&query).ok().is_some_and(|parsed| {
+                    let filter = current_filter_runtime(&filter_runtime);
+                    response_protection_block(
+                        &filter,
+                        &parsed.question,
+                        &forwarded.response,
+                        routed_upstream.is_some(),
+                    )
+                    .is_some()
+                });
+                if blocked {
+                    cache.finish_refresh(&cache_key);
+                    cache.record_refresh_failed(refresh_reason);
+                    return;
+                }
                 let cache_for_insert = Some(Arc::clone(&cache));
-                insert_cached_response(
+                let refresh_key = cache_key.clone();
+                if insert_cached_response(
                     &cache_for_insert,
                     Some(&cache_config),
                     cache_key,
                     forwarded.response,
                     current_second(),
-                );
+                ) {
+                    cache.record_refresh_completed(refresh_reason);
+                } else {
+                    cache.finish_refresh(&refresh_key);
+                    cache.record_refresh_failed(refresh_reason);
+                }
             }
             Err(_) => {
                 cache.finish_refresh(&cache_key);
+                cache.record_refresh_failed(refresh_reason);
             }
         }
     }) {
         cache_on_reject.finish_refresh(&cache_key_on_reject);
+        cache_on_reject.record_refresh_failed(refresh_reason);
+    }
+}
+
+fn finish_pending_protection_block(
+    context: &DnsWorkerContext,
+    filter: &FilterRuntime,
+    cache_key: &QueryCacheKey,
+    pending_query: &PendingQuery,
+    block: &ResponseProtectionBlock,
+    upstream_server: Option<&str>,
+    upstream_duration_ms: Option<u64>,
+) {
+    context.pending_queries.finish(cache_key, pending_query);
+    let followers = pending_query
+        .followers
+        .lock()
+        .ok()
+        .and_then(|mut followers| followers.take())
+        .unwrap_or_default();
+    for follower in followers {
+        let Ok(parsed) = parse_query(&follower.query) else {
+            send_no_response(&follower.response_target);
+            continue;
+        };
+        let metadata = QueryLogMetadata {
+            domain: &follower.domain,
+            query_type: follower.query_type,
+            query_class: follower.query_class,
+            transport: follower.transport,
+            processing_started: follower.processing_started,
+        };
+        deliver_response_protection_block(
+            context,
+            filter,
+            &metadata,
+            follower.client_addr,
+            &follower.response_target,
+            &follower.query,
+            &parsed.question,
+            block,
+            upstream_server,
+            upstream_duration_ms,
+        );
     }
 }
 
@@ -1213,13 +1475,22 @@ fn duration_ms(duration: Duration) -> f64 {
 
 #[cfg(test)]
 mod pending_query_tests {
-    use std::{sync::mpsc, time::Instant};
+    use std::{net::IpAddr, sync::mpsc, time::Instant};
 
     use super::{
         DnsResponseTarget, MAX_PENDING_FOLLOWERS, PENDING_QUERY_SHARDS, PendingFollower,
-        PendingQueries, PendingQueryRole, new_pending_query, register_pending_follower,
+        PendingQueries, PendingQueryRole, is_rebinding_address, new_pending_query,
+        register_pending_follower, response_protection_block,
     };
-    use crate::dns::{cache::QueryCacheKey, protocol::Question};
+    use crate::{
+        config::AppConfig,
+        dns::{
+            cache::QueryCacheKey,
+            filter_runtime::build_filter_runtime,
+            protocol::{Question, TYPE_A, TYPE_CNAME},
+            stats::ResponseProtectionKind,
+        },
+    };
 
     fn test_cache_key() -> QueryCacheKey {
         QueryCacheKey::from_question(&Question {
@@ -1315,6 +1586,118 @@ mod pending_query_tests {
             ),
             "leader 完成并摘除共享入口后，下一个查询应另起 leader"
         );
+    }
+
+    #[test]
+    fn rebinding_address_detection_covers_local_ranges_only() {
+        for address in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "169.254.1.1",
+            "192.168.1.1",
+            "::",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            assert!(
+                is_rebinding_address(address.parse::<IpAddr>().unwrap()),
+                "{address} should be protected"
+            );
+        }
+        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(
+                !is_rebinding_address(address.parse::<IpAddr>().unwrap()),
+                "{address} should remain public"
+            );
+        }
+    }
+
+    #[test]
+    fn response_protection_honors_cname_rules_trusted_domains_and_routes() {
+        let filter = build_filter_runtime(&AppConfig::default(), "||tracker.example^");
+        let question = Question {
+            domain: "www.example".into(),
+            qtype: TYPE_A,
+            qclass: 1,
+            question_end: 0,
+        };
+        let cname_response = cname_response("www.example", "tracker.example", [1, 1, 1, 1]);
+        let blocked = response_protection_block(&filter, &question, &cname_response, false)
+            .expect("blocked CNAME target should be detected");
+        assert_eq!(blocked.kind, ResponseProtectionKind::CnameCloaking);
+        assert_eq!(blocked.rule_match.source, "自定义规则");
+
+        let private_response = a_response("www.example", [192, 168, 1, 10]);
+        let blocked = response_protection_block(&filter, &question, &private_response, false)
+            .expect("private response should be detected");
+        assert_eq!(blocked.kind, ResponseProtectionKind::Rebinding);
+        assert!(response_protection_block(&filter, &question, &private_response, true).is_none());
+
+        let trusted_question = Question {
+            domain: "nas.home.arpa".into(),
+            ..question
+        };
+        assert!(
+            response_protection_block(&filter, &trusted_question, &private_response, false)
+                .is_none()
+        );
+    }
+
+    fn a_response(domain: &str, address: [u8; 4]) -> Vec<u8> {
+        let mut response = response_question(domain, 1);
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        append_record_tail(&mut response, TYPE_A, 4);
+        response.extend_from_slice(&address);
+        response
+    }
+
+    fn cname_response(domain: &str, target: &str, address: [u8; 4]) -> Vec<u8> {
+        let mut response = response_question(domain, 1);
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        response[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&TYPE_CNAME.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&60_u32.to_be_bytes());
+        let data_len_offset = response.len();
+        response.extend_from_slice(&0_u16.to_be_bytes());
+        let data_offset = response.len();
+        append_name(&mut response, target);
+        let data_len = (response.len() - data_offset) as u16;
+        response[data_len_offset..data_len_offset + 2].copy_from_slice(&data_len.to_be_bytes());
+        append_name(&mut response, target);
+        append_record_tail(&mut response, TYPE_A, 4);
+        response.extend_from_slice(&address);
+        response
+    }
+
+    fn response_question(domain: &str, qtype: u16) -> Vec<u8> {
+        let mut response = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        append_name(&mut response, domain);
+        response.extend_from_slice(&qtype.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response
+    }
+
+    fn append_name(packet: &mut Vec<u8>, domain: &str) {
+        for label in domain.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
+    }
+
+    fn append_record_tail(packet: &mut Vec<u8>, record_type: u16, data_len: u16) {
+        packet.extend_from_slice(&record_type.to_be_bytes());
+        packet.extend_from_slice(&1_u16.to_be_bytes());
+        packet.extend_from_slice(&60_u32.to_be_bytes());
+        packet.extend_from_slice(&data_len.to_be_bytes());
     }
 }
 

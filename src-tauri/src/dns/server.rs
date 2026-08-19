@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     access::ClientAccess,
-    cache::{DnsCacheConfig, DnsCacheStore},
+    cache::{DnsCacheConfig, DnsCacheStatsSnapshot, DnsCacheStore},
     filter_runtime::{FilterRuntime, SharedFilterRuntime, share_filter_runtime},
     protocol::MAX_DNS_PACKET_SIZE,
     stats::{
@@ -233,6 +233,13 @@ impl DnsServer {
             cache.clear();
         }
         Ok(())
+    }
+
+    pub(crate) fn cache_stats(&self) -> DnsCacheStatsSnapshot {
+        self.cache
+            .as_deref()
+            .map(DnsCacheStore::stats_snapshot)
+            .unwrap_or_default()
     }
 
     pub(crate) fn filter_runtime_handle(&self) -> SharedFilterRuntime {
@@ -1005,5 +1012,69 @@ mod tests {
         }));
 
         server.stop();
+    }
+
+    #[test]
+    fn udp_rebinding_response_is_blocked_before_reaching_the_client() {
+        let upstream =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("模拟上游 UDP 服务应可绑定");
+        upstream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("应可设置模拟上游超时");
+        let upstream_address = upstream.local_addr().expect("应可读取模拟上游地址");
+        let upstream_thread = thread::spawn(move || {
+            let mut request = [0_u8; 512];
+            let (request_len, peer) = upstream
+                .recv_from(&mut request)
+                .expect("模拟上游应收到查询");
+            let mut response = request[..request_len].to_vec();
+            response[2] = 0x81;
+            response[3] = 0x80;
+            response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+            response.extend_from_slice(&[
+                0xc0, 0x0c, // NAME 指向问题域名。
+                0x00, 0x01, // A
+                0x00, 0x01, // IN
+                0x00, 0x00, 0x00, 0x3c, // TTL 60
+                0x00, 0x04, // RDLENGTH
+                192, 168, 1, 10,
+            ]);
+            upstream
+                .send_to(&response, peer)
+                .expect("模拟上游应可返回私网地址");
+        });
+
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: upstream_address.to_string(),
+            fallback_dns: String::new(),
+            dns_cache_enabled: false,
+            query_log_enabled: false,
+            statistics_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
+        let server = DnsServer::start(config, "", Arc::clone(&stats), database)
+            .expect("测试 DNS 服务应可启动");
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP 客户端应可绑定");
+        udp.set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("应可设置 UDP 读取超时");
+        udp.send_to(&example_a_query(), (Ipv4Addr::LOCALHOST, port))
+            .expect("应可发送 UDP 查询");
+        let mut response = [0_u8; 512];
+        let (response_len, _) = udp.recv_from(&mut response).expect("应收到拦截响应");
+
+        assert_eq!(&response[response_len - 4..response_len], &[0, 0, 0, 0]);
+        let snapshot = stats.lock().expect("统计锁不应中毒").clone();
+        assert_eq!(snapshot.rebinding_blocked_total, 1);
+        assert_eq!(snapshot.blocked, 1);
+
+        server.stop();
+        upstream_thread.join().expect("模拟上游线程应正常结束");
     }
 }

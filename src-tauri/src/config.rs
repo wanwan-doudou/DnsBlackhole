@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 14;
 pub(crate) const MAX_STATISTICS_RETENTION_HOURS: u32 = 24 * 365;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
@@ -96,16 +96,28 @@ pub struct AppConfig {
     pub dns_cache_max_ttl: u32,
     #[serde(default = "default_dns_cache_optimistic")]
     pub dns_cache_optimistic: bool,
+    #[serde(default = "default_dns_cache_prefetch_enabled")]
+    pub dns_cache_prefetch_enabled: bool,
+    #[serde(default = "default_dns_cache_prefetch_hit_threshold")]
+    pub dns_cache_prefetch_hit_threshold: u32,
     #[serde(default = "default_runtime_watchdog_enabled")]
     pub runtime_watchdog_enabled: bool,
     #[serde(default = "default_runtime_watchdog_interval_seconds")]
     pub runtime_watchdog_interval_seconds: u64,
     #[serde(default)]
     pub blocking_mode: BlockingMode,
+    #[serde(default = "default_blocking_response_ttl")]
+    pub blocking_response_ttl: u32,
     #[serde(default)]
     pub blocking_custom_ipv4: String,
     #[serde(default)]
     pub blocking_custom_ipv6: String,
+    #[serde(default = "default_rebinding_protection_enabled")]
+    pub rebinding_protection_enabled: bool,
+    #[serde(default = "default_rebinding_allowed_domains")]
+    pub rebinding_allowed_domains: String,
+    #[serde(default = "default_cname_cloaking_enabled")]
+    pub cname_cloaking_enabled: bool,
     #[serde(default)]
     pub dns_rewrites: String,
     #[serde(default)]
@@ -254,11 +266,17 @@ impl Default for AppConfig {
             dns_cache_min_ttl: default_dns_cache_min_ttl(),
             dns_cache_max_ttl: default_dns_cache_max_ttl(),
             dns_cache_optimistic: default_dns_cache_optimistic(),
+            dns_cache_prefetch_enabled: default_dns_cache_prefetch_enabled(),
+            dns_cache_prefetch_hit_threshold: default_dns_cache_prefetch_hit_threshold(),
             runtime_watchdog_enabled: default_runtime_watchdog_enabled(),
             runtime_watchdog_interval_seconds: default_runtime_watchdog_interval_seconds(),
             blocking_mode: BlockingMode::default(),
+            blocking_response_ttl: default_blocking_response_ttl(),
             blocking_custom_ipv4: String::new(),
             blocking_custom_ipv6: String::new(),
+            rebinding_protection_enabled: default_rebinding_protection_enabled(),
+            rebinding_allowed_domains: default_rebinding_allowed_domains(),
+            cname_cloaking_enabled: default_cname_cloaking_enabled(),
             dns_rewrites: String::new(),
             client_names: String::new(),
             query_log_ignored_domains: String::new(),
@@ -378,12 +396,19 @@ impl AppConfig {
         if self.dns_cache_max_ttl > 0 && self.dns_cache_min_ttl > self.dns_cache_max_ttl {
             return Err("DNS 缓存最小 TTL 不能大于最大 TTL".into());
         }
+        if !(2..=10_000).contains(&self.dns_cache_prefetch_hit_threshold) {
+            return Err("热门域名预取命中阈值必须在 2 到 10000 之间".into());
+        }
+        if self.blocking_response_ttl > 7 * 24 * 3600 {
+            return Err("拦截响应 TTL 不能超过 7 天".into());
+        }
         validate_filters(&self.filters, self.allow_insecure_http)?;
         validate_blocking_config(self)?;
         validate_dns_rewrites(&self.dns_rewrites)?;
         validate_client_names(&self.client_names)?;
         validate_ignored_domains(&self.query_log_ignored_domains)?;
         validate_ignored_domains(&self.statistics_ignored_domains)?;
+        validate_domain_list(&self.rebinding_allowed_domains, "Rebinding 可信域名")?;
         Ok(())
     }
 }
@@ -490,6 +515,10 @@ fn validate_client_names(value: &str) -> Result<(), String> {
 }
 
 fn validate_ignored_domains(value: &str) -> Result<(), String> {
+    validate_domain_list(value, "日志忽略清单")
+}
+
+fn validate_domain_list(value: &str, label: &str) -> Result<(), String> {
     for (index, line) in value.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
@@ -498,10 +527,7 @@ fn validate_ignored_domains(value: &str) -> Result<(), String> {
 
         let domain = trimmed.strip_prefix("*.").unwrap_or(trimmed);
         if normalize_hostname(domain).is_none() {
-            return Err(format!(
-                "日志忽略清单第 {} 行域名无效：{trimmed}",
-                index + 1
-            ));
+            return Err(format!("{label}第 {} 行域名无效：{trimmed}", index + 1));
         }
     }
     Ok(())
@@ -568,6 +594,30 @@ fn default_dns_cache_max_ttl() -> u32 {
 }
 
 fn default_dns_cache_optimistic() -> bool {
+    true
+}
+
+fn default_dns_cache_prefetch_enabled() -> bool {
+    true
+}
+
+fn default_dns_cache_prefetch_hit_threshold() -> u32 {
+    10
+}
+
+fn default_blocking_response_ttl() -> u32 {
+    60
+}
+
+fn default_rebinding_protection_enabled() -> bool {
+    true
+}
+
+fn default_rebinding_allowed_domains() -> String {
+    ["localhost", "local", "lan", "home.arpa"].join("\n")
+}
+
+fn default_cname_cloaking_enabled() -> bool {
     true
 }
 
@@ -1715,6 +1765,25 @@ mod tests {
 
         config.allowed_clients = "not-a-network".into();
 
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_response_protection_and_prefetch_settings() {
+        let mut config = AppConfig::default();
+        config.validate().expect("new defaults should validate");
+
+        config.dns_cache_prefetch_hit_threshold = 1;
+        assert!(config.validate().is_err());
+        config.dns_cache_prefetch_hit_threshold = 10;
+
+        config.blocking_response_ttl = 7 * 24 * 3600 + 1;
+        assert!(config.validate().is_err());
+        config.blocking_response_ttl = 60;
+
+        config.rebinding_allowed_domains = "home.arpa\n*.router.example".into();
+        config.validate().expect("trusted domains should validate");
+        config.rebinding_allowed_domains = "not a domain".into();
         assert!(config.validate().is_err());
     }
 

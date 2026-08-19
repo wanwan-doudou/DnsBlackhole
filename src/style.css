@@ -478,6 +478,15 @@ button.refreshing:disabled {
   margin-bottom: 18px;
 }
 
+.cache-runtime-panel {
+  margin-bottom: 18px;
+  padding-bottom: 18px;
+}
+
+.cache-runtime-panel .security-stat-grid {
+  padding: 0 24px;
+}
+
 .dashboard-rank-grid + .dashboard-rank-grid {
   margin-top: 18px;
 }

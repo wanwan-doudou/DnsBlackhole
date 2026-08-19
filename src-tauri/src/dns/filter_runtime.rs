@@ -17,6 +17,9 @@ pub(crate) struct FilterRuntime {
     pub(crate) rules: Arc<CompiledRules>,
     pub(crate) rewrites: CompiledRewrites,
     pub(crate) blocking: BlockingPolicy,
+    pub(crate) rebinding_protection_enabled: bool,
+    pub(crate) rebinding_allowed_domains: DomainSet,
+    pub(crate) cname_cloaking_enabled: bool,
     pub(crate) log_ignore: DomainSet,
     pub(crate) statistics_ignore: DomainSet,
 }
@@ -42,6 +45,9 @@ pub(crate) fn build_filter_runtime_with_rules(
         rules,
         rewrites: compile_rewrites(&config.dns_rewrites),
         blocking: BlockingPolicy::from_config(config),
+        rebinding_protection_enabled: config.rebinding_protection_enabled,
+        rebinding_allowed_domains: compile_domain_set(&config.rebinding_allowed_domains),
+        cname_cloaking_enabled: config.cname_cloaking_enabled,
         log_ignore: compile_domain_set(&config.query_log_ignored_domains),
         statistics_ignore: compile_domain_set(&config.statistics_ignored_domains),
     }

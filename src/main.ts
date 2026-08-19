@@ -87,7 +87,7 @@ import type {
 import "./style.css";
 
 const frontendStartedAt = performance.now();
-const CURRENT_CONFIG_SCHEMA_VERSION = 13;
+const CURRENT_CONFIG_SCHEMA_VERSION = 14;
 
 function logLoadTime(
   module: string,
@@ -242,6 +242,10 @@ const dnsCacheSizeInput = query<HTMLInputElement>("#dns_cache_size");
 const dnsCacheMinTtlInput = query<HTMLInputElement>("#dns_cache_min_ttl");
 const dnsCacheMaxTtlInput = query<HTMLInputElement>("#dns_cache_max_ttl");
 const dnsCacheOptimisticInput = query<HTMLInputElement>("#dns_cache_optimistic");
+const dnsCachePrefetchEnabledInput = query<HTMLInputElement>("#dns_cache_prefetch_enabled");
+const dnsCachePrefetchHitThresholdInput = query<HTMLInputElement>(
+  "#dns_cache_prefetch_hit_threshold",
+);
 const runtimeWatchdogEnabledInput = query<HTMLInputElement>("#runtime_watchdog_enabled");
 const runtimeWatchdogIntervalInput = query<HTMLInputElement>("#runtime_watchdog_interval_seconds");
 const blockingModeInputs = Array.from(
@@ -250,6 +254,12 @@ const blockingModeInputs = Array.from(
 const blockingCustomFields = query<HTMLDivElement>("#blocking_custom_fields");
 const blockingCustomIpv4Input = query<HTMLInputElement>("#blocking_custom_ipv4");
 const blockingCustomIpv6Input = query<HTMLInputElement>("#blocking_custom_ipv6");
+const blockingResponseTtlInput = query<HTMLInputElement>("#blocking_response_ttl");
+const rebindingProtectionEnabledInput = query<HTMLInputElement>(
+  "#rebinding_protection_enabled",
+);
+const rebindingAllowedDomainsInput = query<HTMLTextAreaElement>("#rebinding_allowed_domains");
+const cnameCloakingEnabledInput = query<HTMLInputElement>("#cname_cloaking_enabled");
 const dnsRewritesInput = query<HTMLTextAreaElement>("#dns_rewrites");
 const clientNamesInput = query<HTMLTextAreaElement>("#client_names");
 const queryLogIgnoredInput = query<HTMLTextAreaElement>("#query_log_ignored_domains");
@@ -362,11 +372,21 @@ const securityAccessDenied = query<HTMLElement>("#security_access_denied");
 const securityRateLimited = query<HTMLElement>("#security_rate_limited");
 const securityDroppedUdp = query<HTMLElement>("#security_dropped_udp");
 const securityRefusedAny = query<HTMLElement>("#security_refused_any");
+const securityRebindingBlocked = query<HTMLElement>("#security_rebinding_blocked");
+const securityCnameBlocked = query<HTMLElement>("#security_cname_blocked");
 const workerQueueDropped = query<HTMLElement>("#worker_queue_dropped");
 const persistenceQueueDropped = query<HTMLElement>("#persistence_queue_dropped");
 const upstreamTaskQueueRejected = query<HTMLElement>("#upstream_task_queue_rejected");
 const tcpConnectionRejected = query<HTMLElement>("#tcp_connection_rejected");
 const securityEventBody = query<HTMLDivElement>("#security_event_body");
+const cacheHitRate = query<HTMLElement>("#cache_hit_rate");
+const cacheHitMiss = query<HTMLElement>("#cache_hit_miss");
+const cacheStaleHits = query<HTMLElement>("#cache_stale_hits");
+const cacheRefreshes = query<HTMLElement>("#cache_refreshes");
+const cachePrefetches = query<HTMLElement>("#cache_prefetches");
+const cacheEvictions = query<HTMLElement>("#cache_evictions");
+const cacheEntries = query<HTMLElement>("#cache_entries");
+const cacheBytes = query<HTMLElement>("#cache_bytes");
 const diagnosticDomainInput = query<HTMLInputElement>("#diagnostic_domain");
 const diagnosticQueryTypeInput = query<HTMLSelectElement>("#diagnostic_query_type");
 const runDiagnosticButton = query<HTMLButtonElement>("#run_diagnostic_btn");
@@ -718,6 +738,8 @@ queryLogEnabledInput.addEventListener("change", updateLogControls);
 statisticsEnabledInput.addEventListener("change", updateStatisticsControls);
 filterProxyModeInput.addEventListener("change", updateFilterProxyControls);
 dnsCacheEnabledInput.addEventListener("change", updateDnsCacheControls);
+dnsCachePrefetchEnabledInput.addEventListener("change", updateDnsCacheControls);
+rebindingProtectionEnabledInput.addEventListener("change", updateResponseProtectionControls);
 runtimeWatchdogEnabledInput.addEventListener("change", updateRuntimeWatchdogControls);
 blockingModeInputs.forEach((input) => {
   input.addEventListener("change", updateBlockingModeControls);
@@ -1597,11 +1619,17 @@ async function loadConfig(): Promise<boolean> {
     dnsCacheMinTtlInput.value = String(config.dns_cache_min_ttl);
     dnsCacheMaxTtlInput.value = String(config.dns_cache_max_ttl);
     dnsCacheOptimisticInput.checked = config.dns_cache_optimistic;
+    dnsCachePrefetchEnabledInput.checked = config.dns_cache_prefetch_enabled;
+    dnsCachePrefetchHitThresholdInput.value = String(config.dns_cache_prefetch_hit_threshold);
     runtimeWatchdogEnabledInput.checked = config.runtime_watchdog_enabled;
     runtimeWatchdogIntervalInput.value = String(config.runtime_watchdog_interval_seconds);
     setRadioValue(blockingModeInputs, config.blocking_mode);
+    blockingResponseTtlInput.value = String(config.blocking_response_ttl);
     blockingCustomIpv4Input.value = config.blocking_custom_ipv4;
     blockingCustomIpv6Input.value = config.blocking_custom_ipv6;
+    rebindingProtectionEnabledInput.checked = config.rebinding_protection_enabled;
+    rebindingAllowedDomainsInput.value = config.rebinding_allowed_domains;
+    cnameCloakingEnabledInput.checked = config.cname_cloaking_enabled;
     dnsRewritesInput.value = config.dns_rewrites;
     clientNamesInput.value = config.client_names;
     queryLogIgnoredInput.value = config.query_log_ignored_domains;
@@ -1613,6 +1641,7 @@ async function loadConfig(): Promise<boolean> {
     renderDashboardSummaryWindow();
     updateFilterProxyControls();
     updateDnsCacheControls();
+    updateResponseProtectionControls();
     updateRuntimeWatchdogControls();
     updateBlockingModeControls();
     blacklistInput.value = config.blacklist;
@@ -2260,11 +2289,17 @@ function collectConfig(): AppConfig {
     dns_cache_min_ttl: Number(dnsCacheMinTtlInput.value || 0),
     dns_cache_max_ttl: Number(dnsCacheMaxTtlInput.value || 0),
     dns_cache_optimistic: dnsCacheOptimisticInput.checked,
+    dns_cache_prefetch_enabled: dnsCachePrefetchEnabledInput.checked,
+    dns_cache_prefetch_hit_threshold: Number(dnsCachePrefetchHitThresholdInput.value || 10),
     runtime_watchdog_enabled: runtimeWatchdogEnabledInput.checked,
     runtime_watchdog_interval_seconds: Number(runtimeWatchdogIntervalInput.value || 0),
     blocking_mode: selectedRadioValue(blockingModeInputs, "null_ip") as BlockingMode,
+    blocking_response_ttl: Number(blockingResponseTtlInput.value || 0),
     blocking_custom_ipv4: blockingCustomIpv4Input.value.trim(),
     blocking_custom_ipv6: blockingCustomIpv6Input.value.trim(),
+    rebinding_protection_enabled: rebindingProtectionEnabledInput.checked,
+    rebinding_allowed_domains: rebindingAllowedDomainsInput.value,
+    cname_cloaking_enabled: cnameCloakingEnabledInput.checked,
     dns_rewrites: dnsRewritesInput.value,
     client_names: clientNamesInput.value,
     query_log_ignored_domains: queryLogIgnoredInput.value,
@@ -2746,6 +2781,7 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#queries"), formatCount(status.stats.queries));
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
+  renderCacheStats(status);
   renderDashboardSummaryWindow(status.stats.dashboard_started_at, status.stats.dashboard_ended_at);
   renderSparkline(
     "#query_sparkline",
@@ -2777,6 +2813,14 @@ function renderSecurityEvents(status: RuntimeStatus): void {
   setTextIfChanged(securityRateLimited, formatCount(status.stats.rate_limited_total));
   setTextIfChanged(securityDroppedUdp, formatCount(status.stats.dropped_udp_total));
   setTextIfChanged(securityRefusedAny, formatCount(status.stats.refused_any_total));
+  setTextIfChanged(
+    securityRebindingBlocked,
+    formatCount(status.stats.rebinding_blocked_total ?? 0),
+  );
+  setTextIfChanged(
+    securityCnameBlocked,
+    formatCount(status.stats.cname_cloaking_blocked_total ?? 0),
+  );
   setTextIfChanged(workerQueueDropped, formatCount(status.stats.worker_queue_dropped_total ?? 0));
   setTextIfChanged(
     persistenceQueueDropped,
@@ -2800,6 +2844,26 @@ function renderSecurityEvents(status: RuntimeStatus): void {
     return;
   }
   setHtmlIfChanged(securityEventBody, events.map(renderSecurityEvent).join(""));
+}
+
+function renderCacheStats(status: RuntimeStatus): void {
+  const hits = status.stats.cache_hits ?? 0;
+  const misses = status.stats.cache_misses ?? 0;
+  const total = hits + misses;
+  setTextIfChanged(cacheHitRate, total > 0 ? `${((hits / total) * 100).toFixed(1)}%` : "0%");
+  setTextIfChanged(cacheHitMiss, `${formatCount(hits)} / ${formatCount(misses)}`);
+  setTextIfChanged(cacheStaleHits, formatCount(status.stats.cache_stale_hits ?? 0));
+  setTextIfChanged(
+    cacheRefreshes,
+    `${formatCount(status.stats.cache_refresh_completed ?? 0)} / ${formatCount(status.stats.cache_refresh_failed ?? 0)}`,
+  );
+  setTextIfChanged(
+    cachePrefetches,
+    `${formatCount(status.stats.cache_prefetch_completed ?? 0)} / ${formatCount(status.stats.cache_prefetch_failed ?? 0)}`,
+  );
+  setTextIfChanged(cacheEvictions, formatCount(status.stats.cache_evictions ?? 0));
+  setTextIfChanged(cacheEntries, formatCount(status.stats.cache_entries ?? 0));
+  setTextIfChanged(cacheBytes, formatBytes(status.stats.cache_bytes ?? 0));
 }
 
 function renderSecurityEvent(event: SecurityEvent): string {
@@ -3371,7 +3435,14 @@ function updateDnsCacheControls(): void {
   dnsCacheMinTtlInput.disabled = !enabled;
   dnsCacheMaxTtlInput.disabled = !enabled;
   dnsCacheOptimisticInput.disabled = !enabled;
+  dnsCachePrefetchEnabledInput.disabled = !enabled;
+  dnsCachePrefetchHitThresholdInput.disabled =
+    !enabled || !dnsCachePrefetchEnabledInput.checked;
   clearDnsCacheButton.disabled = !enabled;
+}
+
+function updateResponseProtectionControls(): void {
+  rebindingAllowedDomainsInput.disabled = !rebindingProtectionEnabledInput.checked;
 }
 
 function updateRuntimeWatchdogControls(): void {

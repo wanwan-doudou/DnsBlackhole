@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
 
+use super::cache::DnsCacheStatsSnapshot;
 use super::rules::RuleSummary;
 
 const TRAFFIC_BUCKET_WINDOW_MINUTES: u64 = 90 * 24 * 60;
@@ -29,6 +30,10 @@ pub struct DnsStats {
     pub access_denied_total: u64,
     pub rate_limited_total: u64,
     pub refused_any_total: u64,
+    #[serde(default)]
+    pub rebinding_blocked_total: u64,
+    #[serde(default)]
+    pub cname_cloaking_blocked_total: u64,
     pub dropped_udp_total: u64,
     #[serde(default)]
     pub worker_queue_dropped_total: u64,
@@ -38,6 +43,32 @@ pub struct DnsStats {
     pub upstream_task_queue_rejected_total: u64,
     #[serde(default)]
     pub tcp_connection_rejected_total: u64,
+    #[serde(default)]
+    pub cache_hits: u64,
+    #[serde(default)]
+    pub cache_misses: u64,
+    #[serde(default)]
+    pub cache_stale_hits: u64,
+    #[serde(default)]
+    pub cache_refresh_started: u64,
+    #[serde(default)]
+    pub cache_refresh_completed: u64,
+    #[serde(default)]
+    pub cache_refresh_failed: u64,
+    #[serde(default)]
+    pub cache_prefetch_started: u64,
+    #[serde(default)]
+    pub cache_prefetch_completed: u64,
+    #[serde(default)]
+    pub cache_prefetch_failed: u64,
+    #[serde(default)]
+    pub cache_insertions: u64,
+    #[serde(default)]
+    pub cache_evictions: u64,
+    #[serde(default)]
+    pub cache_entries: u64,
+    #[serde(default)]
+    pub cache_bytes: u64,
     pub security_events: VecDeque<SecurityEvent>,
     pub last_query: Option<String>,
     pub last_blocked: Option<String>,
@@ -356,6 +387,58 @@ pub(crate) fn record_refused_any(stats: &Arc<Mutex<DnsStats>>) {
     if let Ok(mut current) = stats.lock() {
         current.refused_any_total += 1;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponseProtectionKind {
+    Rebinding,
+    CnameCloaking,
+}
+
+pub(crate) fn record_response_blocked(
+    stats: &Arc<Mutex<DnsStats>>,
+    domain: &str,
+    rule_source: &str,
+    kind: ResponseProtectionKind,
+    detailed_runtime_stats: bool,
+) {
+    if let Ok(mut current) = stats.lock() {
+        match kind {
+            ResponseProtectionKind::Rebinding => current.rebinding_blocked_total += 1,
+            ResponseProtectionKind::CnameCloaking => current.cname_cloaking_blocked_total += 1,
+        }
+        if !detailed_runtime_stats {
+            return;
+        }
+
+        current.blocked += 1;
+        current.last_blocked = Some(domain.to_string());
+        *current
+            .blocked_domains
+            .entry(domain.to_string())
+            .or_default() += 1;
+        *current
+            .blocklist_hits
+            .entry(rule_source.to_string())
+            .or_default() += 1;
+        record_traffic(&mut current, true);
+    }
+}
+
+pub(crate) fn apply_cache_stats(stats: &mut DnsStats, cache: DnsCacheStatsSnapshot) {
+    stats.cache_hits = cache.hits;
+    stats.cache_misses = cache.misses;
+    stats.cache_stale_hits = cache.stale_hits;
+    stats.cache_refresh_started = cache.refresh_started;
+    stats.cache_refresh_completed = cache.refresh_completed;
+    stats.cache_refresh_failed = cache.refresh_failed;
+    stats.cache_prefetch_started = cache.prefetch_started;
+    stats.cache_prefetch_completed = cache.prefetch_completed;
+    stats.cache_prefetch_failed = cache.prefetch_failed;
+    stats.cache_insertions = cache.insertions;
+    stats.cache_evictions = cache.evictions;
+    stats.cache_entries = cache.entries;
+    stats.cache_bytes = cache.bytes;
 }
 
 fn record_traffic(stats: &mut DnsStats, blocked: bool) {

@@ -23,6 +23,7 @@ pub(crate) use rule_cache::{RULE_LOAD_TEST_GUARD, forget_active_rules};
 pub(crate) use rule_cache::{RuleLoadSource, clear_rule_cache, load_or_compile_rules};
 pub use rules::{RuleSummary, summarize_rules};
 pub use server::DnsServer;
+pub(crate) use stats::apply_cache_stats;
 pub use stats::{
     DnsStats, RuntimeStatus, TrafficBucket, UpstreamLatencyStat, UpstreamRequestStat, empty_status,
 };
@@ -41,11 +42,12 @@ mod tests {
     use super::{
         cache::{DnsCache, DnsCacheConfig, QueryCacheKey, cache_ttl_seconds},
         protocol::{
-            BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_SOA,
+            BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_CNAME, TYPE_SOA,
             build_block_response, build_error_response, build_rewrite_response,
             extract_response_ips, parse_query, parse_question, prepare_cached_response, read_u16,
-            response_is_truncated, response_min_record_ttl, summarize_response,
-            truncate_response_for_udp, udp_payload_size, validate_response_for_query,
+            response_is_truncated, response_min_record_ttl, response_security_data,
+            summarize_response, truncate_response_for_udp, udp_payload_size,
+            validate_response_for_query,
         },
         rewrites::compile_rewrites,
         rules::{compile_domain_set, compile_rules, custom_rules_have_badfilter, summarize_rules},
@@ -398,11 +400,15 @@ mod tests {
 
         let nxdomain_policy = BlockingPolicy::from_config(&AppConfig {
             blocking_mode: BlockingMode::Nxdomain,
+            blocking_response_ttl: 17,
             ..AppConfig::default()
         });
         let response = build_block_response(&query, &question, &nxdomain_policy);
         assert_eq!(response[3] & 0x0f, RCODE_NXDOMAIN);
         assert_eq!(read_u16(&response, 6), Some(0));
+        assert_eq!(read_u16(&response, 8), Some(1));
+        assert_eq!(response_min_record_ttl(&response), Some(17));
+        assert_eq!(&response[response.len() - 4..], &17_u32.to_be_bytes());
 
         let custom_policy = BlockingPolicy::from_config(&AppConfig {
             blocking_mode: BlockingMode::CustomIp,
@@ -593,6 +599,53 @@ mod tests {
     }
 
     #[test]
+    fn extracts_cname_targets_and_private_addresses_from_response_sections() {
+        let domain = "www.example.org";
+        let target = "tracker.blocked.test";
+        let mut response = typed_query(domain, TYPE_A);
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        response[10..12].copy_from_slice(&2_u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&TYPE_CNAME.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&60_u32.to_be_bytes());
+        let target_start = response.len();
+        response.extend_from_slice(&0_u16.to_be_bytes());
+        let data_start = response.len();
+        append_dns_name(&mut response, target);
+        let data_len = (response.len() - data_start) as u16;
+        response[target_start..target_start + 2].copy_from_slice(&data_len.to_be_bytes());
+        append_dns_name(&mut response, target);
+        response.extend_from_slice(&TYPE_A.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&60_u32.to_be_bytes());
+        response.extend_from_slice(&4_u16.to_be_bytes());
+        response.extend_from_slice(&[192, 168, 1, 20]);
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&65_u16.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&60_u32.to_be_bytes());
+        response.extend_from_slice(&11_u16.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.push(0);
+        response.extend_from_slice(&4_u16.to_be_bytes());
+        response.extend_from_slice(&4_u16.to_be_bytes());
+        response.extend_from_slice(&[10, 0, 0, 9]);
+
+        let data = response_security_data(&response).expect("response should parse");
+        assert_eq!(data.cname_targets, vec![target]);
+        assert_eq!(
+            data.addresses,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))
+            ]
+        );
+    }
+
+    #[test]
     fn dns_cache_rewrites_transaction_id_and_ttl() {
         let query = a_query("example.org");
         let question = parse_question(&query).expect("query should parse");
@@ -603,6 +656,8 @@ mod tests {
             min_ttl: 0,
             max_ttl: 60,
             optimistic: true,
+            prefetch_enabled: false,
+            prefetch_hit_threshold: 10,
         };
         let mut cache = DnsCache::from_config(config).expect("cache should build");
 
@@ -611,10 +666,12 @@ mod tests {
         next_query[0] = 0xab;
         next_query[1] = 0xcd;
         let raw_hit = cache.lookup(&key, 130).expect("cache should hit");
+        let next_hit = cache.lookup(&key, 130).expect("cache should hit again");
+        assert!(Arc::ptr_eq(&raw_hit.response, &next_hit.response));
         let response = prepare_cached_response(&raw_hit.response, &next_query, raw_hit.ttl)
             .expect("cached response should prepare");
 
-        assert!(!raw_hit.refresh);
+        assert!(raw_hit.refresh_reason.is_none());
         assert_eq!(&response[0..2], &[0xab, 0xcd]);
         assert_eq!(response_min_record_ttl(&response), Some(30));
     }
@@ -631,6 +688,8 @@ mod tests {
             min_ttl: 0,
             max_ttl: 120,
             optimistic: true,
+            prefetch_enabled: false,
+            prefetch_hit_threshold: 10,
         };
         let mut cache = DnsCache::from_config(config.clone()).expect("cache should build");
 
@@ -685,6 +744,14 @@ mod tests {
         packet.extend_from_slice(&qtype.to_be_bytes());
         packet.extend_from_slice(&1_u16.to_be_bytes());
         packet
+    }
+
+    fn append_dns_name(packet: &mut Vec<u8>, domain: &str) {
+        for label in domain.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
     }
 
     fn a_response(domain: &str, ip: [u8; 4]) -> Vec<u8> {
