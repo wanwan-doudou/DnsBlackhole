@@ -61,6 +61,9 @@ jobs:
       - name: 前端类型检查与构建
         run: pnpm build
 
+      - name: 前端单元测试
+        run: pnpm test
+
       - name: 构建 macOS 后台服务 sidecar
         run: bash scripts/build-macos-service.sh
         env:

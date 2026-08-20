@@ -50,6 +50,22 @@ export function renderAppTemplate(appIconUrl: string): string {
 
     <main class="content">
       <section class="view active" data-view-panel="dashboard">
+        <div class="dashboard-controls">
+          <div>
+            <h2>DNS 使用概览</h2>
+            <span>点击客户端可直接查看该设备的查询日志。</span>
+          </div>
+          <label class="dashboard-range-field">
+            <span>统计范围</span>
+            <select id="dashboard_statistics_range">
+              <option value="configured">按保留设置</option>
+              <option value="24">最近 24 小时</option>
+              <option value="168">最近 7 天</option>
+              <option value="720">最近 30 天</option>
+              <option value="0">全部历史</option>
+            </select>
+          </label>
+        </div>
         <div class="dashboard-summary" aria-label="统计趋势">
           <article class="spark-card">
             <div class="spark-box">
@@ -144,10 +160,11 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
               <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
             </div>
-            <div class="rank-table">
-              <div class="rank-head">
+            <div class="rank-table client-rank-table">
+              <div class="rank-head client-rank-head">
                 <span>客户端</span>
                 <span>请求数</span>
+                <span>拦截率</span>
               </div>
               <div class="rank-body" id="client_rank"></div>
             </div>
@@ -214,6 +231,8 @@ export function renderAppTemplate(appIconUrl: string): string {
           <div class="query-log-title">
             <h2>查询日志</h2>
             <button class="ghost-icon-button" id="query_log_refresh_btn" type="button" title="刷新查询日志">↻</button>
+            <button class="query-log-tool-button" id="query_log_pause_btn" type="button">暂停实时刷新</button>
+            <button class="query-log-tool-button" id="query_log_export_btn" type="button">导出当前筛选</button>
           </div>
           <label class="query-log-search">
             <span aria-hidden="true">⌕</span>
@@ -535,6 +554,11 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <option value="TXT">TXT</option>
               </select>
             </label>
+            <label class="field">
+              <span>模拟客户端（可选）</span>
+              <input id="diagnostic_client_ip" autocomplete="off" spellcheck="false" placeholder="192.168.1.23" />
+              <small>填写 IPv4 或 IPv6，可验证该设备是否命中过滤绕过策略。</small>
+            </label>
           </div>
           <div class="diagnostic-results" id="diagnostic_results">
             <div class="diagnostic-empty">
@@ -577,6 +601,11 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <span>客户端名称</span>
                 <small>每行一条“IP 名称”，例如 192.168.1.23 客厅电视。查询日志会用名称代替 IP 展示。</small>
                 <textarea id="client_names" autocomplete="off" spellcheck="false" placeholder="192.168.1.23 客厅电视"></textarea>
+              </label>
+              <label class="field access-list-field client-names-field">
+                <span>客户端过滤策略</span>
+                <small>每行一条“IP/CIDR =&gt; filter|bypass”，最长 CIDR 优先。bypass 仅跳过过滤规则与响应保护，仍执行访问控制和 DNS 重写。</small>
+                <textarea id="client_filtering_rules" autocomplete="off" spellcheck="false" placeholder="192.168.1.50 =&gt; bypass&#10;192.168.1.0/24 =&gt; filter"></textarea>
               </label>
             </section>
 
@@ -919,6 +948,18 @@ export function renderAppTemplate(appIconUrl: string): string {
               <button id="clear_filter_cache_btn" type="button">清理缓存</button>
             </section>
 
+            <section class="settings-section config-transfer-section settings-section-wide">
+              <div>
+                <h3>备份与诊断</h3>
+                <p>导出或恢复完整配置；诊断文件会隐藏域名、客户端地址、规则、代理和上游等隐私内容。</p>
+              </div>
+              <div class="button-group config-transfer-actions">
+                <button id="export_config_btn" type="button">导出配置</button>
+                <button id="import_config_btn" type="button">恢复配置</button>
+                <button id="export_diagnostic_btn" type="button">导出脱敏诊断</button>
+              </div>
+            </section>
+
             <section class="settings-section">
               <h3>日志配置</h3>
               <label class="check-row">
@@ -1141,7 +1182,18 @@ export function renderAppTemplate(appIconUrl: string): string {
               <button class="primary" id="save_custom_btn" type="button">保存更改</button>
             </div>
           </div>
-          <textarea id="blacklist" spellcheck="false"></textarea>
+          <div class="rule-editor-toolbar">
+            <span id="rule_analysis_summary" aria-live="polite">等待读取规则</span>
+            <label class="field rule-search-field">
+              <span class="sr-only">在自定义规则中查找</span>
+              <input id="custom_rule_search" type="search" autocomplete="off" spellcheck="false" placeholder="查找规则，按 Enter 跳到下一处" />
+            </label>
+          </div>
+          <div class="rule-editor-shell">
+            <pre id="rule_line_numbers" aria-hidden="true">1</pre>
+            <textarea id="blacklist" spellcheck="false" aria-label="自定义过滤规则"></textarea>
+          </div>
+          <div class="rule-diagnostics" id="rule_diagnostics" aria-live="polite"></div>
 
           <section class="settings-section dns-rewrites-section">
             <div class="section-heading">

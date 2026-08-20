@@ -401,7 +401,11 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         return;
     }
 
-    if !protection_is_paused(&context.protection_paused_until)
+    let client_filtering_enabled = filter.client_filtering.filtering_enabled(client_addr.ip());
+    let filtering_active =
+        client_filtering_enabled && !protection_is_paused(&context.protection_paused_until);
+
+    if filtering_active
         && let Some(rule_match) = filter
             .rules
             .blocking_match(&question.domain, question.qtype)
@@ -457,13 +461,22 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
     let routed_upstream = context
         .upstream_routes
         .select(&question.domain, client_addr.ip());
-    let cache_key = QueryCacheKey::from_query(&parsed_query)
-        .map(|key| key.with_route(routed_upstream.as_deref().map(RouteUpstreamPool::key)));
+    let route_key = routed_upstream.as_deref().map(RouteUpstreamPool::key);
+    let cache_scope = if client_filtering_enabled {
+        route_key.map(str::to_string)
+    } else {
+        Some(match route_key {
+            Some(route) => format!("{route}:filter-bypass"),
+            None => "filter-bypass".to_string(),
+        })
+    };
+    let cache_key =
+        QueryCacheKey::from_query(&parsed_query).map(|key| key.with_route(cache_scope.as_deref()));
     if let Some(cache_key) = cache_key.as_ref()
         && let Some(cache_hit) =
             lookup_cached_response(&context.dns_cache, cache_key, query, current_second())
     {
-        if !protection_is_paused(&context.protection_paused_until)
+        if filtering_active
             && let Some(block) = response_protection_block(
                 &filter,
                 question,
@@ -539,6 +552,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     context.dns_cache.clone(),
                     context.dns_cache_config.clone(),
                     Arc::clone(&context.filter_runtime),
+                    filtering_active,
                 );
             }
         }
@@ -582,7 +596,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         &context.fallback_next_upstream,
         &context.stats,
     );
-    if !protection_is_paused(&context.protection_paused_until)
+    if filtering_active
         && let Ok(forwarded) = &forward_result
         && let Some(block) = response_protection_block(
             &filter,
@@ -779,6 +793,7 @@ fn deliver_response_protection_block(
     record_response_blocked(
         &context.stats,
         metadata.domain,
+        client_addr.ip(),
         &block.rule_match.source,
         block.kind,
         context.detailed_runtime_stats,
@@ -1174,6 +1189,7 @@ fn refresh_cache_async(
     dns_cache: Option<Arc<DnsCacheStore>>,
     dns_cache_config: Option<DnsCacheConfig>,
     filter_runtime: SharedFilterRuntime,
+    filtering_active: bool,
 ) {
     let Some(cache) = dns_cache else {
         return;
@@ -1206,16 +1222,17 @@ fn refresh_cache_async(
             &stats,
         ) {
             Ok(forwarded) => {
-                let blocked = parse_query(&query).ok().is_some_and(|parsed| {
-                    let filter = current_filter_runtime(&filter_runtime);
-                    response_protection_block(
-                        &filter,
-                        &parsed.question,
-                        &forwarded.response,
-                        routed_upstream.is_some(),
-                    )
-                    .is_some()
-                });
+                let blocked = filtering_active
+                    && parse_query(&query).ok().is_some_and(|parsed| {
+                        let filter = current_filter_runtime(&filter_runtime);
+                        response_protection_block(
+                            &filter,
+                            &parsed.question,
+                            &forwarded.response,
+                            routed_upstream.is_some(),
+                        )
+                        .is_some()
+                    });
                 if blocked {
                     cache.finish_refresh(&cache_key);
                     cache.record_refresh_failed(refresh_reason);

@@ -37,6 +37,8 @@ struct StatusParams {
     force_log_stats: bool,
     #[serde(default = "default_true")]
     include_log_stats: bool,
+    #[serde(default)]
+    statistics_hours: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +70,8 @@ struct QueryLogRuleParams {
 struct DnsDiagnosticParams {
     domain: String,
     query_type: String,
+    #[serde(default)]
+    client_ip: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,7 +239,11 @@ fn dispatch_request(
         }
         "get_status" => {
             let params: StatusParams = parse_params(params)?;
-            to_value(state.status_with_log_stats(params.force_log_stats, params.include_log_stats))?
+            to_value(state.status_with_log_stats_window(
+                params.force_log_stats,
+                params.include_log_stats,
+                params.statistics_hours,
+            ))?
         }
         "get_query_logs" => {
             let params: QueryLogsParams = parse_params(params)?;
@@ -262,6 +270,7 @@ fn dispatch_request(
                 state,
                 params.domain,
                 params.query_type,
+                params.client_ip,
             )?)?
         }
         "clear_query_logs" => to_value(clear_query_logs_blocking(state)?)?,

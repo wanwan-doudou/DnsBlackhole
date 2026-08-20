@@ -5,6 +5,7 @@ use std::{
 
 use crate::config::{AppConfig, ClientUpstreamRuleSpec, DomainUpstreamRuleSpec};
 
+use super::ip_network::IpNetwork;
 use super::upstream::{RuntimeUpstream, build_runtime_upstreams_with_dnssec};
 
 pub(crate) struct RouteUpstreamPool {
@@ -29,19 +30,6 @@ struct ClientRoute {
     pool: Arc<RouteUpstreamPool>,
 }
 
-#[derive(Clone, Copy)]
-struct IpNetwork {
-    family: IpFamily,
-    network: u128,
-    prefix_len: u8,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IpFamily {
-    V4,
-    V6,
-}
-
 impl UpstreamRoutes {
     pub(crate) fn from_config(config: &AppConfig) -> Result<Self, String> {
         let bootstrap = config.bootstrap_servers()?;
@@ -63,7 +51,7 @@ impl UpstreamRoutes {
             .clients
             .iter()
             .filter(|route| route.network.contains(client))
-            .max_by_key(|route| route.network.prefix_len);
+            .max_by_key(|route| route.network.prefix_len());
         if let Some(route) = client_route {
             return Some(Arc::clone(&route.pool));
         }
@@ -89,40 +77,6 @@ impl DomainRoute {
                 && domain
                     .strip_suffix(&self.pattern)
                     .is_some_and(|prefix| prefix.ends_with('.')))
-    }
-}
-
-impl IpNetwork {
-    fn parse(value: &str) -> Result<Self, String> {
-        let (ip, prefix_len) = if let Some((ip, prefix_len)) = value.split_once('/') {
-            (
-                ip.parse::<IpAddr>()
-                    .map_err(|_| format!("客户端上游策略 IP 无效：{ip}"))?,
-                prefix_len
-                    .parse::<u8>()
-                    .map_err(|_| format!("客户端上游策略前缀无效：{prefix_len}"))?,
-            )
-        } else {
-            let ip = value
-                .parse::<IpAddr>()
-                .map_err(|_| format!("客户端上游策略 IP 无效：{value}"))?;
-            let prefix_len = if ip.is_ipv4() { 32 } else { 128 };
-            (ip, prefix_len)
-        };
-        let (family, bits, raw) = ip_parts(ip);
-        if prefix_len > bits {
-            return Err(format!("客户端上游策略前缀长度无效：{value}"));
-        }
-        Ok(Self {
-            family,
-            network: prefix_network(raw, bits, prefix_len),
-            prefix_len,
-        })
-    }
-
-    fn contains(&self, ip: IpAddr) -> bool {
-        let (family, bits, raw) = ip_parts(ip);
-        family == self.family && prefix_network(raw, bits, self.prefix_len) == self.network
     }
 }
 
@@ -157,7 +111,7 @@ fn build_client_route(
     dnssec_enabled: bool,
 ) -> Result<ClientRoute, String> {
     Ok(ClientRoute {
-        network: IpNetwork::parse(&spec.network)?,
+        network: IpNetwork::parse(&spec.network, "客户端上游策略")?,
         pool: Arc::new(RouteUpstreamPool {
             key: format!("client:{}", spec.network),
             upstreams: build_runtime_upstreams_with_dnssec(
@@ -168,21 +122,6 @@ fn build_client_route(
             next_upstream: AtomicUsize::new(0),
         }),
     })
-}
-
-fn ip_parts(ip: IpAddr) -> (IpFamily, u8, u128) {
-    match ip {
-        IpAddr::V4(ip) => (IpFamily::V4, 32, u32::from(ip) as u128),
-        IpAddr::V6(ip) => (IpFamily::V6, 128, u128::from(ip)),
-    }
-}
-
-fn prefix_network(value: u128, bits: u8, prefix_len: u8) -> u128 {
-    if prefix_len == 0 {
-        return 0;
-    }
-    let shift = u32::from(bits - prefix_len);
-    (value >> shift) << shift
 }
 
 #[cfg(test)]

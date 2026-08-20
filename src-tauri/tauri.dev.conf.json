@@ -10,8 +10,8 @@
         "title": "DnsBlackhole Dev",
         "width": 980,
         "height": 720,
-        "minWidth": 980,
-        "minHeight": 560,
+        "minWidth": 840,
+        "minHeight": 540,
         "visible": true,
         "center": true
       }

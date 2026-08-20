@@ -4,6 +4,14 @@ import type { ChartPoint, HistoryPoint, TrafficBucket } from "./types";
 
 export const DAILY_TREND_DAYS = 30;
 
+export function trendDayCountForHours(hours: number): number {
+  if (hours === 0) {
+    return DAILY_TREND_DAYS;
+  }
+  // 小时窗口通常跨越两个自然日；额外保留起始日才能避免 24 小时只剩一个点。
+  return Math.min(DAILY_TREND_DAYS, Math.max(2, Math.ceil(hours / 24) + 1));
+}
+
 export function buildDailyTrafficSeries(
   buckets: TrafficBucket[] | undefined,
   field: "queries" | "blocked",

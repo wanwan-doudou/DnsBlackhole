@@ -78,6 +78,8 @@ pub struct DnsStats {
     #[serde(default)]
     pub client_requests: HashMap<String, u64>,
     #[serde(default)]
+    pub client_blocked: HashMap<String, u64>,
+    #[serde(default)]
     pub blocklist_hits: HashMap<String, u64>,
     pub traffic: Vec<TrafficBucket>,
     pub upstream_requests: Vec<UpstreamRequestStat>,
@@ -228,6 +230,10 @@ pub(crate) fn record_blocked_query(
             .or_default() += 1;
         *current
             .client_requests
+            .entry(client_ip.to_string())
+            .or_default() += 1;
+        *current
+            .client_blocked
             .entry(client_ip.to_string())
             .or_default() += 1;
         *current
@@ -398,6 +404,7 @@ pub(crate) enum ResponseProtectionKind {
 pub(crate) fn record_response_blocked(
     stats: &Arc<Mutex<DnsStats>>,
     domain: &str,
+    client_ip: IpAddr,
     rule_source: &str,
     kind: ResponseProtectionKind,
     detailed_runtime_stats: bool,
@@ -416,6 +423,10 @@ pub(crate) fn record_response_blocked(
         *current
             .blocked_domains
             .entry(domain.to_string())
+            .or_default() += 1;
+        *current
+            .client_blocked
+            .entry(client_ip.to_string())
             .or_default() += 1;
         *current
             .blocklist_hits

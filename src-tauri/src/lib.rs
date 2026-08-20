@@ -1,4 +1,5 @@
 mod config;
+mod config_transfer;
 mod database;
 mod dns;
 mod filters;
@@ -13,11 +14,14 @@ use std::path::Path;
 use std::{io, sync::Arc, time::Instant};
 
 use config::AppConfig;
+use config_transfer::{
+    export_config_file, export_diagnostic_file, export_query_log_file, import_config_file,
+};
 #[cfg(not(any(target_os = "macos", windows)))]
 use database::Database;
 use database::QueryLogPage;
-use dns::DnsDiagnosticReport;
 use dns::RuntimeStatus;
+use dns::{DnsDiagnosticReport, RuleAnalysis};
 use service_core::QueryLogRuleActionResult;
 #[cfg(not(any(target_os = "macos", windows)))]
 use service_core::{
@@ -55,6 +59,13 @@ fn record_frontend_timing(
         .map(|value| format!("，{value}"))
         .unwrap_or_default();
     eprintln!("[加载耗时][前端 +{since_start_ms:.1} ms] {module}：{duration_ms:.1} ms{detail}");
+}
+
+#[tauri::command]
+async fn analyze_custom_rules(rules: String) -> Result<RuleAnalysis, String> {
+    tauri::async_runtime::spawn_blocking(move || dns::analyze_rules(&rules))
+        .await
+        .map_err(|error| format!("分析自定义规则任务异常：{error}"))
 }
 
 #[tauri::command]
@@ -505,6 +516,7 @@ async fn get_status(
     state: tauri::State<'_, Arc<GuiState>>,
     force: Option<bool>,
     include_log_stats: Option<bool>,
+    statistics_hours: Option<u32>,
 ) -> Result<RuntimeStatus, String> {
     let started = Instant::now();
     #[cfg(any(target_os = "macos", windows))]
@@ -519,14 +531,17 @@ async fn get_status(
                 &serde_json::json!({
                     "force_log_stats": force.unwrap_or(false),
                     "include_log_stats": include_log_stats.unwrap_or(true),
+                    "statistics_hours": statistics_hours,
                 }),
             )
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
-            Ok(state
-                .local()?
-                .status_with_log_stats(force.unwrap_or(false), include_log_stats.unwrap_or(true)))
+            Ok(state.local()?.status_with_log_stats_window(
+                force.unwrap_or(false),
+                include_log_stats.unwrap_or(true),
+                statistics_hours,
+            ))
         }
     })
     .await
@@ -626,6 +641,7 @@ async fn run_dns_diagnostic(
     state: tauri::State<'_, Arc<GuiState>>,
     domain: String,
     query_type: String,
+    client_ip: Option<String>,
 ) -> Result<DnsDiagnosticReport, String> {
     #[cfg(any(target_os = "macos", windows))]
     let _ = state;
@@ -636,12 +652,21 @@ async fn run_dns_diagnostic(
         {
             privileged_bridge::ServiceClient::call(
                 "run_dns_diagnostic",
-                &serde_json::json!({ "domain": domain, "query_type": query_type }),
+                &serde_json::json!({
+                    "domain": domain,
+                    "query_type": query_type,
+                    "client_ip": client_ip,
+                }),
             )
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
-            service_core::run_dns_diagnostic_blocking(&state.local()?, domain, query_type)
+            service_core::run_dns_diagnostic_blocking(
+                &state.local()?,
+                domain,
+                query_type,
+                client_ip,
+            )
         }
     })
     .await
@@ -1000,6 +1025,11 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             record_frontend_timing,
+            analyze_custom_rules,
+            export_config_file,
+            import_config_file,
+            export_diagnostic_file,
+            export_query_log_file,
             detect_system_proxy,
             get_config,
             get_storage_info,
@@ -1227,12 +1257,38 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_statistics_range_preserves_explicit_lifetime_request() {
+        assert_eq!(
+            service_core::resolve_statistics_hours(None, 30 * 24),
+            30 * 24
+        );
+        assert_eq!(service_core::resolve_statistics_hours(Some(0), 30 * 24), 0);
+        assert_eq!(
+            service_core::resolve_statistics_hours(Some(30 * 24), 7 * 24),
+            7 * 24
+        );
+        assert_eq!(
+            service_core::resolve_statistics_hours(Some(u32::MAX), 0),
+            crate::config::MAX_STATISTICS_RETENTION_HOURS,
+        );
+    }
+
+    #[test]
     fn filtering_config_change_rebuilds_filter_runtime() {
         let previous = AppConfig::default();
-        let mut next = previous.clone();
-        next.dns_rewrites = "nas.lan 192.168.1.10".into();
-
-        assert!(service_core::filter_runtime_changed(&previous, &next));
+        for next in [
+            AppConfig {
+                dns_rewrites: "nas.lan 192.168.1.10".into(),
+                ..previous.clone()
+            },
+            AppConfig {
+                client_filtering_rules: "192.168.1.50 => bypass".into(),
+                ..previous.clone()
+            },
+        ] {
+            assert!(service_core::filter_runtime_changed(&previous, &next));
+            assert!(!service_core::needs_dns_restart(&previous, &next));
+        }
     }
 
     #[test]

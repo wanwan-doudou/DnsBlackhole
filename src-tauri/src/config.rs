@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 15;
 pub(crate) const MAX_STATISTICS_RETENTION_HOURS: u32 = 24 * 365;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
@@ -54,6 +54,8 @@ pub struct AppConfig {
     pub domain_upstream_rules: String,
     #[serde(default)]
     pub client_upstream_rules: String,
+    #[serde(default)]
+    pub client_filtering_rules: String,
     #[serde(default = "default_allowed_clients")]
     pub allowed_clients: String,
     #[serde(default)]
@@ -182,6 +184,12 @@ pub(crate) struct ClientUpstreamRuleSpec {
     pub(crate) upstreams: Vec<UpstreamServer>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ClientFilteringRuleSpec {
+    pub(crate) network: String,
+    pub(crate) bypass: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct FilterSubscription {
@@ -245,6 +253,7 @@ impl Default for AppConfig {
             dnssec_enabled: false,
             domain_upstream_rules: String::new(),
             client_upstream_rules: String::new(),
+            client_filtering_rules: String::new(),
             allowed_clients: default_allowed_clients(),
             blocked_clients: String::new(),
             rate_limit_per_second: default_rate_limit_per_second(),
@@ -338,12 +347,19 @@ impl AppConfig {
         parse_client_upstream_rules(&self.client_upstream_rules, self.allow_insecure_http)
     }
 
+    pub(crate) fn client_filtering_rule_specs(
+        &self,
+    ) -> Result<Vec<ClientFilteringRuleSpec>, String> {
+        parse_client_filtering_rules(&self.client_filtering_rules)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.listen_socket_addrs()?;
         let upstreams = self.upstream_servers()?;
         let fallbacks = self.fallback_servers()?;
         let domain_rules = self.domain_upstream_rule_specs()?;
         let client_rules = self.client_upstream_rule_specs()?;
+        self.client_filtering_rule_specs()?;
         if self.dnssec_enabled
             && upstreams
                 .iter()
@@ -909,6 +925,49 @@ fn parse_client_upstream_rules(
             Ok(ClientUpstreamRuleSpec {
                 network: network.to_string(),
                 upstreams: parse_route_upstreams(index, upstreams, allow_insecure_http)?,
+            })
+        })
+        .collect()
+}
+
+fn parse_client_filtering_rules(value: &str) -> Result<Vec<ClientFilteringRuleSpec>, String> {
+    value
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+                return None;
+            }
+            Some((index, trimmed))
+        })
+        .map(|(index, line)| {
+            let (network, mode) = line.split_once("=>").ok_or_else(|| {
+                format!(
+                    "客户端过滤策略第 {} 行格式必须是“IP/CIDR => filter 或 bypass”",
+                    index + 1
+                )
+            })?;
+            let network = network.trim();
+            validate_ip_or_cidr(network).map_err(|_| {
+                format!(
+                    "客户端过滤策略第 {} 行必须以有效 IP 或 CIDR 开头：{network}",
+                    index + 1
+                )
+            })?;
+            let bypass = match mode.trim().to_ascii_lowercase().as_str() {
+                "filter" => false,
+                "bypass" => true,
+                _ => {
+                    return Err(format!(
+                        "客户端过滤策略第 {} 行模式只能是 filter 或 bypass",
+                        index + 1
+                    ));
+                }
+            };
+            Ok(ClientFilteringRuleSpec {
+                network: network.to_string(),
+                bypass,
             })
         })
         .collect()
@@ -1765,6 +1824,30 @@ mod tests {
 
         config.allowed_clients = "not-a-network".into();
 
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_and_parses_client_filtering_policies() {
+        let mut config = AppConfig {
+            client_filtering_rules: concat!(
+                "# 家长控制例外\n",
+                "192.168.1.50 => bypass\n",
+                "192.168.1.0/24 => filter\n",
+                "fd00::/8 => bypass",
+            )
+            .into(),
+            ..AppConfig::default()
+        };
+        config.validate().expect("客户端过滤策略应有效");
+        let rules = config.client_filtering_rule_specs().unwrap();
+        assert_eq!(rules.len(), 3);
+        assert!(rules[0].bypass);
+        assert!(!rules[1].bypass);
+
+        config.client_filtering_rules = "192.168.1.1 => disabled".into();
+        assert!(config.validate().is_err());
+        config.client_filtering_rules = "not-a-network => bypass".into();
         assert!(config.validate().is_err());
     }
 

@@ -330,6 +330,15 @@ impl AppState {
         force_log_stats: bool,
         include_log_stats: bool,
     ) -> RuntimeStatus {
+        self.status_with_log_stats_window(force_log_stats, include_log_stats, None)
+    }
+
+    pub(crate) fn status_with_log_stats_window(
+        &self,
+        force_log_stats: bool,
+        include_log_stats: bool,
+        statistics_hours: Option<u32>,
+    ) -> RuntimeStatus {
         let total_started = Instant::now();
         let config = self.current_config().unwrap_or_default();
         let summary = self
@@ -344,7 +353,9 @@ impl AppState {
             .unwrap_or_default();
         if config.statistics_enabled && include_log_stats {
             let log_stats_started = Instant::now();
-            match self.cached_log_stats(config.statistics_retention_hours, force_log_stats) {
+            let statistics_hours =
+                resolve_statistics_hours(statistics_hours, config.statistics_retention_hours);
+            match self.cached_log_stats(statistics_hours, force_log_stats) {
                 Ok(log_stats) => {
                     stats.queries = log_stats.queries;
                     stats.blocked = log_stats.blocked;
@@ -353,6 +364,7 @@ impl AppState {
                     stats.query_domains = log_stats.query_domains;
                     stats.blocked_domains = log_stats.blocked_domains;
                     stats.client_requests = log_stats.client_requests;
+                    stats.client_blocked = log_stats.client_blocked;
                     stats.blocklist_hits = log_stats.blocklist_hits;
                     stats.traffic = log_stats.traffic;
                     stats.upstream_requests = log_stats.upstream_requests;
@@ -474,6 +486,15 @@ impl AppState {
     }
 }
 
+pub(crate) fn resolve_statistics_hours(requested: Option<u32>, configured: u32) -> u32 {
+    match requested {
+        None => configured,
+        Some(0) => 0,
+        Some(hours) if configured > 0 => hours.min(configured),
+        Some(hours) => hours.min(crate::config::MAX_STATISTICS_RETENTION_HOURS),
+    }
+}
+
 struct FilterUpdateProgressGuard<'a>(&'a AppState);
 
 impl Drop for FilterUpdateProgressGuard<'_> {
@@ -539,6 +560,7 @@ pub(crate) fn filter_runtime_changed(previous: &AppConfig, next: &AppConfig) -> 
         || previous.rebinding_allowed_domains != next.rebinding_allowed_domains
         || previous.cname_cloaking_enabled != next.cname_cloaking_enabled
         || previous.dns_rewrites != next.dns_rewrites
+        || previous.client_filtering_rules != next.client_filtering_rules
         || previous.query_log_ignored_domains != next.query_log_ignored_domains
         || previous.statistics_ignored_domains != next.statistics_ignored_domains
 }
@@ -724,6 +746,7 @@ pub(crate) fn run_dns_diagnostic_blocking(
     state: &AppState,
     domain: String,
     query_type: String,
+    client_ip: Option<String>,
 ) -> Result<DnsDiagnosticReport, String> {
     let config = state.current_config()?;
     let filter = state.active_filter_runtime();
@@ -735,6 +758,7 @@ pub(crate) fn run_dns_diagnostic_blocking(
         protection_paused,
         &domain,
         &query_type,
+        client_ip.as_deref(),
     )
 }
 

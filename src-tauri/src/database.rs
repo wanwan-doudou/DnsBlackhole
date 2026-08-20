@@ -23,6 +23,13 @@ use crate::{
     },
 };
 
+mod rankings;
+
+use rankings::{
+    blocklist_hit_counts, client_counts, grouped_domain_counts, traffic_buckets,
+    upstream_avg_latency, upstream_request_counts,
+};
+
 const INSERT_QUERY_LOG_SQL: &str = "
     INSERT INTO query_logs
         (
@@ -113,6 +120,7 @@ const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const HOURLY_STATISTICS_INITIALIZED_KEY: &str = "hourly_statistics_initialized_v1";
 const LIFETIME_STATISTICS_INITIALIZED_KEY: &str = "lifetime_statistics_initialized_v1";
+const CLIENT_BLOCKED_STATISTICS_INITIALIZED_KEY: &str = "client_blocked_statistics_v1";
 const QUERY_LOG_SEARCH_INITIALIZED_KEY: &str = "query_log_search_initialized_v1";
 /// 结构迁移把旧页留在 freelist 时打上此标记，启动流程随后显式压缩一次。
 /// 压缩成功才清除，压缩失败或中途退出都会在下次启动重试。
@@ -259,6 +267,7 @@ pub struct LogStats {
     pub query_domains: HashMap<String, u64>,
     pub blocked_domains: HashMap<String, u64>,
     pub client_requests: HashMap<String, u64>,
+    pub client_blocked: HashMap<String, u64>,
     pub blocklist_hits: HashMap<String, u64>,
     pub traffic: Vec<TrafficBucket>,
     pub upstream_requests: Vec<UpstreamRequestStat>,
@@ -984,6 +993,7 @@ fn log_stats_with_connection(conn: &Connection, since_hour: u64) -> Result<LogSt
     let (queries, blocked, forwarded, failed, dashboard_started_at, dashboard_ended_at) =
         total_log_counts(conn, since_hour)?;
     let (query_domains, blocked_domains) = grouped_domain_counts(conn, since_hour)?;
+    let (client_requests, client_blocked) = client_counts(conn, since_hour)?;
     Ok(LogStats {
         queries,
         blocked,
@@ -991,7 +1001,8 @@ fn log_stats_with_connection(conn: &Connection, since_hour: u64) -> Result<LogSt
         failed,
         query_domains,
         blocked_domains,
-        client_requests: client_request_counts(conn, since_hour)?,
+        client_requests,
+        client_blocked,
         blocklist_hits: blocklist_hit_counts(conn, since_hour)?,
         traffic: traffic_buckets(conn)?,
         upstream_requests: upstream_request_counts(conn, since_hour)?,
@@ -1030,8 +1041,10 @@ fn parallel_log_stats(
             let conn = clients_conn
                 .lock()
                 .map_err(|_| "数据库客户端排行连接已损坏".to_string())?;
+            let (client_requests, client_blocked) = client_counts(&conn, since_hour)?;
             Ok::<_, String>((
-                client_request_counts(&conn, since_hour)?,
+                client_requests,
+                client_blocked,
                 blocklist_hit_counts(&conn, since_hour)?,
             ))
         });
@@ -1054,7 +1067,7 @@ fn parallel_log_stats(
         let (query_domains, blocked_domains) = domains
             .join()
             .map_err(|_| "数据库域名排行线程异常".to_string())??;
-        let (client_requests, blocklist_hits) = clients
+        let (client_requests, client_blocked, blocklist_hits) = clients
             .join()
             .map_err(|_| "数据库客户端排行线程异常".to_string())??;
         let (upstream_requests, upstream_avg_latency) = upstreams
@@ -1069,6 +1082,7 @@ fn parallel_log_stats(
             query_domains,
             blocked_domains,
             client_requests,
+            client_blocked,
             blocklist_hits,
             traffic,
             upstream_requests,
@@ -1255,6 +1269,7 @@ fn aggregate_hourly_stats(
                 },
                 StatDelta {
                     queries: 1,
+                    blocked: u64::from(entry.blocked),
                     ..StatDelta::default()
                 },
             );
@@ -1665,6 +1680,7 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     }
     initialize_hourly_statistics(conn)?;
     initialize_lifetime_statistics(conn)?;
+    initialize_client_blocked_statistics(conn)?;
     initialize_query_log_search(conn, query_log_search_existed)?;
     if dropped_legacy_search {
         mark_pending_compaction(conn)?;
@@ -1716,6 +1732,49 @@ fn initialize_lifetime_statistics(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("保存永久统计迁移状态失败：{e}"))?;
     tx.commit()
         .map_err(|e| format!("提交永久统计迁移失败：{e}"))
+}
+
+fn initialize_client_blocked_statistics(conn: &Connection) -> Result<(), String> {
+    if database_meta_key_exists(
+        conn,
+        CLIENT_BLOCKED_STATISTICS_INITIALIZED_KEY,
+        "检查客户端拦截统计迁移状态",
+    )? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TEMP TABLE client_blocked_backfill AS
+             SELECT timestamp / 3600 AS hour, client_ip AS value, COUNT(*) AS blocked
+             FROM query_logs
+             WHERE blocked = 1 AND client_ip IS NOT NULL AND client_ip <> ''
+             GROUP BY timestamp / 3600, client_ip;
+         CREATE UNIQUE INDEX client_blocked_backfill_key
+             ON client_blocked_backfill(hour, value);
+         UPDATE statistics_hourly
+         SET blocked = COALESCE((
+             SELECT backfill.blocked
+             FROM client_blocked_backfill AS backfill
+             WHERE backfill.hour = statistics_hourly.hour
+               AND backfill.value = statistics_hourly.value
+         ), 0)
+         WHERE dimension = 'client';
+         UPDATE dashboard_summary_stats
+         SET blocked = COALESCE((
+             SELECT SUM(hourly.blocked)
+             FROM statistics_hourly AS hourly
+             WHERE hourly.dimension = 'client'
+               AND hourly.value = dashboard_summary_stats.value
+         ), 0)
+         WHERE scope = 'all' AND dimension = 'client';
+         DROP TABLE client_blocked_backfill;",
+    )
+    .map_err(|error| format!("回填客户端拦截统计失败：{error}"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO database_meta (key, value) VALUES (?1, '1')",
+        params![CLIENT_BLOCKED_STATISTICS_INITIALIZED_KEY],
+    )
+    .map_err(|error| format!("保存客户端拦截统计迁移状态失败：{error}"))?;
+    Ok(())
 }
 
 fn rebuild_lifetime_statistics(conn: &Connection, since_hour: Option<i64>) -> Result<(), String> {
@@ -2154,362 +2213,6 @@ fn add_column_if_missing(
     Ok(())
 }
 
-fn grouped_domain_counts(conn: &Connection, since_hour: u64) -> Result<DomainRankings, String> {
-    if since_hour == 0 {
-        return grouped_lifetime_domain_counts(conn);
-    }
-    let since = u64_to_db_i64(since_hour, "域名统计起始小时")?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT 0 AS ranking, value, queries AS count
-             FROM (
-                 SELECT value, SUM(queries) AS queries
-                 FROM statistics_hourly
-                 WHERE dimension = 'domain' AND hour >= ?1
-                 GROUP BY value
-                 HAVING SUM(queries) > 0
-                 ORDER BY SUM(queries) DESC, value ASC
-                 LIMIT 200
-             )
-             UNION ALL
-             SELECT 1 AS ranking, value, blocked AS count
-             FROM (
-                 SELECT value, SUM(blocked) AS blocked
-                 FROM statistics_hourly
-                 WHERE dimension = 'domain' AND hour >= ?1
-                 GROUP BY value
-                 HAVING SUM(blocked) > 0
-                 ORDER BY SUM(blocked) DESC, value ASC
-                 LIMIT 200
-             )
-             ",
-        )
-        .map_err(|e| format!("准备域名排行查询失败：{e}"))?;
-    let rows = stmt
-        .query_map(params![since], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                read_u64(row, 2)?,
-            ))
-        })
-        .map_err(|e| format!("读取域名排行失败：{e}"))?;
-
-    let mut query_counts = HashMap::new();
-    let mut blocked_counts = HashMap::new();
-    for row in rows {
-        let (ranking, domain, count) = row.map_err(|e| format!("解析域名排行失败：{e}"))?;
-        match ranking {
-            0 => {
-                query_counts.insert(domain, count);
-            }
-            1 => {
-                blocked_counts.insert(domain, count);
-            }
-            _ => return Err("域名排行类型无效".into()),
-        }
-    }
-    Ok((query_counts, blocked_counts))
-}
-
-fn grouped_lifetime_domain_counts(conn: &Connection) -> Result<DomainRankings, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT 0 AS ranking, value, queries AS count
-             FROM (
-                 SELECT value, queries
-                 FROM dashboard_summary_stats
-                 WHERE scope = 'all' AND dimension = 'domain' AND queries > 0
-                 ORDER BY queries DESC, value ASC
-                 LIMIT 200
-             )
-             UNION ALL
-             SELECT 1 AS ranking, value, blocked AS count
-             FROM (
-                 SELECT value, blocked
-                 FROM dashboard_summary_stats
-                 WHERE scope = 'all' AND dimension = 'domain' AND blocked > 0
-                 ORDER BY blocked DESC, value ASC
-                 LIMIT 200
-             )",
-        )
-        .map_err(|e| format!("准备永久域名排行查询失败：{e}"))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                read_u64(row, 2)?,
-            ))
-        })
-        .map_err(|e| format!("读取永久域名排行失败：{e}"))?;
-
-    let mut query_counts = HashMap::new();
-    let mut blocked_counts = HashMap::new();
-    for row in rows {
-        let (ranking, domain, count) = row.map_err(|e| format!("解析永久域名排行失败：{e}"))?;
-        match ranking {
-            0 => {
-                query_counts.insert(domain, count);
-            }
-            1 => {
-                blocked_counts.insert(domain, count);
-            }
-            _ => return Err("永久域名排行类型无效".into()),
-        }
-    }
-    Ok((query_counts, blocked_counts))
-}
-
-fn client_request_counts(
-    conn: &Connection,
-    since_hour: u64,
-) -> Result<HashMap<String, u64>, String> {
-    if since_hour == 0 {
-        return lifetime_count_ranking(conn, "client", "queries", "客户端");
-    }
-    let since = u64_to_db_i64(since_hour, "客户端统计起始小时")?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT value, SUM(queries) AS queries
-             FROM statistics_hourly
-             WHERE dimension = 'client' AND hour >= ?1
-             GROUP BY value
-             HAVING SUM(queries) > 0
-             ORDER BY SUM(queries) DESC, value ASC
-             LIMIT 200",
-        )
-        .map_err(|e| format!("准备客户端排行查询失败：{e}"))?;
-    let rows = stmt
-        .query_map(params![since], |row| {
-            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
-        })
-        .map_err(|e| format!("读取客户端排行失败：{e}"))?;
-
-    let mut counts = HashMap::new();
-    for row in rows {
-        let (client, count) = row.map_err(|e| format!("解析客户端排行失败：{e}"))?;
-        counts.insert(client, count);
-    }
-    Ok(counts)
-}
-
-fn blocklist_hit_counts(
-    conn: &Connection,
-    since_hour: u64,
-) -> Result<HashMap<String, u64>, String> {
-    if since_hour == 0 {
-        return lifetime_count_ranking(conn, "blocklist", "blocked", "黑名单");
-    }
-    let since = u64_to_db_i64(since_hour, "黑名单统计起始小时")?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT value, SUM(blocked) AS blocked
-             FROM statistics_hourly
-             WHERE dimension = 'blocklist' AND hour >= ?1
-             GROUP BY value
-             HAVING SUM(blocked) > 0
-             ORDER BY SUM(blocked) DESC, value ASC
-             LIMIT 200",
-        )
-        .map_err(|e| format!("准备黑名单排行查询失败：{e}"))?;
-    let rows = stmt
-        .query_map(params![since], |row| {
-            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
-        })
-        .map_err(|e| format!("读取黑名单排行失败：{e}"))?;
-
-    let mut counts = HashMap::new();
-    for row in rows {
-        let (source, count) = row.map_err(|e| format!("解析黑名单排行失败：{e}"))?;
-        counts.insert(source, count);
-    }
-    Ok(counts)
-}
-
-fn lifetime_count_ranking(
-    conn: &Connection,
-    dimension: &str,
-    count_column: &str,
-    label: &str,
-) -> Result<HashMap<String, u64>, String> {
-    let sql = format!(
-        "SELECT value, {count_column}
-         FROM dashboard_summary_stats
-         WHERE scope = 'all' AND dimension = ?1 AND {count_column} > 0
-         ORDER BY {count_column} DESC, value ASC
-         LIMIT 200"
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("准备永久{label}排行查询失败：{e}"))?;
-    let rows = stmt
-        .query_map(params![dimension], |row| {
-            Ok((row.get::<_, String>(0)?, read_u64(row, 1)?))
-        })
-        .map_err(|e| format!("读取永久{label}排行失败：{e}"))?;
-    let mut counts = HashMap::new();
-    for row in rows {
-        let (value, count) = row.map_err(|e| format!("解析永久{label}排行失败：{e}"))?;
-        counts.insert(value, count);
-    }
-    Ok(counts)
-}
-
-fn traffic_buckets(conn: &Connection) -> Result<Vec<TrafficBucket>, String> {
-    let since_hour = unix_now().saturating_sub(TRAFFIC_RETENTION_HOURS * 3600) / 3600;
-    let since = u64_to_db_i64(since_hour, "趋势统计起始小时")?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT
-            CAST(strftime(
-                '%s',
-                datetime(hour * 3600, 'unixepoch', 'localtime', 'start of day'),
-                'utc'
-            ) AS INTEGER) / 60 AS bucket_minute,
-            SUM(queries),
-            SUM(blocked)
-         FROM statistics_hourly
-         WHERE dimension = 'total' AND value = '' AND hour >= ?1
-         GROUP BY date(hour * 3600, 'unixepoch', 'localtime')
-         ORDER BY bucket_minute",
-        )
-        .map_err(|e| format!("准备趋势查询失败：{e}"))?;
-    let rows = stmt
-        .query_map(params![since], |row| {
-            Ok(TrafficBucket {
-                minute: read_u64(row, 0)?,
-                queries: read_u64(row, 1)?,
-                blocked: read_u64(row, 2)?,
-            })
-        })
-        .map_err(|e| format!("读取趋势数据失败：{e}"))?;
-
-    let mut buckets = Vec::new();
-    for row in rows {
-        buckets.push(row.map_err(|e| format!("解析趋势数据失败：{e}"))?);
-    }
-    Ok(buckets)
-}
-
-fn upstream_request_counts(
-    conn: &Connection,
-    since_hour: u64,
-) -> Result<Vec<UpstreamRequestStat>, String> {
-    if since_hour == 0 {
-        let mut stmt = conn
-            .prepare(
-                "SELECT value, requests
-                 FROM dashboard_summary_stats
-                 WHERE scope = 'all' AND dimension = 'upstream' AND requests > 0
-                 ORDER BY requests DESC, value ASC
-                 LIMIT 200",
-            )
-            .map_err(|e| format!("准备永久上游请求排行失败：{e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(UpstreamRequestStat {
-                    upstream: row.get(0)?,
-                    requests: read_u64(row, 1)?,
-                })
-            })
-            .map_err(|e| format!("读取永久上游请求排行失败：{e}"))?;
-        return rows
-            .map(|row| row.map_err(|e| format!("解析永久上游请求排行失败：{e}")))
-            .collect();
-    }
-    let since = u64_to_db_i64(since_hour, "上游统计起始小时")?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT value, SUM(requests) AS requests
-             FROM statistics_hourly
-             WHERE dimension = 'upstream' AND hour >= ?1
-             GROUP BY value
-             HAVING SUM(requests) > 0
-             ORDER BY SUM(requests) DESC, value ASC
-             LIMIT 200",
-        )
-        .map_err(|e| format!("准备上游请求排行失败：{e}"))?;
-    let rows = stmt
-        .query_map(params![since], |row| {
-            Ok(UpstreamRequestStat {
-                upstream: row.get(0)?,
-                requests: read_u64(row, 1)?,
-            })
-        })
-        .map_err(|e| format!("读取上游请求排行失败：{e}"))?;
-
-    let mut stats = Vec::new();
-    for row in rows {
-        stats.push(row.map_err(|e| format!("解析上游请求排行失败：{e}"))?);
-    }
-    Ok(stats)
-}
-
-fn upstream_avg_latency(
-    conn: &Connection,
-    since_hour: u64,
-) -> Result<Vec<UpstreamLatencyStat>, String> {
-    if since_hour == 0 {
-        let mut stmt = conn
-            .prepare(
-                "SELECT
-                    value,
-                    CAST(ROUND(
-                        CAST(latency_total_ms AS REAL) / latency_samples
-                    ) AS INTEGER)
-                 FROM dashboard_summary_stats
-                 WHERE scope = 'all'
-                   AND dimension = 'upstream'
-                   AND latency_samples > 0
-                 ORDER BY CAST(latency_total_ms AS REAL) / latency_samples ASC, value ASC
-                 LIMIT 200",
-            )
-            .map_err(|e| format!("准备永久上游响应时间排行失败：{e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(UpstreamLatencyStat {
-                    upstream: row.get(0)?,
-                    avg_ms: read_u64(row, 1)?,
-                })
-            })
-            .map_err(|e| format!("读取永久上游响应时间排行失败：{e}"))?;
-        return rows
-            .map(|row| row.map_err(|e| format!("解析永久上游响应时间排行失败：{e}")))
-            .collect();
-    }
-    let since = u64_to_db_i64(since_hour, "上游延迟统计起始小时")?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT
-                value,
-                CAST(ROUND(
-                    CAST(SUM(latency_total_ms) AS REAL) / SUM(latency_samples)
-                ) AS INTEGER)
-             FROM statistics_hourly
-             WHERE dimension = 'upstream' AND hour >= ?1
-             GROUP BY value
-             HAVING SUM(latency_samples) > 0
-             ORDER BY CAST(SUM(latency_total_ms) AS REAL) / SUM(latency_samples) ASC, value ASC
-             LIMIT 200",
-        )
-        .map_err(|e| format!("准备上游响应时间排行失败：{e}"))?;
-    let rows = stmt
-        .query_map(params![since], |row| {
-            Ok(UpstreamLatencyStat {
-                upstream: row.get(0)?,
-                avg_ms: read_u64(row, 1)?,
-            })
-        })
-        .map_err(|e| format!("读取上游响应时间排行失败：{e}"))?;
-
-    let mut stats = Vec::new();
-    for row in rows {
-        stats.push(row.map_err(|e| format!("解析上游响应时间排行失败：{e}"))?);
-    }
-    Ok(stats)
-}
-
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2691,6 +2394,7 @@ mod tests {
         assert_eq!(stats.upstream_avg_latency[0].avg_ms, 24);
         // 两条日志的客户端 IP 匿名化后同属 192.168.1.0
         assert_eq!(stats.client_requests.get("192.168.1.0"), Some(&2));
+        assert_eq!(stats.client_blocked.get("192.168.1.0"), Some(&1));
         assert_eq!(stats.blocklist_hits.get("测试清单"), Some(&1));
         assert_eq!(stats.blocklist_hits.len(), 1);
 
@@ -2755,6 +2459,36 @@ mod tests {
         assert_eq!(expired.queries, 0);
         assert_eq!(expired.blocked, 0);
         assert!(expired.query_domains.is_empty());
+    }
+
+    #[test]
+    fn finite_domain_rankings_aggregate_queries_and_blocks_in_one_window() {
+        let db = Database::open_in_memory().expect("db should open");
+        let current_hour = unix_now() / 3600;
+        let previous_hour = current_hour.saturating_sub(1);
+        {
+            let conn = db.lock().expect("database should lock");
+            conn.execute(
+                "INSERT INTO statistics_hourly
+                    (hour, dimension, value, queries, blocked)
+                 VALUES
+                    (?1, 'domain', 'popular.example', 80, 1),
+                    (?2, 'domain', 'popular.example', 40, 2),
+                    (?1, 'domain', 'blocked.example', 2, 50),
+                    (?2, 'domain', 'blocked.example', 3, 30)",
+                params![
+                    u64_to_db_i64(current_hour, "测试当前小时").expect("hour should fit"),
+                    u64_to_db_i64(previous_hour, "测试上一小时").expect("hour should fit"),
+                ],
+            )
+            .expect("hourly domain statistics should insert");
+        }
+
+        let stats = db.log_stats(24).expect("finite statistics should load");
+        assert_eq!(stats.query_domains.get("popular.example"), Some(&120));
+        assert_eq!(stats.query_domains.get("blocked.example"), Some(&5));
+        assert_eq!(stats.blocked_domains.get("popular.example"), Some(&3));
+        assert_eq!(stats.blocked_domains.get("blocked.example"), Some(&80));
     }
 
     #[test]

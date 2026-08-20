@@ -1,7 +1,9 @@
 mod access;
 mod cache;
+mod client_policy;
 mod diagnostics;
 mod filter_runtime;
+mod ip_network;
 mod protocol;
 mod rewrites;
 mod rule_cache;
@@ -21,7 +23,7 @@ pub(crate) use protocol::{DnsResponseAnswer, DnsResponseSummary};
 #[cfg(test)]
 pub(crate) use rule_cache::{RULE_LOAD_TEST_GUARD, forget_active_rules};
 pub(crate) use rule_cache::{RuleLoadSource, clear_rule_cache, load_or_compile_rules};
-pub use rules::{RuleSummary, summarize_rules};
+pub use rules::{RuleAnalysis, RuleSummary, analyze_rules, summarize_rules};
 pub use server::DnsServer;
 pub(crate) use stats::apply_cache_stats;
 pub use stats::{
@@ -40,6 +42,7 @@ mod tests {
     use crate::config::{AppConfig, BlockingMode};
 
     use super::{
+        analyze_rules,
         cache::{DnsCache, DnsCacheConfig, QueryCacheKey, cache_ttl_seconds},
         protocol::{
             BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_CNAME, TYPE_SOA,
@@ -65,6 +68,27 @@ mod tests {
         assert!(rules.is_blocked("example.org", TYPE_A));
         assert!(rules.is_blocked("ads.example.org", TYPE_A));
         assert!(!rules.is_blocked("badexample.org", TYPE_A));
+    }
+
+    #[test]
+    fn rule_analysis_reports_exact_ignored_lines() {
+        let analysis = analyze_rules(concat!(
+            "||ads.example^\n",
+            "/tracker\\d+/\n",
+            "||valid.example^$third-party\n",
+            "bad domain\n",
+            "@@||safe.example^\n",
+        ));
+
+        assert_eq!(analysis.summary.block_rules, 1);
+        assert_eq!(analysis.summary.allow_rules, 1);
+        assert_eq!(analysis.diagnostics.len(), 3);
+        assert_eq!(analysis.diagnostics[0].line, 2);
+        assert_eq!(analysis.diagnostics[0].reason, "regex");
+        assert_eq!(analysis.diagnostics[1].line, 3);
+        assert_eq!(analysis.diagnostics[1].reason, "unsupported");
+        assert_eq!(analysis.diagnostics[2].line, 4);
+        assert_eq!(analysis.diagnostics[2].severity, "error");
     }
 
     /// 增量合并自定义规则必须和"清单+自定义"整体编译产生完全相同的判定与统计，
@@ -482,6 +506,10 @@ mod tests {
         let query = a_query("example.org");
         let parsed = parse_query(&query).expect("query should parse");
         let base_key = QueryCacheKey::from_query(&parsed).expect("plain query should be cacheable");
+        assert_ne!(
+            base_key.clone().with_route(Some("filter")),
+            base_key.clone().with_route(Some("filter-bypass")),
+        );
 
         let mut cd_query = query.clone();
         cd_query[3] |= 0x10;

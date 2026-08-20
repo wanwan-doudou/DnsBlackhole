@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppConfig,
   DnsDiagnosticReport,
+  RuleAnalysis,
   FilterCacheClearResult,
   FilterUpdateProgress,
   FilterUpdateResult,
@@ -18,6 +19,10 @@ import type {
   WindowsSystemDnsFallbackSelection,
   WindowsSystemDnsStatus,
 } from "./types";
+
+export function analyzeCustomRules(rules: string): Promise<RuleAnalysis> {
+  return timedInvoke<RuleAnalysis>("analyze_custom_rules", { rules });
+}
 
 type QueryLogRequest = {
   filter: QueryLogFilter;
@@ -51,8 +56,16 @@ export function saveConfig(config: AppConfig): Promise<RuntimeStatus> {
   return timedInvoke<RuntimeStatus>("save_config", { config });
 }
 
-export function getStatus(force: boolean, includeLogStats = true): Promise<RuntimeStatus> {
-  return timedInvoke<RuntimeStatus>("get_status", { force, includeLogStats });
+export function getStatus(
+  force: boolean,
+  includeLogStats = true,
+  statisticsHours?: number,
+): Promise<RuntimeStatus> {
+  return timedInvoke<RuntimeStatus>("get_status", {
+    force,
+    includeLogStats,
+    statisticsHours: statisticsHours ?? null,
+  });
 }
 
 export function getQueryLogs(request: QueryLogRequest): Promise<QueryLogPage> {
@@ -78,8 +91,33 @@ export function applyQueryLogRule(
 export function runDnsDiagnostic(
   domain: string,
   queryType: string,
+  clientIp?: string,
 ): Promise<DnsDiagnosticReport> {
-  return timedInvoke<DnsDiagnosticReport>("run_dns_diagnostic", { domain, queryType });
+  return timedInvoke<DnsDiagnosticReport>("run_dns_diagnostic", {
+    domain,
+    queryType,
+    clientIp: clientIp || null,
+  });
+}
+
+export function exportConfigFile(path: string, config: AppConfig): Promise<void> {
+  return timedInvoke<void>("export_config_file", { path, config });
+}
+
+export function importConfigFile(path: string): Promise<AppConfig> {
+  return timedInvoke<AppConfig>("import_config_file", { path });
+}
+
+export function exportDiagnosticFile(
+  path: string,
+  config: AppConfig,
+  status: RuntimeStatus | null,
+): Promise<void> {
+  return timedInvoke<void>("export_diagnostic_file", { path, config, status });
+}
+
+export function exportQueryLogFile(path: string, content: string): Promise<void> {
+  return timedInvoke<void>("export_query_log_file", { path, content });
 }
 
 export function clearStatistics(): Promise<RuntimeStatus> {

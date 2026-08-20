@@ -117,6 +117,7 @@ export type AppConfig = {
   dnssec_enabled: boolean;
   domain_upstream_rules: string;
   client_upstream_rules: string;
+  client_filtering_rules: string;
   allowed_clients: string;
   blocked_clients: string;
   rate_limit_per_second: number;
@@ -221,6 +222,7 @@ export type DnsStats = {
   query_domains?: Record<string, number>;
   blocked_domains?: Record<string, number>;
   client_requests?: Record<string, number>;
+  client_blocked?: Record<string, number>;
   blocklist_hits?: Record<string, number>;
   traffic?: TrafficBucket[];
   upstream_requests?: UpstreamRequestStat[];
@@ -322,9 +324,30 @@ export type UpstreamDiagnosticResult = {
 export type DnsDiagnosticReport = {
   domain: string;
   query_type: string;
-  local_status: "allowed" | "blocked" | "rewrite" | "paused" | "stopped";
+  client_ip: string | null;
+  client_policy: "filter" | "bypass";
+  client_policy_source: string | null;
+  local_status: "allowed" | "blocked" | "bypassed" | "rewrite" | "paused" | "stopped";
   local_detail: string;
+  matched_rule: string | null;
+  rule_source: string | null;
+  rule_type: string | null;
+  allowlist_rule: string | null;
+  important_overrode: boolean;
   upstreams: UpstreamDiagnosticResult[];
+};
+
+export type RuleLineDiagnostic = {
+  line: number;
+  severity: "warning" | "error";
+  reason: "regex" | "unsupported" | "invalid";
+  message: string;
+};
+
+export type RuleAnalysis = {
+  summary: RuleSummary;
+  disabled_rules: number;
+  diagnostics: RuleLineDiagnostic[];
 };
 
 export type FilterUpdateProgress = {

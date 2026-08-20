@@ -115,7 +115,9 @@ pub(crate) fn initialize_at(default_dir: PathBuf) -> Result<StorageBootstrap, St
                 Err(error) => {
                     let operation = match pending_action {
                         StorageTargetAction::UseExisting => "使用现有数据目录",
-                        StorageTargetAction::Migrate | StorageTargetAction::Current => "数据目录迁移",
+                        StorageTargetAction::Migrate | StorageTargetAction::Current => {
+                            "数据目录迁移"
+                        }
                     };
                     let error = format!("{operation}失败，已继续使用原目录：{error}");
                     locator.last_migration_error = Some(error.clone());
@@ -622,8 +624,8 @@ fn validate_existing_database(path: &Path) -> Result<(), String> {
             row.get::<_, String>(0)
         })
         .map_err(|error| format!("读取现有数据库配置失败：{error}"))?;
-    let mut config: crate::config::AppConfig = serde_json::from_str(&raw)
-        .map_err(|error| format!("解析现有数据库配置失败：{error}"))?;
+    let mut config: crate::config::AppConfig =
+        serde_json::from_str(&raw).map_err(|error| format!("解析现有数据库配置失败：{error}"))?;
     if config.schema_version > crate::config::CURRENT_CONFIG_SCHEMA_VERSION {
         return Err(format!(
             "现有数据库配置版本 {} 高于当前支持的版本 {}",
@@ -901,7 +903,10 @@ mod tests {
         );
         assert_eq!(info.pending_path.as_deref(), Some(expected_target.as_str()));
         let pending = read_locator(&current).expect("pending locator should read");
-        assert_eq!(pending.pending_action, Some(StorageTargetAction::UseExisting));
+        assert_eq!(
+            pending.pending_action,
+            Some(StorageTargetAction::UseExisting)
+        );
 
         let bootstrap = initialize_at(current.clone()).expect("existing data should adopt");
 
@@ -999,10 +1004,7 @@ mod tests {
 
         assert_eq!(data_dir, custom_data);
         assert_eq!(locator.pending_data_dir, Some(pending_data));
-        assert_eq!(
-            locator.pending_action,
-            Some(StorageTargetAction::Migrate)
-        );
+        assert_eq!(locator.pending_action, Some(StorageTargetAction::Migrate));
         assert_eq!(
             locator.last_migration_error.as_deref(),
             Some("previous error")

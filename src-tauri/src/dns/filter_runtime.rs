@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use crate::config::AppConfig;
 
 use super::{
+    client_policy::ClientFilteringPolicies,
     protocol::BlockingPolicy,
     rewrites::{CompiledRewrites, compile_rewrites},
     rules::{CompiledRules, DomainSet, compile_domain_set},
@@ -22,6 +23,7 @@ pub(crate) struct FilterRuntime {
     pub(crate) cname_cloaking_enabled: bool,
     pub(crate) log_ignore: DomainSet,
     pub(crate) statistics_ignore: DomainSet,
+    pub(crate) client_filtering: ClientFilteringPolicies,
 }
 
 impl FilterRuntime {
@@ -50,6 +52,8 @@ pub(crate) fn build_filter_runtime_with_rules(
         cname_cloaking_enabled: config.cname_cloaking_enabled,
         log_ignore: compile_domain_set(&config.query_log_ignored_domains),
         statistics_ignore: compile_domain_set(&config.statistics_ignored_domains),
+        client_filtering: ClientFilteringPolicies::from_config(config)
+            .expect("已验证的客户端过滤策略应能构建"),
     }
 }
 

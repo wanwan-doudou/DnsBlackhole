@@ -17,6 +17,21 @@ pub struct RuleSummary {
     pub ignored_invalid_rules: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleAnalysis {
+    pub summary: RuleSummary,
+    pub disabled_rules: usize,
+    pub diagnostics: Vec<RuleLineDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleLineDiagnostic {
+    pub line: usize,
+    pub severity: String,
+    pub reason: String,
+    pub message: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct CompiledRules {
     blocks: RuleSet,
@@ -204,6 +219,39 @@ pub fn summarize_rules(raw: &str) -> RuleSummary {
         }
     });
     summary
+}
+
+/// 为编辑器提供逐行反馈。诊断复用生产解析器，避免前端校验和实际生效结果不一致。
+pub fn analyze_rules(raw: &str) -> RuleAnalysis {
+    let mut analysis = RuleAnalysis {
+        summary: summarize_rules(raw),
+        disabled_rules: raw
+            .lines()
+            .filter(|line| badfilter_target(line).is_some())
+            .count(),
+        diagnostics: Vec::new(),
+    };
+    for (index, line) in raw.lines().enumerate() {
+        let summary = summarize_rules(line);
+        let diagnostic = if summary.ignored_regex_rules > 0 {
+            Some(("warning", "regex", "暂不支持正则表达式规则，该行不会生效"))
+        } else if summary.ignored_unsupported_rules > 0 {
+            Some(("warning", "unsupported", "包含不支持的修饰符，该行不会生效"))
+        } else if summary.ignored_invalid_rules > 0 {
+            Some(("error", "invalid", "规则格式或域名无效，该行不会生效"))
+        } else {
+            None
+        };
+        if let Some((severity, reason, message)) = diagnostic {
+            analysis.diagnostics.push(RuleLineDiagnostic {
+                line: index + 1,
+                severity: severity.to_string(),
+                reason: reason.to_string(),
+                message: message.to_string(),
+            });
+        }
+    }
+    analysis
 }
 
 pub fn compile_rules(raw: &str) -> CompiledRules {

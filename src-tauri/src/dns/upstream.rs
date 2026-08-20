@@ -16,17 +16,15 @@ use crate::config::{
     resolve_hostname_socket_addrs_until,
 };
 use futures_util::StreamExt;
-use hickory_client::{
-    client::Client as HickoryClient,
-    proto::{
-        DnsHandle,
-        h2::HttpsClientStreamBuilder,
-        op::{Edns, Message},
-        quic::QuicClientStreamBuilder,
-        runtime::TokioRuntimeProvider,
-        rustls::{client_config as hickory_tls_client_config, tls_client_connect},
-        udp::UdpClientStream,
-    },
+use hickory_net::{
+    DnsHandle,
+    client::Client,
+    h2::HttpsClientStream,
+    proto::op::{Edns, Message},
+    quic::QuicClientStreamBuilder,
+    runtime::TokioRuntimeProvider,
+    tls::{client_config as hickory_tls_client_config, tls_client_connect},
+    udp::UdpClientStream,
 };
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 
@@ -71,6 +69,8 @@ const PROBE_CACHE_TTL_SECONDS: u64 = 600;
 const PROBE_CACHE_MAX_ENTRIES: usize = 4096;
 const UPSTREAM_INIT_MAX_WORKERS: usize = 8;
 const DNSBLACKHOLE_USER_AGENT: &str = concat!("DnsBlackhole/", env!("CARGO_PKG_VERSION"));
+
+type HickoryClient = Client<TokioRuntimeProvider>;
 
 #[derive(Clone)]
 pub(crate) struct RuntimeUpstream {
@@ -560,9 +560,7 @@ async fn build_hickory_client(
             let connect = UdpClientStream::builder(address, provider)
                 .with_timeout(Some(UPSTREAM_TIMEOUT))
                 .build();
-            let (client, background) = HickoryClient::connect(connect)
-                .await
-                .map_err(|error| format!("创建 DNS 客户端失败：{error}"))?;
+            let (client, background) = HickoryClient::from_sender(connect);
             let _background = tokio::spawn(background);
             client
         }
@@ -577,36 +575,49 @@ async fn build_hickory_client(
                 endpoint.push('?');
                 endpoint.push_str(query);
             }
-            let connect = HttpsClientStreamBuilder::with_client_config(
-                Arc::new(hickory_tls_client_config()),
+            let connect = HttpsClientStream::builder(
+                Arc::new(
+                    hickory_tls_client_config()
+                        .map_err(|error| format!("创建 DoH TLS 配置失败：{error}"))?,
+                ),
                 provider,
             )
-            .build(address, hostname.to_string(), endpoint);
-            let (client, background) = HickoryClient::connect(connect)
+            .build(address, hostname.into(), endpoint.into());
+            let stream = connect
                 .await
                 .map_err(|error| format!("创建 DoH 客户端失败：{error}"))?;
+            let (client, background) = HickoryClient::from_sender(stream);
             let _background = tokio::spawn(background);
             client
         }
         UpstreamServer::Tls { hostname, .. } => {
+            let server_name = hostname
+                .clone()
+                .try_into()
+                .map_err(|error| format!("DoT 主机名无效：{error}"))?;
             let (stream, sender) = tls_client_connect(
                 address,
-                hostname.clone(),
-                Arc::new(hickory_tls_client_config()),
+                server_name,
+                Arc::new(
+                    hickory_tls_client_config()
+                        .map_err(|error| format!("创建 DoT TLS 配置失败：{error}"))?,
+                ),
                 provider,
             );
+            let stream = stream
+                .await
+                .map_err(|error| format!("创建 DoT 客户端失败：{error}"))?;
             let (client, background) =
-                HickoryClient::with_timeout(stream, sender, UPSTREAM_TIMEOUT, None)
-                    .await
-                    .map_err(|error| format!("创建 DoT 客户端失败：{error}"))?;
+                HickoryClient::with_timeout(stream, sender, UPSTREAM_TIMEOUT);
             let _background = tokio::spawn(background);
             client
         }
         UpstreamServer::Quic { hostname, .. } => {
-            let connect = QuicClientStreamBuilder::default().build(address, hostname.clone());
-            let (client, background) = HickoryClient::connect(connect)
+            let stream = QuicClientStreamBuilder::default()
+                .build(address, hostname.clone().into())
                 .await
                 .map_err(|error| format!("创建 DoQ 客户端失败：{error}"))?;
+            let (client, background) = HickoryClient::from_sender(stream);
             let _background = tokio::spawn(background);
             client
         }
@@ -629,11 +640,11 @@ fn forward_hickory(
         Message::from_vec(query).map_err(|error| format!("DNS 查询报文无效：{error}"))?;
     if upstream.dnssec_enabled {
         message
-            .extensions_mut()
+            .edns
             .get_or_insert_with(Edns::new)
             .set_dnssec_ok(true);
-        message.set_authentic_data(true);
-        message.set_checking_disabled(false);
+        message.metadata.authentic_data = true;
+        message.metadata.checking_disabled = false;
     }
     let client = current_hickory_client(upstream, deadline)?;
     let remaining = remaining_upstream_timeout(deadline)?;
@@ -642,7 +653,7 @@ fn forward_hickory(
         .block_on(async {
             tokio::time::timeout(remaining, async move {
                 client
-                    .send(message)
+                    .send(message.into())
                     .next()
                     .await
                     .ok_or_else(|| "上游未返回 DNS 响应".to_string())?
@@ -1835,10 +1846,10 @@ mod tests {
             let mut buffer = [0_u8; MAX_DNS_PACKET_SIZE];
             let (len, client) = socket.recv_from(&mut buffer).expect("应收到 DNSSEC 查询");
             let request = Message::from_vec(&buffer[..len]).expect("DNSSEC 查询应可解析");
-            assert!(request.authentic_data(), "请求应设置 AD 位");
+            assert!(request.metadata.authentic_data, "请求应设置 AD 位");
             assert!(
                 request
-                    .extensions()
+                    .edns
                     .as_ref()
                     .is_some_and(|edns| edns.flags().dnssec_ok),
                 "请求应设置 EDNS DO 位"
@@ -1930,7 +1941,7 @@ mod tests {
         let sent = Message::from_vec(&query_receiver.recv().unwrap()).unwrap();
 
         assert!(
-            sent.extensions()
+            sent.edns
                 .as_ref()
                 .is_some_and(|edns| edns.flags().dnssec_ok)
         );

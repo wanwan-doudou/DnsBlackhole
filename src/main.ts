@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
+  analyzeCustomRules,
   applyQueryLogRule,
   cancelFilterUpdate,
   clearQueryLogs as clearQueryLogsCommand,
@@ -42,7 +43,7 @@ import {
   updateFilters as updateFiltersCommand,
 } from "./api";
 import appIconUrl from "./app-icon.png";
-import { buildDailyTrafficSeries, renderSparkline } from "./charts";
+import { buildDailyTrafficSeries, renderSparkline, trendDayCountForHours } from "./charts";
 import { query } from "./dom";
 import {
   escapeHtml,
@@ -55,7 +56,19 @@ import {
   formatRate,
   formatTime,
 } from "./format";
+import {
+  queryLogPaginationState,
+  totalQueryLogPages,
+} from "./query-log-pagination";
 import { renderAppTemplate } from "./template";
+import { createRuleEditorController } from "./rule-editor";
+import {
+  chooseConfigBackup,
+  exportConfigBackup,
+  exportSanitizedDiagnostics,
+} from "./config-transfer";
+import { exportFilteredQueryLogs } from "./query-log-export";
+import { dnsQueryTypeLabel, renderQueryLogRow } from "./query-log-render";
 import type {
   AppConfig,
   BlockingMode,
@@ -67,7 +80,6 @@ import type {
   MacosServiceStatus,
   QueryLogFilter,
   QueryLogPage,
-  QueryLogRecord,
   QueryLogRuleAction,
   RefreshOptions,
   RenderStatusOptions,
@@ -84,10 +96,11 @@ import type {
   WindowsSystemDnsFallback,
   WindowsSystemDnsStatus,
 } from "./types";
+import "./styles/query-log.css";
 import "./style.css";
 
 const frontendStartedAt = performance.now();
-const CURRENT_CONFIG_SCHEMA_VERSION = 14;
+const CURRENT_CONFIG_SCHEMA_VERSION = 15;
 
 function logLoadTime(
   module: string,
@@ -124,6 +137,7 @@ let filtersState: FilterSubscription[] = [];
 let editingFilterIds = new Set<string>();
 let currentQueryLogEnabled = true;
 let refreshInFlight = false;
+let statusRefreshQueued = false;
 let isContentScrolling = false;
 let queuedAutoRefresh = false;
 let scrollIdleTimer: number | undefined;
@@ -135,9 +149,12 @@ let queryLogRefreshInFlight = false;
 let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
 let queryLogSearchComposing = false;
+let queryLogLivePaused = false;
 let lastDashboardRefreshAt: number | null = null;
 let currentConfigSchemaVersion = CURRENT_CONFIG_SCHEMA_VERSION;
 let currentStatisticsRetentionHours = 30 * 24;
+let dashboardStatisticsHours: number | undefined;
+let dashboardStatisticsRevision = 0;
 let latestDashboardStartedAt: number | null | undefined;
 let latestDashboardEndedAt: number | null | undefined;
 let clientNameMap = new Map<string, string>();
@@ -190,6 +207,10 @@ const WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS = [150, 250, 400, 700, 1_100, 1_80
 const WINDOWS_SERVICE_ERROR_GRACE_MS = 10_000;
 
 const contentElement = query<HTMLDivElement>(".content");
+const dashboardView = query<HTMLElement>('[data-view-panel="dashboard"]');
+const dashboardRangeField = query<HTMLElement>(".dashboard-range-field");
+const dashboardStatisticsRange = query<HTMLSelectElement>("#dashboard_statistics_range");
+const clientRankBody = query<HTMLDivElement>("#client_rank");
 const contextNav = query<HTMLElement>("#context_nav");
 const headerRuntime = query<HTMLElement>("#header_runtime");
 const runtimeStatusButton = query<HTMLButtonElement>("#runtime_status_btn");
@@ -210,6 +231,7 @@ const listenPortInput = query<HTMLInputElement>("#listen_port");
 const listenIpv6Input = query<HTMLInputElement>("#listen_ipv6");
 const allowedClientsInput = query<HTMLTextAreaElement>("#allowed_clients");
 const blockedClientsInput = query<HTMLTextAreaElement>("#blocked_clients");
+const clientFilteringRulesInput = query<HTMLTextAreaElement>("#client_filtering_rules");
 const rateLimitPerSecondInput = query<HTMLInputElement>("#rate_limit_per_second");
 const refuseAnyInput = query<HTMLInputElement>("#refuse_any");
 const filterUpdateIntervalInput = query<HTMLSelectElement>("#filter_update_interval");
@@ -267,6 +289,10 @@ const statisticsIgnoredInput = query<HTMLTextAreaElement>("#statistics_ignored_d
 const clearQueryLogsButton = query<HTMLButtonElement>("#clear_query_logs_btn");
 const clearStatisticsButton = query<HTMLButtonElement>("#clear_statistics_btn");
 const blacklistInput = query<HTMLTextAreaElement>("#blacklist");
+const ruleLineNumbers = query<HTMLElement>("#rule_line_numbers");
+const ruleAnalysisSummary = query<HTMLElement>("#rule_analysis_summary");
+const ruleDiagnostics = query<HTMLElement>("#rule_diagnostics");
+const customRuleSearchInput = query<HTMLInputElement>("#custom_rule_search");
 const filtersTable = query<HTMLDivElement>(".filters-table");
 const filtersBody = query<HTMLDivElement>("#filters_body");
 const saveButton = query<HTMLButtonElement>("#save_btn");
@@ -302,6 +328,9 @@ const dataStorageError = query<HTMLElement>("#data_storage_error");
 const chooseDataStorageButton = query<HTMLButtonElement>("#choose_data_storage_btn");
 const resetDataStorageButton = query<HTMLButtonElement>("#reset_data_storage_btn");
 const migrateDataStorageButton = query<HTMLButtonElement>("#migrate_data_storage_btn");
+const exportConfigButton = query<HTMLButtonElement>("#export_config_btn");
+const importConfigButton = query<HTMLButtonElement>("#import_config_btn");
+const exportDiagnosticButton = query<HTMLButtonElement>("#export_diagnostic_btn");
 const macosServiceSection = query<HTMLElement>("#macos_service_section");
 const macosServiceStatusElement = query<HTMLElement>("#macos_service_status");
 const installMacosServiceButton = query<HTMLButtonElement>("#install_macos_service_btn");
@@ -352,6 +381,8 @@ const updateCurrentVersionElement = query<HTMLElement>("#update_current_version"
 const updateReleaseVersionElement = query<HTMLElement>("#update_release_version");
 const updateReleaseNotesBodyElement = query<HTMLElement>("#update_release_notes_body");
 const queryLogRefreshButton = query<HTMLButtonElement>("#query_log_refresh_btn");
+const queryLogPauseButton = query<HTMLButtonElement>("#query_log_pause_btn");
+const queryLogExportButton = query<HTMLButtonElement>("#query_log_export_btn");
 const queryLogSearchInput = query<HTMLInputElement>("#query_log_search");
 const queryLogFilterInput = query<HTMLSelectElement>("#query_log_filter");
 const queryLogFilterMenu = query<HTMLDivElement>("#query_log_filter_menu");
@@ -389,8 +420,18 @@ const cacheEntries = query<HTMLElement>("#cache_entries");
 const cacheBytes = query<HTMLElement>("#cache_bytes");
 const diagnosticDomainInput = query<HTMLInputElement>("#diagnostic_domain");
 const diagnosticQueryTypeInput = query<HTMLSelectElement>("#diagnostic_query_type");
+const diagnosticClientIpInput = query<HTMLInputElement>("#diagnostic_client_ip");
 const runDiagnosticButton = query<HTMLButtonElement>("#run_diagnostic_btn");
 const diagnosticResults = query<HTMLDivElement>("#diagnostic_results");
+
+const ruleEditor = createRuleEditorController({
+  textarea: blacklistInput,
+  gutter: ruleLineNumbers,
+  summary: ruleAnalysisSummary,
+  diagnostics: ruleDiagnostics,
+  search: customRuleSearchInput,
+  analyze: analyzeCustomRules,
+});
 
 type CustomSelectElements = {
   root: HTMLDivElement;
@@ -552,14 +593,15 @@ function syncCustomSelect(select: HTMLSelectElement): void {
   const selectedOption = select.selectedOptions[0] || select.options[0];
   elements.valueLabel.textContent = selectedOption?.textContent || "请选择";
   elements.trigger.disabled = select.disabled;
-  elements.options.forEach((button) => {
+  elements.options.forEach((button, index) => {
     const selected = button.dataset.value === select.value;
+    button.disabled = select.options[index]?.disabled ?? false;
     button.classList.toggle("selected", selected);
     button.setAttribute("aria-selected", String(selected));
   });
 }
 
-[filterProxyModeInput, filterUpdateIntervalInput, diagnosticQueryTypeInput].forEach(
+[filterProxyModeInput, filterUpdateIntervalInput, diagnosticQueryTypeInput, dashboardStatisticsRange].forEach(
   initializeCustomSelect,
 );
 
@@ -707,14 +749,16 @@ queryLogPrevButton.addEventListener("click", () => {
     return;
   }
   queryLogPage -= 1;
+  contentElement.scrollTop = 0;
   void refreshQueryLogs();
 });
 
 queryLogNextButton.addEventListener("click", () => {
-  if (queryLogPage >= totalQueryLogPages()) {
+  if (queryLogPage >= totalQueryLogPages(queryLogTotal, QUERY_LOG_PAGE_SIZE)) {
     return;
   }
   queryLogPage += 1;
+  contentElement.scrollTop = 0;
   void refreshQueryLogs();
 });
 
@@ -862,6 +906,117 @@ saveFiltersButton.addEventListener("click", async () => {
 saveCustomButton.addEventListener("click", async () => {
   await saveConfig();
 });
+
+queryLogPauseButton.addEventListener("click", () => {
+  queryLogLivePaused = !queryLogLivePaused;
+  queryLogPauseButton.classList.toggle("active", queryLogLivePaused);
+  queryLogPauseButton.textContent = queryLogLivePaused ? "恢复实时刷新" : "暂停实时刷新";
+  if (!queryLogLivePaused) {
+    void refreshQueryLogs();
+  }
+});
+
+queryLogExportButton.addEventListener("click", () => {
+  if (!window.confirm("导出的 CSV 会包含当前筛选中的域名和客户端地址，请妥善保管。是否继续？")) {
+    return;
+  }
+  void runFileAction(queryLogExportButton, "准备导出…", async () => {
+    const result = await exportFilteredQueryLogs(
+      queryLogFilterInput.value as QueryLogFilter,
+      queryLogSearchInput.value.trim(),
+      (exported, total) => {
+        queryLogExportButton.textContent = `导出 ${exported.toLocaleString()}/${total.toLocaleString()}`;
+      },
+    );
+    if (!result) {
+      return;
+    }
+    showMessage(
+      result.truncated
+        ? `已导出最近 ${formatCount(result.exported)} 条；当前筛选共 ${formatCount(result.total)} 条，请缩小筛选范围以导出其余记录`
+        : `已导出 ${formatCount(result.exported)} 条查询日志`,
+      result.truncated,
+    );
+  });
+});
+
+dashboardStatisticsRange.addEventListener("change", () => {
+  dashboardStatisticsHours = dashboardStatisticsRange.value === "configured"
+    ? undefined
+    : Number(dashboardStatisticsRange.value);
+  dashboardStatisticsRevision += 1;
+  syncCustomSelect(dashboardStatisticsRange);
+  setDashboardLoading(true);
+  void refreshStatus({ button: document.querySelector<HTMLButtonElement>("[data-refresh-dashboard]") ?? undefined });
+});
+
+clientRankBody.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-client-log]");
+  const client = button?.dataset.clientLog;
+  if (!client) {
+    return;
+  }
+  queryLogSearchInput.value = client;
+  queryLogPage = 1;
+  setActiveView("logs");
+});
+
+exportConfigButton.addEventListener("click", () => {
+  void runFileAction(exportConfigButton, "导出中…", async () => {
+    if (!configLoaded) {
+      throw new Error("配置尚未加载，无法导出");
+    }
+    if (await exportConfigBackup(collectConfig())) {
+      showMessage("配置备份已导出", false);
+    }
+  });
+});
+
+importConfigButton.addEventListener("click", () => {
+  void runFileAction(importConfigButton, "恢复中…", async () => {
+    if (configDirty && !window.confirm("恢复配置会覆盖当前未保存的更改，是否继续？")) {
+      return;
+    }
+    const imported = await chooseConfigBackup();
+    if (!imported) {
+      return;
+    }
+    currentStatisticsRetentionHours = imported.statistics_retention_hours;
+    const status = await saveConfigCommand(imported);
+    await loadConfig();
+    renderStatus(status);
+    showMessage("配置已校验、迁移并恢复", false);
+  });
+});
+
+exportDiagnosticButton.addEventListener("click", () => {
+  void runFileAction(exportDiagnosticButton, "导出中…", async () => {
+    if (!configLoaded) {
+      throw new Error("配置尚未加载，无法导出诊断信息");
+    }
+    if (await exportSanitizedDiagnostics(collectConfig(), latestRuntimeStatus)) {
+      showMessage("脱敏诊断信息已导出", false);
+    }
+  });
+});
+
+async function runFileAction(
+  button: HTMLButtonElement,
+  busyText: string,
+  action: () => Promise<void>,
+): Promise<void> {
+  const text = button.textContent ?? "";
+  button.disabled = true;
+  button.textContent = busyText;
+  try {
+    await action();
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    button.disabled = false;
+    button.textContent = text;
+  }
+}
 
 startButton.addEventListener("click", async () => {
   setBusy(true);
@@ -1560,6 +1715,7 @@ function refreshActiveView(): void {
 
 function shouldAutoRefreshQueryLogs(): boolean {
   return (
+    !queryLogLivePaused &&
     queryLogPage === 1 &&
     queryLogFilterInput.value === "all" &&
     queryLogSearchInput.value.trim() === "" &&
@@ -1584,6 +1740,7 @@ async function loadConfig(): Promise<boolean> {
     }
     currentConfigSchemaVersion = Math.max(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
     currentStatisticsRetentionHours = config.statistics_retention_hours;
+    updateDashboardRangeOptions();
     enabledInput.checked = config.enabled;
     launchAtStartupInput.checked = config.launch_at_startup;
     useFiltersInput.checked = config.use_filters;
@@ -1598,6 +1755,7 @@ async function loadConfig(): Promise<boolean> {
     listenIpv6Input.checked = config.listen_ipv6;
     allowedClientsInput.value = config.allowed_clients;
     blockedClientsInput.value = config.blocked_clients;
+    clientFilteringRulesInput.value = config.client_filtering_rules;
     rateLimitPerSecondInput.value = String(config.rate_limit_per_second);
     refuseAnyInput.checked = config.refuse_any;
     filterUpdateIntervalInput.value = String(config.filter_update_interval_hours);
@@ -1645,6 +1803,7 @@ async function loadConfig(): Promise<boolean> {
     updateRuntimeWatchdogControls();
     updateBlockingModeControls();
     blacklistInput.value = config.blacklist;
+    ruleEditor.refresh();
     filtersState = config.filters;
     renderFilters();
     configLoaded = true;
@@ -2271,6 +2430,7 @@ function collectConfig(): AppConfig {
     dnssec_enabled: dnssecEnabledInput.checked,
     allowed_clients: allowedClientsInput.value.trim(),
     blocked_clients: blockedClientsInput.value.trim(),
+    client_filtering_rules: clientFilteringRulesInput.value.trim(),
     rate_limit_per_second: Number(rateLimitPerSecondInput.value || 0),
     refuse_any: refuseAnyInput.checked,
     filter_update_interval_hours: Number(filterUpdateIntervalInput.value),
@@ -2355,23 +2515,38 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
     return;
   }
   if (refreshInFlight) {
+    if (!options.auto || activeView === "dashboard") {
+      statusRefreshQueued = true;
+    }
     return;
   }
 
   const started = performance.now();
+  const renderDashboard = activeView === "dashboard";
+  const requestedStatisticsHours = dashboardStatisticsHours;
+  const requestedStatisticsRevision = dashboardStatisticsRevision;
   let succeeded = false;
   refreshInFlight = true;
   setRefreshButtonState(options.button, true);
+  if (renderDashboard && options.auto !== true) {
+    setDashboardLoading(true);
+  }
   try {
-    const renderDashboard = activeView === "dashboard";
-    const status = await getStatus(options.auto !== true, renderDashboard);
+    const status = await getStatus(
+      options.auto !== true,
+      renderDashboard,
+      renderDashboard ? requestedStatisticsHours : undefined,
+    );
     if (options.auto && isContentScrolling) {
       queuedAutoRefresh = true;
       return;
     }
-    renderStatus(status, { renderDashboard });
-    if (renderDashboard) {
+    const dashboardRangeIsCurrent = requestedStatisticsRevision === dashboardStatisticsRevision;
+    renderStatus(status, { renderDashboard: renderDashboard && dashboardRangeIsCurrent });
+    if (renderDashboard && dashboardRangeIsCurrent) {
       lastDashboardRefreshAt = performance.now();
+    } else if (renderDashboard) {
+      statusRefreshQueued = true;
     }
     succeeded = true;
   } catch (error) {
@@ -2390,6 +2565,13 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
     );
     refreshInFlight = false;
     setRefreshButtonState(options.button, false);
+    const runQueuedRefresh = statusRefreshQueued;
+    statusRefreshQueued = false;
+    if (runQueuedRefresh) {
+      void refreshStatus();
+    } else {
+      setDashboardLoading(false);
+    }
   }
 }
 function scheduleQueryLogSearch(): void {
@@ -2504,6 +2686,8 @@ function setActiveView(view: ViewName): void {
   document.querySelectorAll<HTMLElement>("[data-view-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.viewPanel === view);
   });
+  // 所有页面共享同一个滚动容器，导航和初始化落页时都从顶部开始。
+  contentElement.scrollTop = 0;
   if (view === "dashboard" && viewChanged) {
     void refreshStatus({ auto: true });
   }
@@ -2553,7 +2737,11 @@ async function runDiagnostic(): Promise<void> {
     </div>
   `;
   try {
-    const report = await runDnsDiagnostic(domain, diagnosticQueryTypeInput.value);
+    const report = await runDnsDiagnostic(
+      domain,
+      diagnosticQueryTypeInput.value,
+      diagnosticClientIpInput.value.trim(),
+    );
     renderDiagnosticReport(report);
   } catch (error) {
     diagnosticResults.innerHTML = `
@@ -2574,10 +2762,31 @@ function renderDiagnosticReport(report: DnsDiagnosticReport): void {
   const localLabels: Record<DnsDiagnosticReport["local_status"], string> = {
     allowed: "本地判定：允许",
     blocked: "本地判定：已拦截",
+    bypassed: "本地判定：客户端已绕过",
     rewrite: "本地判定：DNS 重写",
     paused: "本地判定：保护已暂停",
     stopped: "本地判定：服务未运行",
   };
+  const localDetails = [
+    report.client_ip ? ["模拟客户端", report.client_ip] : null,
+    report.client_ip
+      ? [
+          "客户端策略",
+          report.client_policy === "bypass"
+            ? `绕过过滤${report.client_policy_source ? `（${report.client_policy_source}）` : ""}`
+            : `正常过滤${report.client_policy_source ? `（${report.client_policy_source}）` : ""}`,
+        ]
+      : null,
+    report.matched_rule ? ["命中规则", report.matched_rule] : null,
+    report.rule_source ? ["规则来源", report.rule_source] : null,
+    report.rule_type ? ["规则类型", report.rule_type] : null,
+    report.allowlist_rule ? ["被覆盖的允许规则", report.allowlist_rule] : null,
+  ].filter((entry): entry is string[] => entry !== null);
+  const localDetailRows = localDetails.length > 0
+    ? `<dl class="diagnostic-local-details">${localDetails
+        .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`)
+        .join("")}</dl>`
+    : "";
   const upstreamRows = report.upstreams.length > 0
     ? report.upstreams.map((result) => {
         const answers = result.answers.length > 0
@@ -2609,6 +2818,8 @@ function renderDiagnosticReport(report: DnsDiagnosticReport): void {
         <strong>${localLabels[report.local_status]}</strong>
       </div>
       <p>${escapeHtml(report.local_detail)}</p>
+      ${report.important_overrode ? `<p class="diagnostic-note">该重要规则覆盖了一条允许规则。</p>` : ""}
+      ${localDetailRows}
     </section>
     <section class="diagnostic-upstream-list">
       <div class="diagnostic-result-heading">
@@ -2784,22 +2995,25 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#blocked"), formatCount(status.stats.blocked));
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
   renderDashboardSummaryWindow(status.stats.dashboard_started_at, status.stats.dashboard_ended_at);
+  const effectiveStatisticsHours = dashboardStatisticsHours ?? currentStatisticsRetentionHours;
+  const allTraffic = status.stats.traffic ?? [];
+  const traffic = effectiveStatisticsHours === 0
+    ? allTraffic
+    : allTraffic.filter(
+        (bucket) => bucket.minute >= Math.floor(Date.now() / 60_000) - effectiveStatisticsHours * 60,
+      );
+  const trendDayCount = trendDayCountForHours(effectiveStatisticsHours);
   renderSparkline(
     "#query_sparkline",
-    buildDailyTrafficSeries(status.stats.traffic, "queries"),
+    buildDailyTrafficSeries(traffic, "queries", trendDayCount),
   );
   renderSparkline(
     "#blocked_sparkline",
-    buildDailyTrafficSeries(status.stats.traffic, "blocked"),
+    buildDailyTrafficSeries(traffic, "blocked", trendDayCount),
   );
   renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries);
   renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked);
-  renderRankTable(
-    "#client_rank",
-    status.stats.client_requests ?? {},
-    status.stats.queries,
-    formatClientRankLabel,
-  );
+  renderClientOverview(status.stats.client_requests ?? {}, status.stats.client_blocked ?? {});
   renderRankTable("#blocklist_rank", status.stats.blocklist_hits ?? {}, status.stats.blocked);
   renderUpstreamRequestRank(
     "#upstream_rank",
@@ -2929,369 +3143,37 @@ function renderQueryLogs(page: QueryLogPage): void {
     return;
   }
 
-  const html = page.records.map(renderQueryLogRow).join("");
+  const html = page.records
+    .map((record) => renderQueryLogRow(record, { clientDisplayName, formatClientLabel }))
+    .join("");
   setHtmlIfChanged(queryLogBody, html);
 }
 
-function renderQueryLogRow(record: QueryLogRecord): string {
-  const status = queryLogStatus(record);
-  const rowClass = record.failed ? " failed" : record.blocked ? " blocked" : "";
-  const detailText = queryLogResponseDetail(record);
-  const detail = escapeHtml(detailText);
-  const measuredDuration = record.processing_duration_ms ?? record.upstream_duration_ms;
-  const duration = measuredDuration !== null ? formatElapsedMs(measuredDuration) : "";
-  const requestMeta = [
-    dnsQueryTypeLabel(record.query_type),
-    record.transport?.toUpperCase() ?? "协议未记录",
-  ];
-  if (record.query_class !== null && record.query_class !== 1) {
-    requestMeta.push(dnsQueryClassLabel(record.query_class));
-  }
-  const requestDetailPopover = renderQueryLogRequestDetail(record);
-  const responseDetailPopover = renderQueryLogResponseDetail(record, status.label);
-
-  return `
-    <div class="query-log-row${rowClass}">
-      <div class="log-time">
-        <strong>${escapeHtml(formatLogTime(record.timestamp))}</strong>
-        <span>${escapeHtml(formatLogDate(record.timestamp))}</span>
-      </div>
-      <div class="log-request">
-        <div class="log-detail-anchor">
-          <button class="log-detail-trigger" type="button" aria-label="查看请求详情">
-            ${renderLogEyeIcon(status.className)}
-          </button>
-          ${requestDetailPopover}
-        </div>
-        <div class="log-request-content">
-          <strong title="${escapeHtml(record.domain)}">${escapeHtml(record.domain)}</strong>
-          <div class="log-request-meta">
-            <span>${escapeHtml(requestMeta.join(" · "))}</span>
-            <div class="log-rule-actions">
-              <button data-log-rule-action="${record.blocked ? "allow" : "block"}" data-domain="${escapeHtml(record.domain)}" type="button">${record.blocked ? "放行" : "拦截"}</button>
-              <button data-log-rule-action="rewrite" data-domain="${escapeHtml(record.domain)}" type="button">重写</button>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="log-response">
-        <div class="log-response-layout">
-          <div class="log-detail-anchor log-response-detail-anchor">
-            <button class="log-detail-trigger" type="button" aria-label="查看响应详情">
-              ${renderLogQuestionIcon()}
-            </button>
-            ${responseDetailPopover}
-          </div>
-          <div class="log-response-summary">
-            <strong class="${status.className}">${status.label}</strong>
-            <span title="${detail}">${detail}</span>
-            ${duration ? `<small>${duration}</small>` : ""}
-          </div>
-        </div>
-      </div>
-      <div class="log-client">
-        <strong>${escapeHtml(clientDisplayName(record.client_ip) ?? record.client_ip ?? "-")}</strong>
-        <span>${escapeHtml(record.client_ip || "未知客户端")}</span>
-      </div>
-    </div>
-  `;
-}
-
-function renderLogEyeIcon(className: string): string {
-  return `
-    <svg class="log-eye-icon ${className}" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <path d="M2.75 12c1.95-3.25 5.2-5.25 9.25-5.25s7.3 2 9.25 5.25c-1.95 3.25-5.2 5.25-9.25 5.25S4.7 15.25 2.75 12Z"></path>
-      <circle cx="12" cy="12" r="2.75"></circle>
-      <path d="M4.75 19.25 19.25 4.75"></path>
-    </svg>
-  `;
-}
-
-function renderLogQuestionIcon(): string {
-  return `
-    <svg class="log-question-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <circle cx="12" cy="12" r="8.75"></circle>
-      <path d="M9.7 9.35a2.45 2.45 0 0 1 4.7.95c0 1.9-2.4 2.1-2.4 3.65"></path>
-      <path d="M12 17.25h.01"></path>
-    </svg>
-  `;
-}
-
-function renderQueryLogRequestDetail(record: QueryLogRecord): string {
-  const rows = [
-    ["时间", formatLogTime(record.timestamp)],
-    ["日期", formatLogDate(record.timestamp)],
-    ["域名", record.domain],
-    ["查询类型", dnsQueryTypeDetail(record.query_type)],
-    ["查询类别", dnsQueryClassLabel(record.query_class)],
-    ["传输协议", record.transport?.toUpperCase() ?? "旧日志未记录"],
-    ["客户端", formatClientLabel(record.client_ip)],
-  ];
-
-  return renderLogDetailPopover("请求详情", rows);
-}
-
-function renderQueryLogResponseDetail(record: QueryLogRecord, statusLabel: string): string {
-  const rows = [
-    ["状态", statusLabel],
-    ["响应来源", queryLogResponseSourceLabel(record)],
-  ];
-  const response = record.response;
-
-  if (response) {
-    rows.push(
-      ["响应代码", dnsResponseCodeLabel(response.code)],
-      ["响应记录", `${formatCount(response.answer_count)} 条`],
-    );
-  } else {
-    rows.push(["响应代码", record.failed ? "无响应" : "旧日志未记录"]);
-  }
-
-  if (record.upstream_server) {
-    rows.push(["上游服务器", record.upstream_server]);
-  }
-
-  if (record.upstream_duration_ms !== null) {
-    rows.push(["上游耗时", formatElapsedMs(record.upstream_duration_ms)]);
-  }
-
-  if (record.processing_duration_ms !== null) {
-    rows.push(["总处理耗时", formatElapsedMs(record.processing_duration_ms)]);
-  }
-
-  if (response?.truncated) {
-    rows.push(["截断响应", "是（TC 标志）"]);
-  }
-
-  if (record.error) {
-    rows.push([record.failed ? "错误" : "说明", record.error]);
-  }
-
-  if (record.blocked) {
-    rows.push(
-      ["命中规则", record.matched_rule ?? "旧日志未记录"],
-      ["来源清单", record.rule_source ?? "旧日志未记录"],
-      ["规则类型", record.rule_type ?? "旧日志未记录"],
-      ["important 覆盖", record.important_overrode ? "是" : "否"],
-      ["allowlist", record.allowlist_rule ?? "无"],
-    );
-  }
-
-  return renderLogDetailPopover("响应详情", rows, renderQueryLogResponseAnswers(record));
-}
-
-function renderLogDetailPopover(
-  title: string,
-  rows: string[][],
-  extraContent = "",
-): string {
-  return `
-    <div class="log-detail-popover${extraContent ? " log-response-popover" : ""}" role="tooltip">
-      <strong>${escapeHtml(title)}</strong>
-      <dl>
-        ${rows
-          .map(
-            ([label, value]) => `
-              <div>
-                <dt>${escapeHtml(label)}</dt>
-                <dd title="${escapeHtml(value)}">${escapeHtml(value)}</dd>
-              </div>
-            `,
-          )
-          .join("")}
-      </dl>
-      ${extraContent}
-    </div>
-  `;
-}
-
-function renderQueryLogResponseAnswers(record: QueryLogRecord): string {
-  const response = record.response;
-  if (!response || response.answer_count === 0) {
-    return "";
-  }
-
-  const omitted = Math.max(0, response.answer_count - response.answers.length);
-  const records = response.answers
-    .map(
-      (answer) => `
-        <div class="log-response-answer">
-          <span>${escapeHtml(dnsQueryTypeLabel(answer.record_type))}</span>
-          <code title="${escapeHtml(answer.value)}">${escapeHtml(answer.value)}</code>
-          <small>TTL ${formatCount(answer.ttl)} 秒</small>
-        </div>
-      `,
-    )
-    .join("");
-
-  return `
-    <section class="log-response-answers">
-      <strong>响应记录</strong>
-      <div class="log-response-answer-list">
-        ${records || `<p>响应记录内容无法解析</p>`}
-      </div>
-      ${omitted > 0 ? `<p>另有 ${formatCount(omitted)} 条记录未写入日志摘要</p>` : ""}
-    </section>
-  `;
-}
-
-function dnsResponseCodeLabel(code: number): string {
-  const labels: Record<number, string> = {
-    0: "NOERROR",
-    1: "FORMERR",
-    2: "SERVFAIL",
-    3: "NXDOMAIN",
-    4: "NOTIMP",
-    5: "REFUSED",
-    6: "YXDOMAIN",
-    7: "YXRRSET",
-    8: "NXRRSET",
-    9: "NOTAUTH",
-    10: "NOTZONE",
-  };
-  return `${labels[code] ?? "RCODE"}（${code}）`;
-}
-
 function renderQueryLogPagination(page: QueryLogPage): void {
-  const totalPages = totalQueryLogPages(page.total);
-  const start = page.total === 0 ? 0 : (page.page - 1) * page.page_size + 1;
-  const end = Math.min(page.total, page.page * page.page_size);
+  const pagination = queryLogPaginationState(
+    page.page,
+    page.total,
+    page.page_size,
+    queryLogRefreshInFlight,
+  );
   queryLogPageInfo.textContent =
     page.total === 0
       ? "0 条记录"
-      : `${formatCount(start)}-${formatCount(end)} / ${formatCount(page.total)} 条`;
-  queryLogPrevButton.disabled = page.page <= 1 || queryLogRefreshInFlight;
-  queryLogNextButton.disabled = page.page >= totalPages || queryLogRefreshInFlight;
+      : `${formatCount(pagination.start)}-${formatCount(pagination.end)} / ${formatCount(page.total)} 条`;
+  queryLogPrevButton.disabled = pagination.previousDisabled;
+  queryLogNextButton.disabled = pagination.nextDisabled;
 }
 
-function totalQueryLogPages(total = queryLogTotal): number {
-  return Math.max(1, Math.ceil(total / QUERY_LOG_PAGE_SIZE));
+function syncQueryLogPaginationDisabled(loading: boolean): void {
+  const pagination = queryLogPaginationState(
+    queryLogPage,
+    queryLogTotal,
+    QUERY_LOG_PAGE_SIZE,
+    loading,
+  );
+  queryLogPrevButton.disabled = pagination.previousDisabled;
+  queryLogNextButton.disabled = pagination.nextDisabled;
 }
-
-function queryLogStatus(record: QueryLogRecord): { label: string; className: string } {
-  if (record.failed) {
-    return { label: "失败", className: "failed" };
-  }
-  if (record.blocked) {
-    return { label: "已拦截", className: "blocked" };
-  }
-  if (queryLogResponseSource(record) === "refused") {
-    return { label: "已拒绝", className: "refused" };
-  }
-  return { label: "已处理", className: "processed" };
-}
-
-type ResolvedQueryResponseSource =
-  | "upstream"
-  | "cache"
-  | "rewrite"
-  | "blocked"
-  | "refused"
-  | "local";
-
-function queryLogResponseSource(record: QueryLogRecord): ResolvedQueryResponseSource {
-  if (record.response_source) {
-    return record.response_source;
-  }
-  if (record.blocked) {
-    return "blocked";
-  }
-  if (record.error?.includes("ANY 查询")) {
-    return "refused";
-  }
-  if (record.upstream_server) {
-    return "upstream";
-  }
-  if (record.upstream_duration_ms === 0) {
-    return "cache";
-  }
-  return "local";
-}
-
-function queryLogResponseSourceLabel(record: QueryLogRecord): string {
-  switch (queryLogResponseSource(record)) {
-    case "upstream":
-      return "上游 DNS";
-    case "cache":
-      return "DNS 缓存";
-    case "rewrite":
-      return "本地 DNS 重写";
-    case "blocked":
-      return "过滤器";
-    case "refused":
-      return "本地拒绝";
-    default:
-      return "本地响应（旧日志未记录来源）";
-  }
-}
-
-function queryLogResponseDetail(record: QueryLogRecord): string {
-  if (record.failed && record.error) {
-    return record.error;
-  }
-  switch (queryLogResponseSource(record)) {
-    case "upstream":
-      return record.upstream_server ? `上游：${record.upstream_server}` : "上游 DNS 解析";
-    case "cache":
-      return "DNS 缓存命中";
-    case "rewrite":
-      return "本地 DNS 重写";
-    case "blocked":
-      return record.rule_source ? `过滤器：${record.rule_source}` : "过滤器拦截";
-    case "refused":
-      return record.error ?? "本地拒绝响应";
-    default:
-      return "本地响应（旧日志）";
-  }
-}
-
-function dnsQueryTypeLabel(queryType: number | null): string {
-  if (queryType === null) {
-    return "类型未记录";
-  }
-  return DNS_QUERY_TYPE_LABELS[queryType] ?? `TYPE${queryType}`;
-}
-
-function dnsQueryTypeDetail(queryType: number | null): string {
-  if (queryType === null) {
-    return "旧日志未记录";
-  }
-  return `${dnsQueryTypeLabel(queryType)}（${queryType}）`;
-}
-
-function dnsQueryClassLabel(queryClass: number | null): string {
-  if (queryClass === null) {
-    return "旧日志未记录";
-  }
-  const labels: Record<number, string> = {
-    1: "IN（互联网）",
-    3: "CH（Chaos）",
-    4: "HS（Hesiod）",
-    255: "ANY（任意类别）",
-  };
-  return labels[queryClass] ?? `CLASS${queryClass}`;
-}
-
-const DNS_QUERY_TYPE_LABELS: Record<number, string> = {
-  1: "A",
-  2: "NS",
-  5: "CNAME",
-  6: "SOA",
-  12: "PTR",
-  15: "MX",
-  16: "TXT",
-  28: "AAAA",
-  33: "SRV",
-  41: "OPT",
-  43: "DS",
-  46: "RRSIG",
-  47: "NSEC",
-  48: "DNSKEY",
-  52: "TLSA",
-  64: "SVCB",
-  65: "HTTPS",
-  255: "ANY",
-};
 
 function setQueryLogFilterValue(value: QueryLogFilter): void {
   const options = queryLogFilterMenu.querySelectorAll<HTMLButtonElement>("[data-filter]");
@@ -3805,9 +3687,11 @@ function renderDashboardSummaryWindow(
   const summaryStartedAt = startedAt ?? latestDashboardStartedAt;
   const summaryEndedAt = endedAt ?? latestDashboardEndedAt;
   let label: string;
-  if (currentStatisticsRetentionHours !== 0) {
-    const days = Math.max(1, Math.ceil(currentStatisticsRetentionHours / 24));
-    label = `最近 ${days} 天`;
+  const effectiveHours = dashboardStatisticsHours ?? currentStatisticsRetentionHours;
+  if (effectiveHours !== 0) {
+    label = effectiveHours < 48
+      ? `最近 ${effectiveHours} 小时`
+      : `最近 ${Math.max(1, Math.ceil(effectiveHours / 24))} 天`;
   } else if (summaryStartedAt && summaryEndedAt) {
     const start = new Date(summaryStartedAt * 1000);
     const end = new Date(summaryEndedAt * 1000);
@@ -3830,6 +3714,22 @@ function renderDashboardSummaryWindow(
   query("#blocklist_rank_window").textContent = label;
   query("#upstream_rank_window").textContent = label;
   query("#upstream_latency_window").textContent = label;
+}
+
+function updateDashboardRangeOptions(): void {
+  Array.from(dashboardStatisticsRange.options).forEach((option) => {
+    if (option.value === "configured" || option.value === "0") {
+      option.disabled = false;
+      return;
+    }
+    const hours = Number(option.value);
+    option.disabled = currentStatisticsRetentionHours > 0 && hours > currentStatisticsRetentionHours;
+  });
+  if (dashboardStatisticsRange.selectedOptions[0]?.disabled) {
+    dashboardStatisticsRange.value = "configured";
+    dashboardStatisticsHours = undefined;
+  }
+  syncCustomSelect(dashboardStatisticsRange);
 }
 
 function updateFilterField(id: string, target: HTMLInputElement): void {
@@ -4022,6 +3922,34 @@ function renderRankTable(
   setHtmlIfChanged(container, html);
 }
 
+function renderClientOverview(
+  requests: Record<string, number>,
+  blocked: Record<string, number>,
+): void {
+  const rows = Object.entries(requests)
+    .filter(([client, count]) => client.length > 0 && count > 0)
+    .sort((a, b) => b[1] - a[1] || compareRankLabel(a[0], b[0]))
+    .slice(0, RANK_ROW_LIMIT);
+  if (rows.length === 0) {
+    setHtmlIfChanged(clientRankBody, `<div class="empty-rank">暂无客户端数据</div>`);
+    return;
+  }
+  const html = rows.map(([client, count]) => {
+    const blockedCount = blocked[client] ?? 0;
+    const label = formatClientRankLabel(client);
+    return `
+      <div class="rank-row client-rank-row">
+        <button class="rank-domain rank-client-button" data-client-log="${escapeHtml(client)}" type="button" title="查看 ${escapeHtml(label)} 的查询日志">
+          <span>${escapeHtml(label)}</span>
+        </button>
+        <span class="client-rank-metric">${formatCount(count)}</span>
+        <span class="client-rank-metric blocked">${formatRate(blockedCount, count)}</span>
+      </div>
+    `;
+  }).join("");
+  setHtmlIfChanged(clientRankBody, html);
+}
+
 function renderUpstreamRequestRank(
   selector: string,
   rows: UpstreamRequestStat[],
@@ -4160,6 +4088,15 @@ function setRefreshButtonState(button: HTMLButtonElement | undefined, refreshing
   button.setAttribute("aria-busy", String(refreshing));
 }
 
+function setDashboardLoading(loading: boolean): void {
+  dashboardView.classList.toggle("is-loading", loading);
+  dashboardView.setAttribute("aria-busy", String(loading));
+  dashboardRangeField.classList.toggle("is-loading", loading);
+  customSelects
+    .get(dashboardStatisticsRange)
+    ?.trigger.setAttribute("aria-busy", String(loading));
+}
+
 function setFilterUpdating(updating: boolean): void {
   updateFiltersButton.classList.toggle("loading", updating);
   updateFiltersButton.textContent = updating ? "更新中" : "检查更新";
@@ -4245,6 +4182,7 @@ function renderFilterUpdateProgress(progress: FilterUpdateProgress): void {
 
 function setQueryLogLoading(loading: boolean, background = false): void {
   queryLogRefreshButton.classList.toggle("loading", loading);
+  syncQueryLogPaginationDisabled(loading);
   if (background) {
     return;
   }
@@ -4254,8 +4192,6 @@ function setQueryLogLoading(loading: boolean, background = false): void {
   if (loading) {
     closeQueryLogFilter();
   }
-  queryLogPrevButton.disabled = loading || queryLogPage <= 1;
-  queryLogNextButton.disabled = loading || queryLogPage >= totalQueryLogPages();
 }
 
 function waitForPaint(): Promise<void> {
