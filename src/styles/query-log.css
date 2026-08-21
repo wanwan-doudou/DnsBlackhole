@@ -1,14 +1,9 @@
 .query-log-toolbar {
-  position: sticky;
-  top: 0;
-  z-index: 12;
   display: grid;
   grid-template-columns: auto minmax(260px, 1fr) 170px;
   align-items: center;
   gap: 18px;
-  margin: 0 0 6px;
-  padding: 0 0 12px;
-  background: #f5f7fa;
+  margin: 0 0 18px;
 }
 
 .query-log-title {
@@ -227,9 +222,6 @@
 }
 
 .query-log-head {
-  position: sticky;
-  top: 60px;
-  z-index: 8;
   min-height: 44px;
   border-bottom: 1px solid #edf0f3;
   color: #3f4b58;
