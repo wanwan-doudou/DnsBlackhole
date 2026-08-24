@@ -9,6 +9,24 @@ export type ViewName =
   | "about"
   | "settings";
 export type QueryLogFilter = "all" | "processed" | "blocked" | "failed";
+export type QueryLogSourceFilter =
+  | "all"
+  | "upstream"
+  | "cache"
+  | "rewrite"
+  | "blocked"
+  | "refused";
+export type QueryLogTypeFilter = "all" | "a" | "aaaa" | "https" | "other";
+export type QueryLogSort = "newest" | "oldest" | "slowest";
+
+export type QueryLogQuery = {
+  filter: QueryLogFilter;
+  search: string;
+  hours: number | null;
+  source: QueryLogSourceFilter;
+  queryType: QueryLogTypeFilter;
+  sort: QueryLogSort;
+};
 
 export type MacosServiceState =
   | "not_registered"
@@ -118,6 +136,9 @@ export type AppConfig = {
   domain_upstream_rules: string;
   client_upstream_rules: string;
   client_filtering_rules: string;
+  client_policy_groups: string;
+  family_safe_search: boolean;
+  family_blocked_services: string;
   allowed_clients: string;
   blocked_clients: string;
   rate_limit_per_second: number;
@@ -143,6 +164,10 @@ export type AppConfig = {
   dns_cache_prefetch_hit_threshold: number;
   runtime_watchdog_enabled: boolean;
   runtime_watchdog_interval_seconds: number;
+  monitoring_api_enabled: boolean;
+  monitoring_api_listen_host: string;
+  monitoring_api_port: number;
+  monitoring_api_token: string;
   blocking_mode: BlockingMode;
   blocking_response_ttl: number;
   blocking_custom_ipv4: string;
@@ -292,6 +317,7 @@ export type QueryLogPage = {
   total: number;
   page: number;
   page_size: number;
+  next_cursor: string | null;
 };
 
 export type FilterUpdateResult = {

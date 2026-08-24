@@ -45,6 +45,11 @@ struct StatusParams {
 struct QueryLogsParams {
     filter: Option<String>,
     search: Option<String>,
+    hours: Option<u32>,
+    source: Option<String>,
+    query_type: Option<String>,
+    sort: Option<String>,
+    cursor: Option<String>,
     page: Option<u32>,
     page_size: Option<u32>,
 }
@@ -251,6 +256,11 @@ fn dispatch_request(
                 Arc::clone(state),
                 params.filter,
                 params.search,
+                params.hours,
+                params.source,
+                params.query_type,
+                params.sort,
+                params.cursor,
                 params.page,
                 params.page_size,
             )?)?

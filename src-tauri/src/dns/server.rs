@@ -134,12 +134,21 @@ impl DnsServer {
             .copied()
             .map(|addr| bind_listener_pair(addr, addr.is_ipv6() && config.listen_ipv6))
             .collect::<Result<Vec<_>, _>>()?;
+        let monitoring_listener = super::monitoring::prepare(&config)?;
         crate::performance::log_service("DNS 服务实例", "监听端口绑定", listener_started);
 
         let threads_started = Instant::now();
         reset_stats(&stats);
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
+        if let Some(listener) = monitoring_listener {
+            threads.push(super::monitoring::spawn(
+                listener,
+                Arc::clone(&stats),
+                Arc::clone(&protection_paused_until),
+                Arc::clone(&stop),
+            ));
+        }
 
         let mut query_log_thread = None;
         let persistence_sender = if query_log_enabled || statistics_enabled {

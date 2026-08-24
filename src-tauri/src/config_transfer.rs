@@ -106,6 +106,7 @@ fn redact_config(config: &mut AppConfig) {
     redact_lines(&mut config.domain_upstream_rules);
     redact_lines(&mut config.client_upstream_rules);
     redact_lines(&mut config.client_filtering_rules);
+    redact_lines(&mut config.client_policy_groups);
     redact_lines(&mut config.allowed_clients);
     redact_lines(&mut config.blocked_clients);
     redact_lines(&mut config.rebinding_allowed_domains);
@@ -115,6 +116,8 @@ fn redact_config(config: &mut AppConfig) {
     redact_lines(&mut config.statistics_ignored_domains);
     redact_lines(&mut config.blacklist);
     config.listen_host = "<已隐藏>".to_string();
+    config.monitoring_api_listen_host = "<已隐藏>".to_string();
+    config.monitoring_api_token = redact_value(&config.monitoring_api_token);
     config.blocking_custom_ipv4 = redact_value(&config.blocking_custom_ipv4);
     config.blocking_custom_ipv6 = redact_value(&config.blocking_custom_ipv6);
     config.filter_proxy_url = redact_value(&config.filter_proxy_url);
@@ -203,12 +206,14 @@ mod tests {
             allowed_clients: "192.168.1.0/24".to_string(),
             blacklist: "||private.example^".to_string(),
             filter_proxy_url: "http://user:pass@proxy.test".to_string(),
+            monitoring_api_token: "monitoring-secret-value".to_string(),
             ..AppConfig::default()
         };
         redact_config(&mut config);
         let json = serde_json::to_string(&config).unwrap();
 
-        assert!(!json.contains("token"));
+        assert!(!json.contains("token@example"));
+        assert!(!json.contains("monitoring-secret-value"));
         assert!(!json.contains("192.168.1.0"));
         assert!(!json.contains("private.example"));
         assert!(!json.contains("user:pass"));

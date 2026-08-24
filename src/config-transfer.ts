@@ -1,5 +1,3 @@
-import { open, save } from "@tauri-apps/plugin-dialog";
-
 import { exportConfigFile, exportDiagnosticFile, importConfigFile } from "./api";
 import type { AppConfig, RuntimeStatus } from "./types";
 
@@ -11,6 +9,7 @@ function dateStamp(): string {
 }
 
 export async function exportConfigBackup(config: AppConfig): Promise<boolean> {
+  const { save } = await import("@tauri-apps/plugin-dialog");
   const path = await save({
     title: "导出 DnsBlackhole 配置",
     defaultPath: `DnsBlackhole-config-${dateStamp()}.json`,
@@ -24,6 +23,7 @@ export async function exportConfigBackup(config: AppConfig): Promise<boolean> {
 }
 
 export async function chooseConfigBackup(): Promise<AppConfig | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog");
   const path = await open({
     title: "选择 DnsBlackhole 配置备份",
     multiple: false,
@@ -40,6 +40,7 @@ export async function exportSanitizedDiagnostics(
   config: AppConfig,
   status: RuntimeStatus | null,
 ): Promise<boolean> {
+  const { save } = await import("@tauri-apps/plugin-dialog");
   const path = await save({
     title: "导出脱敏诊断信息",
     defaultPath: `DnsBlackhole-diagnostic-${dateStamp()}.json`,

@@ -191,13 +191,12 @@ pub(crate) fn record_query(
     client_ip: IpAddr,
     detailed_runtime_stats: bool,
 ) {
-    if !detailed_runtime_stats {
-        return;
-    }
-
     if let Ok(mut current) = stats.lock() {
         current.queries += 1;
         current.last_query = Some(domain.to_string());
+        if !detailed_runtime_stats {
+            return;
+        }
         *current.query_domains.entry(domain.to_string()).or_default() += 1;
         *current
             .client_requests
@@ -214,15 +213,14 @@ pub(crate) fn record_blocked_query(
     rule_source: &str,
     detailed_runtime_stats: bool,
 ) {
-    if !detailed_runtime_stats {
-        return;
-    }
-
     if let Ok(mut current) = stats.lock() {
         current.queries += 1;
         current.blocked += 1;
         current.last_query = Some(domain.to_string());
         current.last_blocked = Some(domain.to_string());
+        if !detailed_runtime_stats {
+            return;
+        }
         *current.query_domains.entry(domain.to_string()).or_default() += 1;
         *current
             .blocked_domains
@@ -268,9 +266,8 @@ pub(crate) fn record_forwarded(stats: &Arc<Mutex<DnsStats>>, detailed_runtime_st
     if let Ok(mut current) = stats.lock() {
         // 成功转发说明上游链路已经恢复，不能继续把开机阶段的瞬态错误展示为当前故障。
         current.last_error = None;
-        if detailed_runtime_stats {
-            current.forwarded += 1;
-        }
+        current.forwarded += 1;
+        let _ = detailed_runtime_stats;
     }
 }
 

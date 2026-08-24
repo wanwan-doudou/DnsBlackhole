@@ -1,9 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type Update } from "@tauri-apps/plugin-updater";
+import type { Update } from "@tauri-apps/plugin-updater";
 import {
   analyzeCustomRules,
   applyQueryLogRule,
@@ -58,8 +55,12 @@ import {
 } from "./format";
 import {
   queryLogPaginationState,
-  totalQueryLogPages,
 } from "./query-log-pagination";
+import {
+  DEFAULT_QUERY_LOG_QUERY,
+  activeAdvancedQueryFilterCount,
+  parseQueryLogHours,
+} from "./query-log-query";
 import { renderAppTemplate } from "./template";
 import { createRuleEditorController } from "./rule-editor";
 import {
@@ -69,6 +70,13 @@ import {
 } from "./config-transfer";
 import { exportFilteredQueryLogs } from "./query-log-export";
 import { dnsQueryTypeLabel, renderQueryLogRow } from "./query-log-render";
+import {
+  loadSavedQueryLogViews,
+  persistSavedQueryLogViews,
+  removeSavedQueryLogView,
+  upsertSavedQueryLogView,
+  type SavedQueryLogView,
+} from "./query-log-saved-views";
 import type {
   AppConfig,
   BlockingMode,
@@ -79,8 +87,12 @@ import type {
   MacosServiceState,
   MacosServiceStatus,
   QueryLogFilter,
+  QueryLogQuery,
   QueryLogPage,
   QueryLogRuleAction,
+  QueryLogSort,
+  QueryLogSourceFilter,
+  QueryLogTypeFilter,
   RefreshOptions,
   RenderStatusOptions,
   RuntimeStatus,
@@ -100,7 +112,7 @@ import "./styles/query-log.css";
 import "./style.css";
 
 const frontendStartedAt = performance.now();
-const CURRENT_CONFIG_SCHEMA_VERSION = 15;
+const CURRENT_CONFIG_SCHEMA_VERSION = 16;
 
 function logLoadTime(
   module: string,
@@ -145,6 +157,8 @@ let pendingUpdate: Update | null = null;
 let manualDownloadUrl = "";
 let queryLogPage = 1;
 let queryLogTotal = 0;
+let queryLogCursorStack = [""];
+let queryLogNextCursor: string | null = null;
 let queryLogRefreshInFlight = false;
 let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
@@ -188,6 +202,7 @@ const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
   "https://api.github.com/repos/wanwan-doudou/DnsBlackhole/releases";
 const ABOUT_LINKS = {
+  docs: "https://github.com/wanwan-doudou/DnsBlackhole#readme",
   repository: "https://github.com/wanwan-doudou/DnsBlackhole",
   releases: RELEASES_URL,
   issues: "https://github.com/wanwan-doudou/DnsBlackhole/issues",
@@ -205,6 +220,121 @@ const CHECK_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
 const WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS = [150, 250, 400, 700, 1_100, 1_800, 2_500, 3_000];
 const WINDOWS_SERVICE_ERROR_GRACE_MS = 10_000;
+
+async function openExternalUrl(url: string): Promise<void> {
+  const { openUrl } = await import("@tauri-apps/plugin-opener");
+  await openUrl(url);
+}
+
+function aboutPlatformLabel(): string {
+  if (isWindows) {
+    return "Windows";
+  }
+  if (isMacOS) {
+    return "macOS";
+  }
+  return "当前桌面平台";
+}
+
+function renderAboutRuntimeInfo(): void {
+  aboutRuntimePlatformElement.textContent = aboutPlatformLabel();
+
+  if (isWindows) {
+    const service = currentWindowsServiceStatus;
+    aboutRuntimeServiceElement.textContent = !service
+      ? "正在读取…"
+      : service.ready
+        ? `已连接${service.serviceVersion ? ` · v${service.serviceVersion}` : ""}`
+        : service.installed
+          ? `需要修复${service.serviceVersion ? ` · v${service.serviceVersion}` : ""}`
+          : "尚未安装";
+  } else if (isMacOS) {
+    const service = currentMacosServiceStatus;
+    aboutRuntimeServiceElement.textContent = !service
+      ? "正在读取…"
+      : service.enabled && !service.needsRepair
+        ? `已启用${service.serviceVersion ? ` · v${service.serviceVersion}` : ""}`
+        : service.state === "not_registered" || service.state === "not_found"
+          ? "尚未安装"
+          : "需要处理";
+  } else {
+    aboutRuntimeServiceElement.textContent = "当前平台无需系统服务";
+  }
+
+  aboutRuntimeCoreElement.textContent = !latestRuntimeStatus
+    ? "正在读取…"
+    : latestRuntimeStatus.protection_paused
+      ? "保护已暂停"
+      : latestRuntimeStatus.running
+        ? "保护运行中"
+        : "当前未运行";
+}
+
+async function writeClipboardText(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    if (!document.execCommand("copy")) {
+      throw new Error("当前系统不允许写入剪贴板");
+    }
+  } finally {
+    textarea.remove();
+  }
+}
+
+async function copyAboutSupportInfo(): Promise<void> {
+  const appVersion = appVersionElement.textContent?.trim() || "未知";
+  const takeoverState = !isWindows
+    ? "不适用"
+    : !currentWindowsSystemDnsStatus
+      ? "未知"
+      : currentWindowsSystemDnsStatus.managed && currentWindowsSystemDnsStatus.inEffect
+        ? "已接管"
+        : currentWindowsSystemDnsStatus.managed
+          ? "接管状态异常"
+          : "未接管";
+  const summary = [
+    `DnsBlackhole v${appVersion}`,
+    `运行平台：${aboutRuntimePlatformElement.textContent}`,
+    `后台服务：${aboutRuntimeServiceElement.textContent}`,
+    `DNS 核心：${aboutRuntimeCoreElement.textContent}`,
+    `系统 DNS：${takeoverState}`,
+    `配置架构：v${CURRENT_CONFIG_SCHEMA_VERSION}`,
+  ].join("\n");
+
+  const originalText = copySupportInfoButton.textContent ?? "复制支持信息";
+  copySupportInfoButton.disabled = true;
+  try {
+    await writeClipboardText(summary);
+    copySupportInfoButton.textContent = "已复制";
+    showMessage("支持信息已复制，不包含域名、客户端或访问令牌", false);
+  } catch (error) {
+    showMessage(`复制支持信息失败：${String(error)}`, true);
+  } finally {
+    window.setTimeout(() => {
+      copySupportInfoButton.textContent = originalText;
+      copySupportInfoButton.disabled = false;
+    }, 1600);
+  }
+}
+
+async function relaunchApplication(): Promise<void> {
+  const { relaunch } = await import("@tauri-apps/plugin-process");
+  await relaunch();
+}
+
+async function checkApplicationUpdate(): Promise<Update | null> {
+  const { check } = await import("@tauri-apps/plugin-updater");
+  return check({ timeout: CHECK_TIMEOUT_MS });
+}
 
 const contentElement = query<HTMLDivElement>(".content");
 const dashboardView = query<HTMLElement>('[data-view-panel="dashboard"]');
@@ -232,6 +362,9 @@ const listenIpv6Input = query<HTMLInputElement>("#listen_ipv6");
 const allowedClientsInput = query<HTMLTextAreaElement>("#allowed_clients");
 const blockedClientsInput = query<HTMLTextAreaElement>("#blocked_clients");
 const clientFilteringRulesInput = query<HTMLTextAreaElement>("#client_filtering_rules");
+const clientPolicyGroupsInput = query<HTMLTextAreaElement>("#client_policy_groups");
+const familySafeSearchInput = query<HTMLInputElement>("#family_safe_search");
+const familyBlockedServicesInput = query<HTMLTextAreaElement>("#family_blocked_services");
 const rateLimitPerSecondInput = query<HTMLInputElement>("#rate_limit_per_second");
 const refuseAnyInput = query<HTMLInputElement>("#refuse_any");
 const filterUpdateIntervalInput = query<HTMLSelectElement>("#filter_update_interval");
@@ -270,6 +403,10 @@ const dnsCachePrefetchHitThresholdInput = query<HTMLInputElement>(
 );
 const runtimeWatchdogEnabledInput = query<HTMLInputElement>("#runtime_watchdog_enabled");
 const runtimeWatchdogIntervalInput = query<HTMLInputElement>("#runtime_watchdog_interval_seconds");
+const monitoringApiEnabledInput = query<HTMLInputElement>("#monitoring_api_enabled");
+const monitoringApiListenHostInput = query<HTMLInputElement>("#monitoring_api_listen_host");
+const monitoringApiPortInput = query<HTMLInputElement>("#monitoring_api_port");
+const monitoringApiTokenInput = query<HTMLInputElement>("#monitoring_api_token");
 const blockingModeInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="blocking_mode"]'),
 );
@@ -370,6 +507,11 @@ const dnsFallbackInputs = Array.from(
   document.querySelectorAll<HTMLInputElement>('input[name="dns_fallback"]'),
 );
 const appVersionElement = query<HTMLElement>("#app_version");
+const aboutRuntimeAppVersionElement = query<HTMLElement>("#about_runtime_app_version");
+const aboutRuntimePlatformElement = query<HTMLElement>("#about_runtime_platform");
+const aboutRuntimeServiceElement = query<HTMLElement>("#about_runtime_service");
+const aboutRuntimeCoreElement = query<HTMLElement>("#about_runtime_core");
+const copySupportInfoButton = query<HTMLButtonElement>("#copy_support_info_btn");
 const checkUpdateButton = query<HTMLButtonElement>("#check_update_btn");
 const installUpdateButton = query<HTMLButtonElement>("#install_update_btn");
 const manualDownloadButton = query<HTMLButtonElement>("#manual_download_btn");
@@ -388,10 +530,23 @@ const queryLogFilterInput = query<HTMLSelectElement>("#query_log_filter");
 const queryLogFilterMenu = query<HTMLDivElement>("#query_log_filter_menu");
 const queryLogFilterButton = query<HTMLButtonElement>("#query_log_filter_button");
 const queryLogFilterLabel = query<HTMLElement>("#query_log_filter_label");
+const queryLogAdvancedButton = query<HTMLButtonElement>("#query_log_advanced_btn");
+const queryLogAdvancedCount = query<HTMLElement>("#query_log_advanced_count");
+const queryLogAdvancedPanel = query<HTMLElement>("#query_log_advanced_panel");
+const queryLogTimeRange = query<HTMLSelectElement>("#query_log_time_range");
+const queryLogSource = query<HTMLSelectElement>("#query_log_source");
+const queryLogQueryType = query<HTMLSelectElement>("#query_log_query_type");
+const queryLogSort = query<HTMLSelectElement>("#query_log_sort");
+const queryLogSavedViewSelect = query<HTMLSelectElement>("#query_log_saved_view");
+const queryLogViewNameInput = query<HTMLInputElement>("#query_log_view_name");
+const queryLogSaveViewButton = query<HTMLButtonElement>("#query_log_save_view_btn");
+const queryLogDeleteViewButton = query<HTMLButtonElement>("#query_log_delete_view_btn");
+const queryLogResetButton = query<HTMLButtonElement>("#query_log_reset_btn");
 const queryLogBody = query<HTMLDivElement>("#query_log_body");
 const queryLogPageInfo = query<HTMLElement>("#query_log_page_info");
 const queryLogPrevButton = query<HTMLButtonElement>("#query_log_prev_btn");
 const queryLogNextButton = query<HTMLButtonElement>("#query_log_next_btn");
+let savedQueryLogViews: SavedQueryLogView[] = loadSavedQueryLogViews();
 const queryRuleDialog = query<HTMLDialogElement>("#query_rule_dialog");
 const queryRuleForm = query<HTMLFormElement>("#query_rule_form");
 const queryRuleDomain = query<HTMLElement>("#query_rule_domain");
@@ -620,11 +775,15 @@ document.querySelectorAll<HTMLButtonElement>("[data-about-link]").forEach((butto
     if (!link || !(link in ABOUT_LINKS)) {
       return;
     }
-    void openUrl(ABOUT_LINKS[link]).catch((error) => {
+    void openExternalUrl(ABOUT_LINKS[link]).catch((error) => {
       console.error("打开关于链接失败", error);
       showMessage(`打开浏览器失败：${String(error)}`, true);
     });
   });
+});
+
+copySupportInfoButton.addEventListener("click", () => {
+  void copyAboutSupportInfo();
 });
 
 function closeQueryLogFilter(): void {
@@ -675,6 +834,7 @@ runtimeStatusMenu.addEventListener("click", (event) => {
 });
 
 document.querySelectorAll<HTMLButtonElement>("[data-refresh-dashboard]").forEach((button) => {
+  button.setAttribute("aria-label", button.title || "刷新仪表盘");
   button.addEventListener("click", async () => {
     await refreshStatus({ button });
   });
@@ -694,7 +854,7 @@ queryLogSearchInput.addEventListener("keydown", (event) => {
   }
   event.preventDefault();
   window.clearTimeout(queryLogSearchTimer);
-  queryLogPage = 1;
+  resetQueryLogPagination();
   void refreshQueryLogs();
 });
 
@@ -709,9 +869,86 @@ queryLogSearchInput.addEventListener("compositionend", () => {
 });
 
 queryLogFilterInput.addEventListener("change", () => {
-  queryLogPage = 1;
+  resetQueryLogPagination();
   void refreshQueryLogs();
 });
+
+queryLogAdvancedButton.addEventListener("click", () => {
+  const open = queryLogAdvancedPanel.hidden;
+  queryLogAdvancedPanel.hidden = !open;
+  queryLogAdvancedButton.setAttribute("aria-expanded", String(open));
+  refreshQueryLogAdvancedState();
+});
+
+[queryLogTimeRange, queryLogSource, queryLogQueryType, queryLogSort].forEach((control) => {
+  control.addEventListener("change", () => {
+    resetQueryLogPagination();
+    refreshQueryLogAdvancedState();
+    void refreshQueryLogs();
+  });
+});
+
+queryLogResetButton.addEventListener("click", () => {
+  queryLogSearchInput.value = DEFAULT_QUERY_LOG_QUERY.search;
+  setQueryLogFilterValue(DEFAULT_QUERY_LOG_QUERY.filter);
+  queryLogTimeRange.value = "configured";
+  queryLogSource.value = DEFAULT_QUERY_LOG_QUERY.source;
+  queryLogQueryType.value = DEFAULT_QUERY_LOG_QUERY.queryType;
+  queryLogSort.value = DEFAULT_QUERY_LOG_QUERY.sort;
+  resetQueryLogPagination();
+  refreshQueryLogAdvancedState();
+  void refreshQueryLogs();
+});
+queryLogSavedViewSelect.addEventListener("change", () => {
+  const saved = savedQueryLogViews.find((view) => view.id === queryLogSavedViewSelect.value);
+  queryLogDeleteViewButton.disabled = !saved;
+  if (!saved) {
+    return;
+  }
+  applyQueryLogQuery(saved.query);
+  resetQueryLogPagination();
+  refreshQueryLogAdvancedState();
+  void refreshQueryLogs();
+});
+
+queryLogSaveViewButton.addEventListener("click", () => {
+  try {
+    savedQueryLogViews = upsertSavedQueryLogView(
+      savedQueryLogViews,
+      queryLogViewNameInput.value,
+      collectQueryLogQuery(),
+    );
+    persistSavedQueryLogViews(savedQueryLogViews);
+    const saved = savedQueryLogViews.find(
+      (view) => view.name === queryLogViewNameInput.value.replace(/\s+/g, " ").trim(),
+    );
+    renderSavedQueryLogViews(saved?.id ?? "");
+    queryLogViewNameInput.value = "";
+    showMessage(saved ? `已保存查询视图“${saved.name}”` : "查询视图已保存", false);
+  } catch (error) {
+    showMessage(String(error), true);
+  }
+});
+
+queryLogViewNameInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    queryLogSaveViewButton.click();
+  }
+});
+
+queryLogDeleteViewButton.addEventListener("click", () => {
+  const saved = savedQueryLogViews.find((view) => view.id === queryLogSavedViewSelect.value);
+  if (!saved || !window.confirm(`删除查询视图“${saved.name}”？`)) {
+    return;
+  }
+  savedQueryLogViews = removeSavedQueryLogView(savedQueryLogViews, saved.id);
+  persistSavedQueryLogViews(savedQueryLogViews);
+  renderSavedQueryLogViews();
+  showMessage(`已删除查询视图“${saved.name}”`, false);
+});
+renderSavedQueryLogViews();
+refreshQueryLogAdvancedState();
 
 queryLogFilterButton.addEventListener("click", (event) => {
   event.stopPropagation();
@@ -754,10 +991,25 @@ queryLogPrevButton.addEventListener("click", () => {
 });
 
 queryLogNextButton.addEventListener("click", () => {
-  if (queryLogPage >= totalQueryLogPages(queryLogTotal, QUERY_LOG_PAGE_SIZE)) {
-    return;
+  if (queryLogUsesCursor()) {
+    if (!queryLogNextCursor) {
+      return;
+    }
+    queryLogCursorStack[queryLogPage] = queryLogNextCursor;
+    queryLogCursorStack.length = queryLogPage + 1;
+    queryLogPage += 1;
+  } else {
+    const pagination = queryLogPaginationState(
+      queryLogPage,
+      queryLogTotal,
+      QUERY_LOG_PAGE_SIZE,
+      false,
+    );
+    if (pagination.nextDisabled) {
+      return;
+    }
+    queryLogPage += 1;
   }
-  queryLogPage += 1;
   contentElement.scrollTop = 0;
   void refreshQueryLogs();
 });
@@ -785,6 +1037,7 @@ dnsCacheEnabledInput.addEventListener("change", updateDnsCacheControls);
 dnsCachePrefetchEnabledInput.addEventListener("change", updateDnsCacheControls);
 rebindingProtectionEnabledInput.addEventListener("change", updateResponseProtectionControls);
 runtimeWatchdogEnabledInput.addEventListener("change", updateRuntimeWatchdogControls);
+monitoringApiEnabledInput.addEventListener("change", updateMonitoringApiControls);
 blockingModeInputs.forEach((input) => {
   input.addEventListener("change", updateBlockingModeControls);
 });
@@ -887,6 +1140,25 @@ function handleConfigFieldChange(event: Event): void {
 app.addEventListener("input", handleConfigFieldChange);
 app.addEventListener("change", handleConfigFieldChange);
 
+window.addEventListener("keydown", (event) => {
+  if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s") {
+    return;
+  }
+  if (!configLoaded || !configDirty) {
+    return;
+  }
+  event.preventDefault();
+  void saveConfig();
+});
+
+window.addEventListener("beforeunload", (event) => {
+  if (!configDirty) {
+    return;
+  }
+  event.preventDefault();
+  event.returnValue = "";
+});
+
 saveButton.addEventListener("click", async () => {
   await saveConfig();
 });
@@ -922,8 +1194,7 @@ queryLogExportButton.addEventListener("click", () => {
   }
   void runFileAction(queryLogExportButton, "准备导出…", async () => {
     const result = await exportFilteredQueryLogs(
-      queryLogFilterInput.value as QueryLogFilter,
-      queryLogSearchInput.value.trim(),
+      collectQueryLogQuery(),
       (exported, total) => {
         queryLogExportButton.textContent = `导出 ${exported.toLocaleString()}/${total.toLocaleString()}`;
       },
@@ -957,7 +1228,7 @@ clientRankBody.addEventListener("click", (event) => {
     return;
   }
   queryLogSearchInput.value = client;
-  queryLogPage = 1;
+  resetQueryLogPagination();
   setActiveView("logs");
 });
 
@@ -1138,7 +1409,8 @@ chooseDataStorageButton.addEventListener("click", async () => {
     return;
   }
   try {
-    const selected = await openDialog({
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
       directory: true,
       multiple: false,
       title: "选择 DnsBlackhole 数据存储目录",
@@ -1189,7 +1461,7 @@ migrateDataStorageButton.addEventListener("click", async () => {
         : "迁移任务已保存，正在重启应用…",
       false,
     );
-    await relaunch();
+    await relaunchApplication();
   } catch (error) {
     showMessage(String(error), true);
     await loadStorageInfo();
@@ -1227,7 +1499,7 @@ checkUpdateButton.addEventListener("click", async () => {
       installUpdateButton.disabled = false;
       manualDownloadButton.disabled = false;
     } else {
-      setUpdateStatus("ok", `已是最新版本 v${currentVersion}`, 3500);
+      setUpdateStatus("ok", `已是最新版本 v${currentVersion}`);
     }
   } catch (error) {
     console.error("检查更新失败", error);
@@ -1257,7 +1529,7 @@ installUpdateButton.addEventListener("click", async () => {
   try {
     await downloadAndInstallWithRetry();
     setUpdateStatus("ok", "安装完成，即将重启应用...");
-    await relaunch();
+    await relaunchApplication();
   } catch (error) {
     console.error("更新失败", error);
     const fallbackTip = manualDownloadUrl
@@ -1275,7 +1547,7 @@ manualDownloadButton.addEventListener("click", async () => {
   manualDownloadButton.disabled = true;
 
   try {
-    await openUrl(url);
+    await openExternalUrl(url);
   } catch (error) {
     console.error("打开下载链接失败", error);
     setUpdateStatus("err", `打开浏览器失败：${formatUpdateError(error)}\n下载地址：${url}`);
@@ -1363,7 +1635,7 @@ clearQueryLogsButton.addEventListener("click", async () => {
   try {
     const status = await clearQueryLogsCommand();
     renderStatus(status);
-    queryLogPage = 1;
+    resetQueryLogPagination();
     await refreshQueryLogs();
     await loadStorageInfo();
     showMessage("查询日志已清除，统计数据未受影响", false);
@@ -1603,6 +1875,7 @@ filtersBody.addEventListener("click", (event) => {
 async function bootstrapApplication(): Promise<void> {
   void getVersion().then((version) => {
     appVersionElement.textContent = version;
+    aboutRuntimeAppVersionElement.textContent = `v${version}`;
   });
   const systemProxyReady = loadDetectedSystemProxy();
 
@@ -1714,11 +1987,13 @@ function refreshActiveView(): void {
 }
 
 function shouldAutoRefreshQueryLogs(): boolean {
+  const query = collectQueryLogQuery();
   return (
     !queryLogLivePaused &&
     queryLogPage === 1 &&
-    queryLogFilterInput.value === "all" &&
-    queryLogSearchInput.value.trim() === "" &&
+    query.filter === DEFAULT_QUERY_LOG_QUERY.filter &&
+    query.search === DEFAULT_QUERY_LOG_QUERY.search &&
+    activeAdvancedQueryFilterCount(query) === 0 &&
     !queryLogSearchComposing
   );
 }
@@ -1756,6 +2031,9 @@ async function loadConfig(): Promise<boolean> {
     allowedClientsInput.value = config.allowed_clients;
     blockedClientsInput.value = config.blocked_clients;
     clientFilteringRulesInput.value = config.client_filtering_rules;
+    clientPolicyGroupsInput.value = config.client_policy_groups;
+    familySafeSearchInput.checked = config.family_safe_search;
+    familyBlockedServicesInput.value = config.family_blocked_services;
     rateLimitPerSecondInput.value = String(config.rate_limit_per_second);
     refuseAnyInput.checked = config.refuse_any;
     filterUpdateIntervalInput.value = String(config.filter_update_interval_hours);
@@ -1781,6 +2059,10 @@ async function loadConfig(): Promise<boolean> {
     dnsCachePrefetchHitThresholdInput.value = String(config.dns_cache_prefetch_hit_threshold);
     runtimeWatchdogEnabledInput.checked = config.runtime_watchdog_enabled;
     runtimeWatchdogIntervalInput.value = String(config.runtime_watchdog_interval_seconds);
+    monitoringApiEnabledInput.checked = config.monitoring_api_enabled;
+    monitoringApiListenHostInput.value = config.monitoring_api_listen_host;
+    monitoringApiPortInput.value = String(config.monitoring_api_port);
+    monitoringApiTokenInput.value = config.monitoring_api_token;
     setRadioValue(blockingModeInputs, config.blocking_mode);
     blockingResponseTtlInput.value = String(config.blocking_response_ttl);
     blockingCustomIpv4Input.value = config.blocking_custom_ipv4;
@@ -1801,6 +2083,7 @@ async function loadConfig(): Promise<boolean> {
     updateDnsCacheControls();
     updateResponseProtectionControls();
     updateRuntimeWatchdogControls();
+    updateMonitoringApiControls();
     updateBlockingModeControls();
     blacklistInput.value = config.blacklist;
     ruleEditor.refresh();
@@ -1925,6 +2208,7 @@ function renderMacosServiceStatus(status: MacosServiceStatus): void {
   openMacosServiceSettingsButton.classList.toggle("hidden", !status.requiresApproval);
   uninstallMacosServiceButton.disabled =
     status.state === "not_registered" || status.state === "not_found";
+  renderAboutRuntimeInfo();
 }
 
 const WINDOWS_SERVICE_STATE_TEXT: Record<WindowsServiceState, string> = {
@@ -2021,6 +2305,7 @@ function renderWindowsServiceStatus(status: WindowsServiceStatus): void {
   if (!status.ready) {
     renderWindowsSystemDnsUnavailable("请先安装并启动 Windows DNS 系统服务");
   }
+  renderAboutRuntimeInfo();
 }
 
 async function loadWindowsSystemDnsStatus(): Promise<WindowsSystemDnsStatus | null> {
@@ -2431,6 +2716,9 @@ function collectConfig(): AppConfig {
     allowed_clients: allowedClientsInput.value.trim(),
     blocked_clients: blockedClientsInput.value.trim(),
     client_filtering_rules: clientFilteringRulesInput.value.trim(),
+    client_policy_groups: clientPolicyGroupsInput.value.trim(),
+    family_safe_search: familySafeSearchInput.checked,
+    family_blocked_services: familyBlockedServicesInput.value.trim(),
     rate_limit_per_second: Number(rateLimitPerSecondInput.value || 0),
     refuse_any: refuseAnyInput.checked,
     filter_update_interval_hours: Number(filterUpdateIntervalInput.value),
@@ -2453,6 +2741,10 @@ function collectConfig(): AppConfig {
     dns_cache_prefetch_hit_threshold: Number(dnsCachePrefetchHitThresholdInput.value || 10),
     runtime_watchdog_enabled: runtimeWatchdogEnabledInput.checked,
     runtime_watchdog_interval_seconds: Number(runtimeWatchdogIntervalInput.value || 0),
+    monitoring_api_enabled: monitoringApiEnabledInput.checked,
+    monitoring_api_listen_host: monitoringApiListenHostInput.value.trim(),
+    monitoring_api_port: Number(monitoringApiPortInput.value || 0),
+    monitoring_api_token: monitoringApiTokenInput.value.trim(),
     blocking_mode: selectedRadioValue(blockingModeInputs, "null_ip") as BlockingMode,
     blocking_response_ttl: Number(blockingResponseTtlInput.value || 0),
     blocking_custom_ipv4: blockingCustomIpv4Input.value.trim(),
@@ -2574,6 +2866,77 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
     }
   }
 }
+
+function collectQueryLogQuery(): QueryLogQuery {
+  return {
+    filter: queryLogFilterInput.value as QueryLogFilter,
+    search: queryLogSearchInput.value.trim(),
+    hours: parseQueryLogHours(queryLogTimeRange.value),
+    source: queryLogSource.value as QueryLogSourceFilter,
+    queryType: queryLogQueryType.value as QueryLogTypeFilter,
+    sort: queryLogSort.value as QueryLogSort,
+  };
+}
+
+function queryLogUsesCursor(query = collectQueryLogQuery()): boolean {
+  return query.sort === "newest" || query.sort === "oldest";
+}
+
+function resetQueryLogPagination(): void {
+  queryLogPage = 1;
+  queryLogCursorStack = [""];
+  queryLogNextCursor = null;
+}
+
+function applyQueryLogQuery(queryValue: QueryLogQuery): void {
+  queryLogSearchInput.value = queryValue.search;
+  setQueryLogFilterValue(queryValue.filter);
+  queryLogTimeRange.value = queryValue.hours === null ? "configured" : String(queryValue.hours);
+  queryLogSource.value = queryValue.source;
+  queryLogQueryType.value = queryValue.queryType;
+  queryLogSort.value = queryValue.sort;
+  [queryLogTimeRange, queryLogSource, queryLogQueryType, queryLogSort].forEach(syncCustomSelect);
+}
+
+function renderSavedQueryLogViews(selectedId = queryLogSavedViewSelect.value): void {
+  queryLogSavedViewSelect.innerHTML = [
+    '<option value="">选择已保存视图</option>',
+    ...savedQueryLogViews.map(
+      (view) => `<option value="${escapeHtml(view.id)}">${escapeHtml(view.name)}</option>`,
+    ),
+  ].join("");
+  queryLogSavedViewSelect.value = savedQueryLogViews.some((view) => view.id === selectedId)
+    ? selectedId
+    : "";
+  queryLogDeleteViewButton.disabled = queryLogSavedViewSelect.value === "";
+  syncCustomSelect(queryLogSavedViewSelect);
+}
+
+function syncSavedQueryLogViewSelection(): void {
+  const queryValue = collectQueryLogQuery();
+  const matched = savedQueryLogViews.find(
+    (view) => JSON.stringify(view.query) === JSON.stringify(queryValue),
+  );
+  if (queryLogSavedViewSelect.value !== (matched?.id ?? "")) {
+    queryLogSavedViewSelect.value = matched?.id ?? "";
+    syncCustomSelect(queryLogSavedViewSelect);
+  }
+  queryLogDeleteViewButton.disabled = !matched;
+}
+
+function refreshQueryLogAdvancedState(): void {
+  const count = activeAdvancedQueryFilterCount(collectQueryLogQuery());
+  queryLogAdvancedCount.textContent = String(count);
+  queryLogAdvancedCount.hidden = count === 0;
+  queryLogAdvancedButton.classList.toggle("active", count > 0);
+  queryLogAdvancedButton.title = count > 0 ? `已启用 ${count} 个高级筛选` : "";
+  queryLogAdvancedButton.setAttribute(
+    "aria-label",
+    count > 0 ? `更多筛选，已启用 ${count} 个条件` : "更多筛选",
+  );
+  syncSavedQueryLogViewSelection();
+}
+
 function scheduleQueryLogSearch(): void {
   if (queryLogSearchComposing) {
     return;
@@ -2581,7 +2944,7 @@ function scheduleQueryLogSearch(): void {
 
   window.clearTimeout(queryLogSearchTimer);
   queryLogSearchTimer = window.setTimeout(() => {
-    queryLogPage = 1;
+    resetQueryLogPagination();
     void refreshQueryLogs();
   }, QUERY_LOG_SEARCH_DEBOUNCE_MS);
 }
@@ -2600,29 +2963,33 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
   setRefreshButtonState(options.button, true);
   setQueryLogLoading(true, options.auto === true);
   try {
-    const requestedFilter = queryLogFilterInput.value as QueryLogFilter;
-    const requestedSearch = queryLogSearchInput.value.trim();
+    const requestedQuery = collectQueryLogQuery();
     const requestedPage = queryLogPage;
+    const requestedCursor = queryLogUsesCursor(requestedQuery)
+      ? (queryLogCursorStack[requestedPage - 1] ?? "")
+      : null;
     const page = await getQueryLogs({
-      filter: requestedFilter,
-      search: requestedSearch,
+      ...requestedQuery,
       page: requestedPage,
       pageSize: QUERY_LOG_PAGE_SIZE,
+      cursor: requestedCursor,
     });
     if (options.auto && isContentScrolling) {
       queuedAutoRefresh = true;
       return;
     }
     if (
-      requestedFilter !== queryLogFilterInput.value ||
-      requestedSearch !== queryLogSearchInput.value.trim() ||
-      requestedPage !== queryLogPage
+      JSON.stringify(requestedQuery) !== JSON.stringify(collectQueryLogQuery()) ||
+      requestedPage !== queryLogPage ||
+      (queryLogUsesCursor(requestedQuery) &&
+        requestedCursor !== (queryLogCursorStack[requestedPage - 1] ?? ""))
     ) {
       queryLogRefreshQueued = true;
       return;
     }
     queryLogPage = page.page;
     queryLogTotal = page.total;
+    queryLogNextCursor = page.next_cursor;
     renderQueryLogs(page);
   } catch (error) {
     if (options.auto) {
@@ -2678,10 +3045,13 @@ function setActiveView(view: ViewName): void {
     const isSettingsGroup =
       button.dataset.navGroup === "settings" &&
       (view === "settings" || view === "dns" || view === "security" || view === "diagnostics");
-    button.classList.toggle(
-      "active",
-      button.dataset.view === view || isFilterGroup || isSettingsGroup,
-    );
+    const selected = button.dataset.view === view || isFilterGroup || isSettingsGroup;
+    button.classList.toggle("active", selected);
+    if (selected) {
+      button.setAttribute("aria-current", "page");
+    } else {
+      button.removeAttribute("aria-current");
+    }
   });
   document.querySelectorAll<HTMLElement>("[data-view-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.viewPanel === view);
@@ -2973,6 +3343,7 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
 
   latestRuntimeStatus = status;
   renderRuntimeStatus(status);
+  renderAboutRuntimeInfo();
 
   const lastError = status.error ?? status.stats.last_error;
   const statusErrorKey = status.error
@@ -3135,7 +3506,11 @@ function renderQueryLogs(page: QueryLogPage): void {
   }
 
   if (page.records.length === 0) {
-    const hasSearch = queryLogSearchInput.value.trim().length > 0 || queryLogFilterInput.value !== "all";
+    const query = collectQueryLogQuery();
+    const hasSearch =
+      query.search.length > 0 ||
+      query.filter !== DEFAULT_QUERY_LOG_QUERY.filter ||
+      activeAdvancedQueryFilterCount(query) > 0;
     setHtmlIfChanged(
       queryLogBody,
       `<div class="query-log-empty">${hasSearch ? "没有匹配的查询记录" : "暂无查询记录"}</div>`,
@@ -3160,8 +3535,10 @@ function renderQueryLogPagination(page: QueryLogPage): void {
     page.total === 0
       ? "0 条记录"
       : `${formatCount(pagination.start)}-${formatCount(pagination.end)} / ${formatCount(page.total)} 条`;
-  queryLogPrevButton.disabled = pagination.previousDisabled;
-  queryLogNextButton.disabled = pagination.nextDisabled;
+  queryLogPrevButton.disabled = queryLogRefreshInFlight || page.page <= 1;
+  queryLogNextButton.disabled = queryLogUsesCursor()
+    ? queryLogRefreshInFlight || page.next_cursor === null
+    : pagination.nextDisabled;
 }
 
 function syncQueryLogPaginationDisabled(loading: boolean): void {
@@ -3171,8 +3548,10 @@ function syncQueryLogPaginationDisabled(loading: boolean): void {
     QUERY_LOG_PAGE_SIZE,
     loading,
   );
-  queryLogPrevButton.disabled = pagination.previousDisabled;
-  queryLogNextButton.disabled = pagination.nextDisabled;
+  queryLogPrevButton.disabled = loading || queryLogPage <= 1;
+  queryLogNextButton.disabled = queryLogUsesCursor()
+    ? loading || queryLogNextCursor === null
+    : pagination.nextDisabled;
 }
 
 function setQueryLogFilterValue(value: QueryLogFilter): void {
@@ -3332,6 +3711,13 @@ function updateRuntimeWatchdogControls(): void {
   runtimeWatchdogIntervalInput.disabled = !runtimeWatchdogEnabledInput.checked;
 }
 
+function updateMonitoringApiControls(): void {
+  const enabled = monitoringApiEnabledInput.checked;
+  monitoringApiListenHostInput.disabled = !enabled;
+  monitoringApiPortInput.disabled = !enabled;
+  monitoringApiTokenInput.disabled = !enabled;
+}
+
 function updateBlockingModeControls(): void {
   const isCustom = selectedRadioValue(blockingModeInputs, "null_ip") === "custom_ip";
   blockingCustomFields.classList.toggle("visible", isCustom);
@@ -3443,6 +3829,8 @@ async function retryWithBackoff<T>(
 function setUpdateStatus(kind: "info" | "ok" | "err", message: string, autoHideMs = 0): void {
   window.clearTimeout(updateStatusTimer);
   updateStatusElement.classList.remove("hidden", "ok", "err");
+  updateStatusElement.setAttribute("role", kind === "err" ? "alert" : "status");
+  updateStatusElement.setAttribute("aria-live", kind === "err" ? "assertive" : "polite");
   if (kind !== "info") {
     updateStatusElement.classList.add(kind);
   }
@@ -3616,7 +4004,7 @@ function resolveManualDownloadUrl(update: Update): string {
 
 async function checkForUpdateWithRetry(): Promise<Update | null> {
   return retryWithBackoff(
-    () => check({ timeout: CHECK_TIMEOUT_MS }),
+    () => checkApplicationUpdate(),
     CHECK_RETRY_DELAYS_MS,
     (attempt, delayMs, error) => {
       setUpdateStatus(
@@ -3630,7 +4018,7 @@ async function checkForUpdateWithRetry(): Promise<Update | null> {
 async function downloadAndInstallWithRetry(): Promise<void> {
   await retryWithBackoff(
     async (attempt) => {
-      const candidate = await check({ timeout: CHECK_TIMEOUT_MS });
+      const candidate = await checkApplicationUpdate();
       if (!candidate) {
         throw new Error("重新检查时未发现可安装的新版本");
       }
@@ -4189,6 +4577,12 @@ function setQueryLogLoading(loading: boolean, background = false): void {
   queryLogRefreshButton.disabled = loading;
   queryLogFilterInput.disabled = loading;
   queryLogFilterButton.disabled = loading;
+  queryLogAdvancedButton.disabled = loading;
+  queryLogTimeRange.disabled = loading;
+  queryLogSource.disabled = loading;
+  queryLogQueryType.disabled = loading;
+  queryLogSort.disabled = loading;
+  queryLogResetButton.disabled = loading;
   if (loading) {
     closeQueryLogFilter();
   }
@@ -4211,6 +4605,9 @@ function showMessage(value: string, isError: boolean): void {
 
   const el = document.createElement("div");
   el.className = isError ? "message error" : "message";
+  el.setAttribute("role", isError ? "alert" : "status");
+  el.setAttribute("aria-live", isError ? "assertive" : "polite");
+  el.setAttribute("aria-atomic", "true");
   el.innerHTML = `<span class="msg-text">${escapeHtml(value)}</span>`;
   document.body.appendChild(el);
 
@@ -4226,6 +4623,8 @@ function showMessage(value: string, isError: boolean): void {
     messageTimer = window.setTimeout(dismiss, 8000);
   }
 }
+
+renderAboutRuntimeInfo();
 
 void bootstrapApplication().catch((error) => {
   console.error("应用启动失败", error);

@@ -1,6 +1,6 @@
 .query-log-toolbar {
   display: grid;
-  grid-template-columns: auto minmax(260px, 1fr) 170px;
+  grid-template-columns: auto minmax(420px, 1fr);
   align-items: center;
   gap: 18px;
   margin: 0 0 18px;
@@ -47,8 +47,17 @@
   place-items: center;
   color: #74808d;
   background: transparent;
-  font-size: 17px;
   line-height: 1;
+}
+
+.ghost-icon-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
 }
 
 .ghost-icon-button:hover:not(:disabled) {
@@ -70,20 +79,30 @@
 .query-log-search {
   position: relative;
   display: block;
+  min-width: 220px;
+  flex: 1 1 320px;
 }
 
-.query-log-search span {
+.query-log-search svg {
   position: absolute;
   top: 50%;
   left: 13px;
+  width: 16px;
+  height: 16px;
   color: #99a5b3;
-  font-size: 18px;
-  line-height: 1;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.8;
   transform: translateY(-50%);
+  pointer-events: none;
 }
 
 .query-log-search input,
-.query-log-filter-trigger {
+.query-log-filter-trigger,
+.query-log-advanced-trigger,
+.query-log-advanced-panel select,
+.query-log-advanced-panel input {
   height: 36px;
   border: 1px solid #dbe4ee;
   border-radius: 3px;
@@ -104,15 +123,116 @@
 
 .query-log-search input:focus,
 .query-log-filter.open .query-log-filter-trigger,
-.query-log-filter-trigger:focus-visible {
+.query-log-filter-trigger:focus-visible,
+.query-log-advanced-trigger:focus-visible,
+.query-log-advanced-panel select:focus-visible,
+.query-log-advanced-panel input:focus-visible {
   border-color: var(--green);
   box-shadow: 0 0 0 3px rgba(103, 178, 121, 0.16);
   outline: none;
 }
 
+.query-log-primary-filters {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .query-log-filter {
   position: relative;
   min-width: 170px;
+}
+
+.query-log-advanced-trigger {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  color: #526274;
+  background: #ffffff;
+  white-space: nowrap;
+}
+
+.query-log-advanced-trigger.active {
+  border-color: #9fc8aa;
+  color: var(--green);
+  background: #f2f8f3;
+}
+
+.query-log-advanced-trigger[aria-expanded="true"] {
+  border-color: #9fc8aa;
+  color: var(--green);
+  background: #f7fbf8;
+}
+
+.query-log-advanced-trigger span {
+  display: grid;
+  min-width: 18px;
+  height: 18px;
+  place-items: center;
+  border-radius: 9px;
+  color: #ffffff;
+  background: var(--green);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.query-log-advanced-trigger span[hidden] {
+  display: none;
+}
+
+.query-log-advanced-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  align-items: end;
+  gap: 12px;
+  border-top: 1px solid #e2e8ef;
+  padding-top: 14px;
+}
+
+.query-log-advanced-panel[hidden] {
+  display: none;
+}
+
+.query-log-advanced-panel label {
+  display: grid;
+  gap: 6px;
+}
+
+.query-log-advanced-panel label > span {
+  color: #526274;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.query-log-advanced-panel select,
+.query-log-advanced-panel input {
+  width: 100%;
+  padding: 0 30px 0 10px;
+}
+
+.query-log-advanced-panel input {
+  padding-right: 10px;
+}
+
+.query-log-view-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.query-log-view-actions button,
+.query-log-reset-button {
+  height: 36px;
+}
+
+.query-log-reset-button {
+  justify-self: start;
+  white-space: nowrap;
 }
 
 .query-log-filter-trigger {
@@ -297,7 +417,7 @@
 .log-client span {
   display: block;
   margin-top: 4px;
-  color: #8390a0;
+  color: #637386;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -695,13 +815,13 @@
 }
 
 .log-response-answer small {
-  color: #8390a0;
+  color: #637386;
   white-space: nowrap;
 }
 
 .log-response-answers p {
   margin: 7px 0 0;
-  color: #8390a0;
+  color: #637386;
   font-size: 12px;
   line-height: 1.4;
 }
@@ -725,7 +845,18 @@
   gap: 16px;
   border-top: 1px solid #edf0f3;
   padding: 10px 18px;
-  color: #738294;
+  color: #596a7d;
   background: #fbfcfd;
   font-size: 13px;
+}
+
+@media (max-height: 600px) {
+  .query-log-body {
+    min-height: 220px;
+  }
+
+  .query-log-empty {
+    padding-top: 36px;
+    padding-bottom: 36px;
+  }
 }

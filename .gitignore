@@ -12,6 +12,13 @@ dist
 dist-ssr
 *.local
 
+# 项目内缓存、界面审查记录与本地发布产物
+.pnpm-store/
+.impeccable/
+artifacts/
+.release-bench/
+RELEASE_PROCESS.local.md
+
 # 机器本地的 cargo 配置（含本机 Windows SDK 路径，勿入库）
 src-tauri/.cargo/
 src-tauri/target/

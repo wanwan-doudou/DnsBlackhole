@@ -4,6 +4,7 @@ mod client_policy;
 mod diagnostics;
 mod filter_runtime;
 mod ip_network;
+mod monitoring;
 mod protocol;
 mod rewrites;
 mod rule_cache;

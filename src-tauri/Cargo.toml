@@ -1,6 +1,6 @@
 [package]
 name = "dnsblackhole"
-version = "0.1.61"
+version = "0.2.0"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"
@@ -22,6 +22,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 socket2 = "0.6"
 reqwest = { version = "0.13", features = ["blocking"] }

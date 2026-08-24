@@ -26,12 +26,12 @@ export function renderQueryLogRow(
   const responseDetailPopover = renderQueryLogResponseDetail(record, status.label);
 
   return `
-    <div class="query-log-row${rowClass}">
-      <div class="log-time">
+    <div class="query-log-row${rowClass}" role="row">
+      <div class="log-time" role="cell">
         <strong>${escapeHtml(formatLogTime(record.timestamp))}</strong>
         <span>${escapeHtml(formatLogDate(record.timestamp))}</span>
       </div>
-      <div class="log-request">
+      <div class="log-request" role="cell">
         <div class="log-detail-anchor">
           <button class="log-detail-trigger" type="button" aria-label="查看请求详情">
             ${renderLogEyeIcon(status.className)}
@@ -49,7 +49,7 @@ export function renderQueryLogRow(
           </div>
         </div>
       </div>
-      <div class="log-response">
+      <div class="log-response" role="cell">
         <div class="log-response-layout">
           <div class="log-detail-anchor log-response-detail-anchor">
             <button class="log-detail-trigger" type="button" aria-label="查看响应详情">
@@ -64,7 +64,7 @@ export function renderQueryLogRow(
           </div>
         </div>
       </div>
-      <div class="log-client">
+      <div class="log-client" role="cell">
         <strong>${escapeHtml(options.clientDisplayName(record.client_ip) ?? record.client_ip ?? "-")}</strong>
         <span>${escapeHtml(record.client_ip || "未知客户端")}</span>
       </div>

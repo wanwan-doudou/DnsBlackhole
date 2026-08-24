@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{self, AppConfig},
-    database::{Database, LogStats, QueryLogPage},
+    database::{Database, LogStats, QueryLogPage, QueryLogQuery},
     dns::{
         self, DnsDiagnosticReport, DnsServer, DnsStats, FilterRuntime, RuleLoadSource, RuleSummary,
         RuntimeStatus, apply_cache_stats, build_filter_runtime_with_rules, clear_rule_cache,
@@ -561,6 +561,9 @@ pub(crate) fn filter_runtime_changed(previous: &AppConfig, next: &AppConfig) -> 
         || previous.cname_cloaking_enabled != next.cname_cloaking_enabled
         || previous.dns_rewrites != next.dns_rewrites
         || previous.client_filtering_rules != next.client_filtering_rules
+        || previous.client_policy_groups != next.client_policy_groups
+        || previous.family_safe_search != next.family_safe_search
+        || previous.family_blocked_services != next.family_blocked_services
         || previous.query_log_ignored_domains != next.query_log_ignored_domains
         || previous.statistics_ignored_domains != next.statistics_ignored_domains
 }
@@ -593,6 +596,10 @@ pub(crate) fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool 
         || previous.dns_cache_optimistic != next.dns_cache_optimistic
         || previous.dns_cache_prefetch_enabled != next.dns_cache_prefetch_enabled
         || previous.dns_cache_prefetch_hit_threshold != next.dns_cache_prefetch_hit_threshold
+        || previous.monitoring_api_enabled != next.monitoring_api_enabled
+        || previous.monitoring_api_listen_host != next.monitoring_api_listen_host
+        || previous.monitoring_api_port != next.monitoring_api_port
+        || previous.monitoring_api_token != next.monitoring_api_token
 }
 
 /// 保存配置并按需热替换或重启 DNS。开机自启等 GUI 侧系统集成由调用方处理。
@@ -607,6 +614,7 @@ pub(crate) fn save_config_blocking(
     let previous = state.current_config()?;
     let submitted_without_statistics_config =
         config.schema_version < config::CURRENT_CONFIG_SCHEMA_VERSION;
+    let submitted_schema_version = config.schema_version;
     config::migrate_legacy_defaults(&mut config);
     if submitted_without_statistics_config {
         // 旧版界面不知道独立统计配置，保存其他设置时沿用服务端现值，
@@ -614,6 +622,15 @@ pub(crate) fn save_config_blocking(
         config.statistics_enabled = previous.statistics_enabled;
         config.statistics_retention_hours = previous.statistics_retention_hours;
         config.statistics_ignored_domains = previous.statistics_ignored_domains.clone();
+    }
+    if submitted_schema_version < 16 {
+        config.client_policy_groups = previous.client_policy_groups.clone();
+        config.family_safe_search = previous.family_safe_search;
+        config.family_blocked_services = previous.family_blocked_services.clone();
+        config.monitoring_api_enabled = previous.monitoring_api_enabled;
+        config.monitoring_api_listen_host = previous.monitoring_api_listen_host.clone();
+        config.monitoring_api_port = previous.monitoring_api_port;
+        config.monitoring_api_token = previous.monitoring_api_token.clone();
     }
     config.validate()?;
     let filter_changed = filter_runtime_changed(&previous, &config);
@@ -656,10 +673,16 @@ fn statistics_retention_was_shortened(previous: u32, next: u32) -> bool {
     next != 0 && (previous == 0 || next < previous)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_logs_blocking(
     state: Arc<AppState>,
     filter: Option<String>,
     search: Option<String>,
+    hours: Option<u32>,
+    source: Option<String>,
+    query_type: Option<String>,
+    sort: Option<String>,
+    cursor: Option<String>,
     page: Option<u32>,
     page_size: Option<u32>,
 ) -> Result<QueryLogPage, String> {
@@ -670,16 +693,22 @@ pub(crate) fn query_logs_blocking(
             total: 0,
             page: page.unwrap_or(1).max(1),
             page_size: page_size.unwrap_or(50).clamp(20, 200),
+            next_cursor: None,
         });
     }
 
-    state.database.query_logs(
-        config.query_log_retention_hours,
-        filter.as_deref().unwrap_or("all"),
-        search.as_deref().unwrap_or(""),
-        page.unwrap_or(1),
-        page_size.unwrap_or(50),
-    )
+    state.database.query_logs_advanced(QueryLogQuery {
+        retention_hours: config.query_log_retention_hours,
+        hours,
+        filter: filter.as_deref().unwrap_or("all"),
+        search: search.as_deref().unwrap_or(""),
+        source: source.as_deref().unwrap_or("all"),
+        query_type: query_type.as_deref().unwrap_or("all"),
+        sort: sort.as_deref().unwrap_or("newest"),
+        cursor: cursor.as_deref(),
+        page: page.unwrap_or(1),
+        page_size: page_size.unwrap_or(50),
+    })
 }
 
 pub(crate) fn clear_query_logs_blocking(state: &AppState) -> Result<RuntimeStatus, String> {
@@ -1186,8 +1215,19 @@ mod tests {
         let state = test_state();
 
         let _ = state.status_with_log_stats(false, true);
-        query_logs_blocking(Arc::clone(&state), None, None, Some(1), Some(50))
-            .expect("查询日志应可读取");
+        query_logs_blocking(
+            Arc::clone(&state),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1),
+            Some(50),
+        )
+        .expect("查询日志应可读取");
 
         assert_eq!(
             *state.last_prune_at.lock().expect("清理状态应可读取"),

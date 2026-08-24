@@ -13,11 +13,24 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 15;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 16;
 pub(crate) const MAX_STATISTICS_RETENTION_HOURS: u32 = 24 * 365;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
 const MAX_FILTER_SIZE_MB: u32 = 256;
+pub(crate) const BLOCKED_SERVICE_KEYS: &[&str] = &[
+    "youtube",
+    "tiktok",
+    "instagram",
+    "facebook",
+    "x",
+    "reddit",
+    "twitch",
+    "discord",
+    "steam",
+    "epic",
+    "roblox",
+];
 const LEGACY_DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 100;
 const LEGACY_ADGUARD_DNS_FILTER_URL: &str =
     "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
@@ -56,6 +69,12 @@ pub struct AppConfig {
     pub client_upstream_rules: String,
     #[serde(default)]
     pub client_filtering_rules: String,
+    #[serde(default)]
+    pub client_policy_groups: String,
+    #[serde(default = "default_family_safe_search")]
+    pub family_safe_search: bool,
+    #[serde(default = "default_family_blocked_services")]
+    pub family_blocked_services: String,
     #[serde(default = "default_allowed_clients")]
     pub allowed_clients: String,
     #[serde(default)]
@@ -106,6 +125,14 @@ pub struct AppConfig {
     pub runtime_watchdog_enabled: bool,
     #[serde(default = "default_runtime_watchdog_interval_seconds")]
     pub runtime_watchdog_interval_seconds: u64,
+    #[serde(default)]
+    pub monitoring_api_enabled: bool,
+    #[serde(default = "default_monitoring_api_listen_host")]
+    pub monitoring_api_listen_host: String,
+    #[serde(default = "default_monitoring_api_port")]
+    pub monitoring_api_port: u16,
+    #[serde(default)]
+    pub monitoring_api_token: String,
     #[serde(default)]
     pub blocking_mode: BlockingMode,
     #[serde(default = "default_blocking_response_ttl")]
@@ -187,7 +214,23 @@ pub(crate) struct ClientUpstreamRuleSpec {
 #[derive(Debug, Clone)]
 pub(crate) struct ClientFilteringRuleSpec {
     pub(crate) network: String,
+    pub(crate) profile: String,
+    pub(crate) schedule: Option<ClientScheduleSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClientPolicyGroupSpec {
+    pub(crate) name: String,
     pub(crate) bypass: bool,
+    pub(crate) safe_search: bool,
+    pub(crate) blocked_services: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientScheduleSpec {
+    pub(crate) weekdays: [bool; 7],
+    pub(crate) start_minute: u16,
+    pub(crate) end_minute: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +297,9 @@ impl Default for AppConfig {
             domain_upstream_rules: String::new(),
             client_upstream_rules: String::new(),
             client_filtering_rules: String::new(),
+            client_policy_groups: String::new(),
+            family_safe_search: default_family_safe_search(),
+            family_blocked_services: default_family_blocked_services(),
             allowed_clients: default_allowed_clients(),
             blocked_clients: String::new(),
             rate_limit_per_second: default_rate_limit_per_second(),
@@ -279,6 +325,10 @@ impl Default for AppConfig {
             dns_cache_prefetch_hit_threshold: default_dns_cache_prefetch_hit_threshold(),
             runtime_watchdog_enabled: default_runtime_watchdog_enabled(),
             runtime_watchdog_interval_seconds: default_runtime_watchdog_interval_seconds(),
+            monitoring_api_enabled: false,
+            monitoring_api_listen_host: default_monitoring_api_listen_host(),
+            monitoring_api_port: default_monitoring_api_port(),
+            monitoring_api_token: String::new(),
             blocking_mode: BlockingMode::default(),
             blocking_response_ttl: default_blocking_response_ttl(),
             blocking_custom_ipv4: String::new(),
@@ -353,13 +403,24 @@ impl AppConfig {
         parse_client_filtering_rules(&self.client_filtering_rules)
     }
 
+    pub(crate) fn client_policy_group_specs(&self) -> Result<Vec<ClientPolicyGroupSpec>, String> {
+        parse_client_policy_groups(&self.client_policy_groups)
+    }
+
+    pub(crate) fn family_blocked_service_names(&self) -> Result<Vec<String>, String> {
+        parse_blocked_services(&self.family_blocked_services, "家庭策略")
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.listen_socket_addrs()?;
         let upstreams = self.upstream_servers()?;
         let fallbacks = self.fallback_servers()?;
         let domain_rules = self.domain_upstream_rule_specs()?;
         let client_rules = self.client_upstream_rule_specs()?;
-        self.client_filtering_rule_specs()?;
+        let client_filtering_rules = self.client_filtering_rule_specs()?;
+        let client_policy_groups = self.client_policy_group_specs()?;
+        validate_client_policy_profiles(&client_filtering_rules, &client_policy_groups)?;
+        parse_blocked_services(&self.family_blocked_services, "家庭策略")?;
         if self.dnssec_enabled
             && upstreams
                 .iter()
@@ -374,6 +435,7 @@ impl AppConfig {
         if !(10..=3600).contains(&self.runtime_watchdog_interval_seconds) {
             return Err("自恢复检查间隔必须在 10 到 3600 秒之间".into());
         }
+        self.monitoring_api_socket_addr()?;
         if self.schema_version > CURRENT_CONFIG_SCHEMA_VERSION {
             return Err(format!(
                 "配置版本 {} 高于当前支持的版本 {}",
@@ -426,6 +488,29 @@ impl AppConfig {
         validate_ignored_domains(&self.statistics_ignored_domains)?;
         validate_domain_list(&self.rebinding_allowed_domains, "Rebinding 可信域名")?;
         Ok(())
+    }
+
+    pub(crate) fn monitoring_api_socket_addr(&self) -> Result<SocketAddr, String> {
+        let host = self.monitoring_api_listen_host.trim();
+        let ip = host
+            .parse::<IpAddr>()
+            .map_err(|_| "监控接口监听地址必须是 IP 地址".to_string())?;
+        if self.monitoring_api_port == 0 {
+            return Err("监控接口端口必须大于 0".into());
+        }
+        if self.monitoring_api_enabled
+            && !ip.is_loopback()
+            && self.monitoring_api_token.trim().len() < 16
+        {
+            return Err("监控接口监听非本机地址时，访问令牌至少需要 16 个字符".into());
+        }
+        if self.monitoring_api_enabled && self.monitoring_api_port == self.listen_port {
+            return Err("监控接口端口不能与 DNS 监听端口相同".into());
+        }
+        if self.monitoring_api_token.len() > 256 {
+            return Err("监控接口访问令牌不能超过 256 个字符".into());
+        }
+        Ok(SocketAddr::new(ip, self.monitoring_api_port))
     }
 }
 
@@ -575,6 +660,22 @@ fn default_filter_max_size_mb() -> u32 {
 
 fn default_query_log_enabled() -> bool {
     true
+}
+
+fn default_family_safe_search() -> bool {
+    true
+}
+
+fn default_family_blocked_services() -> String {
+    "youtube,tiktok,instagram,facebook,x,reddit,twitch,discord,steam,epic,roblox".into()
+}
+
+fn default_monitoring_api_listen_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_monitoring_api_port() -> u16 {
+    9095
 }
 
 fn default_launch_at_startup() -> bool {
@@ -942,9 +1043,9 @@ fn parse_client_filtering_rules(value: &str) -> Result<Vec<ClientFilteringRuleSp
             Some((index, trimmed))
         })
         .map(|(index, line)| {
-            let (network, mode) = line.split_once("=>").ok_or_else(|| {
+            let (network, policy_and_schedule) = line.split_once("=>").ok_or_else(|| {
                 format!(
-                    "客户端过滤策略第 {} 行格式必须是“IP/CIDR => filter 或 bypass”",
+                    "客户端过滤策略第 {} 行格式必须是“IP/CIDR => 策略组 [@ 周期 时间]”",
                     index + 1
                 )
             })?;
@@ -955,22 +1056,242 @@ fn parse_client_filtering_rules(value: &str) -> Result<Vec<ClientFilteringRuleSp
                     index + 1
                 )
             })?;
-            let bypass = match mode.trim().to_ascii_lowercase().as_str() {
-                "filter" => false,
-                "bypass" => true,
-                _ => {
-                    return Err(format!(
-                        "客户端过滤策略第 {} 行模式只能是 filter 或 bypass",
-                        index + 1
-                    ));
-                }
+            let (profile, schedule) = match policy_and_schedule.split_once('@') {
+                Some((profile, schedule)) => (
+                    profile.trim(),
+                    Some(parse_client_schedule(index, schedule.trim())?),
+                ),
+                None => (policy_and_schedule.trim(), None),
             };
+            let profile = profile.to_ascii_lowercase();
+            if !valid_policy_name(&profile) {
+                return Err(format!("客户端过滤策略第 {} 行的策略组名称无效", index + 1));
+            }
             Ok(ClientFilteringRuleSpec {
                 network: network.to_string(),
-                bypass,
+                profile,
+                schedule,
             })
         })
         .collect()
+}
+
+fn parse_client_policy_groups(value: &str) -> Result<Vec<ClientPolicyGroupSpec>, String> {
+    let mut names = HashSet::new();
+    let groups = value
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+                return None;
+            }
+            Some((index, trimmed))
+        })
+        .map(|(index, line)| {
+            let (name, options) = line.split_once("=>").ok_or_else(|| {
+                format!(
+                    "客户端策略组第 {} 行格式必须是“名称 => filter|bypass, 选项”",
+                    index + 1
+                )
+            })?;
+            let name = name.trim().to_ascii_lowercase();
+            if !valid_policy_name(&name) || matches!(name.as_str(), "filter" | "bypass" | "family")
+            {
+                return Err(format!(
+                    "客户端策略组第 {} 行名称无效或使用了保留名称",
+                    index + 1
+                ));
+            }
+            if !names.insert(name.clone()) {
+                return Err(format!("客户端策略组名称重复：{name}"));
+            }
+
+            let mut bypass = false;
+            let mut mode_seen = false;
+            let mut safe_search = false;
+            let mut blocked_services = Vec::new();
+            for option in options
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let normalized = option.to_ascii_lowercase();
+                match normalized.as_str() {
+                    "filter" => {
+                        if mode_seen {
+                            return Err(format!("客户端策略组第 {} 行重复指定过滤模式", index + 1));
+                        }
+                        mode_seen = true;
+                    }
+                    "bypass" => {
+                        if mode_seen {
+                            return Err(format!("客户端策略组第 {} 行重复指定过滤模式", index + 1));
+                        }
+                        mode_seen = true;
+                        bypass = true;
+                    }
+                    "safe_search" => safe_search = true,
+                    _ => {
+                        let Some(services) = normalized.strip_prefix("block:") else {
+                            return Err(format!(
+                                "客户端策略组第 {} 行包含未知选项：{option}",
+                                index + 1
+                            ));
+                        };
+                        blocked_services.extend(parse_blocked_services(
+                            &services.replace('|', ","),
+                            &format!("客户端策略组第 {} 行", index + 1),
+                        )?);
+                    }
+                }
+            }
+            blocked_services.sort();
+            blocked_services.dedup();
+            Ok(ClientPolicyGroupSpec {
+                name,
+                bypass,
+                safe_search,
+                blocked_services,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if groups.len() > 64 {
+        return Err("客户端策略组不能超过 64 个".into());
+    }
+    Ok(groups)
+}
+
+fn validate_client_policy_profiles(
+    rules: &[ClientFilteringRuleSpec],
+    groups: &[ClientPolicyGroupSpec],
+) -> Result<(), String> {
+    let names = groups
+        .iter()
+        .map(|group| group.name.as_str())
+        .collect::<HashSet<_>>();
+    for rule in rules {
+        if !matches!(rule.profile.as_str(), "filter" | "bypass" | "family")
+            && !names.contains(rule.profile.as_str())
+        {
+            return Err(format!(
+                "客户端过滤策略引用了未定义的策略组：{}",
+                rule.profile
+            ));
+        }
+    }
+    if rules.len() > 4096 {
+        return Err("客户端过滤策略不能超过 4096 条".into());
+    }
+    Ok(())
+}
+
+fn valid_policy_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn parse_client_schedule(index: usize, value: &str) -> Result<ClientScheduleSpec, String> {
+    let mut parts = value.split_whitespace();
+    let days = parts
+        .next()
+        .ok_or_else(|| format!("客户端过滤策略第 {} 行缺少计划周期", index + 1))?;
+    let time = parts
+        .next()
+        .ok_or_else(|| format!("客户端过滤策略第 {} 行缺少计划时间", index + 1))?;
+    if parts.next().is_some() {
+        return Err(format!(
+            "客户端过滤策略第 {} 行计划格式必须是“mon-fri 20:00-07:00”",
+            index + 1
+        ));
+    }
+    let weekdays = parse_schedule_weekdays(days)
+        .map_err(|error| format!("客户端过滤策略第 {} 行计划周期无效：{error}", index + 1))?;
+    let (start, end) = time
+        .split_once('-')
+        .ok_or_else(|| format!("客户端过滤策略第 {} 行计划时间缺少连字符", index + 1))?;
+    Ok(ClientScheduleSpec {
+        weekdays,
+        start_minute: parse_schedule_time(start)
+            .map_err(|error| format!("客户端过滤策略第 {} 行开始时间无效：{error}", index + 1))?,
+        end_minute: parse_schedule_time(end)
+            .map_err(|error| format!("客户端过滤策略第 {} 行结束时间无效：{error}", index + 1))?,
+    })
+}
+
+fn parse_schedule_weekdays(value: &str) -> Result<[bool; 7], String> {
+    if value.eq_ignore_ascii_case("daily") {
+        return Ok([true; 7]);
+    }
+    let mut weekdays = [false; 7];
+    for part in value.to_ascii_lowercase().split(',') {
+        let (start, end) = part.split_once('-').unwrap_or((part, part));
+        let start = weekday_index(start).ok_or_else(|| format!("未知星期：{start}"))?;
+        let end = weekday_index(end).ok_or_else(|| format!("未知星期：{end}"))?;
+        let mut current = start;
+        loop {
+            weekdays[current] = true;
+            if current == end {
+                break;
+            }
+            current = (current + 1) % 7;
+        }
+    }
+    if weekdays.iter().all(|selected| !selected) {
+        return Err("至少选择一天".into());
+    }
+    Ok(weekdays)
+}
+
+fn weekday_index(value: &str) -> Option<usize> {
+    match value.trim() {
+        "mon" => Some(0),
+        "tue" => Some(1),
+        "wed" => Some(2),
+        "thu" => Some(3),
+        "fri" => Some(4),
+        "sat" => Some(5),
+        "sun" => Some(6),
+        _ => None,
+    }
+}
+
+fn parse_schedule_time(value: &str) -> Result<u16, String> {
+    let (hour, minute) = value
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| "时间必须是 HH:MM".to_string())?;
+    let hour = hour
+        .parse::<u16>()
+        .map_err(|_| "小时不是数字".to_string())?;
+    let minute = minute
+        .parse::<u16>()
+        .map_err(|_| "分钟不是数字".to_string())?;
+    if hour > 23 || minute > 59 {
+        return Err("时间超出 00:00-23:59".into());
+    }
+    Ok(hour * 60 + minute)
+}
+
+fn parse_blocked_services(value: &str, label: &str) -> Result<Vec<String>, String> {
+    let mut services = Vec::new();
+    for service in value
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .map(str::trim)
+        .filter(|service| !service.is_empty())
+    {
+        let service = service.to_ascii_lowercase();
+        if !BLOCKED_SERVICE_KEYS.contains(&service.as_str()) {
+            return Err(format!("{label}包含不支持的服务：{service}"));
+        }
+        services.push(service);
+    }
+    services.sort();
+    services.dedup();
+    Ok(services)
 }
 
 fn parse_route_line(index: usize, line: &str) -> Option<Result<(usize, &str, &str), String>> {
@@ -1842,13 +2163,44 @@ mod tests {
         config.validate().expect("客户端过滤策略应有效");
         let rules = config.client_filtering_rule_specs().unwrap();
         assert_eq!(rules.len(), 3);
-        assert!(rules[0].bypass);
-        assert!(!rules[1].bypass);
+        assert_eq!(rules[0].profile, "bypass");
+        assert_eq!(rules[1].profile, "filter");
 
         config.client_filtering_rules = "192.168.1.1 => disabled".into();
         assert!(config.validate().is_err());
         config.client_filtering_rules = "not-a-network => bypass".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_named_client_groups_and_schedules() {
+        let mut config = AppConfig {
+            client_policy_groups: "study => filter, safe_search, block:youtube|tiktok".into(),
+            client_filtering_rules: "192.168.1.50 => study @ mon-fri 20:00-07:00".into(),
+            ..AppConfig::default()
+        };
+        config.validate().expect("命名策略组与周计划应有效");
+        let rules = config.client_filtering_rule_specs().unwrap();
+        assert_eq!(rules[0].profile, "study");
+        assert!(rules[0].schedule.is_some());
+
+        config.client_filtering_rules = "192.168.1.50 => missing".into();
+        assert!(config.validate().is_err());
+        config.client_filtering_rules = "192.168.1.50 => study @ weekday 20:00-07:00".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn requires_token_when_monitoring_api_is_exposed() {
+        let mut config = AppConfig {
+            monitoring_api_enabled: true,
+            monitoring_api_listen_host: "0.0.0.0".into(),
+            monitoring_api_token: "short".into(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().is_err());
+        config.monitoring_api_token = "long-enough-token".into();
+        config.validate().expect("非回环监控接口使用强令牌时应有效");
     }
 
     #[test]

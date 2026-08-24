@@ -24,9 +24,9 @@ use super::{
     },
     filter_runtime::{FilterRuntime, SharedFilterRuntime, current_filter_runtime},
     protocol::{
-        Question, RCODE_REFUSED, TYPE_ANY, build_block_response, build_error_response,
-        build_rewrite_response, parse_query, prepare_response_for_query, response_security_data,
-        summarize_response, truncate_response_for_udp, udp_payload_size,
+        Question, RCODE_REFUSED, TYPE_ANY, build_block_response, build_cname_response,
+        build_error_response, build_rewrite_response, parse_query, prepare_response_for_query,
+        response_security_data, summarize_response, truncate_response_for_udp, udp_payload_size,
     },
     stats::{
         DnsStats, DnsTransport, ResponseProtectionKind, current_second, record_access_denied,
@@ -401,9 +401,90 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         return;
     }
 
-    let client_filtering_enabled = filter.client_filtering.filtering_enabled(client_addr.ip());
+    let client_policy = filter.client_filtering.decision(client_addr.ip());
+    let client_filtering_enabled =
+        client_policy.mode == super::client_policy::ClientFilteringMode::Filter;
     let filtering_active =
         client_filtering_enabled && !protection_is_paused(&context.protection_paused_until);
+    if filtering_active && let Some(service) = client_policy.blocked_service(&question.domain) {
+        let rule_match = super::rules::BlockMatch {
+            rule: format!("service:{service}"),
+            source: format!("家庭策略：{service}"),
+            rule_type: "service".into(),
+            important_overrode: false,
+            allowlist_rule: None,
+        };
+        let response = build_block_response(query, question, &filter.blocking);
+        if let Err(error) = send_dns_response(response_target, query, &response) {
+            let message = format!("返回服务分类拦截响应失败：{error}");
+            record_query(
+                &context.stats,
+                &question.domain,
+                client_addr.ip(),
+                context.detailed_runtime_stats,
+            );
+            record_error(&context.stats, message.clone());
+            queue_blocked_query_log(
+                context,
+                &filter,
+                &log_metadata,
+                client_addr,
+                true,
+                Some(message),
+                &rule_match,
+            );
+            return;
+        }
+        record_blocked_query(
+            &context.stats,
+            &question.domain,
+            client_addr.ip(),
+            &rule_match.source,
+            context.detailed_runtime_stats,
+        );
+        queue_blocked_query_log_with_response(
+            context,
+            &filter,
+            &log_metadata,
+            client_addr,
+            false,
+            None,
+            Some(&response),
+            &rule_match,
+        );
+        return;
+    }
+
+    if filtering_active && let Some(target) = client_policy.safe_search_target(&question.domain) {
+        record_query(
+            &context.stats,
+            &question.domain,
+            client_addr.ip(),
+            context.detailed_runtime_stats,
+        );
+        let response = build_cname_response(query, question, target);
+        let error = send_dns_response(response_target, query, &response)
+            .err()
+            .map(|error| format!("返回安全搜索重定向失败：{error}"));
+        if let Some(message) = &error {
+            record_error(&context.stats, message.clone());
+        }
+        queue_query_log_with_response(
+            context,
+            &filter,
+            &log_metadata,
+            client_addr,
+            QueryResponseSource::Rewrite,
+            false,
+            false,
+            error.is_some(),
+            None,
+            None,
+            error,
+            Some(&response),
+        );
+        return;
+    }
 
     if filtering_active
         && let Some(rule_match) = filter

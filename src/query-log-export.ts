@@ -1,7 +1,5 @@
-import { save } from "@tauri-apps/plugin-dialog";
-
 import { exportQueryLogFile, getQueryLogs } from "./api";
-import type { QueryLogFilter, QueryLogRecord } from "./types";
+import type { QueryLogQuery, QueryLogRecord } from "./types";
 
 const EXPORT_PAGE_SIZE = 200;
 const EXPORT_RECORD_LIMIT = 50_000;
@@ -13,10 +11,10 @@ export type QueryLogExportResult = {
 };
 
 export async function exportFilteredQueryLogs(
-  filter: QueryLogFilter,
-  search: string,
+  query: QueryLogQuery,
   onProgress?: (exported: number, total: number) => void,
 ): Promise<QueryLogExportResult | null> {
+  const { save } = await import("@tauri-apps/plugin-dialog");
   const path = await save({
     title: "导出查询日志",
     defaultPath: `DnsBlackhole-query-logs-${dateStamp()}.csv`,
@@ -28,14 +26,20 @@ export async function exportFilteredQueryLogs(
 
   const records: QueryLogRecord[] = [];
   let total = 0;
+  let cursor: string | null = query.sort === "slowest" ? null : "";
   for (let page = 1; records.length < EXPORT_RECORD_LIMIT; page += 1) {
-    const result = await getQueryLogs({ filter, search, page, pageSize: EXPORT_PAGE_SIZE });
+    const result = await getQueryLogs({ ...query, page, pageSize: EXPORT_PAGE_SIZE, cursor });
     total = result.total;
     records.push(...result.records.slice(0, EXPORT_RECORD_LIMIT - records.length));
     onProgress?.(records.length, Math.min(total, EXPORT_RECORD_LIMIT));
-    if (result.records.length < EXPORT_PAGE_SIZE || records.length >= total) {
+    if (
+      result.records.length < EXPORT_PAGE_SIZE ||
+      records.length >= total ||
+      (cursor !== null && result.next_cursor === null)
+    ) {
       break;
     }
+    cursor = cursor === null ? null : result.next_cursor;
   }
 
   const content = serializeQueryLogsCsv(records);

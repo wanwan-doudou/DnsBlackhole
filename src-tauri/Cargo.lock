@@ -912,8 +912,9 @@ dependencies = [
 
 [[package]]
 name = "dnsblackhole"
-version = "0.1.61"
+version = "0.2.0"
 dependencies = [
+ "chrono",
  "futures-util",
  "hickory-net",
  "libc",

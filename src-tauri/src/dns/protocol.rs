@@ -312,6 +312,32 @@ pub(crate) fn build_rewrite_response(
     )
 }
 
+pub(crate) fn build_cname_response(query: &[u8], question: &Question, target: &str) -> Vec<u8> {
+    let mut encoded_target = Vec::with_capacity(target.len() + 2);
+    for label in target.trim_end_matches('.').split('.') {
+        encoded_target.push(label.len() as u8);
+        encoded_target.extend_from_slice(label.as_bytes());
+    }
+    encoded_target.push(0);
+
+    let mut response = Vec::with_capacity(question.question_end + encoded_target.len() + 16);
+    response.extend_from_slice(&query[0..2]);
+    response.push(0x80 | (query[2] & 0x01));
+    response.push(0x80 | RCODE_NOERROR);
+    write_u16(&mut response, 1);
+    write_u16(&mut response, 1);
+    write_u16(&mut response, 0);
+    write_u16(&mut response, 0);
+    response.extend_from_slice(&query[DNS_HEADER_LEN..question.question_end]);
+    response.extend_from_slice(&[0xC0, 0x0C]);
+    write_u16(&mut response, TYPE_CNAME);
+    write_u16(&mut response, question.qclass);
+    response.extend_from_slice(&REWRITE_RESPONSE_TTL.to_be_bytes());
+    write_u16(&mut response, encoded_target.len() as u16);
+    response.extend_from_slice(&encoded_target);
+    response
+}
+
 fn build_ip_response(
     query: &[u8],
     question: &Question,

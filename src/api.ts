@@ -8,7 +8,7 @@ import type {
   FilterUpdateProgress,
   FilterUpdateResult,
   MacosServiceStatus,
-  QueryLogFilter,
+  QueryLogQuery,
   QueryLogPage,
   QueryLogRuleAction,
   QueryLogRuleActionResult,
@@ -24,11 +24,10 @@ export function analyzeCustomRules(rules: string): Promise<RuleAnalysis> {
   return timedInvoke<RuleAnalysis>("analyze_custom_rules", { rules });
 }
 
-type QueryLogRequest = {
-  filter: QueryLogFilter;
-  search: string;
+export type QueryLogRequest = QueryLogQuery & {
   page: number;
   pageSize: number;
+  cursor: string | null;
 };
 
 function timedInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {

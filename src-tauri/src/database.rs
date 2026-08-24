@@ -256,6 +256,21 @@ pub struct QueryLogPage {
     pub total: u64,
     pub page: u32,
     pub page_size: u32,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QueryLogQuery<'a> {
+    pub retention_hours: u32,
+    pub hours: Option<u32>,
+    pub filter: &'a str,
+    pub search: &'a str,
+    pub source: &'a str,
+    pub query_type: &'a str,
+    pub sort: &'a str,
+    pub cursor: Option<&'a str>,
+    pub page: u32,
+    pub page_size: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -630,6 +645,7 @@ impl Database {
         log_stats_with_connection(&conn, since_hour)
     }
 
+    #[cfg(test)]
     pub fn query_logs(
         &self,
         retention_hours: u32,
@@ -638,7 +654,43 @@ impl Database {
         page: u32,
         page_size: u32,
     ) -> Result<QueryLogPage, String> {
-        let since = unix_now().saturating_sub(u64::from(retention_hours) * 3600);
+        self.query_logs_advanced(QueryLogQuery {
+            retention_hours,
+            hours: None,
+            filter,
+            search,
+            source: "all",
+            query_type: "all",
+            sort: "newest",
+            cursor: None,
+            page,
+            page_size,
+        })
+    }
+
+    pub fn query_logs_advanced(&self, query: QueryLogQuery<'_>) -> Result<QueryLogPage, String> {
+        let QueryLogQuery {
+            retention_hours,
+            hours,
+            filter,
+            search,
+            source,
+            query_type,
+            sort,
+            cursor,
+            page,
+            page_size,
+        } = query;
+        let effective_hours = match (retention_hours, hours) {
+            (0, Some(requested)) => requested,
+            (configured, Some(requested)) => configured.min(requested),
+            (configured, None) => configured,
+        };
+        let since = if effective_hours == 0 {
+            0
+        } else {
+            unix_now().saturating_sub(u64::from(effective_hours) * 3600)
+        };
         let since_param = u64_to_db_i64(since, "查询日志起始时间戳")?;
         let filter_sql = match filter {
             "blocked" => " AND blocked = 1",
@@ -646,8 +698,44 @@ impl Database {
             "failed" => " AND failed = 1",
             _ => "",
         };
+        let source_sql = match source {
+            "upstream" => " AND response_source = 'upstream'",
+            "cache" => " AND response_source = 'cache'",
+            "rewrite" => " AND response_source = 'rewrite'",
+            "blocked" => " AND response_source = 'blocked'",
+            "refused" => " AND response_source = 'refused'",
+            _ => "",
+        };
+        let query_type_sql = match query_type {
+            "a" => " AND query_type = 1",
+            "aaaa" => " AND query_type = 28",
+            "https" => " AND query_type = 65",
+            "other" => " AND (query_type NOT IN (1, 28, 65) OR query_type IS NULL)",
+            _ => "",
+        };
+        let order_sql = match sort {
+            "oldest" => "timestamp ASC, id ASC",
+            "slowest" => "processing_duration_ms DESC, timestamp DESC, id DESC",
+            _ => "timestamp DESC, id DESC",
+        };
+        let cursor_mode = cursor.is_some();
+        let cursor_position = parse_query_log_cursor(cursor, sort)?;
+        let cursor_sql = cursor_position.map_or_else(String::new, |position| match sort {
+            "oldest" => format!(
+                " AND (timestamp > {} OR (timestamp = {} AND id > {}))",
+                position.timestamp, position.timestamp, position.id
+            ),
+            _ => format!(
+                " AND (timestamp < {} OR (timestamp = {} AND id < {}))",
+                position.timestamp, position.timestamp, position.id
+            ),
+        });
         let search = search.trim();
-        let query_logs_source = if search.is_empty() {
+        let query_logs_source = if search.is_empty()
+            && source_sql.is_empty()
+            && query_type_sql.is_empty()
+            && order_sql == "timestamp DESC, id DESC"
+        {
             match filter {
                 "blocked" => "query_logs INDEXED BY idx_query_logs_blocked_timestamp",
                 "processed" => "query_logs INDEXED BY idx_query_logs_processed_timestamp",
@@ -681,10 +769,13 @@ impl Database {
                 OR COALESCE(error, '') LIKE :search
              )"
         };
-        let where_sql = format!("timestamp >= :since{search_index_sql}{search_sql}{filter_sql}");
+        let base_where_sql = format!(
+            "timestamp >= :since{search_index_sql}{search_sql}{filter_sql}{source_sql}{query_type_sql}"
+        );
+        let page_where_sql = format!("{base_where_sql}{cursor_sql}");
         // 模糊搜索的候选集构建成本远高于普通时间索引分页。把总数作为窗口列
         // 随当前页一次算出，避免 COUNT 和列表查询各跑一遍四列 trigram 子查询。
-        let total_window_sql = if use_search_index {
+        let total_window_sql = if use_search_index && cursor_position.is_none() {
             ", COUNT(*) OVER() AS matched_total"
         } else {
             ""
@@ -717,18 +808,22 @@ impl Database {
                 response_truncated
                 {total_window_sql}
              FROM {query_logs_source}
-             WHERE {where_sql}
-             ORDER BY timestamp DESC, id DESC
+             WHERE {page_where_sql}
+             ORDER BY {order_sql}
              LIMIT :limit OFFSET :offset"
         );
         let search_pattern = format!("%{search}%");
         let page = page.max(1);
         let page_size = page_size.clamp(20, 200);
-        let limit = i64::from(page_size);
-        let offset = i64::from(page.saturating_sub(1)) * i64::from(page_size);
+        let limit = i64::from(page_size) + i64::from(cursor_mode);
+        let offset = if cursor_mode {
+            0
+        } else {
+            i64::from(page.saturating_sub(1)) * i64::from(page_size)
+        };
         let conn = self.lock_read()?;
-        let total_sql = format!("SELECT COUNT(*) FROM {query_logs_source} WHERE {where_sql}");
-        let mut total = if use_search_index {
+        let total_sql = format!("SELECT COUNT(*) FROM {query_logs_source} WHERE {base_where_sql}");
+        let mut total = if use_search_index && cursor_position.is_none() {
             None
         } else {
             Some(
@@ -782,6 +877,10 @@ impl Database {
             }
             records.push(read_query_log_record(row).map_err(|e| format!("解析查询日志失败：{e}"))?);
         }
+        let has_more = cursor_mode && records.len() > page_size as usize;
+        if has_more {
+            records.pop();
+        }
         drop(rows);
         drop(stmt);
         // 页码超出最后一页时窗口查询没有返回行，补一次 COUNT 才能让前端纠正页码。
@@ -798,11 +897,19 @@ impl Database {
                 )
                 .map_err(|e| format!("统计查询日志失败：{e}"))?,
         };
+        let next_cursor = if has_more {
+            records
+                .last()
+                .map(|record| encode_query_log_cursor(sort, record.timestamp, record.id))
+        } else {
+            None
+        };
         Ok(QueryLogPage {
             records,
             total,
             page,
             page_size,
+            next_cursor,
         })
     }
 
@@ -1438,6 +1545,50 @@ fn query_log_search_is_indexable(search: &str) -> bool {
         && !search
             .chars()
             .any(|character| matches!(character, '%' | '_' | '\0'))
+}
+
+#[derive(Clone, Copy)]
+struct QueryLogCursorPosition {
+    timestamp: i64,
+    id: i64,
+}
+
+fn parse_query_log_cursor(
+    cursor: Option<&str>,
+    sort: &str,
+) -> Result<Option<QueryLogCursorPosition>, String> {
+    let Some(cursor) = cursor.map(str::trim).filter(|cursor| !cursor.is_empty()) else {
+        return Ok(None);
+    };
+    if !matches!(sort, "newest" | "oldest") {
+        return Err("当前排序方式不支持游标分页".into());
+    }
+    let mut parts = cursor.split(':');
+    let version = parts.next();
+    let cursor_sort = parts.next();
+    let timestamp = parts.next();
+    let id = parts.next();
+    if version != Some("v1")
+        || cursor_sort != Some(sort)
+        || parts.next().is_some()
+        || timestamp.is_none()
+        || id.is_none()
+    {
+        return Err("查询日志分页游标无效或已过期".into());
+    }
+    let timestamp = timestamp
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| "查询日志分页游标时间戳无效".to_string())?;
+    let id = id
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| "查询日志分页游标记录 ID 无效".to_string())?;
+    Ok(Some(QueryLogCursorPosition { timestamp, id }))
+}
+
+fn encode_query_log_cursor(sort: &str, timestamp: u64, id: i64) -> String {
+    format!("v1:{sort}:{timestamp}:{id}")
 }
 
 fn init_schema(conn: &Connection) -> Result<(), String> {
@@ -2268,6 +2419,7 @@ fn anonymize_ip(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn sample_query_log(domain: &str) -> QueryLogEntry {
         QueryLogEntry {
@@ -2291,6 +2443,155 @@ mod tests {
             important_overrode: false,
             allowlist_rule: None,
         }
+    }
+
+    #[test]
+    fn query_logs_support_diagnostic_filters_and_sorting() {
+        let db = Database::open_in_memory().expect("db should open");
+        let mut upstream = sample_query_log("upstream.example");
+        upstream.processing_duration_ms = 3.0;
+        let mut cached = sample_query_log("cache.example");
+        cached.query_type = 28;
+        cached.response_source = "cache".into();
+        cached.processing_duration_ms = 18.0;
+        let mut rewritten = sample_query_log("rewrite.example");
+        rewritten.query_type = 65;
+        rewritten.response_source = "rewrite".into();
+        rewritten.processing_duration_ms = 8.0;
+        db.insert_query_logs(&[(upstream, false), (cached, false), (rewritten, false)])
+            .expect("query logs should save");
+
+        let cached_logs = db
+            .query_logs_advanced(QueryLogQuery {
+                retention_hours: 24,
+                hours: Some(1),
+                filter: "all",
+                search: "",
+                source: "cache",
+                query_type: "aaaa",
+                sort: "newest",
+                cursor: None,
+                page: 1,
+                page_size: 20,
+            })
+            .expect("advanced query should load");
+        assert_eq!(cached_logs.total, 1);
+        assert_eq!(cached_logs.records[0].domain, "cache.example");
+
+        let slowest = db
+            .query_logs_advanced(QueryLogQuery {
+                retention_hours: 24,
+                hours: None,
+                filter: "all",
+                search: "",
+                source: "all",
+                query_type: "all",
+                sort: "slowest",
+                cursor: None,
+                page: 1,
+                page_size: 20,
+            })
+            .expect("slow query sort should load");
+        assert_eq!(slowest.records[0].domain, "cache.example");
+    }
+
+    #[test]
+    fn query_logs_support_stable_cursor_pagination() {
+        let db = Database::open_in_memory().expect("database should open");
+        let entries = (0..25)
+            .map(|index| (sample_query_log(&format!("cursor-{index}.example")), false))
+            .collect::<Vec<_>>();
+        db.insert_query_logs(&entries).expect("logs should insert");
+
+        let first = db
+            .query_logs_advanced(QueryLogQuery {
+                retention_hours: 24,
+                hours: None,
+                filter: "all",
+                search: "",
+                source: "all",
+                query_type: "all",
+                sort: "newest",
+                cursor: Some(""),
+                page: 1,
+                page_size: 20,
+            })
+            .expect("first cursor page should load");
+        assert_eq!(first.records.len(), 20);
+        assert_eq!(first.total, 25);
+        let cursor = first.next_cursor.expect("first page should have a cursor");
+
+        let second = db
+            .query_logs_advanced(QueryLogQuery {
+                retention_hours: 24,
+                hours: None,
+                filter: "all",
+                search: "",
+                source: "all",
+                query_type: "all",
+                sort: "newest",
+                cursor: Some(&cursor),
+                page: 2,
+                page_size: 20,
+            })
+            .expect("second cursor page should load");
+        assert_eq!(second.records.len(), 5);
+        assert!(second.next_cursor.is_none());
+        let first_ids = first
+            .records
+            .iter()
+            .map(|record| record.id)
+            .collect::<HashSet<_>>();
+        assert!(
+            second
+                .records
+                .iter()
+                .all(|record| !first_ids.contains(&record.id))
+        );
+    }
+
+    #[test]
+    #[ignore = "性能测试：按需生成 30000 条查询日志"]
+    fn measures_advanced_query_log_filters() {
+        let db = Database::open_in_memory().expect("db should open");
+        let entries = (0..30_000)
+            .map(|index| {
+                let mut entry = sample_query_log(&format!("host-{index}.example"));
+                entry.query_type = if index % 3 == 0 { 28 } else { 1 };
+                entry.response_source = if index % 4 == 0 {
+                    "cache".into()
+                } else {
+                    "upstream".into()
+                };
+                entry.processing_duration_ms = f64::from(index % 250) / 10.0;
+                (entry, false)
+            })
+            .collect::<Vec<_>>();
+        db.insert_query_logs(&entries)
+            .expect("performance fixture should save");
+
+        let started = Instant::now();
+        let page = db
+            .query_logs_advanced(QueryLogQuery {
+                retention_hours: 24,
+                hours: Some(1),
+                filter: "all",
+                search: "",
+                source: "cache",
+                query_type: "aaaa",
+                sort: "slowest",
+                cursor: None,
+                page: 1,
+                page_size: 50,
+            })
+            .expect("advanced query should load");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "advanced query log filter: {} records in {:.2?}",
+            page.total, elapsed
+        );
+        assert_eq!(page.total, 2_500);
+        assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]

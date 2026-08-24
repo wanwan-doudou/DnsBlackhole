@@ -230,42 +230,107 @@ export function renderAppTemplate(appIconUrl: string): string {
         <div class="query-log-toolbar">
           <div class="query-log-title">
             <h2>查询日志</h2>
-            <button class="ghost-icon-button" id="query_log_refresh_btn" type="button" title="刷新查询日志">↻</button>
+            <button class="ghost-icon-button" id="query_log_refresh_btn" type="button" aria-label="刷新查询日志" title="刷新查询日志">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"></path></svg>
+            </button>
             <button class="query-log-tool-button" id="query_log_pause_btn" type="button">暂停实时刷新</button>
             <button class="query-log-tool-button" id="query_log_export_btn" type="button">导出当前筛选</button>
           </div>
-          <label class="query-log-search">
-            <span aria-hidden="true">⌕</span>
-            <input id="query_log_search" autocomplete="off" spellcheck="false" placeholder="域名或客户端" />
-          </label>
-          <div class="query-log-filter" id="query_log_filter_menu">
-            <button class="query-log-filter-trigger" id="query_log_filter_button" type="button" aria-haspopup="listbox" aria-expanded="false">
-              <span id="query_log_filter_label">所有查询记录</span>
-              <i aria-hidden="true"></i>
-            </button>
-            <div class="query-log-filter-options" role="listbox" aria-label="查询日志筛选">
-              <button class="active" data-filter="all" type="button" role="option" aria-selected="true">所有查询记录</button>
-              <button data-filter="processed" type="button" role="option" aria-selected="false">已处理</button>
-              <button data-filter="blocked" type="button" role="option" aria-selected="false">已过滤</button>
-              <button data-filter="failed" type="button" role="option" aria-selected="false">失败</button>
+          <div class="query-log-primary-filters">
+            <label class="query-log-search">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg>
+              <input id="query_log_search" aria-label="搜索域名或客户端" autocomplete="off" spellcheck="false" placeholder="搜索域名或客户端" />
+            </label>
+            <div class="query-log-filter" id="query_log_filter_menu">
+              <button class="query-log-filter-trigger" id="query_log_filter_button" type="button" aria-haspopup="listbox" aria-expanded="false">
+                <span id="query_log_filter_label">所有查询记录</span>
+                <i aria-hidden="true"></i>
+              </button>
+              <div class="query-log-filter-options" role="listbox" aria-label="查询日志状态筛选">
+                <button class="active" data-filter="all" type="button" role="option" aria-selected="true">所有查询记录</button>
+                <button data-filter="processed" type="button" role="option" aria-selected="false">已处理</button>
+                <button data-filter="blocked" type="button" role="option" aria-selected="false">已过滤</button>
+                <button data-filter="failed" type="button" role="option" aria-selected="false">失败</button>
+              </div>
+              <select id="query_log_filter" aria-hidden="true" tabindex="-1">
+                <option value="all">所有查询记录</option>
+                <option value="processed">已处理</option>
+                <option value="blocked">已过滤</option>
+                <option value="failed">失败</option>
+              </select>
             </div>
-            <select id="query_log_filter" aria-hidden="true" tabindex="-1">
-              <option value="all">所有查询记录</option>
-              <option value="processed">已处理</option>
-              <option value="blocked">已过滤</option>
-              <option value="failed">失败</option>
-            </select>
+            <button class="query-log-advanced-trigger" id="query_log_advanced_btn" type="button" aria-expanded="false" aria-controls="query_log_advanced_panel">
+              更多筛选<span id="query_log_advanced_count" hidden></span>
+            </button>
+          </div>
+          <div class="query-log-advanced-panel" id="query_log_advanced_panel" hidden>
+            <label>
+              <span>时间范围</span>
+              <select id="query_log_time_range">
+                <option value="configured">按日志保留设置</option>
+                <option value="1">最近 1 小时</option>
+                <option value="24">最近 24 小时</option>
+                <option value="168">最近 7 天</option>
+                <option value="720">最近 30 天</option>
+              </select>
+            </label>
+            <label>
+              <span>响应来源</span>
+              <select id="query_log_source">
+                <option value="all">全部来源</option>
+                <option value="upstream">上游服务器</option>
+                <option value="cache">DNS 缓存</option>
+                <option value="rewrite">DNS 重写</option>
+                <option value="blocked">过滤规则</option>
+                <option value="refused">拒绝响应</option>
+              </select>
+            </label>
+            <label>
+              <span>查询类型</span>
+              <select id="query_log_query_type">
+                <option value="all">全部类型</option>
+                <option value="a">A（IPv4）</option>
+                <option value="aaaa">AAAA（IPv6）</option>
+                <option value="https">HTTPS</option>
+                <option value="other">其他类型</option>
+              </select>
+            </label>
+            <label>
+              <span>排序方式</span>
+              <select id="query_log_sort">
+                <option value="newest">最新优先</option>
+                <option value="oldest">最早优先</option>
+                <option value="slowest">最慢优先</option>
+              </select>
+            </label>
+            <label class="query-log-saved-view-select">
+              <span>保存的视图</span>
+              <select id="query_log_saved_view">
+                <option value="">选择已保存视图</option>
+              </select>
+            </label>
+            <label class="query-log-view-name">
+              <span>视图名称</span>
+              <input id="query_log_view_name" type="text" maxlength="40" autocomplete="off" placeholder="例如 夜间失败查询" />
+            </label>
+            <div class="query-log-view-actions">
+              <button id="query_log_save_view_btn" type="button">保存当前</button>
+              <button id="query_log_delete_view_btn" type="button" disabled>删除</button>
+            </div>
+            <button class="query-log-reset-button" id="query_log_reset_btn" type="button">重置筛选</button>
           </div>
         </div>
 
         <section class="query-log-panel">
-          <div class="query-log-head">
-            <span>时间</span>
-            <span>请求</span>
-            <span>响应</span>
-            <span>客户端</span>
+          <div class="query-log-table" role="table" aria-label="DNS 查询日志">
+            <div class="query-log-head" role="row">
+              <span role="columnheader">时间</span>
+              <span role="columnheader">请求</span>
+              <span role="columnheader">响应</span>
+              <span role="columnheader">客户端</span>
+            </div>
+            <div class="query-log-body" id="query_log_body" role="rowgroup"></div>
           </div>
-          <div class="query-log-body" id="query_log_body"></div>
           <div class="query-log-pagination">
             <span id="query_log_page_info">0 条记录</span>
             <div class="button-group">
@@ -604,9 +669,30 @@ export function renderAppTemplate(appIconUrl: string): string {
               </label>
               <label class="field access-list-field client-names-field">
                 <span>客户端过滤策略</span>
-                <small>每行一条“IP/CIDR =&gt; filter|bypass”，最长 CIDR 优先。bypass 仅跳过过滤规则与响应保护，仍执行访问控制和 DNS 重写。</small>
-                <textarea id="client_filtering_rules" autocomplete="off" spellcheck="false" placeholder="192.168.1.50 =&gt; bypass&#10;192.168.1.0/24 =&gt; filter"></textarea>
+                <small>每行一条“IP/CIDR =&gt; 策略组 [@ 周期 时间]”，最长 CIDR 优先。周期使用 mon-sun 或 daily，支持跨午夜时段。</small>
+                <textarea id="client_filtering_rules" autocomplete="off" spellcheck="false" placeholder="192.168.1.50 =&gt; family @ mon-fri 20:00-07:00&#10;192.168.1.0/24 =&gt; filter"></textarea>
               </label>
+              <div class="dns-security-grid client-policy-grid">
+                <label class="field access-list-field">
+                  <span>自定义策略组</span>
+                  <small>格式：名称 =&gt; filter|bypass, safe_search, block:服务|服务。可用服务见右侧说明。</small>
+                  <textarea id="client_policy_groups" autocomplete="off" spellcheck="false" placeholder="study =&gt; filter, safe_search, block:youtube|tiktok"></textarea>
+                </label>
+                <div class="family-policy-fields">
+                  <label class="check-row">
+                    <input id="family_safe_search" type="checkbox" />
+                    <span>
+                      <strong>家庭组启用安全搜索</strong>
+                      <small>为 Google、Bing、DuckDuckGo 和 YouTube 返回强制安全模式重定向。</small>
+                    </span>
+                  </label>
+                  <label class="field access-list-field">
+                    <span>家庭组拦截服务</span>
+                    <small>逗号或换行分隔：youtube、tiktok、instagram、facebook、x、reddit、twitch、discord、steam、epic、roblox。</small>
+                    <textarea id="family_blocked_services" autocomplete="off" spellcheck="false"></textarea>
+                  </label>
+                </div>
+              </div>
             </section>
 
             <section class="settings-section dns-security-section">
@@ -917,6 +1003,34 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
+            <section class="settings-section settings-section-wide monitoring-api-section">
+              <div class="section-heading">
+                <h3>只读监控接口</h3>
+                <span>向本机监控工具提供 <code>/health</code>、<code>/api/v1/status</code> 和 Prometheus <code>/metrics</code>；不会暴露域名或客户端明细。</span>
+              </div>
+              <label class="check-row">
+                <input id="monitoring_api_enabled" type="checkbox" />
+                <span>
+                  <strong>启用 REST 与 Prometheus</strong>
+                  <small>默认仅监听 127.0.0.1；监听局域网地址时必须设置至少 16 个字符的令牌。</small>
+                </span>
+              </label>
+              <div class="monitoring-api-fields">
+                <label class="field">
+                  <span>监听地址</span>
+                  <input id="monitoring_api_listen_host" type="text" spellcheck="false" placeholder="127.0.0.1" />
+                </label>
+                <label class="field">
+                  <span>端口</span>
+                  <input id="monitoring_api_port" type="number" min="1" max="65535" step="1" />
+                </label>
+                <label class="field">
+                  <span>访问令牌（可选）</span>
+                  <input id="monitoring_api_token" type="password" maxlength="256" autocomplete="new-password" placeholder="本机监听可留空" />
+                </label>
+              </div>
+            </section>
+
             <section class="settings-section data-storage-section settings-section-wide">
               <div class="section-heading">
                 <h3>数据存储</h3>
@@ -1045,76 +1159,110 @@ export function renderAppTemplate(appIconUrl: string): string {
         <section class="panel module-panel about-panel">
           <div class="panel-title">
             <h2>关于</h2>
+            <p>版本、运行环境与支持信息。</p>
           </div>
 
           <div class="about-hero">
-            <img class="about-app-mark" src="${appIconUrl}" alt="" />
-            <div class="about-intro">
-              <h3>DnsBlackhole</h3>
-              <p>轻量的本地 DNS 转发与域名拦截工具。</p>
-              <div class="about-capabilities" aria-label="应用特性">
-                <span>DNS 转发</span>
-                <span>域名拦截</span>
-                <span>Windows / macOS</span>
+            <div class="about-brand-lockup">
+              <img class="about-app-mark" src="${appIconUrl}" alt="" />
+              <div class="about-intro">
+                <div class="about-product-title">
+                  <h3>DnsBlackhole</h3>
+                  <span>v<span id="app_version">-</span></span>
+                </div>
+                <p class="about-positioning">轻量的本地 DNS 转发与域名拦截工具。</p>
+                <p class="about-trust">配置、过滤规则和查询数据保存在你的设备上，无需注册账户。</p>
+                <div class="about-capabilities" aria-label="应用特性">
+                  <span>本地优先</span>
+                  <span>后台系统服务</span>
+                  <span>开源透明</span>
+                </div>
               </div>
             </div>
-          </div>
-
-          <section class="about-update-section" aria-labelledby="about_update_title">
-            <div class="about-update-row">
-              <div>
-                <h3 id="about_update_title">软件更新</h3>
-                <p>当前版本：<strong class="about-version">v<span id="app_version">-</span></strong></p>
-              </div>
-              <div class="button-group update-actions">
-                <button class="primary" id="check_update_btn" type="button">检查更新</button>
-              </div>
-            </div>
-            <div class="update-status hidden" id="update_status"></div>
-          </section>
-
-          <div class="about-links-grid" aria-label="项目相关链接">
-            <button class="about-link-card" data-about-link="repository" type="button">
-              <span class="about-link-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24"><path d="M9 18H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4M15 4h4a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-4M8 12h8M13 9l3 3-3 3" /></svg>
-              </span>
-              <span class="about-link-copy">
-                <strong>项目主页</strong>
-                <small>查看源码与使用文档</small>
-              </span>
-              <span class="about-link-arrow" aria-hidden="true">›</span>
-            </button>
-            <button class="about-link-card" data-about-link="releases" type="button">
-              <span class="about-link-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6zM14 3v4h4M9 12h6M9 16h6" /></svg>
-              </span>
-              <span class="about-link-copy">
-                <strong>更新记录</strong>
-                <small>查看历史版本与变更</small>
-              </span>
-              <span class="about-link-arrow" aria-hidden="true">›</span>
-            </button>
-            <button class="about-link-card" data-about-link="issues" type="button">
-              <span class="about-link-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24"><path d="M4 5h16v12H8l-4 4zM8 9h8M8 13h5" /></svg>
-              </span>
-              <span class="about-link-copy">
-                <strong>意见反馈</strong>
-                <small>报告问题或提出建议</small>
-              </span>
-              <span class="about-link-arrow" aria-hidden="true">›</span>
-            </button>
-            <button class="about-link-card" data-about-link="license" type="button">
-              <span class="about-link-icon" aria-hidden="true">
+            <div class="about-protection-note">
+              <span class="about-protection-icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6zM9 12l2 2 4-4" /></svg>
               </span>
-              <span class="about-link-copy">
-                <strong>开源许可</strong>
-                <small>基于 MIT License 发布</small>
+              <span>
+                <strong>独立守护 DNS</strong>
+                <small>关闭界面后，系统服务仍可持续保护本机。</small>
               </span>
-              <span class="about-link-arrow" aria-hidden="true">›</span>
-            </button>
+            </div>
           </div>
+
+          <div class="about-overview-grid">
+            <section class="about-runtime-section" aria-labelledby="about_runtime_title">
+              <div class="about-section-heading">
+                <div>
+                  <h3 id="about_runtime_title">版本与运行环境</h3>
+                  <p>提交问题时，可复制这些不包含域名和客户端信息的摘要。</p>
+                </div>
+                <button id="copy_support_info_btn" type="button">复制支持信息</button>
+              </div>
+              <dl class="about-runtime-list">
+                <div><dt>应用版本</dt><dd id="about_runtime_app_version">v-</dd></div>
+                <div><dt>运行平台</dt><dd id="about_runtime_platform">正在识别…</dd></div>
+                <div><dt>后台服务</dt><dd id="about_runtime_service">正在读取…</dd></div>
+                <div><dt>DNS 核心</dt><dd id="about_runtime_core">正在读取…</dd></div>
+              </dl>
+            </section>
+
+            <section class="about-update-section" aria-labelledby="about_update_title">
+              <div class="about-update-copy">
+                <span class="about-update-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 20h14" /></svg>
+                </span>
+                <div>
+                  <h3 id="about_update_title">软件更新</h3>
+                  <p>检查稳定版本并查看本次变更；安装前会先完成下载验证。</p>
+                </div>
+              </div>
+              <button class="primary" id="check_update_btn" type="button">检查更新</button>
+              <div class="update-status hidden" id="update_status" role="status" aria-live="polite" aria-atomic="true"></div>
+            </section>
+          </div>
+
+          <section class="about-resources" aria-labelledby="about_resources_title">
+            <div class="about-section-heading about-resources-heading">
+              <div>
+                <h3 id="about_resources_title">帮助与项目</h3>
+                <p>文档和反馈会在系统浏览器中打开。</p>
+              </div>
+            </div>
+            <div class="about-resource-columns">
+              <div class="about-resource-group">
+                <h4>获取帮助</h4>
+                <button class="about-link-card about-link-primary" data-about-link="docs" type="button">
+                  <span class="about-link-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><path d="M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3zM8 4v16M11 9h5M11 13h5" /></svg>
+                  </span>
+                  <span class="about-link-copy"><strong>使用文档</strong><small>了解安装、DNS 接管与过滤规则</small></span>
+                  <span class="about-link-arrow" aria-hidden="true">›</span>
+                </button>
+                <button class="about-link-card about-link-primary" data-about-link="issues" type="button">
+                  <span class="about-link-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><path d="M4 5h16v12H8l-4 4zM8 9h8M8 13h5" /></svg>
+                  </span>
+                  <span class="about-link-copy"><strong>报告问题</strong><small>提交故障信息或功能建议</small></span>
+                  <span class="about-link-arrow" aria-hidden="true">›</span>
+                </button>
+              </div>
+              <div class="about-resource-group about-project-group">
+                <h4>项目信息</h4>
+                <button class="about-compact-link" data-about-link="repository" type="button">
+                  <span>项目源码</span><small>GitHub</small><span aria-hidden="true">›</span>
+                </button>
+                <button class="about-compact-link" data-about-link="releases" type="button">
+                  <span>更新记录</span><small>版本与变更</small><span aria-hidden="true">›</span>
+                </button>
+                <button class="about-compact-link" data-about-link="license" type="button">
+                  <span>开源许可</span><small>MIT License</small><span aria-hidden="true">›</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <footer class="about-footer">DnsBlackhole 是基于 MIT License 发布的开源项目。</footer>
 
           <dialog class="update-dialog" id="update_dialog">
             <div class="update-dialog-panel">

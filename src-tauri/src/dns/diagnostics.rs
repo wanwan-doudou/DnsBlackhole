@@ -130,9 +130,11 @@ fn local_diagnostic(
         return empty("stopped", "DNS 服务当前未运行".to_string(), "filter", None);
     };
     let client_decision = client_ip.map(|ip| filter.client_filtering.decision(ip));
-    let client_policy_source = client_decision
-        .as_ref()
-        .and_then(|decision| decision.source.map(str::to_string));
+    let client_policy_source = client_decision.as_ref().and_then(|decision| {
+        decision
+            .source
+            .map(|source| format!("{source} → {}", decision.profile))
+    });
     let client_policy = if client_decision
         .as_ref()
         .is_some_and(|decision| decision.mode == super::client_policy::ClientFilteringMode::Bypass)
@@ -171,6 +173,33 @@ fn local_diagnostic(
             |source| format!("客户端命中 {source} 的绕过策略；不会应用拦截规则和响应保护"),
         );
         return empty("bypassed", detail, client_policy, client_policy_source);
+    }
+    if let Some(service) = client_decision
+        .as_ref()
+        .and_then(|decision| decision.blocked_service(domain))
+    {
+        return LocalDiagnostic {
+            status: "blocked".to_string(),
+            detail: format!("命中家庭策略的 {service} 服务分类"),
+            client_policy: client_policy.to_string(),
+            client_policy_source,
+            matched_rule: Some(format!("service:{service}")),
+            rule_source: Some(format!("家庭策略：{service}")),
+            rule_type: Some("service".into()),
+            allowlist_rule: None,
+            important_overrode: false,
+        };
+    }
+    if let Some(target) = client_decision
+        .as_ref()
+        .and_then(|decision| decision.safe_search_target(domain))
+    {
+        return empty(
+            "rewrite",
+            format!("安全搜索会将查询重定向到 {target}"),
+            client_policy,
+            client_policy_source,
+        );
     }
     if let Some(rule_match) = filter.rules.blocking_match(domain, qtype) {
         return LocalDiagnostic {
@@ -333,7 +362,7 @@ mod tests {
         assert_eq!(bypassed.status, "bypassed");
         assert_eq!(
             bypassed.client_policy_source.as_deref(),
-            Some("192.168.1.50")
+            Some("192.168.1.50 → bypass")
         );
         assert!(bypassed.matched_rule.is_none());
 

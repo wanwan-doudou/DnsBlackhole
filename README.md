@@ -8,33 +8,6 @@ DnsBlackhole 可以运行在 Windows 或 macOS 主机上，通过远程黑名单
 
 > 当前 GitHub Release 同时提供 Windows x64 的 NSIS/MSI 安装包和 macOS Universal DMG。
 
-## 界面预览
-
-DnsBlackhole 提供完整的图形界面，可直接查看 DNS 请求趋势、拦截统计、热门域名和客户端活动。
-
-[![DnsBlackhole 仪表盘](image/dashboard.png)](image/dashboard.png)
-
-查询日志会展示请求类型、处理结果、命中过滤器、响应时间和客户端信息，便于定位异常请求与验证规则。
-
-[![DnsBlackhole 查询日志](image/query-log.png)](image/query-log.png)
-
-<details>
-<summary>查看更多界面截图</summary>
-
-| DNS 设置 | 安全防护 |
-| --- | --- |
-| [![DNS 上游与监听设置](image/dns-settings.png)](image/dns-settings.png) | [![客户端访问与查询防护](image/security-protection.png)](image/security-protection.png) |
-
-| DNS 黑名单 | 自定义规则与 DNS 重写 |
-| --- | --- |
-| [![远程 DNS 黑名单](image/blocklists.png)](image/blocklists.png) | [![自定义过滤规则与 DNS 重写](image/custom-rules.png)](image/custom-rules.png) |
-
-### 应用与运行设置
-
-[![DnsBlackhole 应用与运行设置](image/app-settings.png)](image/app-settings.png)
-
-</details>
-
 ## 安装
 
 1. 打开 [最新 Release](https://github.com/wanwan-doudou/DnsBlackhole/releases/latest)。
@@ -97,16 +70,19 @@ Bootstrap DNS 只接受 IP 或 `IP:端口`，不能填写域名或 DoH 地址，
 - 支持 DNS 重写，格式为 `域名 IP`；`*.example.org` 可匹配子域，优先于黑名单生效。
 - 支持零地址、NXDOMAIN、REFUSED 和自定义 IP 四种拦截响应。
 - 拦截响应 TTL 可配置；NXDOMAIN 会携带同 TTL 的 SOA 负缓存信息，减少客户端对同一被拦域名的重复查询。
+- 支持按客户端分配命名策略组、周期计划、家庭安全搜索及常用服务分类拦截。
 - 规则、清单、重写、拦截方式和日志忽略域名保存后热替换，不重启服务、不清空 DNS 缓存。
 
 ### 查询、统计与缓存
 
-- 查询日志支持按已处理、已过滤、失败筛选，并可按域名或客户端搜索。
+- 查询日志支持按时间、处理状态、响应来源和查询类型组合筛选，可切换排序并保存常用查询视图。
+- 查询日志搜索使用增量索引与稳定游标分页，大规模日志下仍可连续翻页和导出当前筛选结果。
 - 拦截详情显示命中规则、来源清单、规则类型、`important` 覆盖和 allowlist 信息。
 - 支持客户端名称映射、日志忽略域名、日志保留时间及客户端 IP 匿名化。
 - 仪表盘展示查询趋势、拦截率、域名排行、客户端排行、DNS 黑名单排行、上游请求排行、平均响应时间和缓存命中/刷新/淘汰指标。
 - DNS 响应缓存支持容量、最小/最大 TTL、乐观缓存、热门域名过期前预取和手动清理。
 - 可清理远程过滤器磁盘缓存，不影响配置、查询日志和统计数据库。
+- 查询日志、统计数据库和过滤器数据可迁移到自定义目录，并在重装后接管保留的现有数据。
 
 ### 安全与运行维护
 
@@ -120,6 +96,7 @@ Bootstrap DNS 只接受 IP 或 `IP:端口`，不能填写域名或 DoH 地址，
 - 远程清单和 DoH 默认只允许 HTTPS；HTTP 必须在安全防护中显式开启。
 - 单个远程清单默认限制为解压后 50 MB，超限立即中断并保留旧缓存。
 - 支持运行状态监控与异常自动恢复、系统托盘、开机启动和关闭窗口后后台运行。
+- 可选启用只读 REST 与 Prometheus 监控接口；默认仅监听本机，且不暴露域名或客户端明细。
 
 ## 默认安全策略
 

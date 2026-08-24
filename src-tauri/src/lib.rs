@@ -551,10 +551,16 @@ async fn get_status(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn get_query_logs(
     state: tauri::State<'_, Arc<GuiState>>,
     filter: Option<String>,
     search: Option<String>,
+    hours: Option<u32>,
+    source: Option<String>,
+    query_type: Option<String>,
+    sort: Option<String>,
+    cursor: Option<String>,
     page: Option<u32>,
     page_size: Option<u32>,
 ) -> Result<QueryLogPage, String> {
@@ -570,6 +576,11 @@ async fn get_query_logs(
                 &serde_json::json!({
                     "filter": filter,
                     "search": search,
+                    "hours": hours,
+                    "source": source,
+                    "query_type": query_type,
+                    "sort": sort,
+                    "cursor": cursor,
                     "page": page,
                     "page_size": page_size,
                 }),
@@ -577,7 +588,18 @@ async fn get_query_logs(
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
-            query_logs_blocking(state.local()?, filter, search, page, page_size)
+            query_logs_blocking(
+                state.local()?,
+                filter,
+                search,
+                hours,
+                source,
+                query_type,
+                sort,
+                cursor,
+                page,
+                page_size,
+            )
         }
     })
     .await
