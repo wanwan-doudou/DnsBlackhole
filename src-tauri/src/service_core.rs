@@ -594,6 +594,8 @@ pub(crate) fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool 
         || previous.dns_cache_min_ttl != next.dns_cache_min_ttl
         || previous.dns_cache_max_ttl != next.dns_cache_max_ttl
         || previous.dns_cache_optimistic != next.dns_cache_optimistic
+        || previous.dns_cache_optimistic_max_stale_seconds
+            != next.dns_cache_optimistic_max_stale_seconds
         || previous.dns_cache_prefetch_enabled != next.dns_cache_prefetch_enabled
         || previous.dns_cache_prefetch_hit_threshold != next.dns_cache_prefetch_hit_threshold
         || previous.monitoring_api_enabled != next.monitoring_api_enabled

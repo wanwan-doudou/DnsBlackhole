@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 16;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 17;
 pub(crate) const MAX_STATISTICS_RETENTION_HOURS: u32 = 24 * 365;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
@@ -117,6 +117,8 @@ pub struct AppConfig {
     pub dns_cache_max_ttl: u32,
     #[serde(default = "default_dns_cache_optimistic")]
     pub dns_cache_optimistic: bool,
+    #[serde(default = "default_dns_cache_optimistic_max_stale_seconds")]
+    pub dns_cache_optimistic_max_stale_seconds: u32,
     #[serde(default = "default_dns_cache_prefetch_enabled")]
     pub dns_cache_prefetch_enabled: bool,
     #[serde(default = "default_dns_cache_prefetch_hit_threshold")]
@@ -321,6 +323,8 @@ impl Default for AppConfig {
             dns_cache_min_ttl: default_dns_cache_min_ttl(),
             dns_cache_max_ttl: default_dns_cache_max_ttl(),
             dns_cache_optimistic: default_dns_cache_optimistic(),
+            dns_cache_optimistic_max_stale_seconds: default_dns_cache_optimistic_max_stale_seconds(
+            ),
             dns_cache_prefetch_enabled: default_dns_cache_prefetch_enabled(),
             dns_cache_prefetch_hit_threshold: default_dns_cache_prefetch_hit_threshold(),
             runtime_watchdog_enabled: default_runtime_watchdog_enabled(),
@@ -473,6 +477,9 @@ impl AppConfig {
         }
         if self.dns_cache_max_ttl > 0 && self.dns_cache_min_ttl > self.dns_cache_max_ttl {
             return Err("DNS 缓存最小 TTL 不能大于最大 TTL".into());
+        }
+        if !(60..=7 * 24 * 3600).contains(&self.dns_cache_optimistic_max_stale_seconds) {
+            return Err("乐观缓存最大陈旧时间必须在 60 秒到 7 天之间".into());
         }
         if !(2..=10_000).contains(&self.dns_cache_prefetch_hit_threshold) {
             return Err("热门域名预取命中阈值必须在 2 到 10000 之间".into());
@@ -712,6 +719,10 @@ fn default_dns_cache_max_ttl() -> u32 {
 
 fn default_dns_cache_optimistic() -> bool {
     true
+}
+
+fn default_dns_cache_optimistic_max_stale_seconds() -> u32 {
+    12 * 3600
 }
 
 fn default_dns_cache_prefetch_enabled() -> bool {
@@ -1683,6 +1694,10 @@ fn read_config_file(path: &Path) -> Result<AppConfig, String> {
 }
 
 pub fn migrate_legacy_defaults(config: &mut AppConfig) {
+    if config.schema_version < 17 {
+        config.dns_cache_optimistic_max_stale_seconds =
+            default_dns_cache_optimistic_max_stale_seconds();
+    }
     if config.schema_version < 11 {
         // 旧版本的日志开关与忽略域名同时控制持久化统计；迁移时保持原有行为，
         // 用户之后可以在设置中独立调整。
@@ -2212,6 +2227,11 @@ mod tests {
         assert!(config.validate().is_err());
         config.dns_cache_prefetch_hit_threshold = 10;
 
+        config.dns_cache_optimistic_max_stale_seconds = 59;
+        assert!(config.validate().is_err());
+        config.dns_cache_optimistic_max_stale_seconds =
+            default_dns_cache_optimistic_max_stale_seconds();
+
         config.blocking_response_ttl = 7 * 24 * 3600 + 1;
         assert!(config.validate().is_err());
         config.blocking_response_ttl = 60;
@@ -2266,6 +2286,10 @@ mod tests {
             default_runtime_watchdog_interval_seconds()
         );
         assert_eq!(config.filter_max_size_mb, default_filter_max_size_mb());
+        assert_eq!(
+            config.dns_cache_optimistic_max_stale_seconds,
+            default_dns_cache_optimistic_max_stale_seconds()
+        );
     }
 
     #[test]

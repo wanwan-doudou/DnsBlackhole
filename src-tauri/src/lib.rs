@@ -1336,15 +1336,21 @@ mod tests {
     }
 
     #[test]
-    fn cache_prefetch_changes_restart_dns_runtime() {
+    fn cache_settings_changes_restart_dns_runtime() {
         let previous = AppConfig::default();
-        let next = AppConfig {
-            dns_cache_prefetch_hit_threshold: 20,
-            ..previous.clone()
-        };
-
-        assert!(!service_core::filter_runtime_changed(&previous, &next));
-        assert!(service_core::needs_dns_restart(&previous, &next));
+        for next in [
+            AppConfig {
+                dns_cache_prefetch_hit_threshold: 20,
+                ..previous.clone()
+            },
+            AppConfig {
+                dns_cache_optimistic_max_stale_seconds: 3600,
+                ..previous.clone()
+            },
+        ] {
+            assert!(!service_core::filter_runtime_changed(&previous, &next));
+            assert!(service_core::needs_dns_restart(&previous, &next));
+        }
     }
 
     #[test]

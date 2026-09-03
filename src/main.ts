@@ -112,7 +112,7 @@ import "./styles/query-log.css";
 import "./style.css";
 
 const frontendStartedAt = performance.now();
-const CURRENT_CONFIG_SCHEMA_VERSION = 16;
+const CURRENT_CONFIG_SCHEMA_VERSION = 17;
 
 function logLoadTime(
   module: string,
@@ -202,12 +202,19 @@ const RELEASES_URL = "https://github.com/wanwan-doudou/DnsBlackhole/releases";
 const RELEASES_API_URL =
   "https://api.github.com/repos/wanwan-doudou/DnsBlackhole/releases";
 const ABOUT_LINKS = {
-  docs: "https://github.com/wanwan-doudou/DnsBlackhole#readme",
+  docs: "https://github.com/wanwan-doudou/DnsBlackhole/blob/main/README.md",
   repository: "https://github.com/wanwan-doudou/DnsBlackhole",
   releases: RELEASES_URL,
   issues: "https://github.com/wanwan-doudou/DnsBlackhole/issues",
   license: "https://github.com/wanwan-doudou/DnsBlackhole/blob/main/LICENSE",
 } as const;
+const ABOUT_LINK_LABELS: Record<keyof typeof ABOUT_LINKS, string> = {
+  docs: "使用文档",
+  repository: "项目源码",
+  releases: "更新记录",
+  issues: "问题反馈",
+  license: "开源许可",
+};
 const QUERY_LOG_PAGE_SIZE = 50;
 const QUERY_LOG_SEARCH_DEBOUNCE_MS = 800;
 const BACKGROUND_REFRESH_INTERVAL_MS = 5_000;
@@ -287,6 +294,31 @@ async function writeClipboardText(value: string): Promise<void> {
     }
   } finally {
     textarea.remove();
+  }
+}
+
+async function openAboutLink(link: keyof typeof ABOUT_LINKS): Promise<void> {
+  const url = ABOUT_LINKS[link];
+  const label = ABOUT_LINK_LABELS[link];
+  try {
+    await openExternalUrl(url);
+  } catch (error) {
+    console.error(`打开${label}失败`, error);
+    showMessage(`无法打开${label}。请重试，或复制链接后在浏览器中打开。`, true, {
+      actions: [
+        {
+          label: "重试",
+          run: () => openAboutLink(link),
+        },
+        {
+          label: "复制链接",
+          run: async () => {
+            await writeClipboardText(url);
+            showMessage(`${label}链接已复制`, false);
+          },
+        },
+      ],
+    });
   }
 }
 
@@ -397,6 +429,9 @@ const dnsCacheSizeInput = query<HTMLInputElement>("#dns_cache_size");
 const dnsCacheMinTtlInput = query<HTMLInputElement>("#dns_cache_min_ttl");
 const dnsCacheMaxTtlInput = query<HTMLInputElement>("#dns_cache_max_ttl");
 const dnsCacheOptimisticInput = query<HTMLInputElement>("#dns_cache_optimistic");
+const dnsCacheOptimisticMaxStaleInput = query<HTMLInputElement>(
+  "#dns_cache_optimistic_max_stale_seconds",
+);
 const dnsCachePrefetchEnabledInput = query<HTMLInputElement>("#dns_cache_prefetch_enabled");
 const dnsCachePrefetchHitThresholdInput = query<HTMLInputElement>(
   "#dns_cache_prefetch_hit_threshold",
@@ -753,6 +788,7 @@ function syncCustomSelect(select: HTMLSelectElement): void {
     button.disabled = select.options[index]?.disabled ?? false;
     button.classList.toggle("selected", selected);
     button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = -1;
   });
 }
 
@@ -775,10 +811,7 @@ document.querySelectorAll<HTMLButtonElement>("[data-about-link]").forEach((butto
     if (!link || !(link in ABOUT_LINKS)) {
       return;
     }
-    void openExternalUrl(ABOUT_LINKS[link]).catch((error) => {
-      console.error("打开关于链接失败", error);
-      showMessage(`打开浏览器失败：${String(error)}`, true);
-    });
+    void openAboutLink(link);
   });
 });
 
@@ -789,6 +822,26 @@ copySupportInfoButton.addEventListener("click", () => {
 function closeQueryLogFilter(): void {
   queryLogFilterMenu.classList.remove("open");
   queryLogFilterButton.setAttribute("aria-expanded", "false");
+}
+
+function focusCompositeOption(
+  options: HTMLButtonElement[],
+  current: HTMLButtonElement | null,
+  key: "ArrowDown" | "ArrowUp" | "Home" | "End",
+): void {
+  const enabled = options.filter((option) => !option.disabled);
+  if (enabled.length === 0) {
+    return;
+  }
+  const currentIndex = current ? enabled.indexOf(current) : -1;
+  const nextIndex = key === "Home"
+    ? 0
+    : key === "End"
+      ? enabled.length - 1
+      : key === "ArrowUp"
+        ? (currentIndex <= 0 ? enabled.length : currentIndex) - 1
+        : (currentIndex + 1) % enabled.length;
+  enabled[nextIndex].focus();
 }
 
 document.addEventListener("click", (e) => {
@@ -812,7 +865,40 @@ runtimeStatusButton.addEventListener("click", (event) => {
 });
 
 runtimeStatusButton.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    headerRuntime.classList.add("open");
+    runtimeStatusButton.setAttribute("aria-expanded", "true");
+    focusCompositeOption(
+      Array.from(runtimeStatusMenu.querySelectorAll<HTMLButtonElement>("[role='menuitem']")),
+      null,
+      event.key === "ArrowDown" ? "Home" : "End",
+    );
+  } else if (event.key === "Escape") {
+    closeRuntimeStatusMenu();
+  }
+});
+
+runtimeStatusMenu.querySelectorAll<HTMLButtonElement>("[role='menuitem']").forEach((button) => {
+  button.tabIndex = -1;
+});
+
+runtimeStatusMenu.addEventListener("keydown", (event) => {
+  const options = Array.from(
+    runtimeStatusMenu.querySelectorAll<HTMLButtonElement>("[role='menuitem']"),
+  );
+  if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    focusCompositeOption(
+      options,
+      (event.target as HTMLElement).closest<HTMLButtonElement>("[role='menuitem']"),
+      event.key as "ArrowDown" | "ArrowUp" | "Home" | "End",
+    );
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    closeRuntimeStatusMenu();
+    runtimeStatusButton.focus();
+  } else if (event.key === "Tab") {
     closeRuntimeStatusMenu();
   }
 });
@@ -825,6 +911,9 @@ runtimeStatusMenu.addEventListener("click", (event) => {
     return;
   }
   closeRuntimeStatusMenu();
+  if (event.detail === 0) {
+    runtimeStatusButton.focus();
+  }
   void runProtectionAction(
     button.dataset.protectionAction === "resume"
       ? "resume"
@@ -961,23 +1050,59 @@ queryLogFilterButton.addEventListener("click", (event) => {
 });
 
 queryLogFilterMenu.querySelectorAll<HTMLButtonElement>("[data-filter]").forEach((option) => {
+  option.tabIndex = -1;
   option.addEventListener("click", (event) => {
     event.stopPropagation();
     const value = option.dataset.filter as QueryLogFilter | undefined;
     if (!value || queryLogFilterInput.value === value) {
       closeQueryLogFilter();
+      if (event.detail === 0) {
+        queryLogFilterButton.focus();
+      }
       return;
     }
     setQueryLogFilterValue(value);
     closeQueryLogFilter();
+    if (event.detail === 0) {
+      queryLogFilterButton.focus();
+    }
     queryLogFilterInput.dispatchEvent(new Event("change"));
   });
 });
 
 queryLogFilterButton.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    queryLogFilterMenu.classList.add("open");
+    queryLogFilterButton.setAttribute("aria-expanded", "true");
+    const options = Array.from(
+      queryLogFilterMenu.querySelectorAll<HTMLButtonElement>("[data-filter]"),
+    );
+    const selected = options.find((option) => option.getAttribute("aria-selected") === "true") ?? null;
+    focusCompositeOption(options, selected, event.key);
+  } else if (event.key === "Escape") {
     closeQueryLogFilter();
     queryLogFilterButton.focus();
+  }
+});
+
+queryLogFilterMenu.addEventListener("keydown", (event) => {
+  const options = Array.from(
+    queryLogFilterMenu.querySelectorAll<HTMLButtonElement>("[data-filter]"),
+  );
+  if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    focusCompositeOption(
+      options,
+      (event.target as HTMLElement).closest<HTMLButtonElement>("[data-filter]"),
+      event.key as "ArrowDown" | "ArrowUp" | "Home" | "End",
+    );
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    closeQueryLogFilter();
+    queryLogFilterButton.focus();
+  } else if (event.key === "Tab") {
+    closeQueryLogFilter();
   }
 });
 
@@ -1034,6 +1159,7 @@ queryLogEnabledInput.addEventListener("change", updateLogControls);
 statisticsEnabledInput.addEventListener("change", updateStatisticsControls);
 filterProxyModeInput.addEventListener("change", updateFilterProxyControls);
 dnsCacheEnabledInput.addEventListener("change", updateDnsCacheControls);
+dnsCacheOptimisticInput.addEventListener("change", updateDnsCacheControls);
 dnsCachePrefetchEnabledInput.addEventListener("change", updateDnsCacheControls);
 rebindingProtectionEnabledInput.addEventListener("change", updateResponseProtectionControls);
 runtimeWatchdogEnabledInput.addEventListener("change", updateRuntimeWatchdogControls);
@@ -1230,6 +1356,7 @@ clientRankBody.addEventListener("click", (event) => {
   queryLogSearchInput.value = client;
   resetQueryLogPagination();
   setActiveView("logs");
+  queryLogSearchInput.focus();
 });
 
 exportConfigButton.addEventListener("click", () => {
@@ -2055,6 +2182,9 @@ async function loadConfig(): Promise<boolean> {
     dnsCacheMinTtlInput.value = String(config.dns_cache_min_ttl);
     dnsCacheMaxTtlInput.value = String(config.dns_cache_max_ttl);
     dnsCacheOptimisticInput.checked = config.dns_cache_optimistic;
+    dnsCacheOptimisticMaxStaleInput.value = String(
+      config.dns_cache_optimistic_max_stale_seconds,
+    );
     dnsCachePrefetchEnabledInput.checked = config.dns_cache_prefetch_enabled;
     dnsCachePrefetchHitThresholdInput.value = String(config.dns_cache_prefetch_hit_threshold);
     runtimeWatchdogEnabledInput.checked = config.runtime_watchdog_enabled;
@@ -2737,6 +2867,9 @@ function collectConfig(): AppConfig {
     dns_cache_min_ttl: Number(dnsCacheMinTtlInput.value || 0),
     dns_cache_max_ttl: Number(dnsCacheMaxTtlInput.value || 0),
     dns_cache_optimistic: dnsCacheOptimisticInput.checked,
+    dns_cache_optimistic_max_stale_seconds: Number(
+      dnsCacheOptimisticMaxStaleInput.value || 0,
+    ),
     dns_cache_prefetch_enabled: dnsCachePrefetchEnabledInput.checked,
     dns_cache_prefetch_hit_threshold: Number(dnsCachePrefetchHitThresholdInput.value || 10),
     runtime_watchdog_enabled: runtimeWatchdogEnabledInput.checked,
@@ -3216,7 +3349,7 @@ function dnsResponseCodeShortLabel(code: number | null): string {
 
 function renderFilters(): void {
   if (filtersState.length === 0) {
-    filtersBody.innerHTML = `<div class="empty-row">暂无远程清单</div>`;
+    filtersBody.innerHTML = `<div class="empty-row" role="row"><span role="cell">暂无远程清单</span></div>`;
     return;
   }
 
@@ -3281,6 +3414,7 @@ async function refreshFilterUpdateMetadata(): Promise<void> {
 
 function renderFilter(filter: FilterSubscription): string {
   const isEditing = editingFilterIds.has(filter.id);
+  const accessibleName = filter.name.trim() || "未命名清单";
   const hasUnsupportedIgnoredRules =
     filter.ignored_regex_count + filter.ignored_unsupported_count + filter.ignored_invalid_count > 0;
   const statusText = filter.last_error
@@ -3300,36 +3434,38 @@ function renderFilter(filter: FilterSubscription): string {
   const ruleSummary = formatFilterRuleSummary(filter);
 
   return `
-    <div class="filter-item" data-id="${escapeHtml(filter.id)}">
-      <div class="filter-summary">
-        <label class="switch" title="启用清单">
-          <input class="filter-enabled" data-field="enabled" type="checkbox" ${filter.enabled ? "checked" : ""} />
+    <div class="filter-item" data-id="${escapeHtml(filter.id)}" role="rowgroup">
+      <div class="filter-summary" role="row">
+        <label class="switch" title="启用清单" role="cell">
+          <input class="filter-enabled" data-field="enabled" type="checkbox" aria-label="启用黑名单 ${escapeHtml(accessibleName)}" ${filter.enabled ? "checked" : ""} />
         </label>
-        <div class="filter-meta">
+        <div class="filter-meta" role="cell">
           <strong>${escapeHtml(filter.name || "未命名清单")}</strong>
           <span class="url-line" title="${escapeHtml(filter.url)}">${escapeHtml(filter.url || "尚未填写清单网址")}</span>
         </div>
-        <span class="rule-count" title="${escapeHtml(ruleSummary)}">${formatCount(filter.rule_count)}</span>
-        <span class="update-time">${formatTime(filter.last_updated)}</span>
-        <span class="state-tag ${statusClass}" title="${escapeHtml(filter.last_error ?? "")}">${statusText}</span>
-        <div class="row-actions">
-          <button data-action="edit" type="button">${isEditing ? "收起" : "编辑"}</button>
-          <button data-action="remove" type="button">删除</button>
+        <span class="rule-count" role="cell" title="${escapeHtml(ruleSummary)}">${formatCount(filter.rule_count)}</span>
+        <span class="update-time" role="cell">${formatTime(filter.last_updated)}</span>
+        <span class="state-tag ${statusClass}" role="cell" title="${escapeHtml(filter.last_error ?? "")}">${statusText}</span>
+        <div class="row-actions" role="cell">
+          <button data-action="edit" type="button" aria-label="${isEditing ? "收起" : "编辑"}黑名单 ${escapeHtml(accessibleName)}">${isEditing ? "收起" : "编辑"}</button>
+          <button data-action="remove" type="button" aria-label="删除黑名单 ${escapeHtml(accessibleName)}">删除</button>
         </div>
       </div>
       ${
         isEditing
           ? `
-            <div class="filter-edit">
-              <label class="field">
-                <span>名称</span>
-                <input data-field="name" value="${escapeHtml(filter.name)}" spellcheck="false" />
-              </label>
-              <label class="field">
-                <span>清单网址</span>
-                <input data-field="url" value="${escapeHtml(filter.url)}" spellcheck="false" />
-              </label>
-              <small class="filter-rule-detail">${escapeHtml(ruleSummary)}</small>
+            <div role="row">
+              <div class="filter-edit" role="cell" aria-colspan="6">
+                <label class="field">
+                  <span>名称</span>
+                  <input data-field="name" value="${escapeHtml(filter.name)}" spellcheck="false" />
+                </label>
+                <label class="field">
+                  <span>清单网址</span>
+                  <input data-field="url" value="${escapeHtml(filter.url)}" spellcheck="false" />
+                </label>
+                <small class="filter-rule-detail">${escapeHtml(ruleSummary)}</small>
+              </div>
             </div>
           `
           : ""
@@ -3425,7 +3561,7 @@ function renderSecurityEvents(status: RuntimeStatus): void {
   if (events.length === 0) {
     setHtmlIfChanged(
       securityEventBody,
-      `<div class="security-event-empty">暂无安全事件</div>`,
+      `<div class="security-event-empty" role="row"><span role="cell">暂无安全事件</span></div>`,
     );
     return;
   }
@@ -3461,20 +3597,20 @@ function renderSecurityEvent(event: SecurityEvent): string {
       ? `${detail}；首次：${formatLogDate(event.first_seen_at)} ${formatLogTime(event.first_seen_at)}`
       : detail;
   return `
-    <div class="security-event-row ${event.event_type}">
-      <div>
+    <div class="security-event-row ${event.event_type}" role="row">
+      <div role="cell">
         <strong>${escapeHtml(formatLogTime(event.last_seen_at))}</strong>
         <span>${escapeHtml(formatLogDate(event.last_seen_at))}</span>
       </div>
-      <div>
+      <div role="cell">
         <strong title="${escapeHtml(event.client_ip)}">${escapeHtml(clientLabel)}</strong>
         <span>${escapeHtml(event.client_ip)}</span>
       </div>
-      <div>
+      <div role="cell">
         <strong>${eventLabel}</strong>
         <span title="${escapeHtml(detailTitle)}">${escapeHtml(detail)}</span>
       </div>
-      <strong class="security-event-count">${escapeHtml(formatCount(event.count))}</strong>
+      <strong class="security-event-count" role="cell">${escapeHtml(formatCount(event.count))}</strong>
     </div>
   `;
 }
@@ -3697,6 +3833,7 @@ function updateDnsCacheControls(): void {
   dnsCacheMinTtlInput.disabled = !enabled;
   dnsCacheMaxTtlInput.disabled = !enabled;
   dnsCacheOptimisticInput.disabled = !enabled;
+  dnsCacheOptimisticMaxStaleInput.disabled = !enabled || !dnsCacheOptimisticInput.checked;
   dnsCachePrefetchEnabledInput.disabled = !enabled;
   dnsCachePrefetchHitThresholdInput.disabled =
     !enabled || !dnsCachePrefetchEnabledInput.checked;
@@ -4595,10 +4732,18 @@ function waitForPaint(): Promise<void> {
 }
 
 
-function showMessage(value: string, isError: boolean): void {
+type MessageAction = {
+  label: string;
+  run: () => void | Promise<void>;
+};
+
+type MessageOptions = {
+  actions?: MessageAction[];
+};
+
+function showMessage(value: string, isError: boolean, options: MessageOptions = {}): void {
   clearTimeout(messageTimer);
 
-  // 移除已有的消息
   document.querySelectorAll(".message").forEach((el) => el.remove());
 
   if (value.length === 0) return;
@@ -4608,19 +4753,61 @@ function showMessage(value: string, isError: boolean): void {
   el.setAttribute("role", isError ? "alert" : "status");
   el.setAttribute("aria-live", isError ? "assertive" : "polite");
   el.setAttribute("aria-atomic", "true");
-  el.innerHTML = `<span class="msg-text">${escapeHtml(value)}</span>`;
-  document.body.appendChild(el);
+
+  const icon = document.createElement("span");
+  icon.className = "message-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.innerHTML = isError
+    ? `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="m9 9 6 6m0-6-6 6"></path></svg>`
+    : `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="m8 12 2.5 2.5L16 9"></path></svg>`;
+
+  const content = document.createElement("div");
+  content.className = "message-content";
+  const text = document.createElement("span");
+  text.className = "msg-text";
+  text.textContent = value;
+  content.appendChild(text);
 
   const dismiss = () => {
+    window.clearTimeout(messageTimer);
     el.classList.add("fade-out");
-    el.addEventListener("transitionend", () => el.remove(), { once: true });
+    window.setTimeout(() => el.remove(), 300);
   };
+
+  if (options.actions?.length) {
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+    options.actions.forEach((action) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "message-action";
+      button.textContent = action.label;
+      button.addEventListener("click", () => {
+        dismiss();
+        void Promise.resolve(action.run()).catch((error) => {
+          console.error(`通知操作“${action.label}”失败`, error);
+          showMessage(`${action.label}失败，请稍后重试。`, true);
+        });
+      });
+      actions.appendChild(button);
+    });
+    content.appendChild(actions);
+  }
+  el.append(icon, content);
+
+  if (isError) {
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "message-close";
+    close.textContent = "关闭";
+    close.setAttribute("aria-label", "关闭错误提示");
+    close.addEventListener("click", dismiss);
+    el.appendChild(close);
+  }
+  document.body.appendChild(el);
 
   if (!isError) {
     messageTimer = window.setTimeout(dismiss, 3000);
-  } else {
-    // 错误消息 8 秒后自动消失
-    messageTimer = window.setTimeout(dismiss, 8000);
   }
 }
 

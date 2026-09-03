@@ -16,7 +16,7 @@ use super::protocol::{ParsedQuery, prepare_cached_response, response_cache_ttl};
 const DNS_CACHE_ENTRY_OVERHEAD_BYTES: usize = 96;
 // 淘汰时从迭代起点抽样对比 last_used，避免全表扫描找最旧条目
 const DNS_CACHE_EVICT_SAMPLE: usize = 16;
-// 缓存满载后若工作集持续换入，不能让每次插入都在写锁内扫描整个 shard。
+// 工作集持续换入时，不能让每次插入都在写锁内扫描整个 shard。
 const DNS_CACHE_EXPIRED_SCAN_INTERVAL_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,7 @@ pub(crate) struct DnsCacheConfig {
     pub(crate) min_ttl: u32,
     pub(crate) max_ttl: u32,
     pub(crate) optimistic: bool,
+    pub(crate) optimistic_max_stale_seconds: u32,
     pub(crate) prefetch_enabled: bool,
     pub(crate) prefetch_hit_threshold: u32,
 }
@@ -126,6 +127,7 @@ impl DnsCacheConfig {
             min_ttl: config.dns_cache_min_ttl,
             max_ttl: config.dns_cache_max_ttl,
             optimistic: config.dns_cache_optimistic,
+            optimistic_max_stale_seconds: config.dns_cache_optimistic_max_stale_seconds,
             prefetch_enabled: config.dns_cache_prefetch_enabled,
             prefetch_hit_threshold: config.dns_cache_prefetch_hit_threshold,
         }
@@ -343,7 +345,11 @@ impl DnsCache {
         let entry = self.entries.get(key)?;
 
         let fresh = entry.expires_at > now;
-        if !fresh && !self.config.optimistic {
+        let stale_age = now.saturating_sub(entry.expires_at);
+        if !fresh
+            && (!self.config.optimistic
+                || stale_age > u64::from(self.config.optimistic_max_stale_seconds))
+        {
             // 过期条目留给淘汰或下次插入清理，读路径保持只读
             return None;
         }
@@ -453,7 +459,7 @@ impl DnsCache {
 
     fn evict_over_limit(&mut self, now: u64) -> u64 {
         let mut evicted = 0_u64;
-        if self.total_size > self.config.max_size_bytes && self.should_scan_expired(now) {
+        if self.should_scan_expired(now) {
             evicted = evicted.saturating_add(self.evict_expired(now));
             self.last_expired_scan_at = now;
         }
@@ -483,7 +489,10 @@ impl DnsCache {
         let mut removed_size = 0_usize;
         let mut removed_count = 0_u64;
         self.entries.retain(|_, entry| {
-            let keep = entry.expires_at > now;
+            let keep = entry.expires_at > now
+                || (self.config.optimistic
+                    && now.saturating_sub(entry.expires_at)
+                        <= u64::from(self.config.optimistic_max_stale_seconds));
             if !keep {
                 removed_size = removed_size.saturating_add(entry.size);
                 removed_count = removed_count.saturating_add(1);
@@ -586,13 +595,14 @@ mod tests {
     use crate::dns::protocol::Question;
 
     #[test]
-    fn throttles_full_expired_entry_scans() {
+    fn throttles_expired_entry_scans() {
         let mut cache = DnsCache::from_config(DnsCacheConfig {
             enabled: true,
             max_size_bytes: 1024,
             min_ttl: 0,
             max_ttl: 60,
             optimistic: true,
+            optimistic_max_stale_seconds: 12 * 3600,
             prefetch_enabled: true,
             prefetch_hit_threshold: 10,
         })
@@ -614,6 +624,7 @@ mod tests {
                 min_ttl: 0,
                 max_ttl: 300,
                 optimistic: true,
+                optimistic_max_stale_seconds: 12 * 3600,
                 prefetch_enabled: true,
                 prefetch_hit_threshold: 2,
             },
@@ -652,5 +663,40 @@ mod tests {
         let stats = store.stats_snapshot();
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.entries, 0);
+    }
+
+    #[test]
+    fn bounds_optimistic_cache_stale_age_and_cleans_old_entries() {
+        let mut cache = DnsCache::from_config(DnsCacheConfig {
+            enabled: true,
+            max_size_bytes: 16 * 1024,
+            min_ttl: 0,
+            max_ttl: 300,
+            optimistic: true,
+            optimistic_max_stale_seconds: 60,
+            prefetch_enabled: false,
+            prefetch_hit_threshold: 10,
+        })
+        .expect("cache should build");
+        let stale_key = QueryCacheKey::from_question(&Question {
+            domain: "stale.example".into(),
+            qtype: 1,
+            qclass: 1,
+            question_end: 0,
+        });
+        cache.insert_with_ttl(stale_key.clone(), vec![0; 64], 100, 60);
+
+        assert!(cache.lookup(&stale_key, 220).is_some());
+        assert!(cache.lookup(&stale_key, 221).is_none());
+
+        let fresh_key = QueryCacheKey::from_question(&Question {
+            domain: "fresh.example".into(),
+            qtype: 1,
+            qclass: 1,
+            question_end: 0,
+        });
+        cache.insert_with_ttl(fresh_key.clone(), vec![0; 64], 250, 60);
+        assert!(!cache.entries.contains_key(&stale_key));
+        assert!(cache.entries.contains_key(&fresh_key));
     }
 }

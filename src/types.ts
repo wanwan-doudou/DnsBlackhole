@@ -160,6 +160,7 @@ export type AppConfig = {
   dns_cache_min_ttl: number;
   dns_cache_max_ttl: number;
   dns_cache_optimistic: boolean;
+  dns_cache_optimistic_max_stale_seconds: number;
   dns_cache_prefetch_enabled: boolean;
   dns_cache_prefetch_hit_threshold: number;
   runtime_watchdog_enabled: boolean;

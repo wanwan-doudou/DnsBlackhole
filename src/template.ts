@@ -4,7 +4,7 @@ export function renderAppTemplate(appIconUrl: string): string {
     <header class="app-header">
       <div class="header-inner">
         <div class="brand">
-          <img class="brand-mark" src="${appIconUrl}" alt="DnsBlackhole" />
+          <img class="brand-mark" src="${appIconUrl}" alt="" aria-hidden="true" />
           <div>
             <h1>DnsBlackhole</h1>
             <span>DNS sinkhole</span>
@@ -242,11 +242,11 @@ export function renderAppTemplate(appIconUrl: string): string {
               <input id="query_log_search" aria-label="搜索域名或客户端" autocomplete="off" spellcheck="false" placeholder="搜索域名或客户端" />
             </label>
             <div class="query-log-filter" id="query_log_filter_menu">
-              <button class="query-log-filter-trigger" id="query_log_filter_button" type="button" aria-haspopup="listbox" aria-expanded="false">
+              <button class="query-log-filter-trigger" id="query_log_filter_button" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="query_log_filter_options">
                 <span id="query_log_filter_label">所有查询记录</span>
                 <i aria-hidden="true"></i>
               </button>
-              <div class="query-log-filter-options" role="listbox" aria-label="查询日志状态筛选">
+              <div class="query-log-filter-options" id="query_log_filter_options" role="listbox" aria-label="查询日志状态筛选">
                 <button class="active" data-filter="all" type="button" role="option" aria-selected="true">所有查询记录</button>
                 <button data-filter="processed" type="button" role="option" aria-selected="false">已处理</button>
                 <button data-filter="blocked" type="button" role="option" aria-selected="false">已过滤</button>
@@ -332,7 +332,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="query-log-body" id="query_log_body" role="rowgroup"></div>
           </div>
           <div class="query-log-pagination">
-            <span id="query_log_page_info">0 条记录</span>
+            <span id="query_log_page_info" aria-live="polite">0 条记录</span>
             <div class="button-group">
               <button id="query_log_prev_btn" type="button">上一页</button>
               <button id="query_log_next_btn" type="button">下一页</button>
@@ -340,12 +340,12 @@ export function renderAppTemplate(appIconUrl: string): string {
           </div>
         </section>
 
-        <dialog class="update-dialog query-rule-dialog" id="query_rule_dialog">
+        <dialog class="update-dialog query-rule-dialog" id="query_rule_dialog" aria-labelledby="query_rule_dialog_title">
           <form class="update-dialog-panel" method="dialog" id="query_rule_form">
             <div class="update-dialog-header">
               <div>
                 <span class="update-dialog-kicker">查询日志快捷操作</span>
-                <h3>添加 DNS 重写</h3>
+                <h3 id="query_rule_dialog_title">添加 DNS 重写</h3>
               </div>
               <button class="update-dialog-close" id="query_rule_dialog_close_btn" type="button" aria-label="关闭">×</button>
             </div>
@@ -554,9 +554,16 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <input id="dns_cache_optimistic" type="checkbox" />
                 <span>
                   <strong>乐观缓存</strong>
-                  <small>即使条目已过期，也先从缓存中响应，并在后台刷新它们。</small>
+                  <small>条目过期后可在限定时间内先响应缓存，并在后台刷新。</small>
                 </span>
               </label>
+              <div class="dns-cache-grid">
+                <label class="field">
+                  <span>最大陈旧时间</span>
+                  <small>乐观缓存最多可继续使用过期响应的时间，范围 60–604800 秒。</small>
+                  <input id="dns_cache_optimistic_max_stale_seconds" type="number" min="60" max="604800" step="60" />
+                </label>
+              </div>
               <label class="check-row">
                 <input id="dns_cache_prefetch_enabled" type="checkbox" />
                 <span>
@@ -625,7 +632,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               <small>填写 IPv4 或 IPv6，可验证该设备是否命中过滤绕过策略。</small>
             </label>
           </div>
-          <div class="diagnostic-results" id="diagnostic_results">
+              <div class="diagnostic-results" id="diagnostic_results" role="status" aria-live="polite" aria-atomic="true">
             <div class="diagnostic-empty">
               <strong>尚未运行诊断</strong>
               <span>输入域名后开始测试；不会修改配置，也不会写入查询日志。</span>
@@ -775,15 +782,15 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <strong id="security_cname_blocked">0</strong>
                 </div>
               </div>
-              <div class="security-event-table">
-                <div class="security-event-head">
-                  <span>最近发生</span>
-                  <span>来源客户端</span>
-                  <span>事件</span>
-                  <span>次数</span>
+              <div class="security-event-table" role="table" aria-label="最近安全事件">
+                <div class="security-event-head" role="row">
+                  <span role="columnheader">最近发生</span>
+                  <span role="columnheader">来源客户端</span>
+                  <span role="columnheader">事件</span>
+                  <span role="columnheader">次数</span>
                 </div>
-                <div class="security-event-body" id="security_event_body">
-                  <div class="security-event-empty">暂无安全事件</div>
+                <div class="security-event-body" id="security_event_body" role="rowgroup">
+                  <div class="security-event-empty" role="row"><span role="cell">暂无安全事件</span></div>
                 </div>
               </div>
             </section>
@@ -937,7 +944,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
-            <dialog class="update-dialog dns-fallback-dialog" id="dns_fallback_dialog">
+            <dialog class="update-dialog dns-fallback-dialog" id="dns_fallback_dialog" aria-labelledby="dns_fallback_dialog_title">
               <div class="update-dialog-panel">
                 <div class="update-dialog-header">
                   <div>
@@ -1264,12 +1271,12 @@ export function renderAppTemplate(appIconUrl: string): string {
 
           <footer class="about-footer">DnsBlackhole 是基于 MIT License 发布的开源项目。</footer>
 
-          <dialog class="update-dialog" id="update_dialog">
+          <dialog class="update-dialog" id="update_dialog" aria-labelledby="update_dialog_title">
             <div class="update-dialog-panel">
               <div class="update-dialog-header">
                 <div>
                   <span class="update-dialog-kicker">软件更新</span>
-                  <h3>发现新版本</h3>
+                  <h3 id="update_dialog_title">发现新版本</h3>
                 </div>
                 <button class="update-dialog-close" id="update_dialog_close_btn" type="button" aria-label="关闭">×</button>
               </div>
@@ -1307,16 +1314,16 @@ export function renderAppTemplate(appIconUrl: string): string {
               <button class="primary" id="update_filters_btn" type="button">检查更新</button>
             </div>
           </div>
-          <div class="filters-table">
-            <div class="filters-head">
-              <span>启用</span>
-              <span>名称</span>
-              <span>规则数</span>
-              <span>上次更新</span>
-              <span>状态</span>
-              <span>操作</span>
+          <div class="filters-table" role="table" aria-label="远程黑名单">
+            <div class="filters-head" role="row">
+              <span role="columnheader">启用</span>
+              <span role="columnheader">名称</span>
+              <span role="columnheader">规则数</span>
+              <span role="columnheader">上次更新</span>
+              <span role="columnheader">状态</span>
+              <span role="columnheader">操作</span>
             </div>
-            <div id="filters_body" class="filters-body"></div>
+            <div id="filters_body" class="filters-body" role="presentation"></div>
           </div>
         </section>
       </section>
@@ -1345,10 +1352,10 @@ export function renderAppTemplate(appIconUrl: string): string {
 
           <section class="settings-section dns-rewrites-section">
             <div class="section-heading">
-              <h3>DNS 重写</h3>
-              <span>每行一条“域名 IP”本地记录，优先于黑名单生效。用 *.域名 匹配整个子域，同一域名可以分别写一行 IPv4 和一行 IPv6。</span>
+              <h3 id="dns_rewrites_title">DNS 重写</h3>
+              <span id="dns_rewrites_help">每行一条“域名 IP”本地记录，优先于黑名单生效。用 *.域名 匹配整个子域，同一域名可以分别写一行 IPv4 和一行 IPv6。</span>
             </div>
-            <textarea id="dns_rewrites" spellcheck="false" placeholder="nas.lan 192.168.1.10&#10;*.home.lan 192.168.1.1"></textarea>
+            <textarea id="dns_rewrites" spellcheck="false" aria-labelledby="dns_rewrites_title" aria-describedby="dns_rewrites_help" placeholder="nas.lan 192.168.1.10&#10;*.home.lan 192.168.1.1"></textarea>
           </section>
         </section>
       </section>

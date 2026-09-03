@@ -685,6 +685,7 @@ mod tests {
             min_ttl: 0,
             max_ttl: 60,
             optimistic: true,
+            optimistic_max_stale_seconds: 12 * 3600,
             prefetch_enabled: false,
             prefetch_hit_threshold: 10,
         };
@@ -717,6 +718,7 @@ mod tests {
             min_ttl: 0,
             max_ttl: 120,
             optimistic: true,
+            optimistic_max_stale_seconds: 12 * 3600,
             prefetch_enabled: false,
             prefetch_hit_threshold: 10,
         };

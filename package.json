@@ -1,8 +1,8 @@
 {
   "name": "dnsblackhole",
   "private": true,
-  "version": "0.2.0",
-  "packageManager": "pnpm@11.13.1",
+  "version": "0.2.1",
+  "packageManager": "pnpm@11.25.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -14,15 +14,15 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
-    "@tauri-apps/plugin-dialog": "~2.7.1",
-    "@tauri-apps/plugin-opener": "^2.5.4",
+    "@tauri-apps/plugin-dialog": "~2.7.3",
+    "@tauri-apps/plugin-opener": "^2.5.5",
     "@tauri-apps/plugin-process": "^2.3.1",
-    "@tauri-apps/plugin-updater": "^2.10.1"
+    "@tauri-apps/plugin-updater": "^2.11.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
     "typescript": "~7.0.2",
-    "vite": "^8.1.4",
+    "vite": "^8.2.2",
     "vitest": "^4.0.0"
   }
 }

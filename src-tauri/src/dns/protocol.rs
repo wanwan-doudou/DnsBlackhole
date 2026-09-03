@@ -734,17 +734,13 @@ fn append_svcb_ip_hints(
         let value = packet.get(value_offset..value_end)?;
         match key {
             4 if value.len() % 4 == 0 => {
-                for octets in value.chunks_exact(4) {
-                    addresses.push(IpAddr::V4(Ipv4Addr::new(
-                        octets[0], octets[1], octets[2], octets[3],
-                    )));
+                for octets in value.as_chunks::<4>().0 {
+                    addresses.push(IpAddr::V4(Ipv4Addr::from(*octets)));
                 }
             }
             6 if value.len() % 16 == 0 => {
-                for octets in value.chunks_exact(16) {
-                    let mut address = [0_u8; 16];
-                    address.copy_from_slice(octets);
-                    addresses.push(IpAddr::V6(Ipv6Addr::from(address)));
+                for octets in value.as_chunks::<16>().0 {
+                    addresses.push(IpAddr::V6(Ipv6Addr::from(*octets)));
                 }
             }
             _ => {}
