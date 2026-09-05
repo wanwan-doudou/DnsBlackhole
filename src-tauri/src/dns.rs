@@ -9,8 +9,9 @@ mod protocol;
 mod rewrites;
 mod rule_cache;
 mod rules;
+pub(crate) mod security_events;
 mod server;
-mod stats;
+pub(crate) mod stats;
 mod task_pool;
 mod upstream;
 mod upstream_routes;
@@ -25,11 +26,14 @@ pub(crate) use protocol::{DnsResponseAnswer, DnsResponseSummary};
 pub(crate) use rule_cache::{RULE_LOAD_TEST_GUARD, forget_active_rules};
 pub(crate) use rule_cache::{RuleLoadSource, clear_rule_cache, load_or_compile_rules};
 pub use rules::{RuleAnalysis, RuleSummary, analyze_rules, summarize_rules};
+pub(crate) use security_events::flush_security_events;
 pub use server::DnsServer;
 pub(crate) use stats::apply_cache_stats;
 pub use stats::{
-    DnsStats, RuntimeStatus, TrafficBucket, UpstreamLatencyStat, UpstreamRequestStat, empty_status,
+    DnsStats, DnsTransport, RuntimeStatus, SecurityEvent, SecurityEventType, TrafficBucket,
+    UpstreamLatencyStat, UpstreamRequestStat, empty_status,
 };
+pub(crate) use stats::{SECURITY_EVENT_CAPACITY, restore_security_events};
 
 #[cfg(test)]
 mod tests {
@@ -47,14 +51,17 @@ mod tests {
         cache::{DnsCache, DnsCacheConfig, QueryCacheKey, cache_ttl_seconds},
         protocol::{
             BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_CNAME, TYPE_SOA,
-            build_block_response, build_error_response, build_rewrite_response,
-            extract_response_ips, parse_query, parse_question, prepare_cached_response, read_u16,
-            response_is_truncated, response_min_record_ttl, response_security_data,
-            summarize_response, truncate_response_for_udp, udp_payload_size,
-            validate_response_for_query,
+            build_block_response, build_dnsrewrite_response, build_error_response,
+            build_rewrite_response, extract_response_ips, parse_query, parse_question,
+            prepare_cached_response, read_u16, response_is_truncated, response_min_record_ttl,
+            response_security_data, summarize_response, truncate_response_for_udp,
+            udp_payload_size, validate_response_for_query,
         },
         rewrites::compile_rewrites,
-        rules::{compile_domain_set, compile_rules, custom_rules_have_badfilter, summarize_rules},
+        rules::{
+            DnsRewriteAction, compile_domain_set, compile_rules, custom_rules_have_badfilter,
+            summarize_rules,
+        },
         stats::{DnsStats, current_second, record_blocked, record_query},
         upstream::{
             RuntimeUpstream, is_upstream_temporarily_unhealthy, mark_upstream_available,
@@ -69,6 +76,319 @@ mod tests {
         assert!(rules.is_blocked("example.org", TYPE_A));
         assert!(rules.is_blocked("ads.example.org", TYPE_A));
         assert!(!rules.is_blocked("badexample.org", TYPE_A));
+    }
+
+    fn rewrite_action(rule: &str, domain: &str, qtype: u16) -> Option<DnsRewriteAction> {
+        compile_rules(rule)
+            .blocking_match(domain, qtype)
+            .and_then(|matched| matched.dnsrewrite)
+    }
+
+    #[test]
+    fn dnsrewrite_short_forms_cover_ip_cname_and_rcode() {
+        assert_eq!(
+            rewrite_action("||a.example^$dnsrewrite=1.2.3.4", "a.example", TYPE_A),
+            Some(DnsRewriteAction::Address("1.2.3.4".parse().expect("ipv4")))
+        );
+        assert_eq!(
+            rewrite_action("||b.example^$dnsrewrite=2001:db8::1", "b.example", TYPE_A),
+            Some(DnsRewriteAction::Address(
+                "2001:db8::1".parse().expect("ipv6")
+            ))
+        );
+        assert_eq!(
+            rewrite_action(
+                "||c.example^$dnsrewrite=target.example",
+                "c.example",
+                TYPE_A
+            ),
+            Some(DnsRewriteAction::Cname("target.example".into()))
+        );
+        assert_eq!(
+            rewrite_action("||d.example^$dnsrewrite=REFUSED", "d.example", TYPE_A),
+            Some(DnsRewriteAction::RCode(RCODE_REFUSED))
+        );
+        assert_eq!(
+            rewrite_action("||e.example^$dnsrewrite=NXDOMAIN", "e.example", TYPE_A),
+            Some(DnsRewriteAction::RCode(RCODE_NXDOMAIN))
+        );
+    }
+
+    #[test]
+    fn dnsrewrite_full_form_preserves_value_case_and_type() {
+        assert_eq!(
+            rewrite_action(
+                "|txt.example^$dnsrewrite=NOERROR;TXT;Hello_World",
+                "txt.example",
+                16
+            ),
+            Some(DnsRewriteAction::Record {
+                rtype: 16,
+                value: "Hello_World".into()
+            })
+        );
+        assert_eq!(
+            rewrite_action(
+                "||mx.example^$dnsrewrite=NOERROR;MX;10 mail.example.com",
+                "mx.example",
+                15
+            ),
+            Some(DnsRewriteAction::Record {
+                rtype: 15,
+                value: "10 mail.example.com".into()
+            })
+        );
+        assert_eq!(
+            rewrite_action(
+                "||ip.example^$dnsrewrite=NOERROR;A;9.9.9.9",
+                "ip.example",
+                TYPE_A
+            ),
+            Some(DnsRewriteAction::Address("9.9.9.9".parse().expect("ipv4")))
+        );
+    }
+
+    #[test]
+    fn invalid_dnsrewrite_values_are_reported_as_unsupported() {
+        // 非 NOERROR 不能带记录类型；不支持的记录类型宁可报不支持也不返回错误报文。
+        for rule in [
+            "||bad.example^$dnsrewrite=NXDOMAIN;A;1.2.3.4",
+            "||bad.example^$dnsrewrite=NOERROR;CAA;0 issue \"ca.example\"",
+            "||bad.example^$dnsrewrite=",
+            "@@||bad.example^$dnsrewrite=1.2.3.4",
+        ] {
+            let analysis = analyze_rules(rule);
+            assert_eq!(
+                analysis.summary.ignored_unsupported_rules, 1,
+                "规则应被判定为不支持：{rule}"
+            );
+            assert_eq!(analysis.summary.block_rules, 0, "规则不应生效：{rule}");
+        }
+    }
+
+    #[test]
+    fn dnsrewrite_modifier_combines_with_important_and_allowlist() {
+        let rules = compile_rules(concat!(
+            "@@||shop.example^
+",
+            "||shop.example^$important,dnsrewrite=127.0.0.1
+",
+        ));
+        let matched = rules
+            .blocking_match("shop.example", TYPE_A)
+            .expect("important 规则应覆盖 allowlist");
+        assert!(matched.important_overrode);
+        assert_eq!(
+            matched.dnsrewrite,
+            Some(DnsRewriteAction::Address(
+                "127.0.0.1".parse().expect("ipv4")
+            ))
+        );
+    }
+
+    #[test]
+    fn dnsrewrite_response_returns_requested_record() {
+        let policy = BlockingPolicy::default();
+        let query = typed_query("txt.example", 16);
+        let question = parse_question(&query).expect("question should parse");
+        let response = build_dnsrewrite_response(
+            &query,
+            &question,
+            &DnsRewriteAction::Record {
+                rtype: 16,
+                value: "hello".into(),
+            },
+            &policy,
+        );
+        assert_eq!(read_u16(&response, 6), Some(1), "应带 1 条 answer");
+        assert!(
+            response.windows(5).any(|window| window == b"hello"),
+            "TXT 内容应出现在 rdata 中"
+        );
+
+        // 查询类型与重写类型不一致时只返回空 NOERROR，不返回类型错配的记录。
+        let a_query = typed_query("txt.example", TYPE_A);
+        let a_question = parse_question(&a_query).expect("question should parse");
+        let a_response = build_dnsrewrite_response(
+            &a_query,
+            &a_question,
+            &DnsRewriteAction::Record {
+                rtype: 16,
+                value: "hello".into(),
+            },
+            &policy,
+        );
+        assert_eq!(read_u16(&a_response, 6), Some(0), "类型不匹配应为空应答");
+        assert_eq!(a_response[3] & 0x0f, 0, "应为 NOERROR");
+    }
+
+    #[test]
+    fn dnsrewrite_rcode_and_address_responses_match_the_action() {
+        let policy = BlockingPolicy::default();
+        let query = typed_query("a.example", TYPE_A);
+        let question = parse_question(&query).expect("question should parse");
+
+        let refused = build_dnsrewrite_response(
+            &query,
+            &question,
+            &DnsRewriteAction::RCode(RCODE_REFUSED),
+            &policy,
+        );
+        assert_eq!(refused[3] & 0x0f, RCODE_REFUSED);
+        assert_eq!(read_u16(&refused, 6), Some(0));
+
+        let nxdomain = build_dnsrewrite_response(
+            &query,
+            &question,
+            &DnsRewriteAction::RCode(RCODE_NXDOMAIN),
+            &policy,
+        );
+        assert_eq!(nxdomain[3] & 0x0f, RCODE_NXDOMAIN);
+        // NXDOMAIN 复用负缓存 SOA 路径，authority 段必须带一条记录。
+        assert_eq!(read_u16(&nxdomain, 8), Some(1));
+
+        let address = build_dnsrewrite_response(
+            &query,
+            &question,
+            &DnsRewriteAction::Address("9.9.9.9".parse().expect("ipv4")),
+            &policy,
+        );
+        assert_eq!(read_u16(&address, 6), Some(1));
+        assert!(address.ends_with(&[9, 9, 9, 9]));
+    }
+
+    #[test]
+    fn dnsrewrite_combines_records_across_layers_and_beats_normal_rules() {
+        let base = Arc::new(compile_rules(
+            "||example.com^$important\n@@||www.example.com^$important\n||example.com^$dnsrewrite=1.2.3.4",
+        ));
+        let rules = super::rules::CompiledRules::with_custom_layer(
+            base,
+            "||www.example.com^$dnsrewrite=5.6.7.8\n||www.example.com^$dnsrewrite=2001:db8::1\n||www.example.com^$dnsrewrite=1.2.3.4",
+        );
+        for (qtype, expected) in [(1, 2), (28, 1), (16, 0), (255, 3)] {
+            let query = typed_query("www.example.com", qtype);
+            let question = parse_question(&query).unwrap();
+            let matched = rules.blocking_match(&question.domain, qtype).unwrap();
+            let response = build_dnsrewrite_response(
+                &query,
+                &question,
+                matched.dnsrewrite.as_ref().unwrap(),
+                &BlockingPolicy::default(),
+            );
+            assert_eq!(read_u16(&response, 6), Some(expected), "qtype={qtype}");
+            assert_eq!(response[3] & 0xf, 0);
+            assert!(summarize_response(&response).is_some());
+        }
+    }
+
+    #[test]
+    fn dnsrewrite_cache_roundtrip_and_custom_merge_preserve_matching() {
+        let mut rules = compile_rules("||example.com^");
+        rules.merge_custom_rules("||example.com^$dnsrewrite=1.2.3.4");
+        let mut encoded = Vec::new();
+        postcard::to_io(&rules, &mut encoded).unwrap();
+        let restored: super::rules::CompiledRules = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(
+            restored
+                .blocking_match("example.com", 1)
+                .unwrap()
+                .dnsrewrite,
+            Some(DnsRewriteAction::Address("1.2.3.4".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn dnsrewrite_respects_constraints_and_whole_response_priority() {
+        let rules = compile_rules(
+            "||example.com^$dnsrewrite=1.2.3.4,dnstype=A,denyallow=skip.example.com\n||example.com^$dnsrewrite=2001:db8::1,dnstype=AAAA",
+        );
+        assert!(rules.blocking_match("skip.example.com", 1).is_none());
+        assert!(matches!(
+            rules
+                .blocking_match("www.example.com", 28)
+                .unwrap()
+                .dnsrewrite,
+            Some(DnsRewriteAction::Address(IpAddr::V6(_)))
+        ));
+        assert!(rules.blocking_match("www.example.com", 16).is_none());
+        for prefix in ["NOERROR", "REFUSED", "target.example"] {
+            let rules =
+                format!("||example.com^$dnsrewrite=1.2.3.4\n||example.com^$dnsrewrite={prefix}");
+            let action = rewrite_action(&rules, "example.com", 1).unwrap();
+            assert!(!matches!(
+                action,
+                DnsRewriteAction::Address(_) | DnsRewriteAction::Multiple(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn dnsrewrite_rejects_invalid_record_data_before_serving() {
+        for value in [
+            "NOERROR;MX;not-a-priority mail.example",
+            "NOERROR;SRV;1 2 70000 target.example",
+            "NOERROR;PTR;a..example",
+        ] {
+            assert_eq!(
+                analyze_rules(&format!("||example.com^$dnsrewrite={value}"))
+                    .summary
+                    .ignored_unsupported_rules,
+                1
+            );
+        }
+        let oversized = format!(
+            "||example.com^$dnsrewrite=NOERROR;TXT;{}",
+            "a".repeat(65_535)
+        );
+        assert_eq!(
+            analyze_rules(&oversized).summary.ignored_unsupported_rules,
+            1
+        );
+    }
+
+    #[test]
+    fn dnsrewrite_txt_wire_boundaries_never_wrap_lengths() {
+        let query = typed_query("txt.example", 16);
+        let question = parse_question(&query).unwrap();
+        for size in [255, 256, 65_240, 65_279, 65_535] {
+            let action = DnsRewriteAction::Record {
+                rtype: 16,
+                value: "a".repeat(size).into(),
+            };
+            let response =
+                build_dnsrewrite_response(&query, &question, &action, &BlockingPolicy::default());
+            assert!(response.len() <= usize::from(u16::MAX));
+            let valid =
+                size + size.div_ceil(255) + question.question_end + 12 <= usize::from(u16::MAX);
+            assert_eq!(response[3] & 0xf, if valid { 0 } else { 2 }, "size={size}");
+            if valid {
+                let data_start = question.question_end + 12;
+                assert_eq!(
+                    usize::from(read_u16(&response, data_start - 2).unwrap()),
+                    response.len() - data_start
+                );
+            } else {
+                assert_eq!(read_u16(&response, 6), Some(0));
+            }
+        }
+        let action = DnsRewriteAction::Multiple(
+            vec![
+                DnsRewriteAction::Record {
+                    rtype: 16,
+                    value: "a".repeat(40_000).into(),
+                },
+                DnsRewriteAction::Record {
+                    rtype: 16,
+                    value: "b".repeat(40_000).into(),
+                },
+            ]
+            .into(),
+        );
+        let response =
+            build_dnsrewrite_response(&query, &question, &action, &BlockingPolicy::default());
+        assert_eq!(response[3] & 0xf, 2);
+        assert_eq!(read_u16(&response, 6), Some(0));
     }
 
     #[test]
@@ -829,5 +1149,101 @@ mod tests {
         packet.extend_from_slice(&86400_u32.to_be_bytes());
         packet.extend_from_slice(&ttl.to_be_bytes());
         packet
+    }
+}
+
+/// 基准测试用的内部访问层。只在 `bench` feature 下编译，正式产物不包含。
+/// 这里不复制任何逻辑，只是把 `pub(crate)` 的热路径包一层给外部基准 crate 调用。
+#[cfg(feature = "bench")]
+pub mod bench_support {
+    use std::sync::Arc;
+
+    use crate::config::AppConfig;
+
+    use super::{
+        cache::{
+            DnsCacheConfig, DnsCacheStore, QueryCacheKey, insert_cached_response,
+            lookup_cached_response,
+        },
+        protocol::{BlockingPolicy, build_block_response as build_block, parse_query},
+        rules::{CompiledRules, compile_rules as compile},
+        stats::current_second,
+    };
+
+    pub struct BenchRules(CompiledRules);
+
+    pub struct BenchCache {
+        store: Option<Arc<DnsCacheStore>>,
+        config: DnsCacheConfig,
+    }
+
+    pub fn compile_rules(raw: &str) -> BenchRules {
+        BenchRules(compile(raw))
+    }
+
+    pub fn is_blocked(rules: &BenchRules, domain: &str, qtype: u16) -> bool {
+        rules.0.blocking_match(domain, qtype).is_some()
+    }
+
+    pub fn build_query(domain: &str, qtype: u16) -> Vec<u8> {
+        let mut packet = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for label in domain.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
+        packet.extend_from_slice(&qtype.to_be_bytes());
+        packet.extend_from_slice(&1_u16.to_be_bytes());
+        packet
+    }
+
+    pub fn parse_query_len(packet: &[u8]) -> Option<usize> {
+        parse_query(packet)
+            .ok()
+            .map(|parsed| parsed.question.question_end)
+    }
+
+    pub fn build_block_response(packet: &[u8]) -> Option<Vec<u8>> {
+        let parsed = parse_query(packet).ok()?;
+        Some(build_block(
+            packet,
+            &parsed.question,
+            &BlockingPolicy::default(),
+        ))
+    }
+
+    pub fn build_cache(config: &AppConfig) -> Option<BenchCache> {
+        let cache_config = DnsCacheConfig::from_config(config);
+        let store = DnsCacheStore::from_config(cache_config.clone(), 64).map(Arc::new);
+        store.is_some().then_some(BenchCache {
+            store,
+            config: cache_config,
+        })
+    }
+
+    fn cache_key(packet: &[u8]) -> Option<QueryCacheKey> {
+        QueryCacheKey::from_query(&parse_query(packet).ok()?)
+    }
+
+    pub fn cache_insert(cache: &BenchCache, packet: &[u8], response: Vec<u8>) {
+        let Some(key) = cache_key(packet) else {
+            return;
+        };
+        insert_cached_response(
+            &cache.store,
+            Some(&cache.config),
+            key,
+            response,
+            current_second(),
+        );
+    }
+
+    pub fn cache_lookup(cache: &BenchCache, packet: &[u8]) -> bool {
+        let Some(key) = cache_key(packet) else {
+            return false;
+        };
+        lookup_cached_response(&cache.store, &key, packet, current_second()).is_some()
     }
 }

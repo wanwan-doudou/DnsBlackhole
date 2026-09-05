@@ -1,7 +1,7 @@
 {
   "name": "dnsblackhole",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.2",
   "packageManager": "pnpm@11.25.0",
   "type": "module",
   "scripts": {
@@ -23,6 +23,6 @@
     "@tauri-apps/cli": "^2.11.4",
     "typescript": "~7.0.2",
     "vite": "^8.2.2",
-    "vitest": "^4.0.0"
+    "vitest": "^5.0.0"
   }
 }

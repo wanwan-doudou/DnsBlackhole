@@ -155,6 +155,7 @@ export type AppConfig = {
   query_log_retention_hours: number;
   statistics_enabled: boolean;
   statistics_retention_hours: number;
+  security_event_retention_hours: number;
   dns_cache_enabled: boolean;
   dns_cache_size: number;
   dns_cache_min_ttl: number;
@@ -177,6 +178,7 @@ export type AppConfig = {
   rebinding_allowed_domains: string;
   cname_cloaking_enabled: boolean;
   dns_rewrites: string;
+  system_hosts_enabled: boolean;
   client_names: string;
   query_log_ignored_domains: string;
   statistics_ignored_domains: string;

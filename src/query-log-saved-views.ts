@@ -1,4 +1,5 @@
 import type { QueryLogQuery } from "./types";
+import { t } from "./i18n";
 
 const STORAGE_KEY = "dnsblackhole.query-log.saved-views.v1";
 const MAX_SAVED_VIEWS = 12;
@@ -39,13 +40,13 @@ export function upsertSavedQueryLogView(
 ): SavedQueryLogView[] {
   const normalizedName = name.replace(/\s+/g, " ").trim();
   if (!normalizedName || normalizedName.length > 40) {
-    throw new Error("视图名称需要 1-40 个字符");
+    throw new Error(t("视图名称需要 1-40 个字符"));
   }
   const existing = views.find(
     (view) => view.name.localeCompare(normalizedName, undefined, { sensitivity: "accent" }) === 0,
   );
   if (!existing && views.length >= MAX_SAVED_VIEWS) {
-    throw new Error(`最多保存 ${MAX_SAVED_VIEWS} 个查询视图`);
+    throw new Error(t("最多保存 {p0} 个查询视图", { p0: MAX_SAVED_VIEWS }));
   }
   const saved: SavedQueryLogView = {
     id: existing?.id ?? `view-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,

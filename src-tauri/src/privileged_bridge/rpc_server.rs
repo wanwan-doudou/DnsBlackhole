@@ -15,11 +15,11 @@ use crate::{
     database::Database,
     service_core::{
         AppState, apply_query_log_rule_blocking, clear_dns_cache_blocking,
-        clear_filter_cache_blocking, clear_query_logs_blocking, clear_statistics_blocking,
-        pause_protection_blocking, query_logs_blocking, resume_protection_blocking,
-        run_dns_diagnostic_blocking, save_config_blocking, spawn_database_maintenance,
-        spawn_filter_auto_update, spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking,
-        update_filters_blocking,
+        clear_filter_cache_blocking, clear_query_logs_blocking, clear_security_events_blocking,
+        clear_statistics_blocking, pause_protection_blocking, query_logs_blocking,
+        resume_protection_blocking, run_dns_diagnostic_blocking, save_config_blocking,
+        spawn_database_maintenance, spawn_filter_auto_update, spawn_runtime_watchdog,
+        start_dns_blocking, stop_dns_blocking, update_filters_blocking,
     },
     storage,
 };
@@ -285,6 +285,7 @@ fn dispatch_request(
         }
         "clear_query_logs" => to_value(clear_query_logs_blocking(state)?)?,
         "clear_statistics" => to_value(clear_statistics_blocking(state)?)?,
+        "clear_security_events" => to_value(clear_security_events_blocking(state)?)?,
         "update_filters" => {
             let params: ConfigParams = parse_params(params)?;
             to_value(update_filters_blocking(Arc::clone(state), params.config)?)?

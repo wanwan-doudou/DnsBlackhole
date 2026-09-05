@@ -202,9 +202,28 @@ fn local_diagnostic(
         );
     }
     if let Some(rule_match) = filter.rules.blocking_match(domain, qtype) {
+        // $dnsrewrite 命中的是过滤规则，但结果是自定义应答而不是拦截，
+        // 诊断结论要如实区分，否则用户看到 "blocked" 会以为域名被拦掉了。
+        let rewrite = rule_match
+            .dnsrewrite
+            .as_ref()
+            .map(|action| action.describe());
         return LocalDiagnostic {
-            status: "blocked".to_string(),
-            detail: format!("命中 {}：{}", rule_match.source, rule_match.rule),
+            status: if rewrite.is_some() {
+                "rewrite"
+            } else {
+                "blocked"
+            }
+            .to_string(),
+            detail: match &rewrite {
+                Some(description) => {
+                    format!(
+                        "命中 {}：{}（{description}）",
+                        rule_match.source, rule_match.rule
+                    )
+                }
+                None => format!("命中 {}：{}", rule_match.source, rule_match.rule),
+            },
             client_policy: client_policy.to_string(),
             client_policy_source,
             matched_rule: Some(rule_match.rule),

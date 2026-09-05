@@ -1,3 +1,5 @@
+#[cfg(feature = "bench")]
+pub mod bench_api;
 mod config;
 mod config_transfer;
 mod database;
@@ -26,10 +28,10 @@ use service_core::QueryLogRuleActionResult;
 #[cfg(not(any(target_os = "macos", windows)))]
 use service_core::{
     AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, clear_query_logs_blocking,
-    clear_statistics_blocking, pause_protection_blocking, query_logs_blocking,
-    resume_protection_blocking, save_config_blocking, spawn_database_maintenance,
-    spawn_filter_auto_update, spawn_initial_runtime, spawn_runtime_watchdog, start_dns_blocking,
-    stop_dns_blocking, update_filters_blocking,
+    clear_security_events_blocking, clear_statistics_blocking, pause_protection_blocking,
+    query_logs_blocking, resume_protection_blocking, save_config_blocking,
+    spawn_database_maintenance, spawn_filter_auto_update, spawn_initial_runtime,
+    spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking, update_filters_blocking,
 };
 use service_core::{FilterCacheClearResult, FilterUpdateProgressState, FilterUpdateResult};
 use storage::{StorageInfo, StorageTargetInfo};
@@ -716,6 +718,28 @@ async fn clear_statistics(state: tauri::State<'_, Arc<GuiState>>) -> Result<Runt
 }
 
 #[tauri::command]
+async fn clear_security_events(
+    state: tauri::State<'_, Arc<GuiState>>,
+) -> Result<RuntimeStatus, String> {
+    #[cfg(any(target_os = "macos", windows))]
+    let _ = state;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            privileged_bridge::ServiceClient::call("clear_security_events", &serde_json::json!({}))
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            clear_security_events_blocking(state.local()?)
+        }
+    })
+    .await
+    .map_err(|error| format!("清除安全事件任务异常：{error}"))?
+}
+
+#[tauri::command]
 async fn update_filters(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<GuiState>>,
@@ -901,6 +925,11 @@ fn set_tray_runtime_status(
 }
 
 #[tauri::command]
+fn set_tray_locale(app: tauri::AppHandle, locale: String) -> Result<(), String> {
+    tray::set_locale(&app, &locale).map_err(|error| format!("更新托盘语言失败：{error}"))
+}
+
+#[tauri::command]
 fn clear_dns_cache(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
     #[cfg(any(target_os = "macos", windows))]
     {
@@ -1076,6 +1105,7 @@ pub fn run() {
             run_dns_diagnostic,
             clear_query_logs,
             clear_statistics,
+            clear_security_events,
             update_filters,
             get_filter_update_progress,
             cancel_filter_update,
@@ -1084,6 +1114,7 @@ pub fn run() {
             pause_protection,
             resume_protection,
             set_tray_runtime_status,
+            set_tray_locale,
             clear_dns_cache,
             clear_filter_cache
         ])

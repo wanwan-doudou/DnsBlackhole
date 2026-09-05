@@ -5,7 +5,7 @@ use crate::config::AppConfig;
 use super::{
     client_policy::ClientFilteringPolicies,
     protocol::BlockingPolicy,
-    rewrites::{CompiledRewrites, compile_rewrites},
+    rewrites::{CompiledRewrites, compile_rewrites, merge_hosts_file, read_system_hosts},
     rules::{CompiledRules, DomainSet, compile_domain_set},
 };
 
@@ -43,9 +43,18 @@ pub(crate) fn build_filter_runtime_with_rules(
     config: &AppConfig,
     rules: Arc<CompiledRules>,
 ) -> FilterRuntime {
+    // 系统 hosts 在配置重写之后合并，用户显式配置的记录始终优先。
+    // 这里在每次构建过滤运行时读取一次；外部修改 hosts 后需重新切换此开关或重启 DNS 服务。
+    let mut rewrites = compile_rewrites(&config.dns_rewrites);
+    if config.system_hosts_enabled
+        && let Some(contents) = read_system_hosts()
+    {
+        merge_hosts_file(&mut rewrites, &contents);
+    }
+
     FilterRuntime {
         rules,
-        rewrites: compile_rewrites(&config.dns_rewrites),
+        rewrites,
         blocking: BlockingPolicy::from_config(config),
         rebinding_protection_enabled: config.rebinding_protection_enabled,
         rebinding_allowed_domains: compile_domain_set(&config.rebinding_allowed_domains),

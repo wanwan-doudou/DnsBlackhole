@@ -6,6 +6,7 @@ import {
   applyQueryLogRule,
   cancelFilterUpdate,
   clearQueryLogs as clearQueryLogsCommand,
+  clearSecurityEvents as clearSecurityEventsCommand,
   clearStatistics as clearStatisticsCommand,
   clearDnsCache as clearDnsCacheCommand,
   clearFilterCache as clearFilterCacheCommand,
@@ -31,6 +32,7 @@ import {
   restoreWindowsSystemDnsWithFallback,
   resumeProtection,
   runDnsDiagnostic,
+  setTrayLocale,
   setTrayRuntimeStatus,
   startDns,
   stopDns,
@@ -62,6 +64,20 @@ import {
   parseQueryLogHours,
 } from "./query-log-query";
 import { renderAppTemplate } from "./template";
+import {
+  applyTheme,
+  getThemePreference,
+  setThemePreference,
+  watchSystemTheme,
+  type ThemePreference,
+} from "./theme";
+import {
+  getLocale,
+  getLocalePreference,
+  setLocalePreference,
+  t,
+  type LocalePreference,
+} from "./i18n";
 import { createRuleEditorController } from "./rule-editor";
 import {
   chooseConfigBackup,
@@ -110,6 +126,7 @@ import type {
 } from "./types";
 import "./styles/query-log.css";
 import "./style.css";
+import "./styles/ui-extras.css";
 
 const frontendStartedAt = performance.now();
 const CURRENT_CONFIG_SCHEMA_VERSION = 17;
@@ -137,7 +154,7 @@ let lastStatusErrorKey: string | null = null;
 const app = document.querySelector<HTMLDivElement>("#app");
 
 if (!app) {
-  throw new Error("缺少应用挂载节点");
+  throw new Error(t("缺少应用挂载节点"));
 }
 
 const templateStarted = performance.now();
@@ -209,11 +226,11 @@ const ABOUT_LINKS = {
   license: "https://github.com/wanwan-doudou/DnsBlackhole/blob/main/LICENSE",
 } as const;
 const ABOUT_LINK_LABELS: Record<keyof typeof ABOUT_LINKS, string> = {
-  docs: "使用文档",
-  repository: "项目源码",
-  releases: "更新记录",
-  issues: "问题反馈",
-  license: "开源许可",
+  docs: t("使用文档"),
+  repository: t("项目源码"),
+  releases: t("更新记录"),
+  issues: t("问题反馈"),
+  license: t("开源许可"),
 };
 const QUERY_LOG_PAGE_SIZE = 50;
 const QUERY_LOG_SEARCH_DEBOUNCE_MS = 800;
@@ -227,6 +244,8 @@ const CHECK_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
 const WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS = [150, 250, 400, 700, 1_100, 1_800, 2_500, 3_000];
 const WINDOWS_SERVICE_ERROR_GRACE_MS = 10_000;
+// 切换语言要重载页面，重载前把当前页面暂存在这里，重载后接着看，不跳回仪表盘。
+const PENDING_VIEW_KEY = "dnsblackhole.pendingView";
 
 async function openExternalUrl(url: string): Promise<void> {
   const { openUrl } = await import("@tauri-apps/plugin-opener");
@@ -240,7 +259,7 @@ function aboutPlatformLabel(): string {
   if (isMacOS) {
     return "macOS";
   }
-  return "当前桌面平台";
+  return t("当前桌面平台");
 }
 
 function renderAboutRuntimeInfo(): void {
@@ -249,32 +268,32 @@ function renderAboutRuntimeInfo(): void {
   if (isWindows) {
     const service = currentWindowsServiceStatus;
     aboutRuntimeServiceElement.textContent = !service
-      ? "正在读取…"
+      ? t("正在读取…")
       : service.ready
-        ? `已连接${service.serviceVersion ? ` · v${service.serviceVersion}` : ""}`
+        ? t("已连接{p0}", { p0: service.serviceVersion ? ` · v${service.serviceVersion}` : "" })
         : service.installed
-          ? `需要修复${service.serviceVersion ? ` · v${service.serviceVersion}` : ""}`
-          : "尚未安装";
+          ? t("需要修复{p0}", { p0: service.serviceVersion ? ` · v${service.serviceVersion}` : "" })
+          : t("尚未安装");
   } else if (isMacOS) {
     const service = currentMacosServiceStatus;
     aboutRuntimeServiceElement.textContent = !service
-      ? "正在读取…"
+      ? t("正在读取…")
       : service.enabled && !service.needsRepair
-        ? `已启用${service.serviceVersion ? ` · v${service.serviceVersion}` : ""}`
+        ? t("已启用{p0}", { p0: service.serviceVersion ? ` · v${service.serviceVersion}` : "" })
         : service.state === "not_registered" || service.state === "not_found"
-          ? "尚未安装"
-          : "需要处理";
+          ? t("尚未安装")
+          : t("需要处理");
   } else {
-    aboutRuntimeServiceElement.textContent = "当前平台无需系统服务";
+    aboutRuntimeServiceElement.textContent = t("当前平台无需系统服务");
   }
 
   aboutRuntimeCoreElement.textContent = !latestRuntimeStatus
-    ? "正在读取…"
+    ? t("正在读取…")
     : latestRuntimeStatus.protection_paused
-      ? "保护已暂停"
+      ? t("保护已暂停")
       : latestRuntimeStatus.running
-        ? "保护运行中"
-        : "当前未运行";
+        ? t("保护运行中")
+        : t("当前未运行");
 }
 
 async function writeClipboardText(value: string): Promise<void> {
@@ -290,7 +309,7 @@ async function writeClipboardText(value: string): Promise<void> {
   textarea.select();
   try {
     if (!document.execCommand("copy")) {
-      throw new Error("当前系统不允许写入剪贴板");
+      throw new Error(t("当前系统不允许写入剪贴板"));
     }
   } finally {
     textarea.remove();
@@ -304,17 +323,17 @@ async function openAboutLink(link: keyof typeof ABOUT_LINKS): Promise<void> {
     await openExternalUrl(url);
   } catch (error) {
     console.error(`打开${label}失败`, error);
-    showMessage(`无法打开${label}。请重试，或复制链接后在浏览器中打开。`, true, {
+    showMessage(t("无法打开{p0}。请重试，或复制链接后在浏览器中打开。", { p0: label }), true, {
       actions: [
         {
-          label: "重试",
+          label: t("重试"),
           run: () => openAboutLink(link),
         },
         {
-          label: "复制链接",
+          label: t("复制链接"),
           run: async () => {
             await writeClipboardText(url);
-            showMessage(`${label}链接已复制`, false);
+            showMessage(t("{p0}链接已复制", { p0: label }), false);
           },
         },
       ],
@@ -323,33 +342,33 @@ async function openAboutLink(link: keyof typeof ABOUT_LINKS): Promise<void> {
 }
 
 async function copyAboutSupportInfo(): Promise<void> {
-  const appVersion = appVersionElement.textContent?.trim() || "未知";
+  const appVersion = appVersionElement.textContent?.trim() || t("未知");
   const takeoverState = !isWindows
-    ? "不适用"
+    ? t("不适用")
     : !currentWindowsSystemDnsStatus
-      ? "未知"
+      ? t("未知")
       : currentWindowsSystemDnsStatus.managed && currentWindowsSystemDnsStatus.inEffect
-        ? "已接管"
+        ? t("已接管")
         : currentWindowsSystemDnsStatus.managed
-          ? "接管状态异常"
-          : "未接管";
+          ? t("接管状态异常")
+          : t("未接管");
   const summary = [
     `DnsBlackhole v${appVersion}`,
-    `运行平台：${aboutRuntimePlatformElement.textContent}`,
-    `后台服务：${aboutRuntimeServiceElement.textContent}`,
-    `DNS 核心：${aboutRuntimeCoreElement.textContent}`,
-    `系统 DNS：${takeoverState}`,
-    `配置架构：v${CURRENT_CONFIG_SCHEMA_VERSION}`,
+    t("运行平台：{p0}", { p0: aboutRuntimePlatformElement.textContent }),
+    t("后台服务：{p0}", { p0: aboutRuntimeServiceElement.textContent }),
+    t("DNS 核心：{p0}", { p0: aboutRuntimeCoreElement.textContent }),
+    t("系统 DNS：{p0}", { p0: takeoverState }),
+    t("配置架构：v{p0}", { p0: CURRENT_CONFIG_SCHEMA_VERSION }),
   ].join("\n");
 
-  const originalText = copySupportInfoButton.textContent ?? "复制支持信息";
+  const originalText = copySupportInfoButton.textContent ?? t("复制支持信息");
   copySupportInfoButton.disabled = true;
   try {
     await writeClipboardText(summary);
-    copySupportInfoButton.textContent = "已复制";
-    showMessage("支持信息已复制，不包含域名、客户端或访问令牌", false);
+    copySupportInfoButton.textContent = t("已复制");
+    showMessage(t("支持信息已复制，不包含域名、客户端或访问令牌"), false);
   } catch (error) {
-    showMessage(`复制支持信息失败：${String(error)}`, true);
+    showMessage(t("复制支持信息失败：{p0}", { p0: String(error) }), true);
   } finally {
     window.setTimeout(() => {
       copySupportInfoButton.textContent = originalText;
@@ -600,6 +619,11 @@ const persistenceQueueDropped = query<HTMLElement>("#persistence_queue_dropped")
 const upstreamTaskQueueRejected = query<HTMLElement>("#upstream_task_queue_rejected");
 const tcpConnectionRejected = query<HTMLElement>("#tcp_connection_rejected");
 const securityEventBody = query<HTMLDivElement>("#security_event_body");
+const securityEventRetentionInput = query<HTMLSelectElement>("#security_event_retention_hours");
+const clearSecurityEventsButton = query<HTMLButtonElement>("#clear_security_events_btn");
+const themePreferenceInput = query<HTMLSelectElement>("#theme_preference");
+const languagePreferenceInput = query<HTMLSelectElement>("#language_preference");
+const systemHostsEnabledInput = query<HTMLInputElement>("#system_hosts_enabled");
 const cacheHitRate = query<HTMLElement>("#cache_hit_rate");
 const cacheHitMiss = query<HTMLElement>("#cache_hit_miss");
 const cacheStaleHits = query<HTMLElement>("#cache_stale_hits");
@@ -781,7 +805,7 @@ function syncCustomSelect(select: HTMLSelectElement): void {
     return;
   }
   const selectedOption = select.selectedOptions[0] || select.options[0];
-  elements.valueLabel.textContent = selectedOption?.textContent || "请选择";
+  elements.valueLabel.textContent = selectedOption?.textContent || t("请选择");
   elements.trigger.disabled = select.disabled;
   elements.options.forEach((button, index) => {
     const selected = button.dataset.value === select.value;
@@ -792,9 +816,17 @@ function syncCustomSelect(select: HTMLSelectElement): void {
   });
 }
 
-[filterProxyModeInput, filterUpdateIntervalInput, diagnosticQueryTypeInput, dashboardStatisticsRange].forEach(
-  initializeCustomSelect,
-);
+// 选项固定的下拉框统一换成自绘控件，原生 select 在 WebView2 里样式不可控。
+// 已保存视图的选项会动态重建，不能走这里（initializeCustomSelect 只快照一次）。
+[
+  filterProxyModeInput,
+  filterUpdateIntervalInput,
+  diagnosticQueryTypeInput,
+  dashboardStatisticsRange,
+  themePreferenceInput,
+  languagePreferenceInput,
+  securityEventRetentionInput,
+].forEach(initializeCustomSelect);
 
 document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -923,7 +955,7 @@ runtimeStatusMenu.addEventListener("click", (event) => {
 });
 
 document.querySelectorAll<HTMLButtonElement>("[data-refresh-dashboard]").forEach((button) => {
-  button.setAttribute("aria-label", button.title || "刷新仪表盘");
+  button.setAttribute("aria-label", button.title || t("刷新仪表盘"));
   button.addEventListener("click", async () => {
     await refreshStatus({ button });
   });
@@ -1013,7 +1045,7 @@ queryLogSaveViewButton.addEventListener("click", () => {
     );
     renderSavedQueryLogViews(saved?.id ?? "");
     queryLogViewNameInput.value = "";
-    showMessage(saved ? `已保存查询视图“${saved.name}”` : "查询视图已保存", false);
+    showMessage(saved ? t("已保存查询视图“{p0}”", { p0: saved.name }) : t("查询视图已保存"), false);
   } catch (error) {
     showMessage(String(error), true);
   }
@@ -1028,13 +1060,13 @@ queryLogViewNameInput.addEventListener("keydown", (event) => {
 
 queryLogDeleteViewButton.addEventListener("click", () => {
   const saved = savedQueryLogViews.find((view) => view.id === queryLogSavedViewSelect.value);
-  if (!saved || !window.confirm(`删除查询视图“${saved.name}”？`)) {
+  if (!saved || !window.confirm(t("删除查询视图“{p0}”？", { p0: saved.name }))) {
     return;
   }
   savedQueryLogViews = removeSavedQueryLogView(savedQueryLogViews, saved.id);
   persistSavedQueryLogViews(savedQueryLogViews);
   renderSavedQueryLogViews();
-  showMessage(`已删除查询视图“${saved.name}”`, false);
+  showMessage(t("已删除查询视图“{p0}”", { p0: saved.name }), false);
 });
 renderSavedQueryLogViews();
 refreshQueryLogAdvancedState();
@@ -1206,7 +1238,7 @@ queryLogBody.addEventListener("click", (event) => {
     return;
   }
   if (configDirty) {
-    showMessage("请先保存当前配置更改，再从查询日志添加规则", true);
+    showMessage(t("请先保存当前配置更改，再从查询日志添加规则"), true);
     return;
   }
   if (action === "rewrite") {
@@ -1226,7 +1258,7 @@ queryRuleForm.addEventListener("submit", (event) => {
   const target = queryRuleTarget.value.trim();
   if (!target) {
     queryRuleTarget.focus();
-    showMessage("请填写 DNS 重写目标 IP", true);
+    showMessage(t("请填写 DNS 重写目标 IP"), true);
     return;
   }
   const domain = pendingQueryRuleDomain;
@@ -1257,7 +1289,8 @@ function handleConfigFieldChange(event: Event): void {
   }
   const readOnly =
     (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) && target.readOnly;
-  if (readOnly || !target.closest(CONFIG_VIEW_SELECTOR)) {
+  // 界面偏好（主题、语言）存在本机且立即生效，不该让"保存更改"变成待保存状态
+  if (readOnly || target.closest("[data-ui-preference]") || !target.closest(CONFIG_VIEW_SELECTOR)) {
     return;
   }
   window.queueMicrotask(updateConfigDirtyState);
@@ -1308,21 +1341,21 @@ saveCustomButton.addEventListener("click", async () => {
 queryLogPauseButton.addEventListener("click", () => {
   queryLogLivePaused = !queryLogLivePaused;
   queryLogPauseButton.classList.toggle("active", queryLogLivePaused);
-  queryLogPauseButton.textContent = queryLogLivePaused ? "恢复实时刷新" : "暂停实时刷新";
+  queryLogPauseButton.textContent = queryLogLivePaused ? t("恢复实时刷新") : t("暂停实时刷新");
   if (!queryLogLivePaused) {
     void refreshQueryLogs();
   }
 });
 
 queryLogExportButton.addEventListener("click", () => {
-  if (!window.confirm("导出的 CSV 会包含当前筛选中的域名和客户端地址，请妥善保管。是否继续？")) {
+  if (!window.confirm(t("导出的 CSV 会包含当前筛选中的域名和客户端地址，请妥善保管。是否继续？"))) {
     return;
   }
-  void runFileAction(queryLogExportButton, "准备导出…", async () => {
+  void runFileAction(queryLogExportButton, t("准备导出…"), async () => {
     const result = await exportFilteredQueryLogs(
       collectQueryLogQuery(),
       (exported, total) => {
-        queryLogExportButton.textContent = `导出 ${exported.toLocaleString()}/${total.toLocaleString()}`;
+        queryLogExportButton.textContent = t("导出 {p0}/{p1}", { p0: exported.toLocaleString(), p1: total.toLocaleString() });
       },
     );
     if (!result) {
@@ -1330,8 +1363,8 @@ queryLogExportButton.addEventListener("click", () => {
     }
     showMessage(
       result.truncated
-        ? `已导出最近 ${formatCount(result.exported)} 条；当前筛选共 ${formatCount(result.total)} 条，请缩小筛选范围以导出其余记录`
-        : `已导出 ${formatCount(result.exported)} 条查询日志`,
+        ? t("已导出最近 {p0} 条；当前筛选共 {p1} 条，请缩小筛选范围以导出其余记录", { p0: formatCount(result.exported), p1: formatCount(result.total) })
+        : t("已导出 {p0} 条查询日志", { p0: formatCount(result.exported) }),
       result.truncated,
     );
   });
@@ -1360,19 +1393,19 @@ clientRankBody.addEventListener("click", (event) => {
 });
 
 exportConfigButton.addEventListener("click", () => {
-  void runFileAction(exportConfigButton, "导出中…", async () => {
+  void runFileAction(exportConfigButton, t("导出中…"), async () => {
     if (!configLoaded) {
-      throw new Error("配置尚未加载，无法导出");
+      throw new Error(t("配置尚未加载，无法导出"));
     }
     if (await exportConfigBackup(collectConfig())) {
-      showMessage("配置备份已导出", false);
+      showMessage(t("配置备份已导出"), false);
     }
   });
 });
 
 importConfigButton.addEventListener("click", () => {
-  void runFileAction(importConfigButton, "恢复中…", async () => {
-    if (configDirty && !window.confirm("恢复配置会覆盖当前未保存的更改，是否继续？")) {
+  void runFileAction(importConfigButton, t("恢复中…"), async () => {
+    if (configDirty && !window.confirm(t("恢复配置会覆盖当前未保存的更改，是否继续？"))) {
       return;
     }
     const imported = await chooseConfigBackup();
@@ -1383,17 +1416,17 @@ importConfigButton.addEventListener("click", () => {
     const status = await saveConfigCommand(imported);
     await loadConfig();
     renderStatus(status);
-    showMessage("配置已校验、迁移并恢复", false);
+    showMessage(t("配置已校验、迁移并恢复"), false);
   });
 });
 
 exportDiagnosticButton.addEventListener("click", () => {
-  void runFileAction(exportDiagnosticButton, "导出中…", async () => {
+  void runFileAction(exportDiagnosticButton, t("导出中…"), async () => {
     if (!configLoaded) {
-      throw new Error("配置尚未加载，无法导出诊断信息");
+      throw new Error(t("配置尚未加载，无法导出诊断信息"));
     }
     if (await exportSanitizedDiagnostics(collectConfig(), latestRuntimeStatus)) {
-      showMessage("脱敏诊断信息已导出", false);
+      showMessage(t("脱敏诊断信息已导出"), false);
     }
   });
 });
@@ -1422,7 +1455,7 @@ startButton.addEventListener("click", async () => {
     await saveConfigOnly();
     const status = await startDns();
     renderStatus(status);
-    showMessage("DNS 服务已启动", false);
+    showMessage(t("DNS 服务已启动"), false);
     await loadConfig();
   } catch (error) {
     showMessage(String(error), true);
@@ -1433,7 +1466,7 @@ startButton.addEventListener("click", async () => {
 });
 
 stopButton.addEventListener("click", async () => {
-  await runStatusAction(() => stopDns(), "DNS 服务已停止");
+  await runStatusAction(() => stopDns(), t("DNS 服务已停止"));
 });
 
 addFilterButton.addEventListener("click", () => {
@@ -1442,7 +1475,7 @@ addFilterButton.addEventListener("click", () => {
     ...filtersState,
     {
       id,
-      name: "新黑名单",
+      name: t("新黑名单"),
       url: "",
       enabled: true,
       rule_count: 0,
@@ -1482,13 +1515,13 @@ updateFiltersButton.addEventListener("click", async () => {
 
 cancelFilterUpdateButton.addEventListener("click", async () => {
   cancelFilterUpdateButton.disabled = true;
-  cancelFilterUpdateButton.textContent = "正在取消";
+  cancelFilterUpdateButton.textContent = t("正在取消");
   try {
     const progress = await cancelFilterUpdate();
     renderFilterUpdateProgress(progress);
   } catch (error) {
     cancelFilterUpdateButton.disabled = false;
-    cancelFilterUpdateButton.textContent = "取消更新";
+    cancelFilterUpdateButton.textContent = t("取消更新");
     showMessage(String(error), true);
   }
 });
@@ -1498,7 +1531,7 @@ clearDnsCacheButton.addEventListener("click", async () => {
   try {
     const status = await clearDnsCacheCommand();
     renderStatus(status);
-    showMessage("DNS 缓存已清除", false);
+    showMessage(t("DNS 缓存已清除"), false);
   } catch (error) {
     showMessage(String(error), true);
   } finally {
@@ -1509,7 +1542,7 @@ clearDnsCacheButton.addEventListener("click", async () => {
 
 clearFilterCacheButton.addEventListener("click", async () => {
   const confirmed = window.confirm(
-    "这会删除可重新生成的规则编译缓存。已下载的远程黑名单和当前生效规则不会删除；下次启动或规则变更时会自动重新生成缓存。是否继续？",
+    t("这会删除可重新生成的规则编译缓存。已下载的远程黑名单和当前生效规则不会删除；下次启动或规则变更时会自动重新生成缓存。是否继续？"),
   );
   if (!confirmed) {
     return;
@@ -1540,14 +1573,14 @@ chooseDataStorageButton.addEventListener("click", async () => {
     const selected = await open({
       directory: true,
       multiple: false,
-      title: "选择 DnsBlackhole 数据存储目录",
+      title: t("选择 DnsBlackhole 数据存储目录"),
       defaultPath: currentStorageInfo.current_path,
     });
     if (typeof selected === "string") {
       await selectDataStoragePath(selected);
     }
   } catch (error) {
-    showMessage(`选择数据目录失败：${String(error)}`, true);
+    showMessage(t("选择数据目录失败：{p0}", { p0: String(error) }), true);
   }
 });
 
@@ -1571,8 +1604,8 @@ migrateDataStorageButton.addEventListener("click", async () => {
   const useExisting = selectedStorageTarget.action === "use_existing";
   const confirmed = window.confirm(
     useExisting
-      ? `检测到现有 DnsBlackhole 数据：\n${targetPath}\n\n应用将验证并备份该数据库，然后切换使用此目录。现有目录和当前目录都不会被删除。是否继续？`
-      : `应用将重启并把数据库与过滤器缓存迁移到：\n${targetPath}\n\n目标数据验证成功后才会清理原目录。是否继续？`,
+      ? t("检测到现有 DnsBlackhole 数据：\n{p0}\n\n应用将验证并备份该数据库，然后切换使用此目录。现有目录和当前目录都不会被删除。是否继续？", { p0: targetPath })
+      : t("应用将重启并把数据库与过滤器缓存迁移到：\n{p0}\n\n目标数据验证成功后才会清理原目录。是否继续？", { p0: targetPath }),
   );
   if (!confirmed) {
     return;
@@ -1584,8 +1617,8 @@ migrateDataStorageButton.addEventListener("click", async () => {
     await requestDataMigration(targetPath);
     showMessage(
       useExisting
-        ? "现有数据接管任务已保存，正在重启应用…"
-        : "迁移任务已保存，正在重启应用…",
+        ? t("现有数据接管任务已保存，正在重启应用…")
+        : t("迁移任务已保存，正在重启应用…"),
       false,
     );
     await relaunchApplication();
@@ -1601,8 +1634,8 @@ migrateDataStorageButton.addEventListener("click", async () => {
 checkUpdateButton.addEventListener("click", async () => {
   checkUpdateButton.disabled = true;
   checkUpdateButton.classList.add("loading");
-  checkUpdateButton.textContent = "检查中";
-  setUpdateStatus("info", "正在检查更新...");
+  checkUpdateButton.textContent = t("检查中");
+  setUpdateStatus("info", t("正在检查更新..."));
   closeUpdateDialog();
   pendingUpdate = null;
   manualDownloadUrl = "";
@@ -1621,26 +1654,26 @@ checkUpdateButton.addEventListener("click", async () => {
         console.warn("读取 GitHub Release 更新日志失败", error);
       }
 
-      setUpdateStatus("ok", `发现新版本 v${pendingUpdate.version}`);
+      setUpdateStatus("ok", t("发现新版本 v{p0}", { p0: pendingUpdate.version }));
       showUpdateDialog(currentVersion, pendingUpdate.version, notes);
       installUpdateButton.disabled = false;
       manualDownloadButton.disabled = false;
     } else {
-      setUpdateStatus("ok", `已是最新版本 v${currentVersion}`);
+      setUpdateStatus("ok", t("已是最新版本 v{p0}", { p0: currentVersion }));
     }
   } catch (error) {
     console.error("检查更新失败", error);
     const message = formatUpdateError(error);
     if (/platform.+(was )?not found/i.test(message)) {
-      setUpdateStatus("err", "当前平台暂无自动更新包，请前往 GitHub Releases 手动下载");
+      setUpdateStatus("err", t("当前平台暂无自动更新包，请前往 GitHub Releases 手动下载"));
     } else {
-      setUpdateStatus("err", `检查更新失败：${message}`);
+      setUpdateStatus("err", t("检查更新失败：{p0}", { p0: message }));
     }
     manualDownloadUrl = "";
   } finally {
     checkUpdateButton.disabled = false;
     checkUpdateButton.classList.remove("loading");
-    checkUpdateButton.textContent = "检查更新";
+    checkUpdateButton.textContent = t("检查更新");
   }
 });
 
@@ -1655,14 +1688,14 @@ installUpdateButton.addEventListener("click", async () => {
 
   try {
     await downloadAndInstallWithRetry();
-    setUpdateStatus("ok", "安装完成，即将重启应用...");
+    setUpdateStatus("ok", t("安装完成，即将重启应用..."));
     await relaunchApplication();
   } catch (error) {
     console.error("更新失败", error);
     const fallbackTip = manualDownloadUrl
-      ? "\n可重试，或点击“浏览器下载”手动安装。"
+      ? t("\n可重试，或点击“浏览器下载”手动安装。")
       : "";
-    setUpdateStatus("err", `更新失败：${formatUpdateError(error)}${fallbackTip}`);
+    setUpdateStatus("err", t("更新失败：{p0}{p1}", { p0: formatUpdateError(error), p1: fallbackTip }));
     installUpdateButton.disabled = false;
     manualDownloadButton.disabled = false;
   }
@@ -1677,7 +1710,7 @@ manualDownloadButton.addEventListener("click", async () => {
     await openExternalUrl(url);
   } catch (error) {
     console.error("打开下载链接失败", error);
-    setUpdateStatus("err", `打开浏览器失败：${formatUpdateError(error)}\n下载地址：${url}`);
+    setUpdateStatus("err", t("打开浏览器失败：{p0}\n下载地址：{p1}", { p0: formatUpdateError(error), p1: url }));
   } finally {
     manualDownloadButton.disabled = false;
   }
@@ -1700,15 +1733,15 @@ installMacosServiceButton.addEventListener("click", async () => {
     const status = await installMacosService(force);
     renderMacosServiceStatus(status);
     if (status.state === "requires_approval") {
-      showMessage("请在“系统设置 → 通用 → 登录项与扩展”中批准 DnsBlackhole 后台服务", false);
+      showMessage(t("请在“系统设置 → 通用 → 登录项与扩展”中批准 DnsBlackhole 后台服务"), false);
       // 直接带用户到批准页面，避免在设置里找不到入口
       await openMacosServiceSettings();
     } else if (status.enabled && !status.needsRepair) {
-      showMessage("macOS DNS 后台服务已启用", false);
+      showMessage(t("macOS DNS 后台服务已启用"), false);
       await refreshAfterBackgroundServiceEnabled();
     } else if (status.needsRepair) {
       showMessage(
-        "后台服务已注册但暂未响应，请稍后重新进入本页检查；若持续无响应请重启 Mac 后再试",
+        t("后台服务已注册但暂未响应，请稍后重新进入本页检查；若持续无响应请重启 Mac 后再试"),
         true,
       );
     }
@@ -1722,7 +1755,7 @@ installMacosServiceButton.addEventListener("click", async () => {
 
 uninstallMacosServiceButton.addEventListener("click", async () => {
   const confirmed = window.confirm(
-    "卸载后台服务后，DNS 将无法监听 53 端口，局域网设备的 DNS 查询会立即失败。是否继续卸载？",
+    t("卸载后台服务后，DNS 将无法监听 53 端口，局域网设备的 DNS 查询会立即失败。是否继续卸载？"),
   );
   if (!confirmed) {
     return;
@@ -1732,7 +1765,7 @@ uninstallMacosServiceButton.addEventListener("click", async () => {
   try {
     const status = await uninstallMacosService();
     renderMacosServiceStatus(status);
-    showMessage("macOS DNS 后台服务已卸载", false);
+    showMessage(t("macOS DNS 后台服务已卸载"), false);
   } catch (error) {
     showMessage(String(error), true);
   } finally {
@@ -1751,7 +1784,7 @@ openMacosServiceSettingsButton.addEventListener("click", async () => {
 
 clearQueryLogsButton.addEventListener("click", async () => {
   const confirmed = window.confirm(
-    "这会永久删除全部查询日志，但不会删除统计数据和配置。清除后，新查询仍会继续记录。是否继续？",
+    t("这会永久删除全部查询日志，但不会删除统计数据和配置。清除后，新查询仍会继续记录。是否继续？"),
   );
   if (!confirmed) {
     return;
@@ -1765,7 +1798,7 @@ clearQueryLogsButton.addEventListener("click", async () => {
     resetQueryLogPagination();
     await refreshQueryLogs();
     await loadStorageInfo();
-    showMessage("查询日志已清除，统计数据未受影响", false);
+    showMessage(t("查询日志已清除，统计数据未受影响"), false);
   } catch (error) {
     showMessage(String(error), true);
   } finally {
@@ -1776,7 +1809,7 @@ clearQueryLogsButton.addEventListener("click", async () => {
 
 clearStatisticsButton.addEventListener("click", async () => {
   const confirmed = window.confirm(
-    "这会永久删除全部累计统计、趋势和排行，但不会删除查询日志和配置。清除后将从新的 DNS 查询重新统计。是否继续？",
+    t("这会永久删除全部累计统计、趋势和排行，但不会删除查询日志和配置。清除后将从新的 DNS 查询重新统计。是否继续？"),
   );
   if (!confirmed) {
     return;
@@ -1788,11 +1821,55 @@ clearStatisticsButton.addEventListener("click", async () => {
     const status = await clearStatisticsCommand();
     renderStatus(status);
     await loadStorageInfo();
-    showMessage("统计数据已清除，查询日志未受影响", false);
+    showMessage(t("统计数据已清除，查询日志未受影响"), false);
   } catch (error) {
     showMessage(String(error), true);
   } finally {
     clearStatisticsButton.classList.remove("loading");
+    setBusy(false);
+  }
+});
+
+// 主题在模板渲染后立刻落定，并把当前偏好回填到下拉框。
+applyTheme();
+themePreferenceInput.value = getThemePreference();
+syncCustomSelect(themePreferenceInput);
+themePreferenceInput.addEventListener("change", () => {
+  setThemePreference(themePreferenceInput.value as ThemePreference);
+});
+watchSystemTheme();
+
+// 语言在模板渲染时就已生效，这里只回填当前选择并处理切换。
+languagePreferenceInput.value = getLocalePreference();
+syncCustomSelect(languagePreferenceInput);
+// 托盘菜单在后端创建，界面就绪后把当前语言同步过去。
+void setTrayLocale(getLocale()).catch((error: unknown) => {
+  console.warn("同步托盘语言失败", error);
+});
+languagePreferenceInput.addEventListener("change", () => {
+  setLocalePreference(languagePreferenceInput.value as LocalePreference, () => {
+    rememberViewAcrossReload(activeView);
+  });
+});
+
+clearSecurityEventsButton.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    t("这会永久删除已落盘的全部安全事件历史，但不会影响统计数据和查询日志。是否继续？"),
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  setBusy(true);
+  clearSecurityEventsButton.classList.add("loading");
+  try {
+    const status = await clearSecurityEventsCommand();
+    renderStatus(status);
+    showMessage(t("安全事件已清除"), false);
+  } catch (error) {
+    showMessage(String(error), true);
+  } finally {
+    clearSecurityEventsButton.classList.remove("loading");
     setBusy(false);
   }
 });
@@ -1807,10 +1884,10 @@ installWindowsServiceButton.addEventListener("click", async () => {
       status = (await waitForWindowsServiceReady(status)) ?? status;
     }
     if (status.ready) {
-      showMessage("Windows DNS 系统服务已安装并启动", false);
+      showMessage(t("Windows DNS 系统服务已安装并启动"), false);
       await refreshAfterBackgroundServiceEnabled();
     } else {
-      showMessage("系统服务已注册但暂未就绪，请稍候重试；详情可查看服务日志", true);
+      showMessage(t("系统服务已注册但暂未就绪，请稍候重试；详情可查看服务日志"), true);
     }
   } catch (error) {
     showMessage(String(error), true);
@@ -1822,7 +1899,7 @@ installWindowsServiceButton.addEventListener("click", async () => {
 
 uninstallWindowsServiceButton.addEventListener("click", async () => {
   const confirmed = window.confirm(
-    "卸载 Windows DNS 系统服务后，127.0.0.1/::1 将不再提供 DNS；若系统 DNS 已接管，会先自动恢复原 DNS。是否继续？",
+    t("卸载 Windows DNS 系统服务后，127.0.0.1/::1 将不再提供 DNS；若系统 DNS 已接管，会先自动恢复原 DNS。是否继续？"),
   );
   if (!confirmed) {
     return;
@@ -1833,7 +1910,7 @@ uninstallWindowsServiceButton.addEventListener("click", async () => {
     const status = requireWindowsServiceStatus(await uninstallWindowsService());
     renderWindowsServiceStatus(status);
     currentWindowsSystemDnsStatus = null;
-    showMessage("Windows DNS 系统服务已卸载，原 DNS 已恢复，数据和配置未删除", false);
+    showMessage(t("Windows DNS 系统服务已卸载，原 DNS 已恢复，数据和配置未删除"), false);
   } catch (error) {
     showMessage(String(error), true);
   } finally {
@@ -1846,8 +1923,8 @@ takeOverWindowsSystemDnsButton.addEventListener("click", async () => {
   const synchronizing = currentWindowsSystemDnsStatus?.managed === true;
   const confirmed = window.confirm(
     synchronizing
-      ? "同步后，当前活动的有线或无线网卡会使用 127.0.0.1 和 ::1。每张网卡现有的自动获取或手动 DNS 都会分别保存；已在 Windows 中改过的配置会作为新的恢复配置。是否继续？"
-      : "接管后，当前已连接的物理网卡将只使用 127.0.0.1 和 ::1 作为 DNS，不设置公共备用 DNS。每张网卡的原 DNS（包括自动获取）会先分别保存，可随时恢复。是否继续？",
+      ? t("同步后，当前活动的有线或无线网卡会使用 127.0.0.1 和 ::1。每张网卡现有的自动获取或手动 DNS 都会分别保存；已在 Windows 中改过的配置会作为新的恢复配置。是否继续？")
+      : t("接管后，当前已连接的物理网卡将只使用 127.0.0.1 和 ::1 作为 DNS，不设置公共备用 DNS。每张网卡的原 DNS（包括自动获取）会先分别保存，可随时恢复。是否继续？"),
   );
   if (!confirmed) {
     return;
@@ -1859,9 +1936,9 @@ takeOverWindowsSystemDnsButton.addEventListener("click", async () => {
     showMessage(
       status.inEffect
         ? synchronizing
-          ? "当前活动网卡已同步接管"
-          : "系统 DNS 已接管，所有 DNS 查询将交给 DnsBlackhole"
-        : "系统 DNS 备份已保存，但接管状态需要检查",
+          ? t("当前活动网卡已同步接管")
+          : t("系统 DNS 已接管，所有 DNS 查询将交给 DnsBlackhole")
+        : t("系统 DNS 备份已保存，但接管状态需要检查"),
       !status.inEffect,
     );
   } catch (error) {
@@ -1904,7 +1981,7 @@ dnsFallbackDialogConfirmButton.addEventListener("click", async () => {
   const ipv4Servers = parseDnsServerInput(dnsCustomIpv4Input.value);
   const ipv6Servers = parseDnsServerInput(dnsCustomIpv6Input.value);
   if (selection === "custom" && ipv4Servers.length === 0 && ipv6Servers.length === 0) {
-    showMessage("请至少填写一个自定义 DNS 服务器地址", true);
+    showMessage(t("请至少填写一个自定义 DNS 服务器地址"), true);
     dnsCustomIpv4Input.focus();
     return;
   }
@@ -1932,9 +2009,9 @@ dnsFallbackDialogConfirmButton.addEventListener("click", async () => {
     showMessage(
       restoringManagedDns
         ? selection === "original"
-          ? "已恢复仍由 DnsBlackhole 接管的 DNS；在 Windows 中另行修改的配置保持不变"
-          : "已恢复为所选外部 DNS"
-        : "已解除本机 DNS，现在可以重新接管并保存该恢复配置",
+          ? t("已恢复仍由 DnsBlackhole 接管的 DNS；在 Windows 中另行修改的配置保持不变")
+          : t("已恢复为所选外部 DNS")
+        : t("已解除本机 DNS，现在可以重新接管并保存该恢复配置"),
       false,
     );
   } catch (error) {
@@ -2027,8 +2104,10 @@ async function bootstrapApplication(): Promise<void> {
   await systemProxyReady;
   updateFilterProxyControls();
   logLoadTime("初始配置与存储信息", initialDataStarted, `configReady=${configReady}`);
+  // 语言切换重载后接着看原来的页面；核心没就绪时仍然强制落在设置页。
+  let initialView = viewAfterReload ?? activeView;
   if (!windowsCoreReady && !configReady) {
-    activeView = "settings";
+    initialView = "settings";
   }
   void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
     syncFilterUpdateMetadata(payload);
@@ -2056,8 +2135,8 @@ async function bootstrapApplication(): Promise<void> {
     await refreshStatus();
   }
   const initialViewStarted = performance.now();
-  setActiveView(activeView);
-  logLoadTime("初始页面切换与渲染", initialViewStarted, `view=${activeView}`);
+  setActiveView(initialView);
+  logLoadTime("初始页面切换与渲染", initialViewStarted, `view=${initialView}`);
   initialBootstrapComplete = true;
   logLoadTime("前端启动总计", frontendStartedAt);
 
@@ -2138,7 +2217,7 @@ async function loadConfig(): Promise<boolean> {
   try {
     const config = await getConfig();
     if (!config || typeof config.schema_version !== "number") {
-      throw new Error("DNS 服务返回了空配置或配置格式无效");
+      throw new Error(t("DNS 服务返回了空配置或配置格式无效"));
     }
     currentConfigSchemaVersion = Math.max(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
     currentStatisticsRetentionHours = config.statistics_retention_hours;
@@ -2177,6 +2256,8 @@ async function loadConfig(): Promise<boolean> {
     setRetentionValue(config.query_log_retention_hours);
     statisticsEnabledInput.checked = config.statistics_enabled;
     setStatisticsRetentionValue(config.statistics_retention_hours);
+    setSecurityEventRetentionValue(config.security_event_retention_hours);
+    systemHostsEnabledInput.checked = config.system_hosts_enabled;
     dnsCacheEnabledInput.checked = config.dns_cache_enabled;
     dnsCacheSizeInput.value = String(config.dns_cache_size);
     dnsCacheMinTtlInput.value = String(config.dns_cache_min_ttl);
@@ -2259,11 +2340,11 @@ async function loadStorageInfo(): Promise<void> {
 }
 
 const MACOS_SERVICE_STATE_TEXT: Record<MacosServiceState, string> = {
-  not_registered: "后台服务尚未安装。安装并授权后，DNS 才能监听 53 端口。",
-  enabled: "后台服务已启用，DNS 可以监听 53 端口。",
-  requires_approval: "等待批准：请在“系统设置 → 通用 → 登录项与扩展”中允许 DnsBlackhole。",
-  not_found: "未找到后台服务，可能已被系统移除，请重新安装。",
-  unknown: "后台服务状态未知，可尝试“安装或修复”。",
+  not_registered: t("后台服务尚未安装。安装并授权后，DNS 才能监听 53 端口。"),
+  enabled: t("后台服务已启用，DNS 可以监听 53 端口。"),
+  requires_approval: t("等待批准：请在“系统设置 → 通用 → 登录项与扩展”中允许 DnsBlackhole。"),
+  not_found: t("未找到后台服务，可能已被系统移除，请重新安装。"),
+  unknown: t("后台服务状态未知，可尝试“安装或修复”。"),
 };
 
 async function refreshSettingsRuntimeStatus(): Promise<void> {
@@ -2299,7 +2380,7 @@ async function loadMacosServiceStatus(): Promise<void> {
     }
   } catch (error) {
     currentMacosServiceStatus = null;
-    macosServiceStatusElement.textContent = `读取后台服务状态失败：${String(error)}`;
+    macosServiceStatusElement.textContent = t("读取后台服务状态失败：{p0}", { p0: String(error) });
   }
 }
 
@@ -2330,10 +2411,10 @@ function renderMacosServiceStatus(status: MacosServiceStatus): void {
     MACOS_SERVICE_STATE_TEXT[status.state] ?? MACOS_SERVICE_STATE_TEXT.unknown;
   const versionText =
     status.enabled && status.serviceVersion
-      ? ` 当前服务版本 v${status.serviceVersion}。`
+      ? t(" 当前服务版本 v{p0}。", { p0: status.serviceVersion })
       : "";
   macosServiceStatusElement.textContent = status.needsRepair
-    ? "后台服务已启用但暂未响应，可稍后重新进入本页检查；持续无响应时点击“安装或修复”。"
+    ? t("后台服务已启用但暂未响应，可稍后重新进入本页检查；持续无响应时点击“安装或修复”。")
     : `${stateText}${versionText}`;
   openMacosServiceSettingsButton.classList.toggle("hidden", !status.requiresApproval);
   uninstallMacosServiceButton.disabled =
@@ -2342,14 +2423,14 @@ function renderMacosServiceStatus(status: MacosServiceStatus): void {
 }
 
 const WINDOWS_SERVICE_STATE_TEXT: Record<WindowsServiceState, string> = {
-  not_installed: "系统服务尚未安装，DNS 核心无法在开机阶段自动启动。",
-  stopped: "系统服务已停止，可点击“安装或修复”恢复。",
-  start_pending: "系统服务正在启动，请稍候…",
-  stop_pending: "系统服务正在停止，请稍候…",
-  running: "系统服务正在运行，DNS 核心不依赖 GUI。",
-  continue_pending: "系统服务正在恢复运行，请稍候…",
-  pause_pending: "系统服务正在暂停，请稍候…",
-  paused: "系统服务已暂停，可点击“安装或修复”恢复。",
+  not_installed: t("系统服务尚未安装，DNS 核心无法在开机阶段自动启动。"),
+  stopped: t("系统服务已停止，可点击“安装或修复”恢复。"),
+  start_pending: t("系统服务正在启动，请稍候…"),
+  stop_pending: t("系统服务正在停止，请稍候…"),
+  running: t("系统服务正在运行，DNS 核心不依赖 GUI。"),
+  continue_pending: t("系统服务正在恢复运行，请稍候…"),
+  pause_pending: t("系统服务正在暂停，请稍候…"),
+  paused: t("系统服务已暂停，可点击“安装或修复”恢复。"),
 };
 
 async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> {
@@ -2360,7 +2441,7 @@ async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> 
     return windowsServiceStatusInFlight;
   }
   const started = performance.now();
-  let loadDetail = "无有效状态";
+  let loadDetail = t("无有效状态");
   windowsServiceSection.classList.remove("hidden");
   const request = (async (): Promise<WindowsServiceStatus | null> => {
     let rawStatus: WindowsServiceStatus;
@@ -2374,8 +2455,8 @@ async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> 
       const persistent = now - windowsServiceUnavailableSince >= WINDOWS_SERVICE_ERROR_GRACE_MS;
       windowsServiceSection.classList.toggle("needs-repair", persistent);
       windowsServiceStatusElement.textContent = persistent
-        ? `连续读取 Windows 系统服务状态失败：${String(error)}`
-        : "正在等待 Windows 系统服务响应…";
+        ? t("连续读取 Windows 系统服务状态失败：{p0}", { p0: String(error) })
+        : t("正在等待 Windows 系统服务响应…");
       return null;
     }
 
@@ -2383,7 +2464,7 @@ async function loadWindowsServiceStatus(): Promise<WindowsServiceStatus | null> 
     loadDetail = `rawState=${rawStatus.state}, rawReady=${rawStatus.ready}, rawIpcReady=${rawStatus.ipcReady}`;
     const status = requireWindowsServiceStatus(rawStatus);
     renderWindowsServiceStatus(status);
-    loadDetail = `state=${status.state}, ready=${status.ready}, ipcReady=${status.ipcReady}, needsRepair=${status.needsRepair}, diagnostic=${status.diagnostic ?? "无"}`;
+    loadDetail = `state=${status.state}, ready=${status.ready}, ipcReady=${status.ipcReady}, needsRepair=${status.needsRepair}, diagnostic=${status.diagnostic}`;
     if (initialBootstrapComplete && status.ready && !wasReady) {
       await refreshAfterBackgroundServiceEnabled();
     }
@@ -2419,21 +2500,21 @@ function renderWindowsServiceStatus(status: WindowsServiceStatus): void {
   windowsServiceSection.classList.toggle("is-ready", status.ready);
   windowsServiceSection.classList.toggle("needs-repair", showRepair);
   const stateText = WINDOWS_SERVICE_STATE_TEXT[status.state];
-  const versionText = status.serviceVersion ? ` 当前服务版本 v${status.serviceVersion}。` : "";
+  const versionText = status.serviceVersion ? t(" 当前服务版本 v{p0}。", { p0: status.serviceVersion }) : "";
   if (status.ready) {
     windowsServiceStatusElement.textContent = `${stateText}${versionText}`;
   } else if (status.running && status.ipcReady && status.needsRepair) {
-    windowsServiceStatusElement.textContent = `系统服务版本不一致（当前 ${status.serviceVersion ?? "未知"}，需要 ${status.expectedVersion}），请点击“安装或修复”。`;
+    windowsServiceStatusElement.textContent = t("系统服务版本不一致（当前 {p0}，需要 {p1}），请点击“安装或修复”。", { p0: status.serviceVersion ?? t("未知"), p1: status.expectedVersion });
   } else if (status.running && ipcFailurePersistent) {
-    windowsServiceStatusElement.textContent = "系统服务已运行，但 IPC 连续无响应，请点击“安装或修复”。";
+    windowsServiceStatusElement.textContent = t("系统服务已运行，但 IPC 连续无响应，请点击“安装或修复”。");
   } else if (status.running && !status.ipcReady) {
-    windowsServiceStatusElement.textContent = "系统服务正在完成启动并建立通信，请稍候…";
+    windowsServiceStatusElement.textContent = t("系统服务正在完成启动并建立通信，请稍候…");
   } else {
     windowsServiceStatusElement.textContent = `${stateText}${versionText}`;
   }
   uninstallWindowsServiceButton.disabled = !status.installed;
   if (!status.ready) {
-    renderWindowsSystemDnsUnavailable("请先安装并启动 Windows DNS 系统服务");
+    renderWindowsSystemDnsUnavailable(t("请先安装并启动 Windows DNS 系统服务"));
   }
   renderAboutRuntimeInfo();
 }
@@ -2444,7 +2525,7 @@ async function loadWindowsSystemDnsStatus(): Promise<WindowsSystemDnsStatus | nu
   }
   windowsSystemDnsSection.classList.remove("hidden");
   if (!currentWindowsServiceStatus?.ready) {
-    renderWindowsSystemDnsUnavailable("请先安装并启动 Windows DNS 系统服务");
+    renderWindowsSystemDnsUnavailable(t("请先安装并启动 Windows DNS 系统服务"));
     return null;
   }
   if (windowsSystemDnsStatusInFlight) {
@@ -2458,7 +2539,7 @@ async function loadWindowsSystemDnsStatus(): Promise<WindowsSystemDnsStatus | nu
     } catch (error) {
       windowsSystemDnsSection.classList.remove("is-ready");
       windowsSystemDnsSection.classList.add("needs-repair");
-      windowsSystemDnsStatusElement.textContent = `读取系统 DNS 状态失败：${String(error)}`;
+      windowsSystemDnsStatusElement.textContent = t("读取系统 DNS 状态失败：{p0}", { p0: String(error) });
       takeOverWindowsSystemDnsButton.disabled = true;
       restoreWindowsSystemDnsButton.disabled = true;
       return null;
@@ -2480,41 +2561,41 @@ function renderWindowsSystemDnsStatus(status: WindowsSystemDnsStatus): void {
     "needs-repair",
     (status.managed && !status.inEffect) || (!status.managed && status.inEffect),
   );
-  const activeAdapterNames = status.activeAdapters.map((adapter) => adapter.name).join("、");
+  const activeAdapterNames = status.activeAdapters.map((adapter) => adapter.name).join(t("、"));
   const activeDnsText = formatActiveDnsAdapters(status);
   const backupDnsText = formatBackupDnsAdapters(status);
   if (status.managed && status.inEffect) {
-    windowsSystemDnsStatusElement.textContent = `已接管当前活动网卡：${activeAdapterNames}。`;
-    windowsSystemDnsDetailElement.textContent = `当前 DNS 均指向 127.0.0.1 / ::1。接管前配置：${backupDnsText}。`;
+    windowsSystemDnsStatusElement.textContent = t("已接管当前活动网卡：{p0}。", { p0: activeAdapterNames });
+    windowsSystemDnsDetailElement.textContent = t("当前 DNS 均指向 127.0.0.1 / ::1。接管前配置：{p0}。", { p0: backupDnsText });
   } else if (status.managed) {
     windowsSystemDnsStatusElement.textContent = status.activeAdapters.length > 0
-      ? `当前活动网卡尚未全部接管：${activeAdapterNames}。`
-      : "已保留 DNS 接管备份，但当前没有活动的物理网卡。";
-    windowsSystemDnsDetailElement.textContent = `当前配置：${activeDnsText}。历史恢复配置：${backupDnsText}。可同步接管当前网卡，或选择恢复方式。`;
+      ? t("当前活动网卡尚未全部接管：{p0}。", { p0: activeAdapterNames })
+      : t("已保留 DNS 接管备份，但当前没有活动的物理网卡。");
+    windowsSystemDnsDetailElement.textContent = t("当前配置：{p0}。历史恢复配置：{p1}。可同步接管当前网卡，或选择恢复方式。", { p0: activeDnsText, p1: backupDnsText });
   } else if (status.inEffect) {
     const localAdapters = status.activeAdapters
       .filter((adapter) => adapter.usesLocalDns)
       .map((adapter) => adapter.name)
-      .join("、");
-    windowsSystemDnsStatusElement.textContent = `检测到 ${localAdapters} 使用本机 DNS，但没有原配置备份。`;
-    windowsSystemDnsDetailElement.textContent = `当前配置：${activeDnsText}。请选择自动获取、公共 DNS 或自定义 DNS 来解除。`;
+      .join(t("、"));
+    windowsSystemDnsStatusElement.textContent = t("检测到 {p0} 使用本机 DNS，但没有原配置备份。", { p0: localAdapters });
+    windowsSystemDnsDetailElement.textContent = t("当前配置：{p0}。请选择自动获取、公共 DNS 或自定义 DNS 来解除。", { p0: activeDnsText });
   } else {
     windowsSystemDnsStatusElement.textContent = status.activeAdapters.length > 0
-      ? `尚未接管，当前活动网卡：${activeAdapterNames}。`
-      : "尚未接管，当前未检测到已连接的物理网卡。";
+      ? t("尚未接管，当前活动网卡：{p0}。", { p0: activeAdapterNames })
+      : t("尚未接管，当前未检测到已连接的物理网卡。");
     windowsSystemDnsDetailElement.textContent = status.activeAdapters.length > 0
-      ? `当前配置：${activeDnsText}。接管时会按网卡分别保存这些设置。`
-      : "连接有线或无线网络后，可将其 DNS 指向 DnsBlackhole。";
+      ? t("当前配置：{p0}。接管时会按网卡分别保存这些设置。", { p0: activeDnsText })
+      : t("连接有线或无线网络后，可将其 DNS 指向 DnsBlackhole。");
   }
   const canReplaceUnmanagedLocalDns = !status.managed && status.inEffect;
   restoreWindowsSystemDnsButton.textContent = canReplaceUnmanagedLocalDns
-    ? "解除本机 DNS"
-    : "恢复 DNS";
+    ? t("解除本机 DNS")
+    : t("恢复 DNS");
   takeOverWindowsSystemDnsButton.textContent = status.managed
     ? status.inEffect
-      ? "已接管"
-      : "同步接管"
-    : "接管 DNS";
+      ? t("已接管")
+      : t("同步接管")
+    : t("接管 DNS");
   updateWindowsSystemDnsButtons();
 }
 
@@ -2524,7 +2605,7 @@ function renderWindowsSystemDnsUnavailable(message: string): void {
   }
   windowsSystemDnsSection.classList.remove("hidden", "is-ready", "needs-repair");
   windowsSystemDnsStatusElement.textContent = message;
-  windowsSystemDnsDetailElement.textContent = "系统服务就绪后会读取当前活动网卡及每张网卡的 DNS 恢复配置。";
+  windowsSystemDnsDetailElement.textContent = t("系统服务就绪后会读取当前活动网卡及每张网卡的 DNS 恢复配置。");
   takeOverWindowsSystemDnsButton.disabled = true;
   restoreWindowsSystemDnsButton.disabled = true;
 }
@@ -2559,14 +2640,14 @@ function updateWindowsSystemDnsButtons(): void {
 function showDnsFallbackDialog(): void {
   const restoringManagedDns = currentWindowsSystemDnsStatus?.managed === true;
   dnsRestoreOriginalOption.classList.toggle("hidden", !restoringManagedDns);
-  dnsFallbackDialogTitle.textContent = restoringManagedDns ? "选择恢复后的 DNS" : "解除本机 DNS";
+  dnsFallbackDialogTitle.textContent = restoringManagedDns ? t("选择恢复后的 DNS") : t("解除本机 DNS");
   dnsFallbackDialogIntro.textContent = restoringManagedDns
-    ? "“按接管前配置恢复”只还原仍指向本机 DNS 的部分，保留你后来在 Windows 中做的修改；选择其他方式则会将历史备份中的网卡设置为所选 DNS。"
-    : "当前没有原 DNS 备份，请选择解除后使用的 DNS。只会修改仍指向 127.0.0.1 或 ::1 的设置。";
+    ? t("“按接管前配置恢复”只还原仍指向本机 DNS 的部分，保留你后来在 Windows 中做的修改；选择其他方式则会将历史备份中的网卡设置为所选 DNS。")
+    : t("当前没有原 DNS 备份，请选择解除后使用的 DNS。只会修改仍指向 127.0.0.1 或 ::1 的设置。");
   dnsRestoreOriginalDetail.textContent = currentWindowsSystemDnsStatus
     ? formatBackupDnsAdapters(currentWindowsSystemDnsStatus)
-    : "保留接管前的自动获取或手动 DNS 设置";
-  dnsFallbackDialogConfirmButton.textContent = restoringManagedDns ? "确认恢复" : "确认解除";
+    : t("保留接管前的自动获取或手动 DNS 设置");
+  dnsFallbackDialogConfirmButton.textContent = restoringManagedDns ? t("确认恢复") : t("确认解除");
   const recommended = dnsFallbackInputs.find((input) =>
     restoringManagedDns ? input.value === "original" : input.value === "automatic",
   );
@@ -2586,31 +2667,31 @@ function parseDnsServerInput(value: string): string[] {
 }
 
 function formatDnsServers(servers: string[] | null): string {
-  return servers && servers.length > 0 ? servers.join(" / ") : "自动获取";
+  return servers && servers.length > 0 ? servers.join(" / ") : t("自动获取");
 }
 
 function formatActiveDnsAdapters(status: WindowsSystemDnsStatus): string {
   if (status.activeAdapters.length === 0) {
-    return "无活动物理网卡";
+    return t("无活动物理网卡");
   }
   return status.activeAdapters
     .map(
       (adapter) =>
-        `${adapter.name}（IPv4 ${formatDnsServers(adapter.ipv4Servers)}，IPv6 ${formatDnsServers(adapter.ipv6Servers)}）`,
+        t("{p0}（IPv4 {p1}，IPv6 {p2}）", { p0: adapter.name, p1: formatDnsServers(adapter.ipv4Servers), p2: formatDnsServers(adapter.ipv6Servers) }),
     )
-    .join("；");
+    .join(t("；"));
 }
 
 function formatBackupDnsAdapters(status: WindowsSystemDnsStatus): string {
   if (status.backupAdapters.length === 0) {
-    return "无历史备份";
+    return t("无历史备份");
   }
   return status.backupAdapters
     .map(
       (adapter) =>
-        `${adapter.name}（IPv4 ${formatDnsServers(adapter.ipv4Servers)}，IPv6 ${formatDnsServers(adapter.ipv6Servers)}）`,
+        t("{p0}（IPv4 {p1}，IPv6 {p2}）", { p0: adapter.name, p1: formatDnsServers(adapter.ipv4Servers), p2: formatDnsServers(adapter.ipv6Servers) }),
     )
-    .join("；");
+    .join(t("；"));
 }
 
 function closeDnsFallbackDialog(): void {
@@ -2621,7 +2702,7 @@ function closeDnsFallbackDialog(): void {
 
 function requireWindowsSystemDnsStatus(value: unknown): WindowsSystemDnsStatus {
   if (!value || typeof value !== "object") {
-    throw new Error("Windows 系统 DNS 状态接口返回了空结果");
+    throw new Error(t("Windows 系统 DNS 状态接口返回了空结果"));
   }
   const status = value as Partial<WindowsSystemDnsStatus>;
   if (
@@ -2652,7 +2733,7 @@ function requireWindowsSystemDnsStatus(value: unknown): WindowsSystemDnsStatus {
     ) ||
     typeof status.restoreIpv4Automatic !== "boolean"
   ) {
-    throw new Error("Windows 系统 DNS 状态接口返回格式无效");
+    throw new Error(t("Windows 系统 DNS 状态接口返回格式无效"));
   }
   return status as WindowsSystemDnsStatus;
 }
@@ -2698,7 +2779,7 @@ async function waitForWindowsServiceReady(
 
 function requireWindowsServiceStatus(value: unknown): WindowsServiceStatus {
   if (!value || typeof value !== "object") {
-    throw new Error("Windows 系统服务状态接口返回了空结果");
+    throw new Error(t("Windows 系统服务状态接口返回了空结果"));
   }
   const status = value as Partial<WindowsServiceStatus>;
   if (
@@ -2712,7 +2793,7 @@ function requireWindowsServiceStatus(value: unknown): WindowsServiceStatus {
     (status.serviceVersion !== null && typeof status.serviceVersion !== "string") ||
     (status.diagnostic !== null && typeof status.diagnostic !== "string")
   ) {
-    throw new Error("Windows 系统服务状态接口返回格式无效");
+    throw new Error(t("Windows 系统服务状态接口返回格式无效"));
   }
   return status as WindowsServiceStatus;
 }
@@ -2736,26 +2817,26 @@ function isWindowsServiceState(value: unknown): value is WindowsServiceState {
 function renderStorageInfo(info: StorageInfo): void {
   const displayPath = selectedDataStoragePath || info.current_path;
   dataStoragePathInput.value = displayPath;
-  dataStorageSizeElement.textContent = `当前占用 ${formatBytes(info.total_bytes)}（数据库 ${formatBytes(info.database_bytes)}，过滤器数据 ${formatBytes(info.filter_cache_bytes)}）`;
-  dataStorageStateElement.textContent = info.is_default ? "默认目录" : "自定义目录";
+  dataStorageSizeElement.textContent = t("当前占用 {p0}（数据库 {p1}，过滤器数据 {p2}）", { p0: formatBytes(info.total_bytes), p1: formatBytes(info.database_bytes), p2: formatBytes(info.filter_cache_bytes) });
+  dataStorageStateElement.textContent = info.is_default ? t("默认目录") : t("自定义目录");
   dataStorageStateElement.classList.toggle("custom", !info.is_default);
 
   const pending = hasPendingStorageSelection();
   dataStoragePending.classList.toggle("hidden", !pending);
   if (!pending) {
     dataStoragePendingText.textContent = "";
-    migrateDataStorageButton.textContent = "迁移并重启";
+    migrateDataStorageButton.textContent = t("迁移并重启");
   } else if (!selectedStorageTarget) {
     dataStoragePendingText.textContent = storageSelectionError
-      ? "所选目录不可用"
-      : "正在检查所选目录…";
-    migrateDataStorageButton.textContent = "检查目录中…";
+      ? t("所选目录不可用")
+      : t("正在检查所选目录…");
+    migrateDataStorageButton.textContent = t("检查目录中…");
   } else if (selectedStorageTarget.action === "use_existing") {
-    dataStoragePendingText.textContent = `检测到现有数据 ${formatBytes(selectedStorageTarget.total_bytes)}（数据库 ${formatBytes(selectedStorageTarget.database_bytes)}，过滤器数据 ${formatBytes(selectedStorageTarget.filter_cache_bytes)}）`;
-    migrateDataStorageButton.textContent = "使用现有数据并重启";
+    dataStoragePendingText.textContent = t("检测到现有数据 {p0}（数据库 {p1}，过滤器数据 {p2}）", { p0: formatBytes(selectedStorageTarget.total_bytes), p1: formatBytes(selectedStorageTarget.database_bytes), p2: formatBytes(selectedStorageTarget.filter_cache_bytes) });
+    migrateDataStorageButton.textContent = t("使用现有数据并重启");
   } else {
-    dataStoragePendingText.textContent = `重启后迁移到：${displayPath}`;
-    migrateDataStorageButton.textContent = "迁移并重启";
+    dataStoragePendingText.textContent = t("重启后迁移到：{p0}", { p0: displayPath });
+    migrateDataStorageButton.textContent = t("迁移并重启");
   }
   migrateDataStorageButton.disabled =
     !pending || !selectedStorageTarget || Boolean(storageSelectionError);
@@ -2808,10 +2889,10 @@ function normalizePath(value: string): string {
 
 async function saveConfig(): Promise<void> {
   if (!configLoaded) {
-    showMessage("配置尚未从 DNS 服务加载，已阻止保存以保护原配置", true);
+    showMessage(t("配置尚未从 DNS 服务加载，已阻止保存以保护原配置"), true);
     return;
   }
-  await runStatusAction(() => saveConfigOnly(), "配置已保存");
+  await runStatusAction(() => saveConfigOnly(), t("配置已保存"));
 }
 
 async function saveConfigOnly(): Promise<RuntimeStatus> {
@@ -2862,6 +2943,7 @@ function collectConfig(): AppConfig {
     query_log_retention_hours: selectedRetentionHours(),
     statistics_enabled: statisticsEnabledInput.checked,
     statistics_retention_hours: selectedStatisticsRetentionHours(),
+    security_event_retention_hours: Number(securityEventRetentionInput.value || 720),
     dns_cache_enabled: dnsCacheEnabledInput.checked,
     dns_cache_size: Number(dnsCacheSizeInput.value || 0),
     dns_cache_min_ttl: Number(dnsCacheMinTtlInput.value || 0),
@@ -2886,6 +2968,7 @@ function collectConfig(): AppConfig {
     rebinding_allowed_domains: rebindingAllowedDomainsInput.value,
     cname_cloaking_enabled: cnameCloakingEnabledInput.checked,
     dns_rewrites: dnsRewritesInput.value,
+    system_hosts_enabled: systemHostsEnabledInput.checked,
     client_names: clientNamesInput.value,
     query_log_ignored_domains: queryLogIgnoredInput.value,
     statistics_ignored_domains: statisticsIgnoredInput.value,
@@ -2921,10 +3004,10 @@ function updateConfigDirtyState(): void {
 
 function updateConfigSaveState(): void {
   const label = !configLoaded
-    ? "配置不可用"
+    ? t("配置不可用")
     : configDirty
-      ? "有未保存的更改"
-      : "所有更改已保存";
+      ? t("有未保存的更改")
+      : t("所有更改已保存");
   saveStateLabels.forEach((element) => {
     element.textContent = label;
     element.classList.toggle("dirty", configLoaded && configDirty);
@@ -3033,7 +3116,7 @@ function applyQueryLogQuery(queryValue: QueryLogQuery): void {
 
 function renderSavedQueryLogViews(selectedId = queryLogSavedViewSelect.value): void {
   queryLogSavedViewSelect.innerHTML = [
-    '<option value="">选择已保存视图</option>',
+    t("<option value=\"\">选择已保存视图</option>"),
     ...savedQueryLogViews.map(
       (view) => `<option value="${escapeHtml(view.id)}">${escapeHtml(view.name)}</option>`,
     ),
@@ -3062,10 +3145,10 @@ function refreshQueryLogAdvancedState(): void {
   queryLogAdvancedCount.textContent = String(count);
   queryLogAdvancedCount.hidden = count === 0;
   queryLogAdvancedButton.classList.toggle("active", count > 0);
-  queryLogAdvancedButton.title = count > 0 ? `已启用 ${count} 个高级筛选` : "";
+  queryLogAdvancedButton.title = count > 0 ? t("已启用 {p0} 个高级筛选", { p0: count }) : "";
   queryLogAdvancedButton.setAttribute(
     "aria-label",
-    count > 0 ? `更多筛选，已启用 ${count} 个条件` : "更多筛选",
+    count > 0 ? t("更多筛选，已启用 {p0} 个条件", { p0: count }) : t("更多筛选"),
   );
   syncSavedQueryLogViewSelection();
 }
@@ -3159,18 +3242,34 @@ async function runStatusAction(
   }
 }
 
-function setActiveView(view: ViewName): void {
-  const viewChanged = activeView !== view;
-  if (viewChanged) {
-    isContentScrolling = false;
-    queuedAutoRefresh = false;
-    if (scrollIdleTimer !== undefined) {
-      window.clearTimeout(scrollIdleTimer);
-      scrollIdleTimer = undefined;
-    }
+function rememberViewAcrossReload(view: ViewName): void {
+  try {
+    window.sessionStorage.setItem(PENDING_VIEW_KEY, view);
+  } catch (error) {
+    // 存不下最多是重载后回到仪表盘，不影响功能。
+    console.warn("保存当前页面失败", error);
   }
-  activeView = view;
-  showMessage("", false);
+}
+
+/** 取出并清除待恢复的页面：只对紧接着的那一次重载生效，正常启动仍然落在仪表盘。 */
+function takeViewAfterReload(): ViewName | null {
+  let stored: string | null = null;
+  try {
+    stored = window.sessionStorage.getItem(PENDING_VIEW_KEY);
+    window.sessionStorage.removeItem(PENDING_VIEW_KEY);
+  } catch (error) {
+    console.warn("读取待恢复页面失败", error);
+    return null;
+  }
+  if (!stored || !/^[a-z]+$/.test(stored)) {
+    return null;
+  }
+  // 用模板里实际存在的面板校验，省得和 ViewName 各维护一份清单。
+  return document.querySelector(`[data-view-panel="${stored}"]`) ? (stored as ViewName) : null;
+}
+
+/** 只切换面板与导航高亮，不触发任何数据刷新。 */
+function applyViewVisibility(view: ViewName): void {
   updateContextNavigation(view);
   document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
     const isFilterGroup =
@@ -3189,6 +3288,21 @@ function setActiveView(view: ViewName): void {
   document.querySelectorAll<HTMLElement>("[data-view-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.viewPanel === view);
   });
+}
+
+function setActiveView(view: ViewName): void {
+  const viewChanged = activeView !== view;
+  if (viewChanged) {
+    isContentScrolling = false;
+    queuedAutoRefresh = false;
+    if (scrollIdleTimer !== undefined) {
+      window.clearTimeout(scrollIdleTimer);
+      scrollIdleTimer = undefined;
+    }
+  }
+  activeView = view;
+  showMessage("", false);
+  applyViewVisibility(view);
   // 所有页面共享同一个滚动容器，导航和初始化落页时都从顶部开始。
   contentElement.scrollTop = 0;
   if (view === "dashboard" && viewChanged) {
@@ -3227,16 +3341,16 @@ async function runDiagnostic(): Promise<void> {
   const domain = diagnosticDomainInput.value.trim();
   if (!domain) {
     diagnosticDomainInput.focus();
-    showMessage("请输入要诊断的域名", true);
+    showMessage(t("请输入要诊断的域名"), true);
     return;
   }
   runDiagnosticButton.classList.add("loading");
-  runDiagnosticButton.textContent = "诊断中";
+  runDiagnosticButton.textContent = t("诊断中");
   runDiagnosticButton.disabled = true;
   diagnosticResults.innerHTML = `
     <div class="diagnostic-empty loading-state">
-      <strong>正在并行测试上游…</strong>
-      <span>不可用的服务器最多等待 3 秒。</span>
+      <strong>${t("正在并行测试上游…")}</strong>
+      <span>${t("不可用的服务器最多等待 3 秒。")}</span>
     </div>
   `;
   try {
@@ -3249,41 +3363,41 @@ async function runDiagnostic(): Promise<void> {
   } catch (error) {
     diagnosticResults.innerHTML = `
       <div class="diagnostic-empty error-state">
-        <strong>诊断失败</strong>
+        <strong>${t("诊断失败")}</strong>
         <span>${escapeHtml(String(error))}</span>
       </div>
     `;
     showMessage(String(error), true);
   } finally {
     runDiagnosticButton.classList.remove("loading");
-    runDiagnosticButton.textContent = "开始诊断";
+    runDiagnosticButton.textContent = t("开始诊断");
     runDiagnosticButton.disabled = false;
   }
 }
 
 function renderDiagnosticReport(report: DnsDiagnosticReport): void {
   const localLabels: Record<DnsDiagnosticReport["local_status"], string> = {
-    allowed: "本地判定：允许",
-    blocked: "本地判定：已拦截",
-    bypassed: "本地判定：客户端已绕过",
-    rewrite: "本地判定：DNS 重写",
-    paused: "本地判定：保护已暂停",
-    stopped: "本地判定：服务未运行",
+    allowed: t("本地判定：允许"),
+    blocked: t("本地判定：已拦截"),
+    bypassed: t("本地判定：客户端已绕过"),
+    rewrite: t("本地判定：DNS 重写"),
+    paused: t("本地判定：保护已暂停"),
+    stopped: t("本地判定：服务未运行"),
   };
   const localDetails = [
-    report.client_ip ? ["模拟客户端", report.client_ip] : null,
+    report.client_ip ? [t("模拟客户端"), report.client_ip] : null,
     report.client_ip
       ? [
-          "客户端策略",
+          t("客户端策略"),
           report.client_policy === "bypass"
-            ? `绕过过滤${report.client_policy_source ? `（${report.client_policy_source}）` : ""}`
-            : `正常过滤${report.client_policy_source ? `（${report.client_policy_source}）` : ""}`,
+            ? t("绕过过滤{p0}", { p0: report.client_policy_source ? `（${report.client_policy_source}）` : "" })
+            : t("正常过滤{p0}", { p0: report.client_policy_source ? `（${report.client_policy_source}）` : "" }),
         ]
       : null,
-    report.matched_rule ? ["命中规则", report.matched_rule] : null,
-    report.rule_source ? ["规则来源", report.rule_source] : null,
-    report.rule_type ? ["规则类型", report.rule_type] : null,
-    report.allowlist_rule ? ["被覆盖的允许规则", report.allowlist_rule] : null,
+    report.matched_rule ? [t("命中规则"), report.matched_rule] : null,
+    report.rule_source ? [t("规则来源"), report.rule_source] : null,
+    report.rule_type ? [t("规则类型"), report.rule_type] : null,
+    report.allowlist_rule ? [t("被覆盖的允许规则"), report.allowlist_rule] : null,
   ].filter((entry): entry is string[] => entry !== null);
   const localDetailRows = localDetails.length > 0
     ? `<dl class="diagnostic-local-details">${localDetails
@@ -3297,8 +3411,8 @@ function renderDiagnosticReport(report: DnsDiagnosticReport): void {
               .map((answer) => `${dnsQueryTypeLabel(answer.record_type)} ${answer.value}`)
               .join(" · ")
           : result.success
-            ? "响应中没有可展示的记录"
-            : result.error || "上游无响应";
+            ? t("响应中没有可展示的记录")
+            : result.error || t("上游无响应");
         return `
           <div class="diagnostic-upstream ${result.success ? "success" : "failed"}">
             <i aria-hidden="true"></i>
@@ -3307,13 +3421,13 @@ function renderDiagnosticReport(report: DnsDiagnosticReport): void {
               <span title="${escapeHtml(answers)}">${escapeHtml(answers)}</span>
             </div>
             <div class="diagnostic-upstream-meta">
-              <strong>${result.success ? `${dnsResponseCodeShortLabel(result.response_code)}${result.authenticated_data ? " · DNSSEC" : ""}` : "失败"}</strong>
+              <strong>${result.success ? `${dnsResponseCodeShortLabel(result.response_code)}${result.authenticated_data ? " · DNSSEC" : ""}` : t("失败")}</strong>
               <span>${result.latency_ms === null ? "-" : formatElapsedMs(result.latency_ms)}</span>
             </div>
           </div>
         `;
       }).join("")
-    : `<div class="diagnostic-empty"><strong>没有已配置的上游</strong></div>`;
+    : t("<div class=\"diagnostic-empty\"><strong>没有已配置的上游</strong></div>");
   diagnosticResults.innerHTML = `
     <section class="diagnostic-local ${report.local_status}">
       <div>
@@ -3321,13 +3435,13 @@ function renderDiagnosticReport(report: DnsDiagnosticReport): void {
         <strong>${localLabels[report.local_status]}</strong>
       </div>
       <p>${escapeHtml(report.local_detail)}</p>
-      ${report.important_overrode ? `<p class="diagnostic-note">该重要规则覆盖了一条允许规则。</p>` : ""}
+      ${report.important_overrode ? `<p class="diagnostic-note">${t("该重要规则覆盖了一条允许规则。")}</p>` : ""}
       ${localDetailRows}
     </section>
     <section class="diagnostic-upstream-list">
       <div class="diagnostic-result-heading">
-        <h3>上游测试</h3>
-        <span>${report.upstreams.filter((result) => result.success).length}/${report.upstreams.length} 个可用</span>
+        <h3>${t("上游测试")}</h3>
+        <span>${report.upstreams.filter((result) => result.success).length}/${report.upstreams.length} ${t("个可用")}</span>
       </div>
       ${upstreamRows}
     </section>
@@ -3336,7 +3450,7 @@ function renderDiagnosticReport(report: DnsDiagnosticReport): void {
 
 function dnsResponseCodeShortLabel(code: number | null): string {
   if (code === null) {
-    return "已响应";
+    return t("已响应");
   }
   const labels: Record<number, string> = {
     0: "NOERROR",
@@ -3349,7 +3463,7 @@ function dnsResponseCodeShortLabel(code: number | null): string {
 
 function renderFilters(): void {
   if (filtersState.length === 0) {
-    filtersBody.innerHTML = `<div class="empty-row" role="row"><span role="cell">暂无远程清单</span></div>`;
+    filtersBody.innerHTML = t("<div class=\"empty-row\" role=\"row\"><span role=\"cell\">暂无远程清单</span></div>");
     return;
   }
 
@@ -3414,16 +3528,16 @@ async function refreshFilterUpdateMetadata(): Promise<void> {
 
 function renderFilter(filter: FilterSubscription): string {
   const isEditing = editingFilterIds.has(filter.id);
-  const accessibleName = filter.name.trim() || "未命名清单";
+  const accessibleName = filter.name.trim() || t("未命名清单");
   const hasUnsupportedIgnoredRules =
     filter.ignored_regex_count + filter.ignored_unsupported_count + filter.ignored_invalid_count > 0;
   const statusText = filter.last_error
-    ? "更新失败"
+    ? t("更新失败")
     : filter.last_updated
       ? hasUnsupportedIgnoredRules
-        ? "部分忽略"
-        : "已更新"
-      : "未更新";
+        ? t("部分忽略")
+        : t("已更新")
+      : t("未更新");
   const statusClass = filter.last_error
     ? "danger"
     : filter.last_updated
@@ -3436,19 +3550,19 @@ function renderFilter(filter: FilterSubscription): string {
   return `
     <div class="filter-item" data-id="${escapeHtml(filter.id)}" role="rowgroup">
       <div class="filter-summary" role="row">
-        <label class="switch" title="启用清单" role="cell">
-          <input class="filter-enabled" data-field="enabled" type="checkbox" aria-label="启用黑名单 ${escapeHtml(accessibleName)}" ${filter.enabled ? "checked" : ""} />
+        <label class="switch" title="${t("启用清单")}" role="cell">
+          <input class="filter-enabled" data-field="enabled" type="checkbox" aria-label="${t("启用黑名单 {p0}", { p0: escapeHtml(accessibleName) })}" ${filter.enabled ? "checked" : ""} />
         </label>
         <div class="filter-meta" role="cell">
-          <strong>${escapeHtml(filter.name || "未命名清单")}</strong>
-          <span class="url-line" title="${escapeHtml(filter.url)}">${escapeHtml(filter.url || "尚未填写清单网址")}</span>
+          <strong>${escapeHtml(filter.name || t("未命名清单"))}</strong>
+          <span class="url-line" title="${escapeHtml(filter.url)}">${escapeHtml(filter.url || t("尚未填写清单网址"))}</span>
         </div>
         <span class="rule-count" role="cell" title="${escapeHtml(ruleSummary)}">${formatCount(filter.rule_count)}</span>
         <span class="update-time" role="cell">${formatTime(filter.last_updated)}</span>
         <span class="state-tag ${statusClass}" role="cell" title="${escapeHtml(filter.last_error ?? "")}">${statusText}</span>
         <div class="row-actions" role="cell">
-          <button data-action="edit" type="button" aria-label="${isEditing ? "收起" : "编辑"}黑名单 ${escapeHtml(accessibleName)}">${isEditing ? "收起" : "编辑"}</button>
-          <button data-action="remove" type="button" aria-label="删除黑名单 ${escapeHtml(accessibleName)}">删除</button>
+          <button data-action="edit" type="button" aria-label="${isEditing ? t("收起黑名单 {p0}", { p0: escapeHtml(accessibleName) }) : t("编辑黑名单 {p0}", { p0: escapeHtml(accessibleName) })}">${isEditing ? t("收起") : t("编辑")}</button>
+          <button data-action="remove" type="button" aria-label="${t("删除黑名单 {p0}", { p0: escapeHtml(accessibleName) })}">${t("删除")}</button>
         </div>
       </div>
       ${
@@ -3457,11 +3571,11 @@ function renderFilter(filter: FilterSubscription): string {
             <div role="row">
               <div class="filter-edit" role="cell" aria-colspan="6">
                 <label class="field">
-                  <span>名称</span>
+                  <span>${t("名称")}</span>
                   <input data-field="name" value="${escapeHtml(filter.name)}" spellcheck="false" />
                 </label>
                 <label class="field">
-                  <span>清单网址</span>
+                  <span>${t("清单网址")}</span>
                   <input data-field="url" value="${escapeHtml(filter.url)}" spellcheck="false" />
                 </label>
                 <small class="filter-rule-detail">${escapeHtml(ruleSummary)}</small>
@@ -3561,7 +3675,7 @@ function renderSecurityEvents(status: RuntimeStatus): void {
   if (events.length === 0) {
     setHtmlIfChanged(
       securityEventBody,
-      `<div class="security-event-empty" role="row"><span role="cell">暂无安全事件</span></div>`,
+      t("<div class=\"security-event-empty\" role=\"row\"><span role=\"cell\">暂无安全事件</span></div>"),
     );
     return;
   }
@@ -3589,12 +3703,12 @@ function renderCacheStats(status: RuntimeStatus): void {
 }
 
 function renderSecurityEvent(event: SecurityEvent): string {
-  const eventLabel = event.event_type === "rate_limited" ? "触发限速" : "访问拒绝";
+  const eventLabel = event.event_type === "rate_limited" ? t("触发限速") : t("访问拒绝");
   const clientLabel = clientDisplayName(event.client_ip) ?? event.client_ip;
   const detail = `${event.protocol.toUpperCase()} · ${event.reason}`;
   const detailTitle =
     event.count > 1
-      ? `${detail}；首次：${formatLogDate(event.first_seen_at)} ${formatLogTime(event.first_seen_at)}`
+      ? t("{p0}；首次：{p1} {p2}", { p0: detail, p1: formatLogDate(event.first_seen_at), p2: formatLogTime(event.first_seen_at) })
       : detail;
   return `
     <div class="security-event-row ${event.event_type}" role="row">
@@ -3617,27 +3731,27 @@ function renderSecurityEvent(event: SecurityEvent): string {
 
 function formatFilterRuleSummary(filter: FilterSubscription): string {
   const ignoredParts = [
-    filter.ignored_comment_count > 0 ? `空行/注释 ${formatCount(filter.ignored_comment_count)}` : "",
-    filter.ignored_regex_count > 0 ? `正则 ${formatCount(filter.ignored_regex_count)}` : "",
+    filter.ignored_comment_count > 0 ? t("空行/注释 {p0}", { p0: formatCount(filter.ignored_comment_count) }) : "",
+    filter.ignored_regex_count > 0 ? t("正则 {p0}", { p0: formatCount(filter.ignored_regex_count) }) : "",
     filter.ignored_unsupported_count > 0
-      ? `高级修饰符 ${formatCount(filter.ignored_unsupported_count)}`
+      ? t("高级修饰符 {p0}", { p0: formatCount(filter.ignored_unsupported_count) })
       : "",
-    filter.ignored_invalid_count > 0 ? `非法域名 ${formatCount(filter.ignored_invalid_count)}` : "",
+    filter.ignored_invalid_count > 0 ? t("非法域名 {p0}", { p0: formatCount(filter.ignored_invalid_count) }) : "",
   ].filter(Boolean);
 
   const ignoredText =
     filter.ignored_rule_count > 0
-      ? `，忽略 ${formatCount(filter.ignored_rule_count)}（${ignoredParts.join("，") || "未分类"}）`
+      ? t("，忽略 {p0}（{p1}）", { p0: formatCount(filter.ignored_rule_count), p1: ignoredParts.join("，") || t("未分类") })
       : "";
 
-  return `有效 ${formatCount(filter.rule_count)}，黑名单 ${formatCount(filter.block_rule_count)}，白名单 ${formatCount(filter.allow_rule_count)}${ignoredText}`;
+  return t("有效 {p0}，黑名单 {p1}，白名单 {p2}{p3}", { p0: formatCount(filter.rule_count), p1: formatCount(filter.block_rule_count), p2: formatCount(filter.allow_rule_count), p3: ignoredText });
 }
 
 function renderQueryLogs(page: QueryLogPage): void {
   renderQueryLogPagination(page);
 
   if (!currentQueryLogEnabled) {
-    setHtmlIfChanged(queryLogBody, `<div class="query-log-empty">查询日志未启用，请在设置中开启日志配置。</div>`);
+    setHtmlIfChanged(queryLogBody, t("<div class=\"query-log-empty\">查询日志未启用，请在设置中开启日志配置。</div>"));
     return;
   }
 
@@ -3649,7 +3763,7 @@ function renderQueryLogs(page: QueryLogPage): void {
       activeAdvancedQueryFilterCount(query) > 0;
     setHtmlIfChanged(
       queryLogBody,
-      `<div class="query-log-empty">${hasSearch ? "没有匹配的查询记录" : "暂无查询记录"}</div>`,
+      t("<div class=\"query-log-empty\">{p0}</div>", { p0: hasSearch ? t("没有匹配的查询记录") : t("暂无查询记录") }),
     );
     return;
   }
@@ -3669,8 +3783,8 @@ function renderQueryLogPagination(page: QueryLogPage): void {
   );
   queryLogPageInfo.textContent =
     page.total === 0
-      ? "0 条记录"
-      : `${formatCount(pagination.start)}-${formatCount(pagination.end)} / ${formatCount(page.total)} 条`;
+      ? t("0 条记录")
+      : t("{p0}-{p1} / {p2} 条", { p0: formatCount(pagination.start), p1: formatCount(pagination.end), p2: formatCount(page.total) });
   queryLogPrevButton.disabled = queryLogRefreshInFlight || page.page <= 1;
   queryLogNextButton.disabled = queryLogUsesCursor()
     ? queryLogRefreshInFlight || page.next_cursor === null
@@ -3692,7 +3806,7 @@ function syncQueryLogPaginationDisabled(loading: boolean): void {
 
 function setQueryLogFilterValue(value: QueryLogFilter): void {
   const options = queryLogFilterMenu.querySelectorAll<HTMLButtonElement>("[data-filter]");
-  let label = "所有查询记录";
+  let label = t("所有查询记录");
 
   options.forEach((option) => {
     const selected = option.dataset.filter === value;
@@ -3758,6 +3872,19 @@ function selectedRetentionHours(): number {
   }
 
   return Number(queryLogRetentionCustomInput.value || 2160);
+}
+
+/// 保留期用固定选项呈现。配置里若是导入的非预设值，回落到不小于它的最小预设，
+/// 避免下拉框显示空白、保存时又把用户原来的设置改小。
+function setSecurityEventRetentionValue(hours: number): void {
+  const options = Array.from(securityEventRetentionInput.options).map((option) =>
+    Number(option.value),
+  );
+  const matched = options.includes(hours)
+    ? hours
+    : (options.find((option) => option >= hours) ?? options[options.length - 1]);
+  securityEventRetentionInput.value = String(matched);
+  syncCustomSelect(securityEventRetentionInput);
 }
 
 function setStatisticsRetentionValue(hours: number): void {
@@ -3886,15 +4013,15 @@ function clientDisplayName(ip: string | null): string | null {
   if (!ip) {
     return null;
   }
-  return clientNameMap.get(ip) ?? (ip === "127.0.0.1" || ip === "::1" ? "本机" : null);
+  return clientNameMap.get(ip) ?? (ip === "127.0.0.1" || ip === "::1" ? t("本机") : null);
 }
 
 function formatClientLabel(ip: string | null): string {
   if (!ip) {
-    return "未知客户端";
+    return t("未知客户端");
   }
   const name = clientDisplayName(ip);
-  return name ? `${name}（${ip}）` : ip;
+  return name ? t("{p0}（{p1}）", { p0: name, p1: ip }) : ip;
 }
 
 function formatClientRankLabel(ip: string): string {
@@ -4027,13 +4154,13 @@ async function fetchGitHubRelease(version: string): Promise<GitHubReleaseInfo> {
     signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
   });
   if (!response.ok) {
-    throw new Error(`GitHub Release 请求失败（HTTP ${response.status}）`);
+    throw new Error(t("GitHub Release 请求失败（HTTP {p0}）", { p0: response.status }));
   }
 
   const release = (await response.json()) as GitHubRelease;
   const releaseVersion = normalizeVersion(release.tag_name);
   if (!releaseVersion) {
-    throw new Error("GitHub Release 缺少版本号");
+    throw new Error(t("GitHub Release 缺少版本号"));
   }
 
   return {
@@ -4050,7 +4177,7 @@ async function fetchGitHubReleaseWithRetry(version: string): Promise<GitHubRelea
     (attempt, delayMs, error) => {
       setUpdateStatus(
         "info",
-        `读取更新信息失败，${Math.round(delayMs / 1_000)} 秒后重试（${attempt}/${CHECK_RETRY_DELAYS_MS.length}）：${formatUpdateError(error)}`,
+        t("读取更新信息失败，{p0} 秒后重试（{p1}/{p2}）：{p3}", { p0: Math.round(delayMs / 1_000), p1: attempt, p2: CHECK_RETRY_DELAYS_MS.length, p3: formatUpdateError(error) }),
       );
     },
   );
@@ -4085,7 +4212,7 @@ function formatReleaseNotes(notes: string): string {
 }
 
 function showUpdateDialog(currentVersion: string, version: string, notes: string): void {
-  const content = formatReleaseNotes(notes) || "此版本暂未提供更新说明。";
+  const content = formatReleaseNotes(notes) || t("此版本暂未提供更新说明。");
   updateCurrentVersionElement.textContent = currentVersion;
   updateReleaseVersionElement.textContent = `v${version}`;
   updateReleaseNotesBodyElement.textContent = content;
@@ -4146,7 +4273,7 @@ async function checkForUpdateWithRetry(): Promise<Update | null> {
     (attempt, delayMs, error) => {
       setUpdateStatus(
         "info",
-        `检查更新失败，${Math.round(delayMs / 1_000)} 秒后重试（${attempt}/${CHECK_RETRY_DELAYS_MS.length}）：${formatUpdateError(error)}`,
+        t("检查更新失败，{p0} 秒后重试（{p1}/{p2}）：{p3}", { p0: Math.round(delayMs / 1_000), p1: attempt, p2: CHECK_RETRY_DELAYS_MS.length, p3: formatUpdateError(error) }),
       );
     },
   );
@@ -4157,7 +4284,7 @@ async function downloadAndInstallWithRetry(): Promise<void> {
     async (attempt) => {
       const candidate = await checkApplicationUpdate();
       if (!candidate) {
-        throw new Error("重新检查时未发现可安装的新版本");
+        throw new Error(t("重新检查时未发现可安装的新版本"));
       }
 
       pendingUpdate = candidate;
@@ -4165,7 +4292,7 @@ async function downloadAndInstallWithRetry(): Promise<void> {
       let downloaded = 0;
       let total = 0;
       const prefix =
-        attempt > 1 ? `第 ${attempt}/${DOWNLOAD_RETRY_DELAYS_MS.length + 1} 次下载：` : "";
+        attempt > 1 ? t("第 {p0}/{p1} 次下载：", { p0: attempt, p1: DOWNLOAD_RETRY_DELAYS_MS.length + 1 }) : "";
 
       try {
         await candidate.downloadAndInstall(
@@ -4173,13 +4300,13 @@ async function downloadAndInstallWithRetry(): Promise<void> {
             if (event.event === "Started") {
               downloaded = 0;
               total = event.data.contentLength ?? 0;
-              setUpdateStatus("info", `${prefix}开始下载更新...`);
+              setUpdateStatus("info", `${prefix}${t("开始下载更新...")}`);
             } else if (event.event === "Progress") {
               downloaded += event.data.chunkLength;
               const percent = total ? Math.round((downloaded / total) * 100) : 0;
-              setUpdateStatus("info", `${prefix}下载中... ${percent}%`);
+              setUpdateStatus("info", `${prefix}${t("下载中... {p0}%", { p0: percent })}`);
             } else if (event.event === "Finished") {
-              setUpdateStatus("info", `${prefix}下载完成，正在安装...`);
+              setUpdateStatus("info", `${prefix}${t("下载完成，正在安装...")}`);
             }
           },
           { timeout: DOWNLOAD_TIMEOUT_MS },
@@ -4193,7 +4320,7 @@ async function downloadAndInstallWithRetry(): Promise<void> {
     (attempt, delayMs, error) => {
       setUpdateStatus(
         "info",
-        `下载更新失败，${Math.round(delayMs / 1_000)} 秒后重试（${attempt}/${DOWNLOAD_RETRY_DELAYS_MS.length}）：${formatUpdateError(error)}`,
+        t("下载更新失败，{p0} 秒后重试（{p1}/{p2}）：{p3}", { p0: Math.round(delayMs / 1_000), p1: attempt, p2: DOWNLOAD_RETRY_DELAYS_MS.length, p3: formatUpdateError(error) }),
       );
     },
   );
@@ -4215,23 +4342,23 @@ function renderDashboardSummaryWindow(
   const effectiveHours = dashboardStatisticsHours ?? currentStatisticsRetentionHours;
   if (effectiveHours !== 0) {
     label = effectiveHours < 48
-      ? `最近 ${effectiveHours} 小时`
-      : `最近 ${Math.max(1, Math.ceil(effectiveHours / 24))} 天`;
+      ? t("最近 {p0} 小时", { p0: effectiveHours })
+      : t("最近 {p0} 天", { p0: Math.max(1, Math.ceil(effectiveHours / 24)) });
   } else if (summaryStartedAt && summaryEndedAt) {
     const start = new Date(summaryStartedAt * 1000);
     const end = new Date(summaryEndedAt * 1000);
     const days = Math.max(1, Math.floor((end.getTime() - start.getTime()) / 86_400_000) + 1);
     if (days < 32) {
-      label = `累计汇总 ${days} 天`;
+      label = t("累计汇总 {p0} 天", { p0: days });
     } else {
       const months = Math.max(
         1,
         (end.getFullYear() - start.getFullYear()) * 12 + end.getMonth() - start.getMonth() + 1,
       );
-      label = `累计汇总 ${months} 个月`;
+      label = t("累计汇总 {p0} 个月", { p0: months });
     }
   } else {
-    label = "暂无汇总数据";
+    label = t("暂无汇总数据");
   }
   query("#query_rank_window").textContent = label;
   query("#blocked_rank_window").textContent = label;
@@ -4324,21 +4451,21 @@ function renderRuntimeStatus(status: RuntimeStatus): void {
         ? "error"
         : "running";
   const label = state === "running"
-    ? "保护运行中"
+    ? t("保护运行中")
     : state === "paused"
-      ? "过滤已暂停"
+      ? t("过滤已暂停")
       : state === "error"
-        ? "运行异常"
-        : "服务已停止";
+        ? t("运行异常")
+        : t("服务已停止");
   runtimeStatusButton.className = `runtime-status-trigger ${state}`;
   runtimeStatusLabel.textContent = label;
   runtimeStatusDetail.textContent = state === "paused"
-    ? `DNS 仍在运行，黑名单过滤将在${formatPauseRemaining(status.protection_paused_until)}后自动恢复。`
+    ? t("DNS 仍在运行，黑名单过滤将在{p0}后自动恢复。", { p0: formatPauseRemaining(status.protection_paused_until) })
     : state === "running"
-      ? `正在监听 ${status.listen_addr}，可临时暂停黑名单过滤。`
+      ? t("正在监听 {p0}，可临时暂停黑名单过滤。", { p0: status.listen_addr })
       : state === "error"
-        ? status.error || "DNS 运行时出现异常"
-        : "请先启动 DNS 服务，再使用临时暂停。";
+        ? status.error || t("DNS 运行时出现异常")
+        : t("请先启动 DNS 服务，再使用临时暂停。");
 
   runtimeStatusMenu.querySelectorAll<HTMLButtonElement>('[data-protection-action="pause"]')
     .forEach((button) => {
@@ -4373,13 +4500,14 @@ function renderRuntimeStatus(status: RuntimeStatus): void {
 
 function formatPauseRemaining(deadline: number | null): string {
   if (!deadline) {
-    return "稍后";
+    // 与"更新对话框-稍后"按钮同形不同义，这里换个说法避免字典键冲突
+    return t("片刻");
   }
   const seconds = Math.max(0, deadline - Math.floor(Date.now() / 1000));
   if (seconds >= 3600) {
-    return `${Math.ceil(seconds / 3600)} 小时`;
+    return t("{p0} 小时", { p0: Math.ceil(seconds / 3600) });
   }
-  return `${Math.max(1, Math.ceil(seconds / 60))} 分钟`;
+  return t("{p0} 分钟", { p0: Math.max(1, Math.ceil(seconds / 60)) });
 }
 
 async function runProtectionAction(
@@ -4394,8 +4522,8 @@ async function runProtectionAction(
     renderStatus(status, { renderDashboard: activeView === "dashboard" });
     showMessage(
       action === "resume"
-        ? "过滤保护已恢复"
-        : `过滤保护已暂停 ${formatPauseRemaining(status.protection_paused_until)}`,
+        ? t("过滤保护已恢复")
+        : t("过滤保护已暂停 {p0}", { p0: formatPauseRemaining(status.protection_paused_until) }),
       false,
     );
   } catch (error) {
@@ -4419,7 +4547,7 @@ function renderRankTable(
     .slice(0, RANK_ROW_LIMIT);
 
   if (rows.length === 0) {
-    setHtmlIfChanged(container, `<div class="empty-rank">暂无请求数据</div>`);
+    setHtmlIfChanged(container, `<div class="empty-rank">${t("暂无请求数据")}</div>`);
     return;
   }
 
@@ -4456,7 +4584,7 @@ function renderClientOverview(
     .sort((a, b) => b[1] - a[1] || compareRankLabel(a[0], b[0]))
     .slice(0, RANK_ROW_LIMIT);
   if (rows.length === 0) {
-    setHtmlIfChanged(clientRankBody, `<div class="empty-rank">暂无客户端数据</div>`);
+    setHtmlIfChanged(clientRankBody, `<div class="empty-rank">${t("暂无客户端数据")}</div>`);
     return;
   }
   const html = rows.map(([client, count]) => {
@@ -4464,7 +4592,7 @@ function renderClientOverview(
     const label = formatClientRankLabel(client);
     return `
       <div class="rank-row client-rank-row">
-        <button class="rank-domain rank-client-button" data-client-log="${escapeHtml(client)}" type="button" title="查看 ${escapeHtml(label)} 的查询日志">
+        <button class="rank-domain rank-client-button" data-client-log="${escapeHtml(client)}" type="button" title="${t("查看 {p0} 的查询日志", { p0: escapeHtml(label) })}">
           <span>${escapeHtml(label)}</span>
         </button>
         <span class="client-rank-metric">${formatCount(count)}</span>
@@ -4489,7 +4617,7 @@ function renderUpstreamRequestRank(
     .slice(0, RANK_ROW_LIMIT);
 
   if (visibleRows.length === 0) {
-    setHtmlIfChanged(container, `<div class="empty-rank">暂无上游请求数据</div>`);
+    setHtmlIfChanged(container, `<div class="empty-rank">${t("暂无上游请求数据")}</div>`);
     return;
   }
 
@@ -4524,7 +4652,7 @@ function renderUpstreamLatencyRank(selector: string, rows: UpstreamLatencyStat[]
     .slice(0, RANK_ROW_LIMIT);
 
   if (visibleRows.length === 0) {
-    setHtmlIfChanged(container, `<div class="empty-rank">暂无上游响应时间数据</div>`);
+    setHtmlIfChanged(container, `<div class="empty-rank">${t("暂无上游响应时间数据")}</div>`);
     return;
   }
 
@@ -4624,7 +4752,7 @@ function setDashboardLoading(loading: boolean): void {
 
 function setFilterUpdating(updating: boolean): void {
   updateFiltersButton.classList.toggle("loading", updating);
-  updateFiltersButton.textContent = updating ? "更新中" : "检查更新";
+  updateFiltersButton.textContent = updating ? t("更新中") : t("检查更新");
   updateFiltersButton.disabled = updating;
   addFilterButton.disabled = updating;
   filtersTable.classList.toggle("is-updating", updating);
@@ -4635,10 +4763,10 @@ function setFilterUpdating(updating: boolean): void {
   }
   cancelFilterUpdateButton.classList.toggle("hidden", !updating);
   cancelFilterUpdateButton.disabled = !updating;
-  cancelFilterUpdateButton.textContent = "取消更新";
+  cancelFilterUpdateButton.textContent = t("取消更新");
   filterUpdateProgressElement.classList.toggle("hidden", !updating);
   if (updating) {
-    filterUpdateProgressElement.textContent = "正在准备更新…";
+    filterUpdateProgressElement.textContent = t("正在准备更新…");
   }
 }
 
@@ -4648,18 +4776,18 @@ function updateFilterProxyControls(): void {
   filterProxyUrlInput.disabled = mode !== "custom";
 
   if (mode === "direct") {
-    filterProxyStatus.textContent = "后台将直接连接，不使用任何系统或环境代理。";
+    filterProxyStatus.textContent = t("后台将直接连接，不使用任何系统或环境代理。");
     return;
   }
   if (mode === "custom") {
-    filterProxyStatus.textContent = "后台服务将使用这里填写的 HTTP/HTTPS 代理地址。";
+    filterProxyStatus.textContent = t("后台服务将使用这里填写的 HTTP/HTTPS 代理地址。");
     return;
   }
 
   const proxy = detectedSystemProxy ?? savedSystemProxyUrl;
   filterProxyStatus.textContent = proxy
-    ? `已同步当前用户的系统代理：${proxy}`
-    : "当前未检测到系统代理；后台将按系统默认网络直接连接。";
+    ? t("已同步当前用户的系统代理：{p0}", { p0: proxy })
+    : t("当前未检测到系统代理；后台将按系统默认网络直接连接。");
 }
 
 function startFilterUpdateProgressPolling(): void {
@@ -4698,11 +4826,11 @@ function renderFilterUpdateProgress(progress: FilterUpdateProgress): void {
     return;
   }
   const suffix = progress.cancel_requested
-    ? " · 正在取消"
-    : ` · 成功 ${progress.updated} · 失败 ${progress.failed}`;
-  filterUpdateProgressElement.textContent = `已处理 ${progress.completed}/${progress.total}${suffix}`;
+    ? ` · ${t("正在取消")}`
+    : ` · ${t("成功 {p0} · 失败 {p1}", { p0: progress.updated, p1: progress.failed })}`;
+  filterUpdateProgressElement.textContent = t("已处理 {p0}/{p1}{p2}", { p0: progress.completed, p1: progress.total, p2: suffix });
   cancelFilterUpdateButton.disabled = progress.cancel_requested || !progress.running;
-  cancelFilterUpdateButton.textContent = progress.cancel_requested ? "正在取消" : "取消更新";
+  cancelFilterUpdateButton.textContent = progress.cancel_requested ? t("正在取消") : t("取消更新");
 }
 
 function setQueryLogLoading(loading: boolean, background = false): void {
@@ -4786,7 +4914,7 @@ function showMessage(value: string, isError: boolean, options: MessageOptions = 
         dismiss();
         void Promise.resolve(action.run()).catch((error) => {
           console.error(`通知操作“${action.label}”失败`, error);
-          showMessage(`${action.label}失败，请稍后重试。`, true);
+          showMessage(t("{p0}失败，请稍后重试。", { p0: action.label }), true);
         });
       });
       actions.appendChild(button);
@@ -4799,8 +4927,8 @@ function showMessage(value: string, isError: boolean, options: MessageOptions = 
     const close = document.createElement("button");
     close.type = "button";
     close.className = "message-close";
-    close.textContent = "关闭";
-    close.setAttribute("aria-label", "关闭错误提示");
+    close.textContent = t("关闭");
+    close.setAttribute("aria-label", t("关闭错误提示"));
     close.addEventListener("click", dismiss);
     el.appendChild(close);
   }
@@ -4813,8 +4941,15 @@ function showMessage(value: string, isError: boolean, options: MessageOptions = 
 
 renderAboutRuntimeInfo();
 
+// 切换语言是整页重载，这里先把面板切回原来的页面，避免启动过程中先闪一下仪表盘。
+// 真正的数据刷新仍然留给启动流程末尾的 setActiveView。
+const viewAfterReload = takeViewAfterReload();
+if (viewAfterReload) {
+  applyViewVisibility(viewAfterReload);
+}
+
 void bootstrapApplication().catch((error) => {
   console.error("应用启动失败", error);
-  showMessage(`应用启动失败：${String(error)}`, true);
+  showMessage(t("应用启动失败：{p0}", { p0: String(error) }), true);
   logLoadTime("前端启动失败", frontendStartedAt, String(error));
 });

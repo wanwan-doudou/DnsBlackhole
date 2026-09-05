@@ -1,0 +1,64 @@
+/* ==========================================================================
+   v0.2.2 新增样式
+   --------------------------------------------------------------------------
+   style.css 顶部的设计令牌由脚本生成，这里放手写的新增规则，避免被覆盖。
+   ========================================================================== */
+
+/* 界面偏好：主题与语言纵向排列。
+   两者的说明文字长短不一，并排时下拉框会一高一低，纵向叠放才对得齐。
+   宽度沿用 .compact-select 的 300px，与左栏「过滤器更新间隔」保持一致。 */
+.appearance-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.appearance-grid > .field {
+  width: min(300px, 100%);
+}
+
+.appearance-section .section-heading span {
+  display: block;
+}
+
+/* 安全事件的保留期与清除操作 */
+.security-event-options {
+  margin-top: 18px;
+  align-items: end;
+}
+
+/* .field 是 flex 容器，撑不住按钮宽度要用 align-self（justify-self 在 flex 里无效） */
+.security-event-options .field button {
+  align-self: start;
+}
+
+/* 系统 hosts 开关跟在重写文本框下方 */
+.system-hosts-row {
+  margin-top: 14px;
+  margin-bottom: 0;
+}
+
+/* --------------------------------------------------------------------------
+   焦点可见性
+   button、单选框和开关各自已有焦点样式，这里补上原先没有覆盖的控件，
+   并统一成同一套「绿色描边 + 3px 柔光环」，避免同一屏里粗细两种焦点框混排。
+   全部用 :where() 保持零特异度，已有的专属规则依旧优先。
+   -------------------------------------------------------------------------- */
+:where(input, select, textarea):focus-visible {
+  border-color: var(--green);
+  outline: 0;
+  box-shadow: 0 0 0 3px rgb(var(--brand-rgb) / 0.16);
+}
+
+/* 链接、表格行这类没有边框的元素画不出光环，改用外描边 */
+:where(a, summary, [role="button"], [tabindex]):focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* 表格行、导航项这类大块元素用内描边，避免外描边被相邻元素裁掉 */
+.nav-item:focus-visible,
+.context-nav-inner button:focus-visible,
+.query-log-row:focus-visible {
+  outline-offset: -2px;
+}

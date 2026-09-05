@@ -436,6 +436,7 @@ impl AppState {
         &self,
         query_log_retention_hours: u32,
         statistics_retention_hours: u32,
+        security_event_retention_hours: u32,
         now: u64,
     ) -> Result<(), String> {
         let mut last_prune_at = self
@@ -446,8 +447,13 @@ impl AppState {
             return Ok(());
         }
 
-        self.database
-            .prune_expired(query_log_retention_hours, statistics_retention_hours)?;
+        self.database.prune_expired(
+            query_log_retention_hours,
+            statistics_retention_hours,
+            security_event_retention_hours,
+        )?;
+        let since = now.saturating_sub(u64::from(security_event_retention_hours) * 3600);
+        self.prune_security_events(since)?;
         *last_prune_at = now;
         drop(last_prune_at);
         // 维护线程中按需回收磁盘，不再让首页状态或日志分页承担整库 VACUUM。
@@ -463,15 +469,34 @@ impl AppState {
         &self,
         query_log_retention_hours: u32,
         statistics_retention_hours: u32,
+        security_event_retention_hours: u32,
         now: u64,
     ) -> Result<(), String> {
         let mut last_prune_at = self
             .last_prune_at
             .lock()
             .map_err(|_| "读取日志清理时间失败".to_string())?;
-        self.database
-            .prune_expired(query_log_retention_hours, statistics_retention_hours)?;
+        self.database.prune_expired(
+            query_log_retention_hours,
+            statistics_retention_hours,
+            security_event_retention_hours,
+        )?;
+        let since = now.saturating_sub(u64::from(security_event_retention_hours) * 3600);
+        self.prune_security_events(since)?;
         *last_prune_at = now;
+        Ok(())
+    }
+
+    fn prune_security_events(&self, since: u64) -> Result<(), String> {
+        let mut stats = self
+            .stats
+            .lock()
+            .map_err(|_| "读取安全事件失败".to_string())?;
+        dns::flush_security_events(&stats)?;
+        self.database.prune_security_events(since)?;
+        stats
+            .security_events
+            .retain(|event| event.last_seen_at >= since);
         Ok(())
     }
 
@@ -560,6 +585,7 @@ pub(crate) fn filter_runtime_changed(previous: &AppConfig, next: &AppConfig) -> 
         || previous.rebinding_allowed_domains != next.rebinding_allowed_domains
         || previous.cname_cloaking_enabled != next.cname_cloaking_enabled
         || previous.dns_rewrites != next.dns_rewrites
+        || previous.system_hosts_enabled != next.system_hosts_enabled
         || previous.client_filtering_rules != next.client_filtering_rules
         || previous.client_policy_groups != next.client_policy_groups
         || previous.family_safe_search != next.family_safe_search
@@ -658,7 +684,8 @@ pub(crate) fn save_config_blocking(
     }
 
     // 新窗口会立即用于所有查询；物理删除和 VACUUM 放到后台，避免保存配置卡住数秒。
-    if config.query_log_retention_hours < previous.query_log_retention_hours
+    if config.security_event_retention_hours < previous.security_event_retention_hours
+        || config.query_log_retention_hours < previous.query_log_retention_hours
         || statistics_retention_was_shortened(
             previous.statistics_retention_hours,
             config.statistics_retention_hours,
@@ -721,6 +748,22 @@ pub(crate) fn clear_query_logs_blocking(state: &AppState) -> Result<RuntimeStatu
 pub(crate) fn clear_statistics_blocking(state: &AppState) -> Result<RuntimeStatus, String> {
     state.database.clear_statistics()?;
     state.invalidate_log_stats_cache();
+    Ok(state.status_with_log_stats(true, true))
+}
+
+pub(crate) fn clear_security_events_blocking(state: &AppState) -> Result<RuntimeStatus, String> {
+    let _runtime_guard = state
+        .runtime_update_lock
+        .lock()
+        .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
+    let mut stats = state
+        .stats
+        .lock()
+        .map_err(|_| "读取安全事件失败".to_string())?;
+    dns::flush_security_events(&stats)?;
+    state.database.clear_security_events()?;
+    stats.security_events.clear();
+    drop(stats);
     Ok(state.status_with_log_stats(true, true))
 }
 
@@ -1117,6 +1160,7 @@ pub(crate) fn spawn_database_maintenance(state: Arc<AppState>) {
             if let Err(error) = state.maintain_persisted_data_if_due(
                 config.query_log_retention_hours,
                 config.statistics_retention_hours,
+                config.security_event_retention_hours,
                 unix_now(),
             ) {
                 eprintln!("数据库后台维护失败：{error}");
@@ -1137,6 +1181,7 @@ fn spawn_database_maintenance_now(state: Arc<AppState>) {
         if let Err(error) = state.prune_persisted_data_now(
             config.query_log_retention_hours,
             config.statistics_retention_hours,
+            config.security_event_retention_hours,
             unix_now(),
         ) {
             eprintln!("缩短保留期后的后台清理失败：{error}");
@@ -1213,6 +1258,88 @@ mod tests {
     }
 
     #[test]
+    fn toggling_system_hosts_only_hot_swaps_filter_runtime() {
+        let previous = AppConfig::default();
+        let next = AppConfig {
+            system_hosts_enabled: true,
+            ..previous.clone()
+        };
+        assert!(filter_runtime_changed(&previous, &next));
+        assert!(filter_runtime_changed(&next, &previous));
+        assert!(!needs_dns_restart(&previous, &next));
+    }
+
+    #[test]
+    fn clearing_security_events_orders_pending_writes_before_delete() {
+        let state = test_state();
+        let writer = crate::dns::security_events::SecurityEventWriter::start(
+            Arc::clone(&state.stats),
+            Arc::clone(&state.database),
+        );
+        for index in 0..300 {
+            crate::dns::stats::record_access_denied(
+                &state.stats,
+                "192.0.2.1".parse().unwrap(),
+                crate::dns::DnsTransport::Udp,
+                format!("old-{index}"),
+            );
+        }
+        clear_security_events_blocking(&state).unwrap();
+        crate::dns::stats::record_access_denied(
+            &state.stats,
+            "192.0.2.1".parse().unwrap(),
+            crate::dns::DnsTransport::Udp,
+            "new".into(),
+        );
+        writer.stop();
+        let events = state.database.recent_security_events(1000).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, "new");
+        assert_eq!(state.stats.lock().unwrap().security_events.len(), 1);
+    }
+
+    #[test]
+    fn pruning_security_events_removes_pending_and_in_memory_history() {
+        let state = test_state();
+        let writer = crate::dns::security_events::SecurityEventWriter::start(
+            Arc::clone(&state.stats),
+            Arc::clone(&state.database),
+        );
+        let old = crate::dns::SecurityEvent {
+            event_type: crate::dns::SecurityEventType::AccessDenied,
+            protocol: crate::dns::DnsTransport::Udp,
+            client_ip: "192.0.2.1".into(),
+            reason: "old".into(),
+            first_seen_at: 1,
+            last_seen_at: 2,
+            count: 1,
+        };
+        {
+            let mut stats = state.stats.lock().unwrap();
+            stats.security_events.push_back(old.clone());
+            stats
+                .security_event_sender
+                .as_ref()
+                .unwrap()
+                .send(crate::dns::security_events::SecurityEventMessage::Event(
+                    old,
+                ))
+                .unwrap();
+        }
+        let now = unix_now();
+        state.prune_persisted_data_now(24, 24, 24, now).unwrap();
+        assert!(state.stats.lock().unwrap().security_events.is_empty());
+        writer.stop();
+        assert!(
+            state
+                .database
+                .recent_security_events(1000)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn interactive_reads_do_not_run_database_maintenance() {
         let state = test_state();
 
@@ -1248,6 +1375,7 @@ mod tests {
             .maintain_persisted_data_if_due(
                 config.query_log_retention_hours,
                 config.statistics_retention_hours,
+                config.security_event_retention_hours,
                 now,
             )
             .expect("后台维护应成功");

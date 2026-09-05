@@ -1,3 +1,5 @@
+import { t } from "./i18n";
+
 export function renderAppTemplate(appIconUrl: string): string {
   return `
   <div class="app-shell">
@@ -12,38 +14,38 @@ export function renderAppTemplate(appIconUrl: string): string {
           <div class="header-runtime" id="header_runtime">
             <button class="runtime-status-trigger connecting" id="runtime_status_btn" type="button" aria-haspopup="menu" aria-expanded="false">
               <i aria-hidden="true"></i>
-              <span id="runtime_status_label">正在连接</span>
+              <span id="runtime_status_label">${t("正在连接")}</span>
               <b aria-hidden="true"></b>
             </button>
-            <div class="runtime-status-menu" id="runtime_status_menu" role="menu" aria-label="过滤保护控制">
-              <strong id="runtime_status_detail">正在读取 DNS 运行状态…</strong>
-              <button data-protection-action="pause" data-duration="300" type="button" role="menuitem">暂停 5 分钟</button>
-              <button data-protection-action="pause" data-duration="1800" type="button" role="menuitem">暂停 30 分钟</button>
-              <button data-protection-action="pause" data-duration="3600" type="button" role="menuitem">暂停 1 小时</button>
-              <button class="resume-action" data-protection-action="resume" type="button" role="menuitem">立即恢复过滤</button>
+            <div class="runtime-status-menu" id="runtime_status_menu" role="menu" aria-label="${t("过滤保护控制")}">
+              <strong id="runtime_status_detail">${t("正在读取 DNS 运行状态…")}</strong>
+              <button data-protection-action="pause" data-duration="300" type="button" role="menuitem">${t("暂停 5 分钟")}</button>
+              <button data-protection-action="pause" data-duration="1800" type="button" role="menuitem">${t("暂停 30 分钟")}</button>
+              <button data-protection-action="pause" data-duration="3600" type="button" role="menuitem">${t("暂停 1 小时")}</button>
+              <button class="resume-action" data-protection-action="resume" type="button" role="menuitem">${t("立即恢复过滤")}</button>
             </div>
           </div>
         </div>
 
-        <nav class="module-nav" aria-label="模块">
-          <button class="nav-item active" data-view="dashboard" type="button">仪表盘</button>
-          <button class="nav-item" data-view="settings" data-nav-group="settings" type="button">设置</button>
-          <button class="nav-item" data-view="filters" data-nav-group="filters" type="button">过滤器</button>
-          <button class="nav-item" data-view="logs" type="button">查询日志</button>
-          <button class="nav-item" data-view="about" type="button">关于</button>
+        <nav class="module-nav" aria-label="${t("模块")}">
+          <button class="nav-item active" data-view="dashboard" type="button">${t("仪表盘")}</button>
+          <button class="nav-item" data-view="settings" data-nav-group="settings" type="button">${t("设置")}</button>
+          <button class="nav-item" data-view="filters" data-nav-group="filters" type="button">${t("过滤器")}</button>
+          <button class="nav-item" data-view="logs" type="button">${t("查询日志")}</button>
+          <button class="nav-item" data-view="about" type="button">${t("关于")}</button>
         </nav>
       </div>
 
       <div class="context-nav" id="context_nav">
-        <nav class="context-nav-inner" data-context-group="settings" aria-label="设置分类">
-          <button data-view="settings" type="button">常规与运行</button>
-          <button data-view="dns" type="button">DNS 设置</button>
-          <button data-view="security" type="button">安全防护</button>
-          <button data-view="diagnostics" type="button">DNS 诊断</button>
+        <nav class="context-nav-inner" data-context-group="settings" aria-label="${t("设置分类")}">
+          <button data-view="settings" type="button">${t("常规与运行")}</button>
+          <button data-view="dns" type="button">${t("DNS 设置")}</button>
+          <button data-view="security" type="button">${t("安全防护")}</button>
+          <button data-view="diagnostics" type="button">${t("DNS 诊断")}</button>
         </nav>
-        <nav class="context-nav-inner" data-context-group="filters" aria-label="过滤器分类">
-          <button data-view="filters" type="button">DNS 黑名单</button>
-          <button data-view="custom" type="button">自定义规则与重写</button>
+        <nav class="context-nav-inner" data-context-group="filters" aria-label="${t("过滤器分类")}">
+          <button data-view="filters" type="button">${t("DNS 黑名单")}</button>
+          <button data-view="custom" type="button">${t("自定义规则与重写")}</button>
         </nav>
       </div>
     </header>
@@ -52,32 +54,32 @@ export function renderAppTemplate(appIconUrl: string): string {
       <section class="view active" data-view-panel="dashboard">
         <div class="dashboard-controls">
           <div>
-            <h2>DNS 使用概览</h2>
-            <span>点击客户端可直接查看该设备的查询日志。</span>
+            <h2>${t("DNS 使用概览")}</h2>
+            <span>${t("点击客户端可直接查看该设备的查询日志。")}</span>
           </div>
           <label class="dashboard-range-field">
-            <span>统计范围</span>
+            <span>${t("统计范围")}</span>
             <select id="dashboard_statistics_range">
-              <option value="configured">按保留设置</option>
-              <option value="24">最近 24 小时</option>
-              <option value="168">最近 7 天</option>
-              <option value="720">最近 30 天</option>
-              <option value="0">全部历史</option>
+              <option value="configured">${t("按保留设置")}</option>
+              <option value="24">${t("最近 24 小时")}</option>
+              <option value="168">${t("最近 7 天")}</option>
+              <option value="720">${t("最近 30 天")}</option>
+              <option value="0">${t("全部历史")}</option>
             </select>
           </label>
         </div>
-        <div class="dashboard-summary" aria-label="统计趋势">
+        <div class="dashboard-summary" aria-label="${t("统计趋势")}">
           <article class="spark-card">
             <div class="spark-box">
-              <span class="spark-caption">DNS 查询</span>
+              <span class="spark-caption">${t("DNS 查询")}</span>
               <strong id="queries">0</strong>
               <svg class="sparkline" data-tooltip="query_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
                 <defs>
                   <linearGradient id="query_spark_gradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stop-color="#7f7f7f" stop-opacity="0.82"></stop>
-                    <stop offset="64%" stop-color="#7f7f7f" stop-opacity="0.6"></stop>
-                    <stop offset="92%" stop-color="#7f7f7f" stop-opacity="0.16"></stop>
-                    <stop offset="100%" stop-color="#7f7f7f" stop-opacity="0"></stop>
+                    <stop offset="0%" stop-color="var(--neutral-10)" stop-opacity="0.82"></stop>
+                    <stop offset="64%" stop-color="var(--neutral-10)" stop-opacity="0.6"></stop>
+                    <stop offset="92%" stop-color="var(--neutral-10)" stop-opacity="0.16"></stop>
+                    <stop offset="100%" stop-color="var(--neutral-10)" stop-opacity="0"></stop>
                   </linearGradient>
                 </defs>
                 <line class="spark-baseline" x1="0" y1="72" x2="260" y2="72"></line>
@@ -92,16 +94,16 @@ export function renderAppTemplate(appIconUrl: string): string {
 
           <article class="spark-card blocked-spark">
             <div class="spark-box">
-              <span class="spark-caption">已拦截查询</span>
+              <span class="spark-caption">${t("已拦截查询")}</span>
               <strong id="blocked">0</strong>
               <small id="block_rate">0%</small>
               <svg class="sparkline" data-tooltip="blocked_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
                 <defs>
                   <linearGradient id="blocked_spark_gradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stop-color="#f67247" stop-opacity="0.82"></stop>
-                    <stop offset="64%" stop-color="#f67247" stop-opacity="0.6"></stop>
-                    <stop offset="92%" stop-color="#f67247" stop-opacity="0.16"></stop>
-                    <stop offset="100%" stop-color="#f67247" stop-opacity="0"></stop>
+                    <stop offset="0%" stop-color="var(--danger-7)" stop-opacity="0.82"></stop>
+                    <stop offset="64%" stop-color="var(--danger-7)" stop-opacity="0.6"></stop>
+                    <stop offset="92%" stop-color="var(--danger-7)" stop-opacity="0.16"></stop>
+                    <stop offset="100%" stop-color="var(--danger-7)" stop-opacity="0"></stop>
                   </linearGradient>
                 </defs>
                 <line class="spark-baseline" x1="0" y1="72" x2="260" y2="72"></line>
@@ -119,15 +121,15 @@ export function renderAppTemplate(appIconUrl: string): string {
           <section class="panel rank-panel">
             <div class="rank-title">
               <div>
-                <h2>请求域名排行</h2>
-                <span id="query_rank_window">暂无汇总数据</span>
+                <h2>${t("请求域名排行")}</h2>
+                <span id="query_rank_window">${t("暂无汇总数据")}</span>
               </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+              <button class="icon-button" data-refresh-dashboard type="button" title="${t("刷新")}">↻</button>
             </div>
             <div class="rank-table">
               <div class="rank-head">
-                <span>域名</span>
-                <span>请求数</span>
+                <span>${t("域名")}</span>
+                <span>${t("请求数")}</span>
               </div>
               <div class="rank-body" id="query_rank"></div>
             </div>
@@ -136,15 +138,15 @@ export function renderAppTemplate(appIconUrl: string): string {
           <section class="panel rank-panel blocked-rank">
             <div class="rank-title">
               <div>
-                <h2>被拦截域名排行</h2>
-                <span id="blocked_rank_window">暂无汇总数据</span>
+                <h2>${t("被拦截域名排行")}</h2>
+                <span id="blocked_rank_window">${t("暂无汇总数据")}</span>
               </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+              <button class="icon-button" data-refresh-dashboard type="button" title="${t("刷新")}">↻</button>
             </div>
             <div class="rank-table">
               <div class="rank-head">
-                <span>域名</span>
-                <span>请求数</span>
+                <span>${t("域名")}</span>
+                <span>${t("请求数")}</span>
               </div>
               <div class="rank-body" id="blocked_rank"></div>
             </div>
@@ -155,16 +157,16 @@ export function renderAppTemplate(appIconUrl: string): string {
           <section class="panel rank-panel">
             <div class="rank-title">
               <div>
-                <h2>客户端排行</h2>
-                <span id="client_rank_window">暂无汇总数据</span>
+                <h2>${t("客户端排行")}</h2>
+                <span id="client_rank_window">${t("暂无汇总数据")}</span>
               </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+              <button class="icon-button" data-refresh-dashboard type="button" title="${t("刷新")}">↻</button>
             </div>
             <div class="rank-table client-rank-table">
               <div class="rank-head client-rank-head">
-                <span>客户端</span>
-                <span>请求数</span>
-                <span>拦截率</span>
+                <span>${t("客户端")}</span>
+                <span>${t("请求数")}</span>
+                <span>${t("拦截率")}</span>
               </div>
               <div class="rank-body" id="client_rank"></div>
             </div>
@@ -173,15 +175,15 @@ export function renderAppTemplate(appIconUrl: string): string {
           <section class="panel rank-panel blocked-rank">
             <div class="rank-title">
               <div>
-                <h2>DNS 黑名单排行</h2>
-                <span id="blocklist_rank_window">暂无汇总数据</span>
+                <h2>${t("DNS 黑名单排行")}</h2>
+                <span id="blocklist_rank_window">${t("暂无汇总数据")}</span>
               </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+              <button class="icon-button" data-refresh-dashboard type="button" title="${t("刷新")}">↻</button>
             </div>
             <div class="rank-table">
               <div class="rank-head">
-                <span>黑名单</span>
-                <span>拦截数</span>
+                <span>${t("黑名单")}</span>
+                <span>${t("拦截数")}</span>
               </div>
               <div class="rank-body" id="blocklist_rank"></div>
             </div>
@@ -192,15 +194,15 @@ export function renderAppTemplate(appIconUrl: string): string {
           <section class="panel rank-panel">
             <div class="rank-title">
               <div>
-                <h2>经常请求的上游服务器</h2>
-                <span id="upstream_rank_window">暂无汇总数据</span>
+                <h2>${t("经常请求的上游服务器")}</h2>
+                <span id="upstream_rank_window">${t("暂无汇总数据")}</span>
               </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+              <button class="icon-button" data-refresh-dashboard type="button" title="${t("刷新")}">↻</button>
             </div>
             <div class="rank-table">
               <div class="rank-head">
-                <span>上游服务器</span>
-                <span>请求数</span>
+                <span>${t("上游服务器")}</span>
+                <span>${t("请求数")}</span>
               </div>
               <div class="rank-body" id="upstream_rank"></div>
             </div>
@@ -209,15 +211,15 @@ export function renderAppTemplate(appIconUrl: string): string {
           <section class="panel rank-panel">
             <div class="rank-title">
               <div>
-                <h2>上游服务器的平均响应时间</h2>
-                <span id="upstream_latency_window">暂无汇总数据</span>
+                <h2>${t("上游服务器的平均响应时间")}</h2>
+                <span id="upstream_latency_window">${t("暂无汇总数据")}</span>
               </div>
-              <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+              <button class="icon-button" data-refresh-dashboard type="button" title="${t("刷新")}">↻</button>
             </div>
             <div class="rank-table">
               <div class="rank-head">
-                <span>上游服务器</span>
-                <span>响应时间</span>
+                <span>${t("上游服务器")}</span>
+                <span>${t("响应时间")}</span>
               </div>
               <div class="rank-body" id="upstream_latency_rank"></div>
             </div>
@@ -229,113 +231,113 @@ export function renderAppTemplate(appIconUrl: string): string {
       <section class="view query-log-view" data-view-panel="logs">
         <div class="query-log-toolbar">
           <div class="query-log-title">
-            <h2>查询日志</h2>
-            <button class="ghost-icon-button" id="query_log_refresh_btn" type="button" aria-label="刷新查询日志" title="刷新查询日志">
+            <h2>${t("查询日志")}</h2>
+            <button class="ghost-icon-button" id="query_log_refresh_btn" type="button" aria-label="${t("刷新查询日志")}" title="${t("刷新查询日志")}">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"></path></svg>
             </button>
-            <button class="query-log-tool-button" id="query_log_pause_btn" type="button">暂停实时刷新</button>
-            <button class="query-log-tool-button" id="query_log_export_btn" type="button">导出当前筛选</button>
+            <button class="query-log-tool-button" id="query_log_pause_btn" type="button">${t("暂停实时刷新")}</button>
+            <button class="query-log-tool-button" id="query_log_export_btn" type="button">${t("导出当前筛选")}</button>
           </div>
           <div class="query-log-primary-filters">
             <label class="query-log-search">
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg>
-              <input id="query_log_search" aria-label="搜索域名或客户端" autocomplete="off" spellcheck="false" placeholder="搜索域名或客户端" />
+              <input id="query_log_search" aria-label="${t("搜索域名或客户端")}" autocomplete="off" spellcheck="false" placeholder="${t("搜索域名或客户端")}" />
             </label>
             <div class="query-log-filter" id="query_log_filter_menu">
               <button class="query-log-filter-trigger" id="query_log_filter_button" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="query_log_filter_options">
-                <span id="query_log_filter_label">所有查询记录</span>
+                <span id="query_log_filter_label">${t("所有查询记录")}</span>
                 <i aria-hidden="true"></i>
               </button>
-              <div class="query-log-filter-options" id="query_log_filter_options" role="listbox" aria-label="查询日志状态筛选">
-                <button class="active" data-filter="all" type="button" role="option" aria-selected="true">所有查询记录</button>
-                <button data-filter="processed" type="button" role="option" aria-selected="false">已处理</button>
-                <button data-filter="blocked" type="button" role="option" aria-selected="false">已过滤</button>
-                <button data-filter="failed" type="button" role="option" aria-selected="false">失败</button>
+              <div class="query-log-filter-options" id="query_log_filter_options" role="listbox" aria-label="${t("查询日志状态筛选")}">
+                <button class="active" data-filter="all" type="button" role="option" aria-selected="true">${t("所有查询记录")}</button>
+                <button data-filter="processed" type="button" role="option" aria-selected="false">${t("已处理")}</button>
+                <button data-filter="blocked" type="button" role="option" aria-selected="false">${t("已过滤")}</button>
+                <button data-filter="failed" type="button" role="option" aria-selected="false">${t("失败")}</button>
               </div>
               <select id="query_log_filter" aria-hidden="true" tabindex="-1">
-                <option value="all">所有查询记录</option>
-                <option value="processed">已处理</option>
-                <option value="blocked">已过滤</option>
-                <option value="failed">失败</option>
+                <option value="all">${t("所有查询记录")}</option>
+                <option value="processed">${t("已处理")}</option>
+                <option value="blocked">${t("已过滤")}</option>
+                <option value="failed">${t("失败")}</option>
               </select>
             </div>
             <button class="query-log-advanced-trigger" id="query_log_advanced_btn" type="button" aria-expanded="false" aria-controls="query_log_advanced_panel">
-              更多筛选<span id="query_log_advanced_count" hidden></span>
+              ${t("更多筛选")}<span id="query_log_advanced_count" hidden></span>
             </button>
           </div>
           <div class="query-log-advanced-panel" id="query_log_advanced_panel" hidden>
             <label>
-              <span>时间范围</span>
+              <span>${t("时间范围")}</span>
               <select id="query_log_time_range">
-                <option value="configured">按日志保留设置</option>
-                <option value="1">最近 1 小时</option>
-                <option value="24">最近 24 小时</option>
-                <option value="168">最近 7 天</option>
-                <option value="720">最近 30 天</option>
+                <option value="configured">${t("按日志保留设置")}</option>
+                <option value="1">${t("最近 1 小时")}</option>
+                <option value="24">${t("最近 24 小时")}</option>
+                <option value="168">${t("最近 7 天")}</option>
+                <option value="720">${t("最近 30 天")}</option>
               </select>
             </label>
             <label>
-              <span>响应来源</span>
+              <span>${t("响应来源")}</span>
               <select id="query_log_source">
-                <option value="all">全部来源</option>
-                <option value="upstream">上游服务器</option>
-                <option value="cache">DNS 缓存</option>
-                <option value="rewrite">DNS 重写</option>
-                <option value="blocked">过滤规则</option>
-                <option value="refused">拒绝响应</option>
+                <option value="all">${t("全部来源")}</option>
+                <option value="upstream">${t("上游服务器")}</option>
+                <option value="cache">${t("DNS 缓存")}</option>
+                <option value="rewrite">${t("DNS 重写")}</option>
+                <option value="blocked">${t("过滤规则")}</option>
+                <option value="refused">${t("拒绝响应")}</option>
               </select>
             </label>
             <label>
-              <span>查询类型</span>
+              <span>${t("查询类型")}</span>
               <select id="query_log_query_type">
-                <option value="all">全部类型</option>
-                <option value="a">A（IPv4）</option>
-                <option value="aaaa">AAAA（IPv6）</option>
+                <option value="all">${t("全部类型")}</option>
+                <option value="a">${t("A（IPv4）")}</option>
+                <option value="aaaa">${t("AAAA（IPv6）")}</option>
                 <option value="https">HTTPS</option>
-                <option value="other">其他类型</option>
+                <option value="other">${t("其他类型")}</option>
               </select>
             </label>
             <label>
-              <span>排序方式</span>
+              <span>${t("排序方式")}</span>
               <select id="query_log_sort">
-                <option value="newest">最新优先</option>
-                <option value="oldest">最早优先</option>
-                <option value="slowest">最慢优先</option>
+                <option value="newest">${t("最新优先")}</option>
+                <option value="oldest">${t("最早优先")}</option>
+                <option value="slowest">${t("最慢优先")}</option>
               </select>
             </label>
             <label class="query-log-saved-view-select">
-              <span>保存的视图</span>
+              <span>${t("保存的视图")}</span>
               <select id="query_log_saved_view">
-                <option value="">选择已保存视图</option>
+                <option value="">${t("选择已保存视图")}</option>
               </select>
             </label>
             <label class="query-log-view-name">
-              <span>视图名称</span>
-              <input id="query_log_view_name" type="text" maxlength="40" autocomplete="off" placeholder="例如 夜间失败查询" />
+              <span>${t("视图名称")}</span>
+              <input id="query_log_view_name" type="text" maxlength="40" autocomplete="off" placeholder="${t("例如 夜间失败查询")}" />
             </label>
             <div class="query-log-view-actions">
-              <button id="query_log_save_view_btn" type="button">保存当前</button>
-              <button id="query_log_delete_view_btn" type="button" disabled>删除</button>
+              <button id="query_log_save_view_btn" type="button">${t("保存当前")}</button>
+              <button id="query_log_delete_view_btn" type="button" disabled>${t("删除")}</button>
             </div>
-            <button class="query-log-reset-button" id="query_log_reset_btn" type="button">重置筛选</button>
+            <button class="query-log-reset-button" id="query_log_reset_btn" type="button">${t("重置筛选")}</button>
           </div>
         </div>
 
         <section class="query-log-panel">
-          <div class="query-log-table" role="table" aria-label="DNS 查询日志">
+          <div class="query-log-table" role="table" aria-label="${t("DNS 查询日志")}">
             <div class="query-log-head" role="row">
-              <span role="columnheader">时间</span>
-              <span role="columnheader">请求</span>
-              <span role="columnheader">响应</span>
-              <span role="columnheader">客户端</span>
+              <span role="columnheader">${t("时间")}</span>
+              <span role="columnheader">${t("请求")}</span>
+              <span role="columnheader">${t("响应")}</span>
+              <span role="columnheader">${t("客户端")}</span>
             </div>
             <div class="query-log-body" id="query_log_body" role="rowgroup"></div>
           </div>
           <div class="query-log-pagination">
-            <span id="query_log_page_info" aria-live="polite">0 条记录</span>
+            <span id="query_log_page_info" aria-live="polite">${t("0 条记录")}</span>
             <div class="button-group">
-              <button id="query_log_prev_btn" type="button">上一页</button>
-              <button id="query_log_next_btn" type="button">下一页</button>
+              <button id="query_log_prev_btn" type="button">${t("上一页")}</button>
+              <button id="query_log_next_btn" type="button">${t("下一页")}</button>
             </div>
           </div>
         </section>
@@ -344,22 +346,22 @@ export function renderAppTemplate(appIconUrl: string): string {
           <form class="update-dialog-panel" method="dialog" id="query_rule_form">
             <div class="update-dialog-header">
               <div>
-                <span class="update-dialog-kicker">查询日志快捷操作</span>
-                <h3 id="query_rule_dialog_title">添加 DNS 重写</h3>
+                <span class="update-dialog-kicker">${t("查询日志快捷操作")}</span>
+                <h3 id="query_rule_dialog_title">${t("添加 DNS 重写")}</h3>
               </div>
-              <button class="update-dialog-close" id="query_rule_dialog_close_btn" type="button" aria-label="关闭">×</button>
+              <button class="update-dialog-close" id="query_rule_dialog_close_btn" type="button" aria-label="${t("关闭")}">×</button>
             </div>
             <div class="update-dialog-body">
-              <p class="query-rule-domain">域名：<strong id="query_rule_domain">-</strong></p>
+              <p class="query-rule-domain">${t("域名：")}<strong id="query_rule_domain">-</strong></p>
               <label class="field">
-                <span>重写目标 IP</span>
-                <small>填写有效的 IPv4 或 IPv6 地址；保存后会立即热更新，无需重启 DNS。</small>
-                <input id="query_rule_target" autocomplete="off" spellcheck="false" placeholder="例如 192.168.1.10" />
+                <span>${t("重写目标 IP")}</span>
+                <small>${t("填写有效的 IPv4 或 IPv6 地址；保存后会立即热更新，无需重启 DNS。")}</small>
+                <input id="query_rule_target" autocomplete="off" spellcheck="false" placeholder="${t("例如 192.168.1.10")}" />
               </label>
             </div>
             <div class="update-dialog-footer">
-              <button id="query_rule_dialog_cancel_btn" type="button">取消</button>
-              <button class="primary" id="query_rule_dialog_confirm_btn" type="submit">保存重写</button>
+              <button id="query_rule_dialog_cancel_btn" type="button">${t("取消")}</button>
+              <button class="primary" id="query_rule_dialog_confirm_btn" type="submit">${t("保存重写")}</button>
             </div>
           </form>
         </dialog>
@@ -368,81 +370,81 @@ export function renderAppTemplate(appIconUrl: string): string {
       <section class="view" data-view-panel="dns">
         <section class="panel module-panel">
           <div class="panel-title with-actions">
-            <h2>DNS 设置</h2>
+            <h2>${t("DNS 设置")}</h2>
             <div class="button-group">
-              <span class="save-state-label" aria-live="polite">正在读取配置</span>
-              <button class="primary" id="save_btn" type="button">保存更改</button>
-              <button id="start_btn" type="button">启动</button>
-              <button id="stop_btn" type="button">停止</button>
+              <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
+              <button class="primary" id="save_btn" type="button">${t("保存更改")}</button>
+              <button id="start_btn" type="button">${t("启动")}</button>
+              <button id="stop_btn" type="button">${t("停止")}</button>
             </div>
           </div>
 
           <div class="settings-stack">
             <section class="settings-section">
-              <h3>上游 DNS</h3>
+              <h3>${t("上游 DNS")}</h3>
               <div class="dns-settings">
                 <label class="field upstream-field">
-                  <span>上游 DNS 服务器</span>
-                  <small>每行一个上游：普通 DNS、https://（DoH）、tls://（DoT）或 quic://（DoQ）。DoT / DoQ 必须填写证书对应的主机名。</small>
+                  <span>${t("上游 DNS 服务器")}</span>
+                  <small>${t("每行一个上游：普通 DNS、https://（DoH）、tls://（DoT）或 quic://（DoQ）。DoT / DoQ 必须填写证书对应的主机名。")}</small>
                   <textarea id="upstream_dns" autocomplete="off" spellcheck="false"></textarea>
                 </label>
                 <div class="listen-settings">
                   <label class="field">
-                    <span>IPv4 监听地址</span>
+                    <span>${t("IPv4 监听地址")}</span>
                     <input id="listen_host" autocomplete="off" spellcheck="false" placeholder="0.0.0.0" />
                   </label>
                   <label class="field compact-field">
-                    <span>端口</span>
+                    <span>${t("端口")}</span>
                     <input id="listen_port" type="number" min="1" max="65535" step="1" />
                   </label>
                   <label class="check-row ipv6-listen-row">
                     <input id="listen_ipv6" type="checkbox" />
                     <span>
-                      <strong>监听 IPv6</strong>
-                      <small>开启后额外绑定 [::]:同一端口，同时接受 IPv4 与 IPv6 DNS 请求。</small>
+                      <strong>${t("监听 IPv6")}</strong>
+                      <small>${t("开启后额外绑定 [::]:同一端口，同时接受 IPv4 与 IPv6 DNS 请求。")}</small>
                     </span>
                   </label>
                 </div>
               </div>
               <div class="upstream-extra-grid">
                 <label class="field upstream-extra-field">
-                  <span>Fallback DNS 服务器</span>
-                  <small>所有上游服务器都失败时重试的后备 DNS，语法与上游相同。留空则禁用。</small>
+                  <span>${t("Fallback DNS 服务器")}</span>
+                  <small>${t("所有上游服务器都失败时重试的后备 DNS，语法与上游相同。留空则禁用。")}</small>
                   <textarea id="fallback_dns" autocomplete="off" spellcheck="false" placeholder="114.114.114.114"></textarea>
                 </label>
                 <label class="field upstream-extra-field">
-                  <span>Bootstrap DNS 服务器</span>
-                  <small>用于解析 DoH 和域名形式上游自身的地址，并同时查询 IPv4/IPv6；只支持普通 IP 地址 DNS。</small>
+                  <span>${t("Bootstrap DNS 服务器")}</span>
+                  <small>${t("用于解析 DoH 和域名形式上游自身的地址，并同时查询 IPv4/IPv6；只支持普通 IP 地址 DNS。")}</small>
                   <textarea id="bootstrap_dns" autocomplete="off" spellcheck="false" placeholder="223.5.5.5"></textarea>
                 </label>
               </div>
               <label class="check-row dnssec-row">
                 <input id="dnssec_enabled" type="checkbox" />
                 <span>
-                  <strong>验证 DNSSEC</strong>
-                  <small>请求 DNSSEC 记录并要求上游执行验证；验证失败的 SERVFAIL 响应会被拒绝。建议搭配可信的 DoH、DoT 或 DoQ 上游。</small>
+                  <strong>${t("验证 DNSSEC")}</strong>
+                  <small>${t("请求 DNSSEC 记录并要求上游执行验证；验证失败的 SERVFAIL 响应会被拒绝。建议搭配可信的 DoH、DoT 或 DoQ 上游。")}</small>
                 </span>
               </label>
               <div class="radio-stack upstream-mode">
                 <label class="radio-row">
                   <input name="upstream_mode" type="radio" value="load_balance" />
                   <span>
-                    <strong>负载均衡</strong>
-                    <small>一次查询一台上游服务器，失败后尝试其它服务器。</small>
+                    <strong>${t("负载均衡")}</strong>
+                    <small>${t("一次查询一台上游服务器，失败后尝试其它服务器。")}</small>
                   </span>
                 </label>
                 <label class="radio-row">
                   <input name="upstream_mode" type="radio" value="parallel_requests" />
                   <span>
-                    <strong>并行请求</strong>
-                    <small>优先查询一个上游；25 毫秒内未成功时并发查询其余上游，并使用最先成功的响应。</small>
+                    <strong>${t("并行请求")}</strong>
+                    <small>${t("优先查询一个上游；25 毫秒内未成功时并发查询其余上游，并使用最先成功的响应。")}</small>
                   </span>
                 </label>
                 <label class="radio-row">
                   <input name="upstream_mode" type="radio" value="fastest_addr" />
                   <span>
-                    <strong>最快的 IP 地址</strong>
-                    <small>等待上游服务器响应，测速返回的 IP 地址，并优先采用最快的可用结果。</small>
+                    <strong>${t("最快的 IP 地址")}</strong>
+                    <small>${t("等待上游服务器响应，测速返回的 IP 地址，并优先采用最快的可用结果。")}</small>
                   </span>
                 </label>
               </div>
@@ -450,18 +452,18 @@ export function renderAppTemplate(appIconUrl: string): string {
 
             <section class="settings-section upstream-routing-section">
               <div class="section-heading">
-                <h3>DNS 分流与客户端上游策略</h3>
-                <span>匹配后只使用指定上游，不回退到全局服务器。客户端策略优先于域名分流；保存后会安全重启 DNS 运行时。</span>
+                <h3>${t("DNS 分流与客户端上游策略")}</h3>
+                <span>${t("匹配后只使用指定上游，不回退到全局服务器。客户端策略优先于域名分流；保存后会安全重启 DNS 运行时。")}</span>
               </div>
               <div class="upstream-routing-grid">
                 <label class="field">
-                  <span>域名分流</span>
-                  <small>每行“域名模式 => 上游”。使用 *.example.com 同时匹配主域和子域；多个上游用逗号分隔。</small>
+                  <span>${t("域名分流")}</span>
+                  <small>${t("每行“域名模式 =&gt; 上游”。使用 *.example.com 同时匹配主域和子域；多个上游用逗号分隔。")}</small>
                   <textarea id="domain_upstream_rules" autocomplete="off" spellcheck="false" placeholder="*.home.arpa => 192.168.1.1&#10;example.com => https://dns.example/dns-query, 1.1.1.1"></textarea>
                 </label>
                 <label class="field">
-                  <span>客户端上游策略</span>
-                  <small>每行“IP/CIDR => 上游”。更精确的网段优先，可让指定设备或网段使用独立 DNS。</small>
+                  <span>${t("客户端上游策略")}</span>
+                  <small>${t("每行“IP/CIDR =&gt; 上游”。更精确的网段优先，可让指定设备或网段使用独立 DNS。")}</small>
                   <textarea id="client_upstream_rules" autocomplete="off" spellcheck="false" placeholder="192.168.1.20 => 223.5.5.5&#10;192.168.2.0/24 => https://doh.pub/dns-query"></textarea>
                 </label>
               </div>
@@ -469,133 +471,133 @@ export function renderAppTemplate(appIconUrl: string): string {
 
             <section class="settings-section blocking-mode-section">
               <div class="section-heading">
-                <h3>拦截响应方式</h3>
-                <span>命中黑名单时返回给客户端的响应类型，保存后立即生效，无需重启服务。</span>
+                <h3>${t("拦截响应方式")}</h3>
+                <span>${t("命中黑名单时返回给客户端的响应类型，保存后立即生效，无需重启服务。")}</span>
               </div>
               <div class="radio-stack">
                 <label class="radio-row">
                   <input name="blocking_mode" type="radio" value="null_ip" />
                   <span>
-                    <strong>零地址（默认）</strong>
-                    <small>A 返回 0.0.0.0，AAAA 返回 ::，兼容性最好。</small>
+                    <strong>${t("零地址（默认）")}</strong>
+                    <small>${t("A 返回 0.0.0.0，AAAA 返回 ::，兼容性最好。")}</small>
                   </span>
                 </label>
                 <label class="radio-row">
                   <input name="blocking_mode" type="radio" value="nxdomain" />
                   <span>
                     <strong>NXDOMAIN</strong>
-                    <small>返回“域名不存在”，部分应用对此的处理更干脆。</small>
+                    <small>${t("返回“域名不存在”，部分应用对此的处理更干脆。")}</small>
                   </span>
                 </label>
                 <label class="radio-row">
                   <input name="blocking_mode" type="radio" value="refused" />
                   <span>
                     <strong>REFUSED</strong>
-                    <small>返回“拒绝服务”，客户端会更快放弃重试。</small>
+                    <small>${t("返回“拒绝服务”，客户端会更快放弃重试。")}</small>
                   </span>
                 </label>
                 <label class="radio-row">
                   <input name="blocking_mode" type="radio" value="custom_ip" />
                   <span>
-                    <strong>自定义 IP</strong>
-                    <small>返回指定 IP，可指向局域网内的提示页面服务器。</small>
+                    <strong>${t("自定义 IP")}</strong>
+                    <small>${t("返回指定 IP，可指向局域网内的提示页面服务器。")}</small>
                   </span>
                 </label>
               </div>
               <div class="dns-cache-grid">
                 <label class="field">
-                  <span>拦截响应 TTL</span>
-                  <small>客户端缓存零地址、自定义 IP 或 NXDOMAIN 拦截结果的秒数；0 表示不缓存。</small>
+                  <span>${t("拦截响应 TTL")}</span>
+                  <small>${t("客户端缓存零地址、自定义 IP 或 NXDOMAIN 拦截结果的秒数；0 表示不缓存。")}</small>
                   <input id="blocking_response_ttl" type="number" min="0" max="604800" step="1" />
                 </label>
               </div>
               <div class="blocking-custom-grid" id="blocking_custom_fields">
                 <label class="field">
-                  <span>自定义 IPv4</span>
-                  <input id="blocking_custom_ipv4" autocomplete="off" spellcheck="false" placeholder="例如 192.168.1.100" />
+                  <span>${t("自定义 IPv4")}</span>
+                  <input id="blocking_custom_ipv4" autocomplete="off" spellcheck="false" placeholder="${t("例如 192.168.1.100")}" />
                 </label>
                 <label class="field">
-                  <span>自定义 IPv6（可选）</span>
-                  <input id="blocking_custom_ipv6" autocomplete="off" spellcheck="false" placeholder="例如 fd00::1" />
+                  <span>${t("自定义 IPv6（可选）")}</span>
+                  <input id="blocking_custom_ipv6" autocomplete="off" spellcheck="false" placeholder="${t("例如 fd00::1")}" />
                 </label>
               </div>
             </section>
 
             <section class="settings-section dns-cache-section">
               <div class="section-heading">
-                <h3>DNS 缓存配置</h3>
-                <span>您可以在此处配置 DNS 缓存</span>
+                <h3>${t("DNS 缓存配置")}</h3>
+                <span>${t("您可以在此处配置 DNS 缓存")}</span>
               </div>
               <label class="check-row">
                 <input id="dns_cache_enabled" type="checkbox" />
                 <span>
-                  <strong>启用缓存</strong>
-                  <small>在本地存储 DNS 响应，减少重复查询的上游请求延迟。</small>
+                  <strong>${t("启用缓存")}</strong>
+                  <small>${t("在本地存储 DNS 响应，减少重复查询的上游请求延迟。")}</small>
                 </span>
               </label>
               <div class="dns-cache-grid">
                 <label class="field">
-                  <span>缓存大小</span>
-                  <small>DNS 缓存大小（单位：字节）</small>
+                  <span>${t("缓存大小")}</span>
+                  <small>${t("DNS 缓存大小（单位：字节）")}</small>
                   <input id="dns_cache_size" type="number" min="1024" max="536870912" step="1024" />
                 </label>
                 <label class="field">
-                  <span>覆盖最小 TTL 值</span>
-                  <small>缓存 DNS 响应时，延长从上游服务器接收到的 TTL 值（秒）。</small>
+                  <span>${t("覆盖最小 TTL 值")}</span>
+                  <small>${t("缓存 DNS 响应时，延长从上游服务器接收到的 TTL 值（秒）。")}</small>
                   <input id="dns_cache_min_ttl" type="number" min="0" max="604800" step="1" />
                 </label>
                 <label class="field">
-                  <span>覆盖最大 TTL 值</span>
-                  <small>设定 DNS 缓存条目的最大 TTL 值（秒）。</small>
+                  <span>${t("覆盖最大 TTL 值")}</span>
+                  <small>${t("设定 DNS 缓存条目的最大 TTL 值（秒）。")}</small>
                   <input id="dns_cache_max_ttl" type="number" min="0" max="604800" step="1" />
                 </label>
               </div>
               <label class="check-row">
                 <input id="dns_cache_optimistic" type="checkbox" />
                 <span>
-                  <strong>乐观缓存</strong>
-                  <small>条目过期后可在限定时间内先响应缓存，并在后台刷新。</small>
+                  <strong>${t("乐观缓存")}</strong>
+                  <small>${t("条目过期后可在限定时间内先响应缓存，并在后台刷新。")}</small>
                 </span>
               </label>
               <div class="dns-cache-grid">
                 <label class="field">
-                  <span>最大陈旧时间</span>
-                  <small>乐观缓存最多可继续使用过期响应的时间，范围 60–604800 秒。</small>
+                  <span>${t("最大陈旧时间")}</span>
+                  <small>${t("乐观缓存最多可继续使用过期响应的时间，范围 60–604800 秒。")}</small>
                   <input id="dns_cache_optimistic_max_stale_seconds" type="number" min="60" max="604800" step="60" />
                 </label>
               </div>
               <label class="check-row">
                 <input id="dns_cache_prefetch_enabled" type="checkbox" />
                 <span>
-                  <strong>热门域名预取</strong>
-                  <small>高频条目接近过期时在后台提前刷新，减少客户端遇到冷缓存的概率；同一条目只允许一个刷新任务。</small>
+                  <strong>${t("热门域名预取")}</strong>
+                  <small>${t("高频条目接近过期时在后台提前刷新，减少客户端遇到冷缓存的概率；同一条目只允许一个刷新任务。")}</small>
                 </span>
               </label>
               <div class="dns-cache-grid">
                 <label class="field">
-                  <span>预取命中阈值</span>
-                  <small>条目至少命中多少次后才允许预取，范围 2–10000。</small>
+                  <span>${t("预取命中阈值")}</span>
+                  <small>${t("条目至少命中多少次后才允许预取，范围 2–10000。")}</small>
                   <input id="dns_cache_prefetch_hit_threshold" type="number" min="2" max="10000" step="1" />
                 </label>
               </div>
-              <button id="clear_dns_cache_btn" type="button">清除缓存</button>
+              <button id="clear_dns_cache_btn" type="button">${t("清除缓存")}</button>
               <div class="cache-runtime-summary">
                 <div class="cache-runtime-heading">
                   <div>
-                    <h4>运行状态</h4>
-                    <span>本次 DNS 服务运行期间的内存缓存指标</span>
+                    <h4>${t("运行状态")}</h4>
+                    <span>${t("本次 DNS 服务运行期间的内存缓存指标")}</span>
                   </div>
-                  <button class="icon-button" data-refresh-dashboard type="button" title="刷新">↻</button>
+                  <button class="icon-button" data-refresh-dashboard type="button" title="${t("刷新")}">↻</button>
                 </div>
                 <div class="security-stat-grid cache-stat-grid">
-                  <div class="security-stat-card"><span>命中率</span><strong id="cache_hit_rate">0%</strong></div>
-                  <div class="security-stat-card"><span>命中 / 未命中</span><strong id="cache_hit_miss">0 / 0</strong></div>
-                  <div class="security-stat-card"><span>过期应答</span><strong id="cache_stale_hits">0</strong></div>
-                  <div class="security-stat-card"><span>后台刷新（成功 / 失败）</span><strong id="cache_refreshes">0 / 0</strong></div>
-                  <div class="security-stat-card"><span>热门预取（成功 / 失败）</span><strong id="cache_prefetches">0 / 0</strong></div>
-                  <div class="security-stat-card"><span>淘汰条目</span><strong id="cache_evictions">0</strong></div>
-                  <div class="security-stat-card"><span>当前条目</span><strong id="cache_entries">0</strong></div>
-                  <div class="security-stat-card"><span>当前占用</span><strong id="cache_bytes">0 B</strong></div>
+                  <div class="security-stat-card"><span>${t("命中率")}</span><strong id="cache_hit_rate">0%</strong></div>
+                  <div class="security-stat-card"><span>${t("命中 / 未命中")}</span><strong id="cache_hit_miss">0 / 0</strong></div>
+                  <div class="security-stat-card"><span>${t("过期应答")}</span><strong id="cache_stale_hits">0</strong></div>
+                  <div class="security-stat-card"><span>${t("后台刷新（成功 / 失败）")}</span><strong id="cache_refreshes">0 / 0</strong></div>
+                  <div class="security-stat-card"><span>${t("热门预取（成功 / 失败）")}</span><strong id="cache_prefetches">0 / 0</strong></div>
+                  <div class="security-stat-card"><span>${t("淘汰条目")}</span><strong id="cache_evictions">0</strong></div>
+                  <div class="security-stat-card"><span>${t("当前条目")}</span><strong id="cache_entries">0</strong></div>
+                  <div class="security-stat-card"><span>${t("当前占用")}</span><strong id="cache_bytes">0 B</strong></div>
                 </div>
               </div>
             </section>
@@ -607,35 +609,35 @@ export function renderAppTemplate(appIconUrl: string): string {
         <section class="panel module-panel diagnostic-panel">
           <div class="panel-title with-actions">
             <div>
-              <h2>DNS 诊断中心</h2>
-              <p>检查本地过滤判定，并并行测试每个已配置上游的响应、延迟与返回记录。</p>
+              <h2>${t("DNS 诊断中心")}</h2>
+              <p>${t("检查本地过滤判定，并并行测试每个已配置上游的响应、延迟与返回记录。")}</p>
             </div>
-            <button class="primary" id="run_diagnostic_btn" type="button">开始诊断</button>
+            <button class="primary" id="run_diagnostic_btn" type="button">${t("开始诊断")}</button>
           </div>
           <div class="diagnostic-form">
             <label class="field">
-              <span>测试域名</span>
+              <span>${t("测试域名")}</span>
               <input id="diagnostic_domain" autocomplete="off" spellcheck="false" value="example.com" placeholder="example.com" />
             </label>
             <label class="field compact-select">
-              <span>查询类型</span>
+              <span>${t("查询类型")}</span>
               <select id="diagnostic_query_type">
-                <option value="A">A（IPv4）</option>
-                <option value="AAAA">AAAA（IPv6）</option>
+                <option value="A">${t("A（IPv4）")}</option>
+                <option value="AAAA">${t("AAAA（IPv6）")}</option>
                 <option value="HTTPS">HTTPS</option>
                 <option value="TXT">TXT</option>
               </select>
             </label>
             <label class="field">
-              <span>模拟客户端（可选）</span>
+              <span>${t("模拟客户端（可选）")}</span>
               <input id="diagnostic_client_ip" autocomplete="off" spellcheck="false" placeholder="192.168.1.23" />
-              <small>填写 IPv4 或 IPv6，可验证该设备是否命中过滤绕过策略。</small>
+              <small>${t("填写 IPv4 或 IPv6，可验证该设备是否命中过滤绕过策略。")}</small>
             </label>
           </div>
               <div class="diagnostic-results" id="diagnostic_results" role="status" aria-live="polite" aria-atomic="true">
             <div class="diagnostic-empty">
-              <strong>尚未运行诊断</strong>
-              <span>输入域名后开始测试；不会修改配置，也不会写入查询日志。</span>
+              <strong>${t("尚未运行诊断")}</strong>
+              <span>${t("输入域名后开始测试；不会修改配置，也不会写入查询日志。")}</span>
             </div>
           </div>
         </section>
@@ -644,58 +646,58 @@ export function renderAppTemplate(appIconUrl: string): string {
       <section class="view" data-view-panel="security">
         <section class="panel module-panel">
           <div class="panel-title with-actions">
-            <h2>安全防护</h2>
+            <h2>${t("安全防护")}</h2>
             <div class="button-group">
-              <span class="save-state-label" aria-live="polite">正在读取配置</span>
-              <button class="primary" id="save_security_btn" type="button">保存更改</button>
+              <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
+              <button class="primary" id="save_security_btn" type="button">${t("保存更改")}</button>
             </div>
           </div>
 
           <div class="settings-stack">
             <section class="settings-section dns-security-section">
               <div class="section-heading">
-                <h3>客户端访问控制</h3>
-                <span>限制可使用此 DNS 服务的客户端，避免成为开放递归 DNS。</span>
+                <h3>${t("客户端访问控制")}</h3>
+                <span>${t("限制可使用此 DNS 服务的客户端，避免成为开放递归 DNS。")}</span>
               </div>
               <div class="dns-security-grid">
                 <label class="field access-list-field">
-                  <span>允许客户端</span>
-                  <small>每行一个 IP 或 CIDR。留空时允许所有未被拒绝的客户端。</small>
+                  <span>${t("允许客户端")}</span>
+                  <small>${t("每行一个 IP 或 CIDR。留空时允许所有未被拒绝的客户端。")}</small>
                   <textarea id="allowed_clients" autocomplete="off" spellcheck="false"></textarea>
                 </label>
                 <label class="field access-list-field">
-                  <span>拒绝客户端</span>
-                  <small>每行一个 IP 或 CIDR。拒绝列表优先于允许列表。</small>
+                  <span>${t("拒绝客户端")}</span>
+                  <small>${t("每行一个 IP 或 CIDR。拒绝列表优先于允许列表。")}</small>
                   <textarea id="blocked_clients" autocomplete="off" spellcheck="false"></textarea>
                 </label>
               </div>
               <label class="field access-list-field client-names-field">
-                <span>客户端名称</span>
-                <small>每行一条“IP 名称”，例如 192.168.1.23 客厅电视。查询日志会用名称代替 IP 展示。</small>
-                <textarea id="client_names" autocomplete="off" spellcheck="false" placeholder="192.168.1.23 客厅电视"></textarea>
+                <span>${t("客户端名称")}</span>
+                <small>${t("每行一条“IP 名称”，例如 192.168.1.23 客厅电视。查询日志会用名称代替 IP 展示。")}</small>
+                <textarea id="client_names" autocomplete="off" spellcheck="false" placeholder="${t("192.168.1.23 客厅电视")}"></textarea>
               </label>
               <label class="field access-list-field client-names-field">
-                <span>客户端过滤策略</span>
-                <small>每行一条“IP/CIDR =&gt; 策略组 [@ 周期 时间]”，最长 CIDR 优先。周期使用 mon-sun 或 daily，支持跨午夜时段。</small>
+                <span>${t("客户端过滤策略")}</span>
+                <small>${t("每行一条“IP/CIDR =&gt; 策略组 [@ 周期 时间]”，最长 CIDR 优先。周期使用 mon-sun 或 daily，支持跨午夜时段。")}</small>
                 <textarea id="client_filtering_rules" autocomplete="off" spellcheck="false" placeholder="192.168.1.50 =&gt; family @ mon-fri 20:00-07:00&#10;192.168.1.0/24 =&gt; filter"></textarea>
               </label>
               <div class="dns-security-grid client-policy-grid">
                 <label class="field access-list-field">
-                  <span>自定义策略组</span>
-                  <small>格式：名称 =&gt; filter|bypass, safe_search, block:服务|服务。可用服务见右侧说明。</small>
+                  <span>${t("自定义策略组")}</span>
+                  <small>${t("格式：名称 =&gt; filter|bypass, safe_search, block:服务|服务。可用服务见右侧说明。")}</small>
                   <textarea id="client_policy_groups" autocomplete="off" spellcheck="false" placeholder="study =&gt; filter, safe_search, block:youtube|tiktok"></textarea>
                 </label>
                 <div class="family-policy-fields">
                   <label class="check-row">
                     <input id="family_safe_search" type="checkbox" />
                     <span>
-                      <strong>家庭组启用安全搜索</strong>
-                      <small>为 Google、Bing、DuckDuckGo 和 YouTube 返回强制安全模式重定向。</small>
+                      <strong>${t("家庭组启用安全搜索")}</strong>
+                      <small>${t("为 Google、Bing、DuckDuckGo 和 YouTube 返回强制安全模式重定向。")}</small>
                     </span>
                   </label>
                   <label class="field access-list-field">
-                    <span>家庭组拦截服务</span>
-                    <small>逗号或换行分隔：youtube、tiktok、instagram、facebook、x、reddit、twitch、discord、steam、epic、roblox。</small>
+                    <span>${t("家庭组拦截服务")}</span>
+                    <small>${t("逗号或换行分隔：youtube、tiktok、instagram、facebook、x、reddit、twitch、discord、steam、epic、roblox。")}</small>
                     <textarea id="family_blocked_services" autocomplete="off" spellcheck="false"></textarea>
                   </label>
                 </div>
@@ -704,20 +706,20 @@ export function renderAppTemplate(appIconUrl: string): string {
 
             <section class="settings-section dns-security-section">
               <div class="section-heading">
-                <h3>查询防护</h3>
-                <span>降低异常流量和 DNS 放大攻击风险。</span>
+                <h3>${t("查询防护")}</h3>
+                <span>${t("降低异常流量和 DNS 放大攻击风险。")}</span>
               </div>
               <div class="dns-security-options">
                 <label class="field">
-                  <span>每客户端限速</span>
-                  <small>持续每秒允许的 DNS 查询数；默认 2000 并可容纳约 10 秒短时突发，适合路由器汇聚多台设备，0 表示关闭限速。</small>
+                  <span>${t("每客户端限速")}</span>
+                  <small>${t("持续每秒允许的 DNS 查询数；默认 2000 并可容纳约 10 秒短时突发，适合路由器汇聚多台设备，0 表示关闭限速。")}</small>
                   <input id="rate_limit_per_second" type="number" min="0" max="100000" step="1" />
                 </label>
                 <label class="check-row">
                   <input id="refuse_any" type="checkbox" />
                   <span>
-                    <strong>拒绝 ANY 查询</strong>
-                    <small>减少 DNS 放大攻击面，家庭网关场景通常应开启。</small>
+                    <strong>${t("拒绝 ANY 查询")}</strong>
+                    <small>${t("减少 DNS 放大攻击面，家庭网关场景通常应开启。")}</small>
                   </span>
                 </label>
               </div>
@@ -725,96 +727,114 @@ export function renderAppTemplate(appIconUrl: string): string {
 
             <section class="settings-section dns-security-section">
               <div class="section-heading">
-                <h3>响应安全防护</h3>
-                <span>检查上游返回的地址和 CNAME 链，阻止恶意域名绕过过滤器或访问局域网资源。</span>
+                <h3>${t("响应安全防护")}</h3>
+                <span>${t("检查上游返回的地址和 CNAME 链，阻止恶意域名绕过过滤器或访问局域网资源。")}</span>
               </div>
               <div class="dns-security-options">
                 <label class="check-row">
                   <input id="rebinding_protection_enabled" type="checkbox" />
                   <span>
                     <strong>DNS Rebinding Protection</strong>
-                    <small>公共域名返回私有、回环、链路本地或组播地址时改为拦截响应；域名分流上游自动视为可信。</small>
+                    <small>${t("公共域名返回私有、回环、链路本地或组播地址时改为拦截响应；域名分流上游自动视为可信。")}</small>
                   </span>
                 </label>
                 <label class="check-row">
                   <input id="cname_cloaking_enabled" type="checkbox" />
                   <span>
-                    <strong>CNAME cloaking 检测</strong>
-                    <small>解析响应中的 CNAME 目标，并用当前黑白名单再次判定，阻止首方别名隐藏被拦截域名。</small>
+                    <strong>${t("CNAME cloaking 检测")}</strong>
+                    <small>${t("解析响应中的 CNAME 目标，并用当前黑白名单再次判定，阻止首方别名隐藏被拦截域名。")}</small>
                   </span>
                 </label>
               </div>
               <label class="field access-list-field">
-                <span>Rebinding 可信域名</span>
-                <small>每行一个域名；同时信任它的子域名。用于确实需要返回局域网地址的内部服务。</small>
+                <span>${t("Rebinding 可信域名")}</span>
+                <small>${t("每行一个域名；同时信任它的子域名。用于确实需要返回局域网地址的内部服务。")}</small>
                 <textarea id="rebinding_allowed_domains" autocomplete="off" spellcheck="false" placeholder="home.arpa&#10;router.example.com"></textarea>
               </label>
             </section>
 
             <section class="settings-section dns-security-section">
               <div class="section-heading">
-                <h3>安全事件</h3>
-                <span>UDP 拒绝仍保持静默丢弃；这里展示本次运行期间的拒绝与限速情况，最多保留最近 200 条聚合事件。</span>
+                <h3>${t("安全事件")}</h3>
+                <span>${t("UDP 拒绝仍保持静默丢弃；这里展示拒绝与限速情况，最多保留最近 200 条聚合事件。事件会落盘保存，重启后仍可查看。")}</span>
               </div>
               <div class="security-stat-grid">
                 <div class="security-stat-card">
-                  <span>访问拒绝</span>
+                  <span>${t("访问拒绝")}</span>
                   <strong id="security_access_denied">0</strong>
                 </div>
                 <div class="security-stat-card">
-                  <span>限速触发</span>
+                  <span>${t("限速触发")}</span>
                   <strong id="security_rate_limited">0</strong>
                 </div>
                 <div class="security-stat-card">
-                  <span>UDP 静默丢弃</span>
+                  <span>${t("UDP 静默丢弃")}</span>
                   <strong id="security_dropped_udp">0</strong>
                 </div>
                 <div class="security-stat-card">
-                  <span>ANY 拒绝</span>
+                  <span>${t("ANY 拒绝")}</span>
                   <strong id="security_refused_any">0</strong>
                 </div>
                 <div class="security-stat-card">
-                  <span>Rebinding 拦截</span>
+                  <span>${t("Rebinding 拦截")}</span>
                   <strong id="security_rebinding_blocked">0</strong>
                 </div>
                 <div class="security-stat-card">
-                  <span>CNAME cloaking 拦截</span>
+                  <span>${t("CNAME cloaking 拦截")}</span>
                   <strong id="security_cname_blocked">0</strong>
                 </div>
               </div>
-              <div class="security-event-table" role="table" aria-label="最近安全事件">
+              <div class="security-event-table" role="table" aria-label="${t("最近安全事件")}">
                 <div class="security-event-head" role="row">
-                  <span role="columnheader">最近发生</span>
-                  <span role="columnheader">来源客户端</span>
-                  <span role="columnheader">事件</span>
-                  <span role="columnheader">次数</span>
+                  <span role="columnheader">${t("最近发生")}</span>
+                  <span role="columnheader">${t("来源客户端")}</span>
+                  <span role="columnheader">${t("事件")}</span>
+                  <span role="columnheader">${t("次数")}</span>
                 </div>
                 <div class="security-event-body" id="security_event_body" role="rowgroup">
-                  <div class="security-event-empty" role="row"><span role="cell">暂无安全事件</span></div>
+                  <div class="security-event-empty" role="row"><span role="cell">${t("暂无安全事件")}</span></div>
+                </div>
+              </div>
+              <div class="dns-security-options security-event-options">
+                <label class="field">
+                  <span>${t("安全事件保留时间")}</span>
+                  <small>${t("超过保留期的历史事件会在后台维护时清理。")}</small>
+                  <select id="security_event_retention_hours">
+                    <option value="24">${t("最近 24 小时")}</option>
+                    <option value="168">${t("最近 7 天")}</option>
+                    <option value="720">${t("最近 30 天")}</option>
+                    <option value="2160">${t("最近 90 天")}</option>
+                    <option value="8760">${t("最近 365 天")}</option>
+                  </select>
+                </label>
+                <div class="field">
+                  <span>${t("清除历史事件")}</span>
+                  <small>${t("立即删除已落盘的全部安全事件，不影响统计和查询日志。")}</small>
+                  <button class="ghost-button" id="clear_security_events_btn" type="button">${t("清除安全事件")}</button>
                 </div>
               </div>
             </section>
 
             <section class="settings-section dns-security-section">
               <div class="section-heading">
-                <h3>容量保护</h3>
-                <span>展示本次服务运行期间因内部队列或连接上限触发的降级；正常情况下都应为 0。</span>
+                <h3>${t("容量保护")}</h3>
+                <span>${t("展示本次服务运行期间因内部队列或连接上限触发的降级；正常情况下都应为 0。")}</span>
               </div>
               <div class="security-stat-grid">
                 <div class="security-stat-card">
-                  <span>DNS 工作队列丢弃</span>
+                  <span>${t("DNS 工作队列丢弃")}</span>
                   <strong id="worker_queue_dropped">0</strong>
                 </div>
                 <div class="security-stat-card">
-                  <span>日志持久化丢弃</span>
+                  <span>${t("日志持久化丢弃")}</span>
                   <strong id="persistence_queue_dropped">0</strong>
                 </div>
                 <div class="security-stat-card">
-                  <span>上游任务池降级</span>
+                  <span>${t("上游任务池降级")}</span>
                   <strong id="upstream_task_queue_rejected">0</strong>
                 </div>
                 <div class="security-stat-card">
-                  <span>TCP 连接拒绝</span>
+                  <span>${t("TCP 连接拒绝")}</span>
                   <strong id="tcp_connection_rejected">0</strong>
                 </div>
               </div>
@@ -822,34 +842,34 @@ export function renderAppTemplate(appIconUrl: string): string {
 
             <section class="settings-section dns-security-section">
               <div class="section-heading">
-                <h3>过滤器下载安全</h3>
-                <span>限制远程黑名单下载行为，降低异常响应和中间人篡改风险。</span>
+                <h3>${t("过滤器下载安全")}</h3>
+                <span>${t("限制远程黑名单下载行为，降低异常响应和中间人篡改风险。")}</span>
               </div>
               <div class="dns-security-options">
                 <label class="field">
-                  <span>单个过滤器最大大小（MB）</span>
-                  <small>按解压后的实际读取大小限制，超过后立即中断下载。</small>
+                  <span>${t("单个过滤器最大大小（MB）")}</span>
+                  <small>${t("按解压后的实际读取大小限制，超过后立即中断下载。")}</small>
                   <input id="filter_max_size_mb" type="number" min="1" max="256" step="1" />
                 </label>
                 <div class="field">
-                  <span>下载代理</span>
-                  <small id="filter_proxy_status">自动读取当前用户的系统代理，并交给后台服务使用。</small>
+                  <span>${t("下载代理")}</span>
+                  <small id="filter_proxy_status">${t("自动读取当前用户的系统代理，并交给后台服务使用。")}</small>
                   <select id="filter_proxy_mode">
-                    <option value="system">跟随系统代理</option>
-                    <option value="direct">直接连接</option>
-                    <option value="custom">自定义代理</option>
+                    <option value="system">${t("跟随系统代理")}</option>
+                    <option value="direct">${t("直接连接")}</option>
+                    <option value="custom">${t("自定义代理")}</option>
                   </select>
                 </div>
                 <label class="field filter-proxy-url-field" id="filter_proxy_url_field">
-                  <span>自定义代理地址</span>
-                  <small>支持 HTTP/HTTPS 代理，例如 http://127.0.0.1:7897。</small>
+                  <span>${t("自定义代理地址")}</span>
+                  <small>${t("支持 HTTP/HTTPS 代理，例如 http://127.0.0.1:7897。")}</small>
                   <input id="filter_proxy_url" type="url" placeholder="http://127.0.0.1:7897" spellcheck="false" />
                 </label>
                 <label class="check-row warning-check-row">
                   <input id="allow_insecure_http" type="checkbox" />
                   <span>
-                    <strong>允许不安全 HTTP</strong>
-                    <small>允许 HTTP 黑名单订阅和 HTTP DoH。仅在可信内网或临时迁移时使用。</small>
+                    <strong>${t("允许不安全 HTTP")}</strong>
+                    <small>${t("允许 HTTP 黑名单订阅和 HTTP DoH。仅在可信内网或临时迁移时使用。")}</small>
                   </span>
                 </label>
               </div>
@@ -862,59 +882,90 @@ export function renderAppTemplate(appIconUrl: string): string {
         <section class="panel module-panel settings-overview-panel">
           <div class="panel-title with-actions">
             <div>
-              <h2>常规与运行</h2>
-              <p class="panel-subtitle">管理启动行为、后台服务、数据与隐私。</p>
+              <h2>${t("常规与运行")}</h2>
+              <p class="panel-subtitle">${t("管理启动行为、后台服务、数据与隐私。")}</p>
             </div>
             <div class="button-group">
-              <span class="save-state-label" aria-live="polite">正在读取配置</span>
-              <button class="primary" id="save_settings_btn" type="button">保存更改</button>
+              <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
+              <button class="primary" id="save_settings_btn" type="button">${t("保存更改")}</button>
             </div>
           </div>
 
           <div class="settings-stack settings-overview-grid">
             <section class="settings-section settings-section-first-row">
-              <h3>常规设置</h3>
+              <div class="section-heading">
+                <h3>${t("常规设置")}</h3>
+                <span>${t("拦截总开关、过滤器更新频率与启动方式。")}</span>
+              </div>
               <label class="check-row">
                 <input id="use_filters" type="checkbox" />
                 <span>
-                  <strong>使用过滤器和 Hosts 文件以拦截指定域名</strong>
-                  <small>你可以在 DNS 黑名单和自定义过滤规则中添加过滤规则。</small>
+                  <strong>${t("使用过滤器和 Hosts 文件以拦截指定域名")}</strong>
+                  <small>${t("你可以在 DNS 黑名单和自定义过滤规则中添加过滤规则。")}</small>
                 </span>
               </label>
               <div class="field compact-select">
-                <span>过滤器更新间隔</span>
+                <span>${t("过滤器更新间隔")}</span>
                 <select id="filter_update_interval">
-                  <option value="6">6 小时</option>
-                  <option value="12">12 小时</option>
-                  <option value="24">24 小时</option>
-                  <option value="72">3 天</option>
-                  <option value="168">7 天</option>
+                  <option value="6">${t("6 小时")}</option>
+                  <option value="12">${t("12 小时")}</option>
+                  <option value="24">${t("24 小时")}</option>
+                  <option value="72">${t("3 天")}</option>
+                  <option value="168">${t("7 天")}</option>
                 </select>
               </div>
               <label class="toggle-row">
                 <input id="enabled" type="checkbox" />
-                <span>启动时自动运行 DNS 服务</span>
+                <span>${t("启动时自动运行 DNS 服务")}</span>
               </label>
               <label class="toggle-row">
                 <input id="launch_at_startup" type="checkbox" />
-                <span>开机时启动应用</span>
+                <span>${t("开机时启动应用")}</span>
               </label>
             </section>
 
-            <section class="settings-section settings-section-first-row settings-section-right runtime-watchdog-section">
+            <section class="settings-section settings-section-first-row appearance-section" data-ui-preference>
               <div class="section-heading">
-                <h3>运行监控</h3>
+                <h3>${t("界面")}</h3>
+                <span>${t("界面偏好立即生效，保存在本机，不属于需要保存的 DNS 配置。")}</span>
+              </div>
+              <div class="appearance-grid">
+                <div class="field">
+                  <span>${t("主题")}</span>
+                  <small>${t("跟随系统会随 Windows 的浅色/深色设置自动切换。")}</small>
+                  <select id="theme_preference">
+                    <option value="system">${t("跟随系统")}</option>
+                    <option value="light">${t("浅色")}</option>
+                    <option value="dark">${t("深色")}</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <span>${t("界面语言")}</span>
+                  <small id="language_hint">${t("切换语言会重新载入界面。")}</small>
+                  <select id="language_preference">
+                    <option value="system">${t("跟随系统")}</option>
+                    <option value="zh-CN">${t("简体中文")}</option>
+                    <option value="en-US">English</option>
+                  </select>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-section runtime-watchdog-section">
+              <div class="section-heading">
+                <h3>${t("运行监控")}</h3>
+                <span>${t("DNS 服务意外停止时自动拉起，避免本机解析中断。")}</span>
               </div>
               <div class="runtime-watchdog-grid">
                 <label class="check-row">
                   <input id="runtime_watchdog_enabled" type="checkbox" />
                   <span>
-                    <strong>自动恢复 DNS 服务</strong>
-                    <small>检测到服务未运行或内部线程异常时自动重启 DNS 服务。</small>
+                    <strong>${t("自动恢复 DNS 服务")}</strong>
+                    <small>${t("检测到服务未运行或内部线程异常时自动重启 DNS 服务。")}</small>
                   </span>
                 </label>
                 <label class="field">
-                  <span>检查间隔（秒）</span>
+                  <span>${t("检查间隔（秒）")}</span>
                   <input id="runtime_watchdog_interval_seconds" type="number" min="10" max="3600" step="1" />
                 </label>
               </div>
@@ -922,25 +973,25 @@ export function renderAppTemplate(appIconUrl: string): string {
 
             <section class="settings-section background-service-section hidden" id="windows_service_section">
               <div>
-                <h3>Windows DNS 系统服务</h3>
-                <p id="windows_service_status">正在读取系统服务状态…</p>
-                <small>DNS 核心由 Windows 服务控制管理器在开机阶段自动启动；关闭 GUI、尚未登录或 Clash 稍后启动都不会中断本机 DNS。</small>
+                <h3>${t("Windows DNS 系统服务")}</h3>
+                <p id="windows_service_status">${t("正在读取系统服务状态…")}</p>
+                <small>${t("DNS 核心由 Windows 服务控制管理器在开机阶段自动启动；关闭 GUI、尚未登录或 Clash 稍后启动都不会中断本机 DNS。")}</small>
               </div>
               <div class="button-group background-service-actions">
-                <button class="primary" id="install_windows_service_btn" type="button">安装或修复</button>
-                <button id="uninstall_windows_service_btn" type="button">卸载服务</button>
+                <button class="primary" id="install_windows_service_btn" type="button">${t("安装或修复")}</button>
+                <button id="uninstall_windows_service_btn" type="button">${t("卸载服务")}</button>
               </div>
             </section>
 
-            <section class="settings-section settings-section-right background-service-section hidden" id="windows_system_dns_section">
+            <section class="settings-section settings-section-wide background-service-section hidden" id="windows_system_dns_section">
               <div>
-                <h3>系统 DNS</h3>
-                <p id="windows_system_dns_status">正在读取系统 DNS 状态…</p>
-                <small id="windows_system_dns_detail">会按有线、无线网卡分别保存原始 DNS；切换网络后可将当前活动网卡同步纳入接管。</small>
+                <h3>${t("系统 DNS")}</h3>
+                <p id="windows_system_dns_status">${t("正在读取系统 DNS 状态…")}</p>
+                <small id="windows_system_dns_detail">${t("会按有线、无线网卡分别保存原始 DNS；切换网络后可将当前活动网卡同步纳入接管。")}</small>
               </div>
               <div class="button-group background-service-actions">
-                <button class="primary" id="take_over_windows_system_dns_btn" type="button">接管 DNS</button>
-                <button id="restore_windows_system_dns_btn" type="button">恢复 DNS</button>
+                <button class="primary" id="take_over_windows_system_dns_btn" type="button">${t("接管 DNS")}</button>
+                <button id="restore_windows_system_dns_btn" type="button">${t("恢复 DNS")}</button>
               </div>
             </section>
 
@@ -948,21 +999,21 @@ export function renderAppTemplate(appIconUrl: string): string {
               <div class="update-dialog-panel">
                 <div class="update-dialog-header">
                   <div>
-                    <span class="update-dialog-kicker">系统 DNS</span>
-                    <h3 id="dns_fallback_dialog_title">解除本机 DNS</h3>
+                    <span class="update-dialog-kicker">${t("系统 DNS")}</span>
+                    <h3 id="dns_fallback_dialog_title">${t("解除本机 DNS")}</h3>
                   </div>
-                  <button class="update-dialog-close" id="dns_fallback_dialog_close_btn" type="button" aria-label="关闭">×</button>
+                  <button class="update-dialog-close" id="dns_fallback_dialog_close_btn" type="button" aria-label="${t("关闭")}">×</button>
                 </div>
                 <div class="update-dialog-body">
-                  <p class="dns-fallback-intro" id="dns_fallback_dialog_intro">当前没有原 DNS 备份，请选择解除后使用的 DNS。只会修改仍指向 127.0.0.1 或 ::1 的设置。</p>
+                  <p class="dns-fallback-intro" id="dns_fallback_dialog_intro">${t("当前没有原 DNS 备份，请选择解除后使用的 DNS。只会修改仍指向 127.0.0.1 或 ::1 的设置。")}</p>
                   <div class="dns-fallback-options">
                     <label class="dns-fallback-option hidden" id="dns_restore_original_option">
                       <input type="radio" name="dns_fallback" value="original" />
-                      <span><strong>按接管前配置恢复（推荐）</strong><small id="dns_restore_original_detail">保留接管前的自动获取或手动 DNS 设置</small></span>
+                      <span><strong>${t("按接管前配置恢复（推荐）")}</strong><small id="dns_restore_original_detail">${t("保留接管前的自动获取或手动 DNS 设置")}</small></span>
                     </label>
                     <label class="dns-fallback-option">
                       <input type="radio" name="dns_fallback" value="automatic" />
-                      <span><strong>自动获取（DHCP）</strong><small>适合 IP 也由 DHCP 分配的网络；静态 IP 建议使用自定义 DNS</small></span>
+                      <span><strong>${t("自动获取（DHCP）")}</strong><small>${t("适合 IP 也由 DHCP 分配的网络；静态 IP 建议使用自定义 DNS")}</small></span>
                     </label>
                     <label class="dns-fallback-option">
                       <input type="radio" name="dns_fallback" value="dns114" />
@@ -970,191 +1021,191 @@ export function renderAppTemplate(appIconUrl: string): string {
                     </label>
                     <label class="dns-fallback-option">
                       <input type="radio" name="dns_fallback" value="google" />
-                      <span><strong>Google DNS</strong><small>8.8.8.8 / 8.8.4.4，并配置 IPv6</small></span>
+                      <span><strong>Google DNS</strong><small>${t("8.8.8.8 / 8.8.4.4，并配置 IPv6")}</small></span>
                     </label>
                     <div class="dns-fallback-option dns-fallback-custom-option" id="dns_fallback_custom_option">
                       <label>
                         <input type="radio" name="dns_fallback" value="custom" />
-                        <span><strong>自定义 DNS</strong><small>填写希望在解除接管后使用的 DNS 服务器地址</small></span>
+                        <span><strong>${t("自定义 DNS")}</strong><small>${t("填写希望在解除接管后使用的 DNS 服务器地址")}</small></span>
                       </label>
                       <div class="dns-custom-fields">
                         <label class="field">
                           <span>IPv4 DNS</span>
-                          <input id="dns_custom_ipv4" type="text" inputmode="decimal" placeholder="例如 1.1.1.1, 1.0.0.1" />
+                          <input id="dns_custom_ipv4" type="text" inputmode="decimal" placeholder="${t("例如 1.1.1.1, 1.0.0.1")}" />
                         </label>
                         <label class="field">
-                          <span>IPv6 DNS（可选）</span>
-                          <input id="dns_custom_ipv6" type="text" placeholder="例如 2606:4700:4700::1111" />
+                          <span>${t("IPv6 DNS（可选）")}</span>
+                          <input id="dns_custom_ipv6" type="text" placeholder="${t("例如 2606:4700:4700::1111")}" />
                         </label>
                       </div>
                     </div>
                   </div>
                 </div>
                 <div class="update-dialog-footer">
-                  <button id="dns_fallback_dialog_cancel_btn" type="button">取消</button>
-                  <button class="primary" id="dns_fallback_dialog_confirm_btn" type="button">确认解除</button>
+                  <button id="dns_fallback_dialog_cancel_btn" type="button">${t("取消")}</button>
+                  <button class="primary" id="dns_fallback_dialog_confirm_btn" type="button">${t("确认解除")}</button>
                 </div>
               </div>
             </dialog>
 
             <section class="settings-section settings-section-wide background-service-section hidden" id="macos_service_section">
               <div>
-                <h3>macOS DNS 后台服务</h3>
-                <p id="macos_service_status">正在读取后台服务状态…</p>
-                <small>正式版通过系统后台服务监听 UDP/TCP 53。首次安装需要管理员在“系统设置 → 通用 → 登录项与扩展”中批准。</small>
+                <h3>${t("macOS DNS 后台服务")}</h3>
+                <p id="macos_service_status">${t("正在读取后台服务状态…")}</p>
+                <small>${t("正式版通过系统后台服务监听 UDP/TCP 53。首次安装需要管理员在“系统设置 → 通用 → 登录项与扩展”中批准。")}</small>
               </div>
               <div class="button-group background-service-actions">
-                <button class="primary" id="install_macos_service_btn" type="button">安装或修复</button>
-                <button class="hidden" id="open_macos_service_settings_btn" type="button">打开系统设置</button>
-                <button id="uninstall_macos_service_btn" type="button">卸载服务</button>
+                <button class="primary" id="install_macos_service_btn" type="button">${t("安装或修复")}</button>
+                <button class="hidden" id="open_macos_service_settings_btn" type="button">${t("打开系统设置")}</button>
+                <button id="uninstall_macos_service_btn" type="button">${t("卸载服务")}</button>
               </div>
             </section>
 
             <section class="settings-section settings-section-wide monitoring-api-section">
               <div class="section-heading">
-                <h3>只读监控接口</h3>
-                <span>向本机监控工具提供 <code>/health</code>、<code>/api/v1/status</code> 和 Prometheus <code>/metrics</code>；不会暴露域名或客户端明细。</span>
+                <h3>${t("只读监控接口")}</h3>
+                <span>${t("向本机监控工具提供")} <code>/health</code>、<code>/api/v1/status</code> ${t("和 Prometheus")} <code>/metrics</code>${t("；不会暴露域名或客户端明细。")}</span>
               </div>
               <label class="check-row">
                 <input id="monitoring_api_enabled" type="checkbox" />
                 <span>
-                  <strong>启用 REST 与 Prometheus</strong>
-                  <small>默认仅监听 127.0.0.1；监听局域网地址时必须设置至少 16 个字符的令牌。</small>
+                  <strong>${t("启用 REST 与 Prometheus")}</strong>
+                  <small>${t("默认仅监听 127.0.0.1；监听局域网地址时必须设置至少 16 个字符的令牌。")}</small>
                 </span>
               </label>
               <div class="monitoring-api-fields">
                 <label class="field">
-                  <span>监听地址</span>
+                  <span>${t("监听地址")}</span>
                   <input id="monitoring_api_listen_host" type="text" spellcheck="false" placeholder="127.0.0.1" />
                 </label>
                 <label class="field">
-                  <span>端口</span>
+                  <span>${t("端口")}</span>
                   <input id="monitoring_api_port" type="number" min="1" max="65535" step="1" />
                 </label>
                 <label class="field">
-                  <span>访问令牌（可选）</span>
-                  <input id="monitoring_api_token" type="password" maxlength="256" autocomplete="new-password" placeholder="本机监听可留空" />
+                  <span>${t("访问令牌（可选）")}</span>
+                  <input id="monitoring_api_token" type="password" maxlength="256" autocomplete="new-password" placeholder="${t("本机监听可留空")}" />
                 </label>
               </div>
             </section>
 
             <section class="settings-section data-storage-section settings-section-wide">
               <div class="section-heading">
-                <h3>数据存储</h3>
-                <span>查询日志、统计数据库和过滤器数据会保存在此目录。可迁移到空目录，也可在重装系统后安全使用保留的现有数据。</span>
+                <h3>${t("数据存储")}</h3>
+                <span>${t("查询日志、统计数据库和过滤器数据会保存在此目录。可迁移到空目录，也可在重装系统后安全使用保留的现有数据。")}</span>
               </div>
               <div class="data-storage-path-row">
-                <input id="data_storage_path" type="text" readonly aria-label="数据存储路径" />
+                <input id="data_storage_path" type="text" readonly aria-label="${t("数据存储路径")}" />
                 <div class="button-group data-storage-actions">
-                  <button id="choose_data_storage_btn" type="button">选择目录</button>
-                  <button id="reset_data_storage_btn" type="button">恢复默认</button>
+                  <button id="choose_data_storage_btn" type="button">${t("选择目录")}</button>
+                  <button id="reset_data_storage_btn" type="button">${t("恢复默认")}</button>
                 </div>
               </div>
               <div class="data-storage-meta">
-                <span id="data_storage_size">正在读取占用空间…</span>
+                <span id="data_storage_size">${t("正在读取占用空间…")}</span>
                 <span id="data_storage_state"></span>
               </div>
               <div class="data-storage-pending hidden" id="data_storage_pending">
                 <span id="data_storage_pending_text"></span>
-                <button class="primary" id="migrate_data_storage_btn" type="button">迁移并重启</button>
+                <button class="primary" id="migrate_data_storage_btn" type="button">${t("迁移并重启")}</button>
               </div>
               <div class="data-storage-error hidden" id="data_storage_error"></div>
             </section>
 
             <section class="settings-section cache-maintenance-section settings-section-wide">
               <div>
-                <h3>磁盘缓存</h3>
-                <p>清理可重新生成的规则编译缓存，不会删除远程黑名单、当前生效规则、配置、查询日志和统计数据。</p>
+                <h3>${t("磁盘缓存")}</h3>
+                <p>${t("清理可重新生成的规则编译缓存，不会删除远程黑名单、当前生效规则、配置、查询日志和统计数据。")}</p>
               </div>
-              <button id="clear_filter_cache_btn" type="button">清理缓存</button>
+              <button id="clear_filter_cache_btn" type="button">${t("清理缓存")}</button>
             </section>
 
             <section class="settings-section config-transfer-section settings-section-wide">
               <div>
-                <h3>备份与诊断</h3>
-                <p>导出或恢复完整配置；诊断文件会隐藏域名、客户端地址、规则、代理和上游等隐私内容。</p>
+                <h3>${t("备份与诊断")}</h3>
+                <p>${t("导出或恢复完整配置；诊断文件会隐藏域名、客户端地址、规则、代理和上游等隐私内容。")}</p>
               </div>
               <div class="button-group config-transfer-actions">
-                <button id="export_config_btn" type="button">导出配置</button>
-                <button id="import_config_btn" type="button">恢复配置</button>
-                <button id="export_diagnostic_btn" type="button">导出脱敏诊断</button>
+                <button id="export_config_btn" type="button">${t("导出配置")}</button>
+                <button id="import_config_btn" type="button">${t("恢复配置")}</button>
+                <button id="export_diagnostic_btn" type="button">${t("导出脱敏诊断")}</button>
               </div>
             </section>
 
             <section class="settings-section">
-              <h3>日志配置</h3>
+              <h3>${t("日志配置")}</h3>
               <label class="check-row">
                 <input id="query_log_enabled" type="checkbox" />
                 <span>
-                  <strong>启用日志</strong>
+                  <strong>${t("启用日志")}</strong>
                 </span>
               </label>
               <label class="check-row inline-help-row">
                 <input id="anonymize_client_ip" type="checkbox" />
                 <span>
-                  <strong>匿名化客户端 IP</strong>
-                  <small>持久化查询日志和统计中仅保存匿名化后的客户端 IP；运行期安全事件仍会显示来源 IP。</small>
+                  <strong>${t("匿名化客户端 IP")}</strong>
+                  <small>${t("持久化查询日志和统计中仅保存匿名化后的客户端 IP；运行期安全事件仍会显示来源 IP。")}</small>
                 </span>
               </label>
               <div class="retention-settings">
-                <span class="retention-title">查询日志保留时间</span>
+                <span class="retention-title">${t("查询日志保留时间")}</span>
                 <div class="retention-options">
-                  <label><input name="query_log_retention" type="radio" value="24" /> 24 小时</label>
-                  <label><input name="query_log_retention" type="radio" value="168" /> 7 天</label>
-                  <label><input name="query_log_retention" type="radio" value="720" /> 30 天</label>
-                  <label><input name="query_log_retention" type="radio" value="2160" /> 90 天</label>
-                  <label><input name="query_log_retention" type="radio" value="4320" /> 180 天</label>
-                  <label><input name="query_log_retention" type="radio" value="8640" /> 360 天</label>
-                  <label><input name="query_log_retention" type="radio" value="custom" /> 自定义</label>
+                  <label><input name="query_log_retention" type="radio" value="24" /> ${t("24 小时")}</label>
+                  <label><input name="query_log_retention" type="radio" value="168" /> ${t("7 天")}</label>
+                  <label><input name="query_log_retention" type="radio" value="720" /> ${t("30 天")}</label>
+                  <label><input name="query_log_retention" type="radio" value="2160" /> ${t("90 天")}</label>
+                  <label><input name="query_log_retention" type="radio" value="4320" /> ${t("180 天")}</label>
+                  <label><input name="query_log_retention" type="radio" value="8640" /> ${t("360 天")}</label>
+                  <label><input name="query_log_retention" type="radio" value="custom" /> ${t("自定义")}</label>
                 </div>
                 <label class="field custom-retention-field" id="custom_retention_field">
-                  <span>自定义保留时间（小时）</span>
-                  <input id="query_log_retention_custom" type="number" min="1" max="8760" step="1" placeholder="例如 120" />
+                  <span>${t("自定义保留时间（小时）")}</span>
+                  <input id="query_log_retention_custom" type="number" min="1" max="8760" step="1" placeholder="${t("例如 120")}" />
                 </label>
               </div>
               <label class="field log-ignore-field">
-                <span>日志忽略域名</span>
-                <small>每行一个域名，自动包含其子域名。命中的查询不会写入查询日志。</small>
+                <span>${t("日志忽略域名")}</span>
+                <small>${t("每行一个域名，自动包含其子域名。命中的查询不会写入查询日志。")}</small>
                 <textarea id="query_log_ignored_domains" autocomplete="off" spellcheck="false" placeholder="example.com"></textarea>
               </label>
               <div class="button-group persistence-actions">
-                <button id="clear_query_logs_btn" type="button">清除查询日志</button>
+                <button id="clear_query_logs_btn" type="button">${t("清除查询日志")}</button>
               </div>
             </section>
 
             <section class="settings-section settings-section-right">
-              <h3>统计配置</h3>
+              <h3>${t("统计配置")}</h3>
               <label class="check-row">
                 <input id="statistics_enabled" type="checkbox" />
                 <span>
-                  <strong>启用统计数据</strong>
-                  <small>按小时聚合查询趋势、域名、客户端、上游和黑名单命中，不保存完整 DNS 响应。</small>
+                  <strong>${t("启用统计数据")}</strong>
+                  <small>${t("按小时聚合查询趋势、域名、客户端、上游和黑名单命中，不保存完整 DNS 响应。")}</small>
                 </span>
               </label>
               <div class="retention-settings">
-                <span class="retention-title">统计数据保留时间</span>
+                <span class="retention-title">${t("统计数据保留时间")}</span>
                 <div class="retention-options">
-                  <label><input name="statistics_retention" type="radio" value="24" /> 24 小时</label>
-                  <label><input name="statistics_retention" type="radio" value="168" /> 7 天</label>
-                  <label><input name="statistics_retention" type="radio" value="720" /> 30 天</label>
-                  <label><input name="statistics_retention" type="radio" value="2160" /> 90 天</label>
-                  <label><input name="statistics_retention" type="radio" value="4320" /> 180 天</label>
-                  <label><input name="statistics_retention" type="radio" value="8760" /> 365 天</label>
-                  <label><input name="statistics_retention" type="radio" value="forever" /> 永久</label>
-                  <label><input name="statistics_retention" type="radio" value="custom" /> 自定义</label>
+                  <label><input name="statistics_retention" type="radio" value="24" /> ${t("24 小时")}</label>
+                  <label><input name="statistics_retention" type="radio" value="168" /> ${t("7 天")}</label>
+                  <label><input name="statistics_retention" type="radio" value="720" /> ${t("30 天")}</label>
+                  <label><input name="statistics_retention" type="radio" value="2160" /> ${t("90 天")}</label>
+                  <label><input name="statistics_retention" type="radio" value="4320" /> ${t("180 天")}</label>
+                  <label><input name="statistics_retention" type="radio" value="8760" /> ${t("365 天")}</label>
+                  <label><input name="statistics_retention" type="radio" value="forever" /> ${t("永久")}</label>
+                  <label><input name="statistics_retention" type="radio" value="custom" /> ${t("自定义")}</label>
                 </div>
                 <label class="field custom-retention-field" id="statistics_custom_retention_field">
-                  <span>自定义保留时间（天）</span>
-                  <input id="statistics_retention_custom" type="number" min="1" max="365" step="1" placeholder="例如 120" />
+                  <span>${t("自定义保留时间（天）")}</span>
+                  <input id="statistics_retention_custom" type="number" min="1" max="365" step="1" placeholder="${t("例如 120")}" />
                 </label>
               </div>
               <label class="field log-ignore-field">
-                <span>统计忽略域名</span>
-                <small>每行一个域名，自动包含其子域名。适合排除 NAS 心跳、探活等高频噪音，不影响查询日志。</small>
+                <span>${t("统计忽略域名")}</span>
+                <small>${t("每行一个域名，自动包含其子域名。适合排除 NAS 心跳、探活等高频噪音，不影响查询日志。")}</small>
                 <textarea id="statistics_ignored_domains" autocomplete="off" spellcheck="false" placeholder="example.com"></textarea>
               </label>
               <div class="button-group persistence-actions">
-                <button id="clear_statistics_btn" type="button">清除统计数据</button>
+                <button id="clear_statistics_btn" type="button">${t("清除统计数据")}</button>
               </div>
             </section>
 
@@ -1165,8 +1216,8 @@ export function renderAppTemplate(appIconUrl: string): string {
       <section class="view about-view" data-view-panel="about">
         <section class="panel module-panel about-panel">
           <div class="panel-title">
-            <h2>关于</h2>
-            <p>版本、运行环境与支持信息。</p>
+            <h2>${t("关于")}</h2>
+            <p>${t("版本、运行环境与支持信息。")}</p>
           </div>
 
           <div class="about-hero">
@@ -1177,12 +1228,12 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <h3>DnsBlackhole</h3>
                   <span>v<span id="app_version">-</span></span>
                 </div>
-                <p class="about-positioning">轻量的本地 DNS 转发与域名拦截工具。</p>
-                <p class="about-trust">配置、过滤规则和查询数据保存在你的设备上，无需注册账户。</p>
-                <div class="about-capabilities" aria-label="应用特性">
-                  <span>本地优先</span>
-                  <span>后台系统服务</span>
-                  <span>开源透明</span>
+                <p class="about-positioning">${t("轻量的本地 DNS 转发与域名拦截工具。")}</p>
+                <p class="about-trust">${t("配置、过滤规则和查询数据保存在你的设备上，无需注册账户。")}</p>
+                <div class="about-capabilities" aria-label="${t("应用特性")}">
+                  <span>${t("本地优先")}</span>
+                  <span>${t("后台系统服务")}</span>
+                  <span>${t("开源透明")}</span>
                 </div>
               </div>
             </div>
@@ -1191,8 +1242,8 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8.1 7 10 4.2-1.9 7-5.4 7-10V6zM9 12l2 2 4-4" /></svg>
               </span>
               <span>
-                <strong>独立守护 DNS</strong>
-                <small>关闭界面后，系统服务仍可持续保护本机。</small>
+                <strong>${t("独立守护 DNS")}</strong>
+                <small>${t("关闭界面后，系统服务仍可持续保护本机。")}</small>
               </span>
             </div>
           </div>
@@ -1201,16 +1252,16 @@ export function renderAppTemplate(appIconUrl: string): string {
             <section class="about-runtime-section" aria-labelledby="about_runtime_title">
               <div class="about-section-heading">
                 <div>
-                  <h3 id="about_runtime_title">版本与运行环境</h3>
-                  <p>提交问题时，可复制这些不包含域名和客户端信息的摘要。</p>
+                  <h3 id="about_runtime_title">${t("版本与运行环境")}</h3>
+                  <p>${t("提交问题时，可复制这些不包含域名和客户端信息的摘要。")}</p>
                 </div>
-                <button id="copy_support_info_btn" type="button">复制支持信息</button>
+                <button id="copy_support_info_btn" type="button">${t("复制支持信息")}</button>
               </div>
               <dl class="about-runtime-list">
-                <div><dt>应用版本</dt><dd id="about_runtime_app_version">v-</dd></div>
-                <div><dt>运行平台</dt><dd id="about_runtime_platform">正在识别…</dd></div>
-                <div><dt>后台服务</dt><dd id="about_runtime_service">正在读取…</dd></div>
-                <div><dt>DNS 核心</dt><dd id="about_runtime_core">正在读取…</dd></div>
+                <div><dt>${t("应用版本")}</dt><dd id="about_runtime_app_version">v-</dd></div>
+                <div><dt>${t("运行平台")}</dt><dd id="about_runtime_platform">${t("正在识别…")}</dd></div>
+                <div><dt>${t("后台服务")}</dt><dd id="about_runtime_service">${t("正在读取…")}</dd></div>
+                <div><dt>${t("DNS 核心")}</dt><dd id="about_runtime_core">${t("正在读取…")}</dd></div>
               </dl>
             </section>
 
@@ -1220,11 +1271,11 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 20h14" /></svg>
                 </span>
                 <div>
-                  <h3 id="about_update_title">软件更新</h3>
-                  <p>检查稳定版本并查看本次变更；安装前会先完成下载验证。</p>
+                  <h3 id="about_update_title">${t("软件更新")}</h3>
+                  <p>${t("检查稳定版本并查看本次变更；安装前会先完成下载验证。")}</p>
                 </div>
               </div>
-              <button class="primary" id="check_update_btn" type="button">检查更新</button>
+              <button class="primary" id="check_update_btn" type="button">${t("检查更新")}</button>
               <div class="update-status hidden" id="update_status" role="status" aria-live="polite" aria-atomic="true"></div>
             </section>
           </div>
@@ -1232,53 +1283,53 @@ export function renderAppTemplate(appIconUrl: string): string {
           <section class="about-resources" aria-labelledby="about_resources_title">
             <div class="about-section-heading about-resources-heading">
               <div>
-                <h3 id="about_resources_title">帮助与项目</h3>
-                <p>文档和反馈会在系统浏览器中打开。</p>
+                <h3 id="about_resources_title">${t("帮助与项目")}</h3>
+                <p>${t("文档和反馈会在系统浏览器中打开。")}</p>
               </div>
             </div>
             <div class="about-resource-columns">
               <div class="about-resource-group">
-                <h4>获取帮助</h4>
+                <h4>${t("获取帮助")}</h4>
                 <button class="about-link-card about-link-primary" data-about-link="docs" type="button">
                   <span class="about-link-icon" aria-hidden="true">
                     <svg viewBox="0 0 24 24"><path d="M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3zM8 4v16M11 9h5M11 13h5" /></svg>
                   </span>
-                  <span class="about-link-copy"><strong>使用文档</strong><small>了解安装、DNS 接管与过滤规则</small></span>
+                  <span class="about-link-copy"><strong>${t("使用文档")}</strong><small>${t("了解安装、DNS 接管与过滤规则")}</small></span>
                   <span class="about-link-arrow" aria-hidden="true">›</span>
                 </button>
                 <button class="about-link-card about-link-primary" data-about-link="issues" type="button">
                   <span class="about-link-icon" aria-hidden="true">
                     <svg viewBox="0 0 24 24"><path d="M4 5h16v12H8l-4 4zM8 9h8M8 13h5" /></svg>
                   </span>
-                  <span class="about-link-copy"><strong>报告问题</strong><small>提交故障信息或功能建议</small></span>
+                  <span class="about-link-copy"><strong>${t("报告问题")}</strong><small>${t("提交故障信息或功能建议")}</small></span>
                   <span class="about-link-arrow" aria-hidden="true">›</span>
                 </button>
               </div>
               <div class="about-resource-group about-project-group">
-                <h4>项目信息</h4>
+                <h4>${t("项目信息")}</h4>
                 <button class="about-compact-link" data-about-link="repository" type="button">
-                  <span>项目源码</span><small>GitHub</small><span aria-hidden="true">›</span>
+                  <span>${t("项目源码")}</span><small>GitHub</small><span aria-hidden="true">›</span>
                 </button>
                 <button class="about-compact-link" data-about-link="releases" type="button">
-                  <span>更新记录</span><small>版本与变更</small><span aria-hidden="true">›</span>
+                  <span>${t("更新记录")}</span><small>${t("版本与变更")}</small><span aria-hidden="true">›</span>
                 </button>
                 <button class="about-compact-link" data-about-link="license" type="button">
-                  <span>开源许可</span><small>MIT License</small><span aria-hidden="true">›</span>
+                  <span>${t("开源许可")}</span><small>MIT License</small><span aria-hidden="true">›</span>
                 </button>
               </div>
             </div>
           </section>
 
-          <footer class="about-footer">DnsBlackhole 是基于 MIT License 发布的开源项目。</footer>
+          <footer class="about-footer">${t("DnsBlackhole 是基于 MIT License 发布的开源项目。")}</footer>
 
           <dialog class="update-dialog" id="update_dialog" aria-labelledby="update_dialog_title">
             <div class="update-dialog-panel">
               <div class="update-dialog-header">
                 <div>
-                  <span class="update-dialog-kicker">软件更新</span>
-                  <h3 id="update_dialog_title">发现新版本</h3>
+                  <span class="update-dialog-kicker">${t("软件更新")}</span>
+                  <h3 id="update_dialog_title">${t("发现新版本")}</h3>
                 </div>
-                <button class="update-dialog-close" id="update_dialog_close_btn" type="button" aria-label="关闭">×</button>
+                <button class="update-dialog-close" id="update_dialog_close_btn" type="button" aria-label="${t("关闭")}">×</button>
               </div>
               <div class="update-dialog-body">
                 <div class="update-version-change">
@@ -1287,14 +1338,14 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <strong id="update_release_version">v-</strong>
                 </div>
                 <div class="update-release-notes">
-                  <div class="update-release-notes-title">本次更新内容</div>
+                  <div class="update-release-notes-title">${t("本次更新内容")}</div>
                   <div class="update-release-notes-body" id="update_release_notes_body"></div>
                 </div>
               </div>
               <div class="update-dialog-footer">
-                <button id="update_dialog_later_btn" type="button">稍后</button>
-                <button id="manual_download_btn" type="button">浏览器下载</button>
-                <button class="primary" id="install_update_btn" type="button">下载并安装</button>
+                <button id="update_dialog_later_btn" type="button">${t("稍后")}</button>
+                <button id="manual_download_btn" type="button">${t("浏览器下载")}</button>
+                <button class="primary" id="install_update_btn" type="button">${t("下载并安装")}</button>
               </div>
             </div>
           </dialog>
@@ -1304,24 +1355,24 @@ export function renderAppTemplate(appIconUrl: string): string {
       <section class="view" data-view-panel="filters">
         <section class="panel module-panel">
           <div class="panel-title with-actions">
-            <h2>DNS 黑名单</h2>
+            <h2>${t("DNS 黑名单")}</h2>
             <div class="button-group">
               <span class="filter-update-progress hidden" id="filter_update_progress" role="status"></span>
-              <span class="save-state-label" aria-live="polite">正在读取配置</span>
-              <button id="save_filters_btn" type="button">保存更改</button>
-              <button id="add_filter_btn" type="button">添加黑名单</button>
-              <button class="hidden" id="cancel_filter_update_btn" type="button">取消更新</button>
-              <button class="primary" id="update_filters_btn" type="button">检查更新</button>
+              <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
+              <button id="save_filters_btn" type="button">${t("保存更改")}</button>
+              <button id="add_filter_btn" type="button">${t("添加黑名单")}</button>
+              <button class="hidden" id="cancel_filter_update_btn" type="button">${t("取消更新")}</button>
+              <button class="primary" id="update_filters_btn" type="button">${t("检查更新")}</button>
             </div>
           </div>
-          <div class="filters-table" role="table" aria-label="远程黑名单">
+          <div class="filters-table" role="table" aria-label="${t("远程黑名单")}">
             <div class="filters-head" role="row">
-              <span role="columnheader">启用</span>
-              <span role="columnheader">名称</span>
-              <span role="columnheader">规则数</span>
-              <span role="columnheader">上次更新</span>
-              <span role="columnheader">状态</span>
-              <span role="columnheader">操作</span>
+              <span role="columnheader">${t("启用")}</span>
+              <span role="columnheader">${t("名称")}</span>
+              <span role="columnheader">${t("规则数")}</span>
+              <span role="columnheader">${t("上次更新")}</span>
+              <span role="columnheader">${t("状态")}</span>
+              <span role="columnheader">${t("操作")}</span>
             </div>
             <div id="filters_body" class="filters-body" role="presentation"></div>
           </div>
@@ -1331,31 +1382,38 @@ export function renderAppTemplate(appIconUrl: string): string {
       <section class="view" data-view-panel="custom">
         <section class="panel module-panel">
           <div class="panel-title with-actions">
-            <h2>自定义过滤规则</h2>
+            <h2>${t("自定义过滤规则")}</h2>
             <div class="button-group">
-              <span class="save-state-label" aria-live="polite">正在读取配置</span>
-              <button class="primary" id="save_custom_btn" type="button">保存更改</button>
+              <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
+              <button class="primary" id="save_custom_btn" type="button">${t("保存更改")}</button>
             </div>
           </div>
           <div class="rule-editor-toolbar">
-            <span id="rule_analysis_summary" aria-live="polite">等待读取规则</span>
+            <span id="rule_analysis_summary" aria-live="polite">${t("等待读取规则")}</span>
             <label class="field rule-search-field">
-              <span class="sr-only">在自定义规则中查找</span>
-              <input id="custom_rule_search" type="search" autocomplete="off" spellcheck="false" placeholder="查找规则，按 Enter 跳到下一处" />
+              <span class="sr-only">${t("在自定义规则中查找")}</span>
+              <input id="custom_rule_search" type="search" autocomplete="off" spellcheck="false" placeholder="${t("查找规则，按 Enter 跳到下一处")}" />
             </label>
           </div>
           <div class="rule-editor-shell">
             <pre id="rule_line_numbers" aria-hidden="true">1</pre>
-            <textarea id="blacklist" spellcheck="false" aria-label="自定义过滤规则"></textarea>
+            <textarea id="blacklist" spellcheck="false" aria-label="${t("自定义过滤规则")}"></textarea>
           </div>
           <div class="rule-diagnostics" id="rule_diagnostics" aria-live="polite"></div>
 
           <section class="settings-section dns-rewrites-section">
             <div class="section-heading">
-              <h3 id="dns_rewrites_title">DNS 重写</h3>
-              <span id="dns_rewrites_help">每行一条“域名 IP”本地记录，优先于黑名单生效。用 *.域名 匹配整个子域，同一域名可以分别写一行 IPv4 和一行 IPv6。</span>
+              <h3 id="dns_rewrites_title">${t("DNS 重写")}</h3>
+              <span id="dns_rewrites_help">${t("每行一条“域名 IP”本地记录，优先于黑名单生效。用 *.域名 匹配整个子域，同一域名可以分别写一行 IPv4 和一行 IPv6。")}</span>
             </div>
             <textarea id="dns_rewrites" spellcheck="false" aria-labelledby="dns_rewrites_title" aria-describedby="dns_rewrites_help" placeholder="nas.lan 192.168.1.10&#10;*.home.lan 192.168.1.1"></textarea>
+            <label class="check-row system-hosts-row">
+              <input id="system_hosts_enabled" type="checkbox" />
+              <span>
+                <strong>${t("合并系统 hosts 文件")}</strong>
+                <small id="system_hosts_help">${t("把本机 hosts 文件中的记录并入上面的重写表。上面显式写出的记录优先；修改 hosts 后需要再保存一次配置才会重新读取。")}</small>
+              </span>
+            </label>
           </section>
         </section>
       </section>

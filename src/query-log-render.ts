@@ -1,5 +1,6 @@
 import { escapeHtml, formatCount, formatElapsedMs, formatLogDate, formatLogTime } from "./format";
 import type { QueryLogRecord } from "./types";
+import { t } from "./i18n";
 
 type QueryLogRenderOptions = {
   clientDisplayName: (ip: string | null) => string | null;
@@ -17,7 +18,7 @@ export function renderQueryLogRow(
   const duration = measuredDuration !== null ? formatElapsedMs(measuredDuration) : "";
   const requestMeta = [
     dnsQueryTypeLabel(record.query_type),
-    record.transport?.toUpperCase() ?? "协议未记录",
+    record.transport?.toUpperCase() ?? t("协议未记录"),
   ];
   if (record.query_class !== null && record.query_class !== 1) {
     requestMeta.push(dnsQueryClassLabel(record.query_class));
@@ -33,7 +34,7 @@ export function renderQueryLogRow(
       </div>
       <div class="log-request" role="cell">
         <div class="log-detail-anchor">
-          <button class="log-detail-trigger" type="button" aria-label="查看请求详情">
+          <button class="log-detail-trigger" type="button" aria-label="${t("查看请求详情")}">
             ${renderLogEyeIcon(status.className)}
           </button>
           ${requestDetailPopover}
@@ -43,8 +44,8 @@ export function renderQueryLogRow(
           <div class="log-request-meta">
             <span>${escapeHtml(requestMeta.join(" · "))}</span>
             <div class="log-rule-actions">
-              <button data-log-rule-action="${record.blocked ? "allow" : "block"}" data-domain="${escapeHtml(record.domain)}" type="button">${record.blocked ? "放行" : "拦截"}</button>
-              <button data-log-rule-action="rewrite" data-domain="${escapeHtml(record.domain)}" type="button">重写</button>
+              <button data-log-rule-action="${record.blocked ? "allow" : "block"}" data-domain="${escapeHtml(record.domain)}" type="button">${record.blocked ? t("放行") : t("拦截")}</button>
+              <button data-log-rule-action="rewrite" data-domain="${escapeHtml(record.domain)}" type="button">${t("重写")}</button>
             </div>
           </div>
         </div>
@@ -52,7 +53,7 @@ export function renderQueryLogRow(
       <div class="log-response" role="cell">
         <div class="log-response-layout">
           <div class="log-detail-anchor log-response-detail-anchor">
-            <button class="log-detail-trigger" type="button" aria-label="查看响应详情">
+            <button class="log-detail-trigger" type="button" aria-label="${t("查看响应详情")}">
               ${renderLogQuestionIcon()}
             </button>
             ${responseDetailPopover}
@@ -66,7 +67,7 @@ export function renderQueryLogRow(
       </div>
       <div class="log-client" role="cell">
         <strong>${escapeHtml(options.clientDisplayName(record.client_ip) ?? record.client_ip ?? "-")}</strong>
-        <span>${escapeHtml(record.client_ip || "未知客户端")}</span>
+        <span>${escapeHtml(record.client_ip || t("未知客户端"))}</span>
       </div>
     </div>
   `;
@@ -96,56 +97,56 @@ function renderQueryLogRequestDetail(
   record: QueryLogRecord,
   formatClientLabel: (ip: string | null) => string,
 ): string {
-  return renderLogDetailPopover("请求详情", [
-    ["时间", formatLogTime(record.timestamp)],
-    ["日期", formatLogDate(record.timestamp)],
-    ["域名", record.domain],
-    ["查询类型", dnsQueryTypeDetail(record.query_type)],
-    ["查询类别", dnsQueryClassLabel(record.query_class)],
-    ["传输协议", record.transport?.toUpperCase() ?? "旧日志未记录"],
-    ["客户端", formatClientLabel(record.client_ip)],
+  return renderLogDetailPopover(t("请求详情"), [
+    [t("时间"), formatLogTime(record.timestamp)],
+    [t("日期"), formatLogDate(record.timestamp)],
+    [t("域名"), record.domain],
+    [t("查询类型"), dnsQueryTypeDetail(record.query_type)],
+    [t("查询类别"), dnsQueryClassLabel(record.query_class)],
+    [t("传输协议"), record.transport?.toUpperCase() ?? t("旧日志未记录")],
+    [t("客户端"), formatClientLabel(record.client_ip)],
   ]);
 }
 
 function renderQueryLogResponseDetail(record: QueryLogRecord, statusLabel: string): string {
   const rows = [
-    ["状态", statusLabel],
-    ["响应来源", queryLogResponseSourceLabel(record)],
+    [t("状态"), statusLabel],
+    [t("响应来源"), queryLogResponseSourceLabel(record)],
   ];
   const response = record.response;
   if (response) {
     rows.push(
-      ["响应代码", dnsResponseCodeLabel(response.code)],
-      ["响应记录", `${formatCount(response.answer_count)} 条`],
+      [t("响应代码"), dnsResponseCodeLabel(response.code)],
+      [t("响应记录"), t("{p0} 条", { p0: formatCount(response.answer_count) })],
     );
   } else {
-    rows.push(["响应代码", record.failed ? "无响应" : "旧日志未记录"]);
+    rows.push([t("响应代码"), record.failed ? t("无响应") : t("旧日志未记录")]);
   }
   if (record.upstream_server) {
-    rows.push(["上游服务器", record.upstream_server]);
+    rows.push([t("上游服务器"), record.upstream_server]);
   }
   if (record.upstream_duration_ms !== null) {
-    rows.push(["上游耗时", formatElapsedMs(record.upstream_duration_ms)]);
+    rows.push([t("上游耗时"), formatElapsedMs(record.upstream_duration_ms)]);
   }
   if (record.processing_duration_ms !== null) {
-    rows.push(["总处理耗时", formatElapsedMs(record.processing_duration_ms)]);
+    rows.push([t("总处理耗时"), formatElapsedMs(record.processing_duration_ms)]);
   }
   if (response?.truncated) {
-    rows.push(["截断响应", "是（TC 标志）"]);
+    rows.push([t("截断响应"), t("是（TC 标志）")]);
   }
   if (record.error) {
-    rows.push([record.failed ? "错误" : "说明", record.error]);
+    rows.push([record.failed ? t("错误") : t("说明"), record.error]);
   }
   if (record.blocked) {
     rows.push(
-      ["命中规则", record.matched_rule ?? "旧日志未记录"],
-      ["来源清单", record.rule_source ?? "旧日志未记录"],
-      ["规则类型", record.rule_type ?? "旧日志未记录"],
-      ["important 覆盖", record.important_overrode ? "是" : "否"],
-      ["allowlist", record.allowlist_rule ?? "无"],
+      [t("命中规则"), record.matched_rule ?? t("旧日志未记录")],
+      [t("来源清单"), record.rule_source ?? t("旧日志未记录")],
+      [t("规则类型"), record.rule_type ?? t("旧日志未记录")],
+      [t("important 覆盖"), record.important_overrode ? t("是") : t("否")],
+      ["allowlist", record.allowlist_rule ?? t("无")],
     );
   }
-  return renderLogDetailPopover("响应详情", rows, renderQueryLogResponseAnswers(record));
+  return renderLogDetailPopover(t("响应详情"), rows, renderQueryLogResponseAnswers(record));
 }
 
 function renderLogDetailPopover(title: string, rows: string[][], extraContent = ""): string {
@@ -175,16 +176,16 @@ function renderQueryLogResponseAnswers(record: QueryLogRecord): string {
     <div class="log-response-answer">
       <span>${escapeHtml(dnsQueryTypeLabel(answer.record_type))}</span>
       <code title="${escapeHtml(answer.value)}">${escapeHtml(answer.value)}</code>
-      <small>TTL ${formatCount(answer.ttl)} 秒</small>
+      <small>${t("TTL {p0} 秒", { p0: formatCount(answer.ttl) })}</small>
     </div>
   `).join("");
   return `
     <section class="log-response-answers">
-      <strong>响应记录</strong>
+      <strong>${t("响应记录")}</strong>
       <div class="log-response-answer-list">
-        ${records || `<p>响应记录内容无法解析</p>`}
+        ${records || `<p>${t("响应记录内容无法解析")}</p>`}
       </div>
-      ${omitted > 0 ? `<p>另有 ${formatCount(omitted)} 条记录未写入日志摘要</p>` : ""}
+      ${omitted > 0 ? `<p>${t("另有 {p0} 条记录未写入日志摘要", { p0: formatCount(omitted) })}</p>` : ""}
     </section>
   `;
 }
@@ -203,16 +204,16 @@ function dnsResponseCodeLabel(code: number): string {
     9: "NOTAUTH",
     10: "NOTZONE",
   };
-  return `${labels[code] ?? "RCODE"}（${code}）`;
+  return t("{p0}（{p1}）", { p0: labels[code] ?? "RCODE", p1: code });
 }
 
 function queryLogStatus(record: QueryLogRecord): { label: string; className: string } {
-  if (record.failed) return { label: "失败", className: "failed" };
-  if (record.blocked) return { label: "已拦截", className: "blocked" };
+  if (record.failed) return { label: t("失败"), className: "failed" };
+  if (record.blocked) return { label: t("已拦截"), className: "blocked" };
   if (queryLogResponseSource(record) === "refused") {
-    return { label: "已拒绝", className: "refused" };
+    return { label: t("已拒绝"), className: "refused" };
   }
-  return { label: "已处理", className: "processed" };
+  return { label: t("已处理"), className: "processed" };
 }
 
 type ResolvedQueryResponseSource =
@@ -234,12 +235,12 @@ function queryLogResponseSource(record: QueryLogRecord): ResolvedQueryResponseSo
 
 function queryLogResponseSourceLabel(record: QueryLogRecord): string {
   switch (queryLogResponseSource(record)) {
-    case "upstream": return "上游 DNS";
-    case "cache": return "DNS 缓存";
-    case "rewrite": return "本地 DNS 重写";
-    case "blocked": return "过滤器";
-    case "refused": return "本地拒绝";
-    default: return "本地响应（旧日志未记录来源）";
+    case "upstream": return t("上游 DNS");
+    case "cache": return t("DNS 缓存");
+    case "rewrite": return t("本地 DNS 重写");
+    case "blocked": return t("过滤器");
+    case "refused": return t("本地拒绝");
+    default: return t("本地响应（旧日志未记录来源）");
   }
 }
 
@@ -247,31 +248,31 @@ function queryLogResponseDetail(record: QueryLogRecord): string {
   if (record.failed && record.error) return record.error;
   switch (queryLogResponseSource(record)) {
     case "upstream":
-      return record.upstream_server ? `上游：${record.upstream_server}` : "上游 DNS 解析";
-    case "cache": return "DNS 缓存命中";
-    case "rewrite": return "本地 DNS 重写";
-    case "blocked": return record.rule_source ? `过滤器：${record.rule_source}` : "过滤器拦截";
-    case "refused": return record.error ?? "本地拒绝响应";
-    default: return "本地响应（旧日志）";
+      return record.upstream_server ? t("上游：{p0}", { p0: record.upstream_server }) : t("上游 DNS 解析");
+    case "cache": return t("DNS 缓存命中");
+    case "rewrite": return t("本地 DNS 重写");
+    case "blocked": return record.rule_source ? t("过滤器：{p0}", { p0: record.rule_source }) : t("过滤器拦截");
+    case "refused": return record.error ?? t("本地拒绝响应");
+    default: return t("本地响应（旧日志）");
   }
 }
 
 export function dnsQueryTypeLabel(queryType: number | null): string {
-  if (queryType === null) return "类型未记录";
+  if (queryType === null) return t("类型未记录");
   return DNS_QUERY_TYPE_LABELS[queryType] ?? `TYPE${queryType}`;
 }
 
 function dnsQueryTypeDetail(queryType: number | null): string {
-  return queryType === null ? "旧日志未记录" : `${dnsQueryTypeLabel(queryType)}（${queryType}）`;
+  return queryType === null ? t("旧日志未记录") : `${dnsQueryTypeLabel(queryType)}（${queryType}）`;
 }
 
 function dnsQueryClassLabel(queryClass: number | null): string {
-  if (queryClass === null) return "旧日志未记录";
+  if (queryClass === null) return t("旧日志未记录");
   const labels: Record<number, string> = {
-    1: "IN（互联网）",
-    3: "CH（Chaos）",
-    4: "HS（Hesiod）",
-    255: "ANY（任意类别）",
+    1: t("IN（互联网）"),
+    3: t("CH（Chaos）"),
+    4: t("HS（Hesiod）"),
+    255: t("ANY（任意类别）"),
   };
   return labels[queryClass] ?? `CLASS${queryClass}`;
 }

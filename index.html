@@ -5,6 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/src/app-icon.png" />
     <title>DnsBlackhole</title>
+    <!-- 在首屏绘制前定好主题，避免深色偏好下先闪一下白底 -->
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("dnsblackhole.theme");
+          if (stored === "light" || stored === "dark") {
+            document.documentElement.dataset.theme = stored;
+          }
+        } catch (error) {
+          /* 站点数据不可用时跟随系统即可 */
+        }
+      })();
+    </script>
     <script type="module" src="/src/main.ts"></script>
   </head>
   <body>

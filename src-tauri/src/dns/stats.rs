@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,9 +11,10 @@ use crate::config::AppConfig;
 
 use super::cache::DnsCacheStatsSnapshot;
 use super::rules::RuleSummary;
+use super::security_events::SecurityEventMessage;
 
 const TRAFFIC_BUCKET_WINDOW_MINUTES: u64 = 90 * 24 * 60;
-const SECURITY_EVENT_CAPACITY: usize = 200;
+pub(crate) const SECURITY_EVENT_CAPACITY: usize = 200;
 const SECURITY_EVENT_AGGREGATE_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,6 +71,8 @@ pub struct DnsStats {
     #[serde(default)]
     pub cache_bytes: u64,
     pub security_events: VecDeque<SecurityEvent>,
+    #[serde(skip)]
+    pub(crate) security_event_sender: Option<mpsc::SyncSender<SecurityEventMessage>>,
     pub last_query: Option<String>,
     pub last_blocked: Option<String>,
     pub last_error: Option<String>,
@@ -369,6 +372,8 @@ fn record_security_event(
     {
         last.last_seen_at = now;
         last.count = last.count.saturating_add(1);
+        let event = last.clone();
+        persist_security_event(stats, event);
         return;
     }
 
@@ -384,6 +389,41 @@ fn record_security_event(
         last_seen_at: now,
         count: 1,
     });
+    let event = stats
+        .security_events
+        .back()
+        .expect("新事件应已加入队列")
+        .clone();
+    persist_security_event(stats, event);
+}
+
+fn persist_security_event(stats: &mut DnsStats, mut event: SecurityEvent) {
+    // 每条消息只代表本次新增计数，不会重复累计已恢复的历史条目。
+    event.count = 1;
+    if let Some(sender) = &stats.security_event_sender
+        && sender.send(SecurityEventMessage::Event(event)).is_err()
+    {
+        stats.persistence_queue_dropped_total += 1;
+        stats.last_error = Some("安全事件写入队列已关闭".into());
+    }
+}
+
+/// 启动时把落盘的历史安全事件放回内存队列，让界面重启后仍能看到既有记录。
+/// 队列按 last_seen_at 升序排列，保持与运行期追加顺序一致。
+pub(crate) fn restore_security_events(
+    stats: &Arc<Mutex<DnsStats>>,
+    mut events: Vec<SecurityEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    events.sort_by_key(|event| (event.last_seen_at, event.first_seen_at));
+    if events.len() > SECURITY_EVENT_CAPACITY {
+        events.drain(..events.len() - SECURITY_EVENT_CAPACITY);
+    }
+    if let Ok(mut current) = stats.lock() {
+        current.security_events = events.into();
+    }
 }
 
 pub(crate) fn record_refused_any(stats: &Arc<Mutex<DnsStats>>) {

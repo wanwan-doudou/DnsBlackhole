@@ -123,6 +123,14 @@ export function clearStatistics(): Promise<RuntimeStatus> {
   return timedInvoke<RuntimeStatus>("clear_statistics");
 }
 
+export function setTrayLocale(locale: string): Promise<void> {
+  return timedInvoke<void>("set_tray_locale", { locale });
+}
+
+export function clearSecurityEvents(): Promise<RuntimeStatus> {
+  return timedInvoke<RuntimeStatus>("clear_security_events");
+}
+
 export function updateFilters(config: AppConfig): Promise<FilterUpdateResult> {
   return timedInvoke<FilterUpdateResult>("update_filters", { config });
 }

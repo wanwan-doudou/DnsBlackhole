@@ -1,4 +1,5 @@
 import type { RuleAnalysis } from "./types";
+import { t } from "./i18n";
 
 type RuleEditorOptions = {
   textarea: HTMLTextAreaElement;
@@ -40,10 +41,10 @@ export function createRuleEditorController(options: RuleEditorOptions): RuleEdit
   function renderAnalysis(analysis: RuleAnalysis): void {
     const summary = analysis.summary;
     options.summary.textContent = [
-      `${summary.block_rules.toLocaleString()} 条拦截`,
-      `${summary.allow_rules.toLocaleString()} 条允许`,
-      analysis.disabled_rules > 0 ? `${analysis.disabled_rules.toLocaleString()} 条 badfilter` : null,
-      analysis.diagnostics.length > 0 ? `${analysis.diagnostics.length.toLocaleString()} 条需处理` : "格式检查通过",
+      t("{p0} 条拦截", { p0: summary.block_rules.toLocaleString() }),
+      t("{p0} 条允许", { p0: summary.allow_rules.toLocaleString() }),
+      analysis.disabled_rules > 0 ? t("{p0} 条 badfilter", { p0: analysis.disabled_rules.toLocaleString() }) : null,
+      analysis.diagnostics.length > 0 ? t("{p0} 条需处理", { p0: analysis.diagnostics.length.toLocaleString() }) : t("格式检查通过"),
     ].filter(Boolean).join(" · ");
     options.summary.classList.toggle("has-errors", analysis.diagnostics.some((item) => item.severity === "error"));
     options.summary.classList.toggle("has-warnings", analysis.diagnostics.length > 0);
@@ -52,7 +53,7 @@ export function createRuleEditorController(options: RuleEditorOptions): RuleEdit
     if (analysis.diagnostics.length === 0) {
       const empty = document.createElement("span");
       empty.className = "rule-diagnostic-empty";
-      empty.textContent = "没有发现无效或不受支持的规则。";
+      empty.textContent = t("没有发现无效或不受支持的规则。");
       options.diagnostics.append(empty);
       return;
     }
@@ -60,21 +61,21 @@ export function createRuleEditorController(options: RuleEditorOptions): RuleEdit
       const button = document.createElement("button");
       button.type = "button";
       button.className = `rule-diagnostic ${item.severity}`;
-      button.textContent = `第 ${item.line} 行：${item.message}`;
+      button.textContent = t("第 {p0} 行：{p1}", { p0: item.line, p1: item.message });
       button.addEventListener("click", () => selectLine(item.line));
       options.diagnostics.append(button);
     });
     if (analysis.diagnostics.length > 100) {
       const more = document.createElement("span");
       more.className = "rule-diagnostic-empty";
-      more.textContent = `另有 ${analysis.diagnostics.length - 100} 条未展开，请先修复上面的规则。`;
+      more.textContent = t("另有 {p0} 条未展开，请先修复上面的规则。", { p0: analysis.diagnostics.length - 100 });
       options.diagnostics.append(more);
     }
   }
 
   async function analyzeNow(): Promise<void> {
     const token = ++analysisToken;
-    options.summary.textContent = "正在检查规则…";
+    options.summary.textContent = t("正在检查规则…");
     try {
       const analysis = await options.analyze(options.textarea.value);
       if (token === analysisToken) {
@@ -82,7 +83,7 @@ export function createRuleEditorController(options: RuleEditorOptions): RuleEdit
       }
     } catch (error) {
       if (token === analysisToken) {
-        options.summary.textContent = `规则检查失败：${String(error)}`;
+        options.summary.textContent = t("规则检查失败：{p0}", { p0: String(error) });
         options.summary.classList.add("has-errors");
       }
     }
@@ -105,7 +106,7 @@ export function createRuleEditorController(options: RuleEditorOptions): RuleEdit
       match = haystack.indexOf(term);
     }
     if (match < 0) {
-      options.search.setCustomValidity("没有找到匹配规则");
+      options.search.setCustomValidity(t("没有找到匹配规则"));
       options.search.reportValidity();
       return;
     }

@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    net::IpAddr,
     sync::Arc,
 };
 
@@ -39,6 +40,7 @@ pub(crate) struct CompiledRules {
     /// 清单名称表：规则条目里只存索引，避免几百万条规则各克隆一份清单名
     sources: Vec<Box<str>>,
     summary: RuleSummary,
+    has_dnsrewrites: bool,
     /// 本次编译收集到的 badfilter 禁用目标。增量合并自定义规则时要继续尊重它，
     /// 否则被清单 badfilter 禁掉的规则会从自定义规则那边重新生效。
     disabled: HashSet<Box<str>>,
@@ -93,6 +95,25 @@ struct ComplexRule {
     important: bool,
     query_types: QueryTypes,
     denyallow: Box<[Box<str>]>,
+    /// `$dnsrewrite=` 指定的自定义应答；为 None 时按全局拦截方式回应。
+    dnsrewrite: Option<DnsRewriteAction>,
+}
+
+/// `$dnsrewrite` 修饰符解析结果。与 AdGuard 语法保持一致：
+/// 短写法 `=1.2.3.4` / `=example.com` / `=NXDOMAIN`，
+/// 完整写法 `=NOERROR;TXT;hello`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DnsRewriteAction {
+    /// 直接返回指定 RCODE，不带任何 answer
+    RCode(u8),
+    /// A / AAAA 地址；查询类型不匹配时返回空 NOERROR
+    Address(IpAddr),
+    /// CNAME 目标域名
+    Cname(Box<str>),
+    /// 其它记录类型的文本值（TXT / MX / SRV / PTR ...）
+    Record { rtype: u16, value: Box<str> },
+    /// 查询时合并得到的记录集合，不写入编译缓存。
+    Multiple(Box<[DnsRewriteAction]>),
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -117,6 +138,8 @@ pub(crate) struct BlockMatch {
     pub(crate) rule_type: String,
     pub(crate) important_overrode: bool,
     pub(crate) allowlist_rule: Option<String>,
+    /// 命中规则自带的 `$dnsrewrite` 应答，优先于全局拦截方式。
+    pub(crate) dnsrewrite: Option<DnsRewriteAction>,
 }
 
 /// 命中结果的只读视图：只有真正命中时才把规则原文物化成 String
@@ -125,6 +148,7 @@ struct MatchedRule<'a> {
     source_id: u16,
     rule_type: RuleType,
     raw: MatchedRaw<'a>,
+    dnsrewrite: Option<&'a DnsRewriteAction>,
 }
 
 enum MatchedRaw<'a> {
@@ -138,6 +162,39 @@ impl MatchedRule<'_> {
             MatchedRaw::Stored(raw) => raw.to_string(),
             MatchedRaw::Canonical(kind) => canonical_rule_text(kind, self.domain, is_allow),
         }
+    }
+}
+
+impl DnsRewriteAction {
+    /// 供诊断页展示的可读描述。
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Multiple(actions) => actions
+                .iter()
+                .map(Self::describe)
+                .collect::<Vec<_>>()
+                .join("；"),
+            Self::RCode(0) => "返回空 NOERROR".to_string(),
+            Self::RCode(2) => "返回 SERVFAIL".to_string(),
+            Self::RCode(3) => "返回 NXDOMAIN".to_string(),
+            Self::RCode(5) => "返回 REFUSED".to_string(),
+            Self::RCode(other) => format!("返回 RCODE {other}"),
+            Self::Address(address) => format!("重写为 {address}"),
+            Self::Cname(target) => format!("重写为 CNAME {target}"),
+            Self::Record { rtype, value } => {
+                format!("重写为 {} 记录 {value}", query_type_name(*rtype))
+            }
+        }
+    }
+}
+
+fn query_type_name(rtype: u16) -> &'static str {
+    match rtype {
+        TYPE_PTR_NUMBER => "PTR",
+        TYPE_MX_NUMBER => "MX",
+        TYPE_TXT_NUMBER => "TXT",
+        TYPE_SRV_NUMBER => "SRV",
+        _ => "自定义",
     }
 }
 
@@ -190,6 +247,7 @@ fn scan_rules_with_disabled<'a>(
                             important: false,
                             query_types: QueryTypes::Any,
                             denyallow: Vec::new(),
+                            dnsrewrite: None,
                             canonical,
                         })));
                     }
@@ -263,6 +321,7 @@ fn compile_rules_with_disabled(raw: &str, extra_disabled: &HashSet<Box<str>>) ->
     let mut blocks = RuleSet::with_capacities(capacities.block_exact, capacities.block_suffix);
     let mut allows = RuleSet::with_capacities(capacities.allow_exact, capacities.allow_suffix);
     let mut summary = RuleSummary::default();
+    let mut has_dnsrewrites = false;
     let mut sources: Vec<Box<str>> = vec![DEFAULT_SOURCE.into()];
     let mut source_id: u16 = 0;
 
@@ -271,7 +330,10 @@ fn compile_rules_with_disabled(raw: &str, extra_disabled: &HashSet<Box<str>>) ->
         ScanEvent::Rule(parsed) => {
             count_rule(&mut summary, &parsed);
             match parsed {
-                ParsedRule::Block(rule) => blocks.insert(rule, source_id, false),
+                ParsedRule::Block(rule) => {
+                    has_dnsrewrites |= rule.dnsrewrite.is_some();
+                    blocks.insert(rule, source_id, false);
+                }
                 ParsedRule::Allow(rule) => allows.insert(rule, source_id, true),
                 ParsedRule::Ignored(_) | ParsedRule::Disable => {}
             }
@@ -286,6 +348,7 @@ fn compile_rules_with_disabled(raw: &str, extra_disabled: &HashSet<Box<str>>) ->
         sources,
         summary,
         disabled,
+        has_dnsrewrites,
         base: None,
     }
 }
@@ -392,6 +455,7 @@ impl CompiledRules {
             summary,
             disabled,
             base: _,
+            has_dnsrewrites,
         } = self;
         let default_id = intern_source(sources, DEFAULT_SOURCE);
         let mut source_id = default_id;
@@ -400,7 +464,10 @@ impl CompiledRules {
             ScanEvent::Rule(parsed) => {
                 count_rule(summary, &parsed);
                 match parsed {
-                    ParsedRule::Block(rule) => blocks.insert(rule, source_id, false),
+                    ParsedRule::Block(rule) => {
+                        *has_dnsrewrites |= rule.dnsrewrite.is_some();
+                        blocks.insert(rule, source_id, false);
+                    }
                     ParsedRule::Allow(rule) => allows.insert(rule, source_id, true),
                     ParsedRule::Ignored(_) | ParsedRule::Disable => {}
                 }
@@ -455,6 +522,7 @@ struct RuleCandidate {
     raw: String,
     source: String,
     rule_type: RuleType,
+    dnsrewrite: Option<DnsRewriteAction>,
 }
 
 fn blocking_match_layers(
@@ -462,6 +530,9 @@ fn blocking_match_layers(
     domain: &str,
     qtype: u16,
 ) -> Option<BlockMatch> {
+    if let Some(rewrite) = rewrite_match_layers(layers, domain, qtype) {
+        return Some(rewrite);
+    }
     if find_layered_match(layers, domain, qtype, true, true).is_some() {
         return None;
     }
@@ -475,6 +546,84 @@ fn blocking_match_layers(
     }
     find_layered_match(layers, domain, qtype, false, false)
         .map(|block| build_block_match(block, None, false))
+}
+
+// 重写记录必须跨清单和域名后缀收集，不能复用普通过滤的“首条命中”路径。
+fn rewrite_match_layers(layers: &[&CompiledRules], domain: &str, qtype: u16) -> Option<BlockMatch> {
+    if !layers.iter().any(|layer| layer.has_dnsrewrites) {
+        return None;
+    }
+    let mut matches = Vec::new();
+    let mut name = domain;
+    loop {
+        for exact in [true, false] {
+            if exact && name != domain {
+                continue;
+            }
+            for layer in layers.iter().filter(|layer| layer.has_dnsrewrites) {
+                let map = if exact {
+                    &layer.blocks.exact
+                } else {
+                    &layer.blocks.suffix
+                };
+                if let Some(RuleEntry::Complex(rules)) = map.get(name) {
+                    for rule in rules.iter() {
+                        if rule.dnsrewrite.is_some() && rule.matches(domain, qtype, rule.important)
+                        {
+                            matches.push((*layer, rule));
+                        }
+                    }
+                }
+            }
+        }
+        let Some((_, suffix)) = name.split_once('.') else {
+            break;
+        };
+        name = suffix;
+    }
+    if matches.iter().any(|(_, rule)| rule.important) {
+        matches.retain(|(_, rule)| rule.important);
+    }
+    // RCODE 整体替换应答；CNAME 只能选择一个目标，优先于普通记录集合。
+    let priority = |action: &DnsRewriteAction| match action {
+        DnsRewriteAction::RCode(_) => 0,
+        DnsRewriteAction::Cname(_) => 1,
+        _ => 2,
+    };
+    let best = matches
+        .iter()
+        .map(|(_, rule)| priority(rule.dnsrewrite.as_ref().unwrap()))
+        .min()?;
+    matches.retain(|(_, rule)| priority(rule.dnsrewrite.as_ref().unwrap()) == best);
+    if best < 2 {
+        matches.truncate(1);
+    }
+    let (layer, first) = matches[0];
+    let mut actions = Vec::new();
+    for (_, rule) in &matches {
+        let action = rule.dnsrewrite.as_ref().unwrap();
+        if !actions.contains(action) {
+            actions.push(action.clone());
+        }
+    }
+    let action = if actions.len() == 1 {
+        actions.remove(0)
+    } else {
+        DnsRewriteAction::Multiple(actions.into_boxed_slice())
+    };
+    let allow = find_layered_match(layers, domain, qtype, false, true);
+    Some(BlockMatch {
+        rule: matches
+            .iter()
+            .map(|(_, rule)| rule.raw.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        source: layer.source_name(first.source_id),
+        rule_type: format!("{} rewrite", first.rule_type.as_str()),
+        important_overrode: first.important && allow.is_some(),
+        allowlist_rule: allow.map(|rule| rule.raw),
+        dnsrewrite: Some(action),
+    })
 }
 
 fn find_layered_match(
@@ -531,6 +680,7 @@ fn lookup_layers(
                 raw: matched.raw_text(allow),
                 source: rules.source_name(matched.source_id),
                 rule_type: matched.rule_type,
+                dnsrewrite: matched.dnsrewrite.cloned(),
             });
         }
     }
@@ -548,6 +698,7 @@ fn build_block_match(
         rule_type: format!("{} block", block.rule_type.as_str()),
         important_overrode,
         allowlist_rule: allow.map(|rule| rule.raw),
+        dnsrewrite: block.dnsrewrite,
     }
 }
 
@@ -568,6 +719,7 @@ impl RuleSet {
             important,
             query_types,
             denyallow,
+            dnsrewrite,
             canonical,
         } = rule;
         let map = if include_subdomains {
@@ -579,7 +731,7 @@ impl RuleSet {
         if let Some(entry) = map.get_mut(domain.as_ref()) {
             // 匹配条件完全相同的规则永远只会命中先插入的一条（find 只取第一条），
             // 多个清单间的重复规则在这里直接去重
-            if entry.covers_semantics(important, &query_types, &denyallow) {
+            if entry.covers_semantics(important, &query_types, &denyallow, &dnsrewrite) {
                 return;
             }
             entry.push(
@@ -592,6 +744,7 @@ impl RuleSet {
                     important,
                     query_types,
                     denyallow: denyallow.into_boxed_slice(),
+                    dnsrewrite,
                 },
             );
             return;
@@ -606,6 +759,7 @@ impl RuleSet {
                 important,
                 query_types,
                 denyallow: denyallow.into_boxed_slice(),
+                dnsrewrite,
             }])),
         };
         map.insert(domain.into_owned().into_boxed_str(), value);
@@ -626,15 +780,17 @@ fn lookup_entry<'a>(
             source_id: rule.source_id,
             rule_type: rule.kind.rule_type(),
             raw: MatchedRaw::Canonical(rule.kind),
+            dnsrewrite: None,
         }),
         RuleEntry::Complex(rules) => rules
             .iter()
-            .find(|rule| rule.matches(query_domain, qtype, important))
+            .find(|rule| rule.dnsrewrite.is_none() && rule.matches(query_domain, qtype, important))
             .map(|rule| MatchedRule {
                 domain: stored_key,
                 source_id: rule.source_id,
                 rule_type: rule.rule_type,
                 raw: MatchedRaw::Stored(&rule.raw),
+                dnsrewrite: rule.dnsrewrite.as_ref(),
             }),
     }
 }
@@ -646,15 +802,20 @@ impl RuleEntry {
         important: bool,
         query_types: &QueryTypes,
         denyallow: &[Box<str>],
+        dnsrewrite: &Option<DnsRewriteAction>,
     ) -> bool {
         match self {
             Self::Simple(_) => {
-                !important && *query_types == QueryTypes::Any && denyallow.is_empty()
+                !important
+                    && *query_types == QueryTypes::Any
+                    && denyallow.is_empty()
+                    && dnsrewrite.is_none()
             }
             Self::Complex(rules) => rules.iter().any(|rule| {
                 rule.important == important
                     && rule.query_types == *query_types
                     && rule.denyallow.as_ref() == denyallow
+                    && rule.dnsrewrite == *dnsrewrite
             }),
         }
     }
@@ -683,6 +844,7 @@ impl SimpleRule {
             important: false,
             query_types: QueryTypes::Any,
             denyallow: Box::default(),
+            dnsrewrite: None,
         }
     }
 }
@@ -818,6 +980,7 @@ struct RuleData<'a> {
     important: bool,
     query_types: QueryTypes,
     denyallow: Vec<Box<str>>,
+    dnsrewrite: Option<DnsRewriteAction>,
     canonical: Option<SimpleKind>,
 }
 
@@ -886,8 +1049,17 @@ fn parse_filter_rule(line: &str) -> ParsedRule<'_> {
     rule.important = modifiers.important;
     rule.query_types = modifiers.query_types;
     rule.denyallow = modifiers.denyallow;
+    rule.dnsrewrite = modifiers.dnsrewrite;
+    // dnsrewrite 只在拦截规则上有意义，允许规则带上它属于无效写法。
+    if is_allow && rule.dnsrewrite.is_some() {
+        return ParsedRule::Ignored(IgnoredRuleReason::Unsupported);
+    }
 
-    if !rule.important && rule.query_types == QueryTypes::Any && rule.denyallow.is_empty() {
+    if !rule.important
+        && rule.query_types == QueryTypes::Any
+        && rule.denyallow.is_empty()
+        && rule.dnsrewrite.is_none()
+    {
         let kind = match rule.rule_type {
             RuleType::Suffix => SimpleKind::Suffix,
             RuleType::Exact | RuleType::Hosts => SimpleKind::ExactPlain,
@@ -917,6 +1089,7 @@ fn parse_pattern(pattern: &str) -> Option<RuleData<'_>> {
             important: false,
             query_types: QueryTypes::Any,
             denyallow: Vec::new(),
+            dnsrewrite: None,
             canonical: None,
         });
     }
@@ -937,6 +1110,7 @@ fn parse_pattern(pattern: &str) -> Option<RuleData<'_>> {
         important: false,
         query_types: QueryTypes::Any,
         denyallow: Vec::new(),
+        dnsrewrite: None,
         canonical: None,
     })
 }
@@ -947,6 +1121,7 @@ struct Modifiers {
     badfilter: bool,
     query_types: QueryTypes,
     denyallow: Vec<Box<str>>,
+    dnsrewrite: Option<DnsRewriteAction>,
 }
 
 fn parse_modifiers(raw: &str) -> Result<Modifiers, ()> {
@@ -955,6 +1130,12 @@ fn parse_modifiers(raw: &str) -> Result<Modifiers, ()> {
         return Ok(parsed);
     }
     for modifier in raw.split(',') {
+        // dnsrewrite 的值（TXT 内容、CNAME 目标）大小写敏感，必须用原文解析，
+        // 不能走下面统一小写化的分支。
+        if let Some(value) = strip_prefix_ignore_ascii_case(modifier, "dnsrewrite=") {
+            parsed.dnsrewrite = Some(parse_dnsrewrite(value)?);
+            continue;
+        }
         let lower = modifier.to_ascii_lowercase();
         if lower == "important" {
             parsed.important = true;
@@ -979,6 +1160,105 @@ fn parse_modifiers(raw: &str) -> Result<Modifiers, ()> {
     }
     Ok(parsed)
 }
+
+/// 大小写不敏感地剥掉前缀，用于需要保留值原文的修饰符。
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = value.get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
+fn rcode_number(value: &str) -> Option<u8> {
+    match value.to_ascii_uppercase().as_str() {
+        "NOERROR" => Some(0),
+        "FORMERR" => Some(1),
+        "SERVFAIL" => Some(2),
+        "NXDOMAIN" => Some(3),
+        "NOTIMP" => Some(4),
+        "REFUSED" => Some(5),
+        _ => None,
+    }
+}
+
+/// 解析 `$dnsrewrite=` 的值。支持两种写法：
+/// - 短写法：`1.2.3.4`（A/AAAA）、`example.com`（CNAME）、`REFUSED`（RCODE）
+/// - 完整写法：`RCODE;TYPE;VALUE`，例如 `NOERROR;TXT;hello`、`NOERROR;MX;10 mail.example.com`
+fn parse_dnsrewrite(raw: &str) -> Result<DnsRewriteAction, ()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(());
+    }
+
+    let parts = raw.split(';').collect::<Vec<_>>();
+    if parts.len() == 1 {
+        let value = parts[0].trim();
+        if let Some(rcode) = rcode_number(value) {
+            return Ok(DnsRewriteAction::RCode(rcode));
+        }
+        if let Ok(address) = value.parse::<IpAddr>() {
+            return Ok(DnsRewriteAction::Address(address));
+        }
+        let domain = normalize_domain(value).ok_or(())?;
+        super::protocol::encode_dns_name(&domain).ok_or(())?;
+        return Ok(DnsRewriteAction::Cname(
+            domain.into_owned().into_boxed_str(),
+        ));
+    }
+
+    // 完整写法。`RCODE;` 之后没有类型时等价于只返回该 RCODE。
+    let rcode = rcode_number(parts[0].trim()).ok_or(())?;
+    let record_type = parts.get(1).map(|value| value.trim()).unwrap_or("");
+    if record_type.is_empty() {
+        return Ok(DnsRewriteAction::RCode(rcode));
+    }
+    if rcode != 0 {
+        // 非 NOERROR 的应答不携带 answer，指定记录类型属于无效组合。
+        return Err(());
+    }
+    // 值本身可能含分号（如 TXT），重新拼回去。
+    let value = parts[2..].join(";");
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(());
+    }
+    let rtype = query_type_number(record_type).ok_or(())?;
+    match rtype {
+        TYPE_A_NUMBER => value
+            .parse::<std::net::Ipv4Addr>()
+            .map(|addr| DnsRewriteAction::Address(IpAddr::V4(addr)))
+            .map_err(|_| ()),
+        TYPE_AAAA_NUMBER => value
+            .parse::<std::net::Ipv6Addr>()
+            .map(|addr| DnsRewriteAction::Address(IpAddr::V6(addr)))
+            .map_err(|_| ()),
+        TYPE_CNAME_NUMBER => {
+            let domain = normalize_domain(value).ok_or(())?;
+            super::protocol::encode_dns_name(&domain).ok_or(())?;
+            Ok(DnsRewriteAction::Cname(
+                domain.into_owned().into_boxed_str(),
+            ))
+        }
+        // 只接受能正确编成线格式的类型，其余按不支持处理，
+        // 避免规则看起来生效却返回结构错误的应答。
+        TYPE_PTR_NUMBER | TYPE_MX_NUMBER | TYPE_TXT_NUMBER | TYPE_SRV_NUMBER => {
+            super::protocol::encode_rewrite_rdata(rtype, value, rtype).ok_or(())?;
+            Ok(DnsRewriteAction::Record {
+                rtype,
+                value: value.into(),
+            })
+        }
+        _ => Err(()),
+    }
+}
+
+const TYPE_A_NUMBER: u16 = 1;
+const TYPE_AAAA_NUMBER: u16 = 28;
+const TYPE_CNAME_NUMBER: u16 = 5;
+const TYPE_PTR_NUMBER: u16 = 12;
+const TYPE_MX_NUMBER: u16 = 15;
+const TYPE_TXT_NUMBER: u16 = 16;
+const TYPE_SRV_NUMBER: u16 = 33;
 
 fn parse_query_types(raw: &str) -> Result<QueryTypes, ()> {
     let values = raw.split('|').collect::<Vec<_>>();

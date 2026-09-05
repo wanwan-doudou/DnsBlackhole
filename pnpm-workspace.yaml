@@ -20,3 +20,6 @@ minimumReleaseAgeExclude:
   - '@typescript/typescript-win32-arm64@7.0.2'
   - '@typescript/typescript-win32-x64@7.0.2'
   - typescript@7.0.2
+  - '@vitest/mocker@5.0.0'
+  - '@vitest/spy@5.0.0'
+  - vitest@5.0.0

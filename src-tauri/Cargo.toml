@@ -1,6 +1,6 @@
 [package]
 name = "dnsblackhole"
-version = "0.2.1"
+version = "0.2.2"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"
@@ -13,6 +13,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 default = []
 macos-service = []
+# 只给 criterion 基准打开：暴露 DNS 热路径的公开门面，不影响正式构建。
+bench = []
+
+[dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
@@ -77,3 +82,24 @@ path = "src/main.rs"
 name = "dnsblackhole-service"
 path = "src/bin/dnsblackhole-service.rs"
 required-features = ["macos-service"]
+
+[[bench]]
+name = "dns_hot_path"
+harness = false
+required-features = ["bench"]
+
+# DNS 转发是热路径，跨 crate 内联收益明显；codegen-units=1 配合 thin LTO 换取运行时吞吐。
+#
+# 用 thin 而不是 fat：fat LTO 的链接阶段是单线程全量重编译，本机实测会让 release
+# 构建多花十几分钟且期间无任何日志输出，日常验证成本太高；thin LTO 保留了绝大部分
+# 跨 crate 内联收益，链接时间只有 fat 的零头。
+#
+# 不设置 panic = "abort"：task_pool 依赖 catch_unwind 兜住单个上游任务的 panic，
+# 改为 abort 会让一次任务 panic 直接终止整个进程。
+#
+# 只想快速出一个本地验证包时，用环境变量临时关掉即可，无需改动本文件：
+#   $env:CARGO_PROFILE_RELEASE_LTO="false"; $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS="16"
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

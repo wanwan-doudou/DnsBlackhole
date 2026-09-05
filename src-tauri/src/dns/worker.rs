@@ -24,9 +24,10 @@ use super::{
     },
     filter_runtime::{FilterRuntime, SharedFilterRuntime, current_filter_runtime},
     protocol::{
-        Question, RCODE_REFUSED, TYPE_ANY, build_block_response, build_cname_response,
-        build_error_response, build_rewrite_response, parse_query, prepare_response_for_query,
-        response_security_data, summarize_response, truncate_response_for_udp, udp_payload_size,
+        Question, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_ANY, build_block_response,
+        build_cname_response, build_dnsrewrite_response, build_error_response,
+        build_rewrite_response, parse_query, prepare_response_for_query, response_security_data,
+        summarize_response, truncate_response_for_udp, udp_payload_size,
     },
     stats::{
         DnsStats, DnsTransport, ResponseProtectionKind, current_second, record_access_denied,
@@ -413,6 +414,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             rule_type: "service".into(),
             important_overrode: false,
             allowlist_rule: None,
+            dnsrewrite: None,
         };
         let response = build_block_response(query, question, &filter.blocking);
         if let Err(error) = send_dns_response(response_target, query, &response) {
@@ -491,6 +493,41 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
             .rules
             .blocking_match(&question.domain, question.qtype)
     {
+        if let Some(action) = &rule_match.dnsrewrite {
+            record_query(
+                &context.stats,
+                &question.domain,
+                client_addr.ip(),
+                context.detailed_runtime_stats,
+            );
+            let response = build_dnsrewrite_response(query, question, action, &filter.blocking);
+            let error = send_dns_response(response_target, query, &response)
+                .err()
+                .map(|error| format!("返回 DNS 重写响应失败：{error}"))
+                .or_else(|| {
+                    (response[3] & 0x0f == RCODE_SERVFAIL)
+                        .then(|| "DNS 重写返回 SERVFAIL".to_string())
+                });
+            if let Some(message) = &error {
+                record_error(&context.stats, message.clone());
+            }
+            queue_query_log_with_match(
+                context,
+                &filter,
+                &log_metadata,
+                client_addr,
+                QueryResponseSource::Rewrite,
+                false,
+                false,
+                error.is_some(),
+                None,
+                None,
+                error,
+                Some(&response),
+                Some(&rule_match),
+            );
+            return;
+        }
         let response = build_block_response(query, question, &filter.blocking);
         if let Err(error) = send_dns_response(response_target, query, &response) {
             let message = format!("返回黑名单响应失败：{error}");
@@ -802,7 +839,9 @@ fn response_protection_block(
 
     if check_cname {
         for target in data.cname_targets {
-            if let Some(rule_match) = filter.rules.blocking_match(&target, question.qtype) {
+            if let Some(rule_match) = filter.rules.blocking_match(&target, question.qtype)
+                && rule_match.dnsrewrite.is_none()
+            {
                 return Some(ResponseProtectionBlock {
                     kind: ResponseProtectionKind::CnameCloaking,
                     rule_match,
@@ -825,6 +864,7 @@ fn response_protection_block(
                 rule_type: "response protection".into(),
                 important_overrode: false,
                 allowlist_rule: None,
+                dnsrewrite: None,
             },
         });
     }

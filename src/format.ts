@@ -1,3 +1,4 @@
+import { t } from "./i18n";
 // 缓存 Intl 格式化器：构造开销较大，仪表盘定时刷新会高频调用，复用可避免重复创建。
 const countFormatter = new Intl.NumberFormat("zh-CN");
 const percentFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
@@ -26,7 +27,7 @@ export function formatCount(value: number): string {
 
 export function formatElapsedMs(value: number): string {
   const formatted = value < 1 ? value.toFixed(2) : Math.floor(value).toString();
-  return `${formatted} 毫秒`;
+  return t("{p0} 毫秒", { p0: formatted });
 }
 
 export function formatBytes(value: number): string {
@@ -54,12 +55,12 @@ export function formatPercent(value: number): string {
 
 export function formatDuration(hours: number): string {
   if (hours % (24 * 30) === 0) {
-    return `${hours / (24 * 30)} 个月`;
+    return t("{p0} 个月", { p0: hours / (24 * 30) });
   }
   if (hours % 24 === 0) {
-    return `${hours / 24} 天`;
+    return t("{p0} 天", { p0: hours / 24 });
   }
-  return `${hours} 小时`;
+  return t("{p0} 小时", { p0: hours });
 }
 
 export function formatTime(value: number | null): string {

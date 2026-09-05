@@ -32,14 +32,20 @@ pub(crate) const BLOCKED_SERVICE_KEYS: &[&str] = &[
     "roblox",
 ];
 const LEGACY_DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 100;
-const LEGACY_ADGUARD_DNS_FILTER_URL: &str =
-    "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
-const LEGACY_ADAWAY_FILTER_URL: &str =
-    "https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt";
+// AdGuard 在 HostlistsRegistry 的 filters.json 里把 GitHub Pages 声明为官方 downloadUrl。
+// 注意：默认值只作用于全新安装，已有配置里的订阅地址一律不改写——用户自己选的源由用户说了算。
 const DEFAULT_ADGUARD_DNS_FILTER_URL: &str =
-    "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/assets/filter_1.txt";
-const DEFAULT_ADAWAY_FILTER_URL: &str =
-    "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/assets/filter_2.txt";
+    "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
+// 以下三个清单都取上游仓库自己标注的原始地址（HaGeZi 的 README 把 GitHub 列为
+// reference repository，217heidai 的表格把 raw 标为「原始链接」），不用任何加速镜像。
+const DEFAULT_ADBLOCK_DNS_FILTER_URL: &str =
+    "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt";
+const DEFAULT_HAGEZI_TIF_URL: &str =
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.txt";
+const DEFAULT_HAGEZI_NSFW_URL: &str =
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/nsfw.txt";
+const DEFAULT_HAGEZI_GAMBLING_URL: &str =
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/gambling.txt";
 static BOOTSTRAP_QUERY_ID: AtomicU16 = AtomicU16::new(0x1234);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +113,11 @@ pub struct AppConfig {
     pub statistics_enabled: bool,
     #[serde(default = "default_statistics_retention_hours")]
     pub statistics_retention_hours: u32,
+    #[serde(default = "default_security_event_retention_hours")]
+    pub security_event_retention_hours: u32,
+    /// 是否把系统 hosts 文件并入 DNS 重写。默认关闭：开启会静默改变解析结果。
+    #[serde(default)]
+    pub system_hosts_enabled: bool,
     #[serde(default = "default_dns_cache_enabled")]
     pub dns_cache_enabled: bool,
     #[serde(default = "default_dns_cache_size")]
@@ -318,6 +329,8 @@ impl Default for AppConfig {
             query_log_retention_hours: default_query_log_retention_hours(),
             statistics_enabled: default_statistics_enabled(),
             statistics_retention_hours: default_statistics_retention_hours(),
+            security_event_retention_hours: default_security_event_retention_hours(),
+            system_hosts_enabled: false,
             dns_cache_enabled: default_dns_cache_enabled(),
             dns_cache_size: default_dns_cache_size(),
             dns_cache_min_ttl: default_dns_cache_min_ttl(),
@@ -465,6 +478,11 @@ impl AppConfig {
         }
         if self.statistics_retention_hours > MAX_STATISTICS_RETENTION_HOURS {
             return Err("统计数据保留时间必须为永久或 1 小时到 365 天".into());
+        }
+        if self.security_event_retention_hours == 0
+            || self.security_event_retention_hours > 24 * 365
+        {
+            return Err("安全事件保留时间必须在 1 小时到 365 天之间".into());
         }
         if self.dns_cache_enabled && self.dns_cache_size == 0 {
             return Err("DNS 缓存大小必须大于 0".into());
@@ -662,7 +680,9 @@ fn default_filter_update_interval_hours() -> u32 {
 }
 
 fn default_filter_max_size_mb() -> u32 {
-    50
+    // 仅作为防御性上限：HaGeZi TIF 完整版已经 45 MB 且仍在增长，留足余量，
+    // 真正异常的响应由 MAX_FILTER_SIZE_MB(256) 兜底。已有配置不会被升级改写。
+    200
 }
 
 fn default_query_log_enabled() -> bool {
@@ -698,6 +718,10 @@ fn default_statistics_enabled() -> bool {
 }
 
 fn default_statistics_retention_hours() -> u32 {
+    30 * 24
+}
+
+fn default_security_event_retention_hours() -> u32 {
     30 * 24
 }
 
@@ -806,15 +830,27 @@ pub fn default_filters() -> Vec<FilterSubscription> {
             ..FilterSubscription::default()
         },
         FilterSubscription {
-            id: "adaway-default-blocklist".into(),
-            name: "AdAway Default Blocklist".into(),
-            url: DEFAULT_ADAWAY_FILTER_URL.into(),
+            id: "adblock-dns-filters".into(),
+            name: "AdBlock DNS Filters".into(),
+            url: DEFAULT_ADBLOCK_DNS_FILTER_URL.into(),
             ..FilterSubscription::default()
         },
         FilterSubscription {
-            id: "adblock-dns-filters".into(),
-            name: "AdBlock DNS Filters".into(),
-            url: "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt".into(),
+            id: "hagezi-tif".into(),
+            name: "HaGeZi Threat Intelligence Feeds".into(),
+            url: DEFAULT_HAGEZI_TIF_URL.into(),
+            ..FilterSubscription::default()
+        },
+        FilterSubscription {
+            id: "hagezi-nsfw".into(),
+            name: "HaGeZi NSFW".into(),
+            url: DEFAULT_HAGEZI_NSFW_URL.into(),
+            ..FilterSubscription::default()
+        },
+        FilterSubscription {
+            id: "hagezi-gambling".into(),
+            name: "HaGeZi Gambling".into(),
+            url: DEFAULT_HAGEZI_GAMBLING_URL.into(),
             ..FilterSubscription::default()
         },
     ]
@@ -1724,9 +1760,6 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
         // 路由器做 DNS 转发时，几十到上百台设备可能共用同一个来源 IP。
         config.rate_limit_per_second = default_rate_limit_per_second();
     }
-    if config.schema_version < 9 {
-        migrate_legacy_filter_urls(config);
-    }
     if config.schema_version < 1 {
         if config.allowed_clients.trim().is_empty() {
             config.allowed_clients = default_allowed_clients();
@@ -1760,21 +1793,6 @@ pub fn migrate_legacy_defaults(config: &mut AppConfig) {
         config.fallback_dns = default_fallback_dns();
     }
     config.schema_version = CURRENT_CONFIG_SCHEMA_VERSION;
-}
-
-fn migrate_legacy_filter_urls(config: &mut AppConfig) {
-    for filter in &mut config.filters {
-        let replacement = match filter.url.trim() {
-            LEGACY_ADGUARD_DNS_FILTER_URL => Some(DEFAULT_ADGUARD_DNS_FILTER_URL),
-            LEGACY_ADAWAY_FILTER_URL => Some(DEFAULT_ADAWAY_FILTER_URL),
-            _ => None,
-        };
-        if let Some(url) = replacement {
-            filter.url = url.into();
-            // 旧地址的网络错误不应继续污染迁移后的订阅状态。
-            filter.last_error = None;
-        }
-    }
 }
 
 fn is_legacy_default_fallback_dns(fallback_dns: &str) -> bool {
@@ -2124,7 +2142,7 @@ mod tests {
         assert_eq!(config.listen_port, 53);
         assert!(config.listen_ipv6);
         assert_eq!(config.rate_limit_per_second, 2_000);
-        assert_eq!(config.filter_max_size_mb, 50);
+        assert_eq!(config.filter_max_size_mb, 200);
         assert!(!config.allow_insecure_http);
         assert_eq!(
             config.upstream_dns,
@@ -2136,16 +2154,26 @@ mod tests {
             ]
             .join("\n")
         );
-        assert_eq!(config.filters.len(), 3);
+        assert_eq!(config.filters.len(), 5);
         assert_eq!(config.filters[0].name, "AdGuard DNS filter");
         assert_eq!(config.filters[0].url, DEFAULT_ADGUARD_DNS_FILTER_URL);
-        assert_eq!(config.filters[1].name, "AdAway Default Blocklist");
-        assert_eq!(config.filters[1].url, DEFAULT_ADAWAY_FILTER_URL);
-        assert_eq!(config.filters[2].name, "AdBlock DNS Filters");
-        assert_eq!(
-            config.filters[2].url,
-            "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt"
-        );
+        assert_eq!(config.filters[1].name, "AdBlock DNS Filters");
+        assert_eq!(config.filters[1].url, DEFAULT_ADBLOCK_DNS_FILTER_URL);
+        assert_eq!(config.filters[2].name, "HaGeZi Threat Intelligence Feeds");
+        assert_eq!(config.filters[2].url, DEFAULT_HAGEZI_TIF_URL);
+        assert_eq!(config.filters[3].name, "HaGeZi NSFW");
+        assert_eq!(config.filters[3].url, DEFAULT_HAGEZI_NSFW_URL);
+        assert_eq!(config.filters[4].name, "HaGeZi Gambling");
+        assert_eq!(config.filters[4].url, DEFAULT_HAGEZI_GAMBLING_URL);
+        // 默认清单只用上游官方地址，不允许混进 jsDelivr / gh-proxy 之类的加速镜像。
+        for filter in &config.filters {
+            assert!(
+                filter.url.starts_with("https://raw.githubusercontent.com/")
+                    || filter.url.starts_with("https://adguardteam.github.io/"),
+                "默认清单出现了非官方地址：{}",
+                filter.url
+            );
+        }
     }
 
     #[test]
@@ -2361,20 +2389,17 @@ mod tests {
         assert_eq!(custom.rate_limit_per_second, 500);
     }
 
+    /// 升级不得替用户改配置：默认清单和默认上限都只作用于全新安装。
     #[test]
-    fn migrates_legacy_filter_urls_but_preserves_custom_sources() {
+    fn upgrade_never_rewrites_existing_filter_settings() {
+        let old_adguard_url =
+            "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/assets/filter_1.txt";
         let mut config = AppConfig {
-            schema_version: 8,
+            schema_version: 17,
             filters: vec![
                 FilterSubscription {
                     id: "adguard-dns-filter".into(),
-                    url: LEGACY_ADGUARD_DNS_FILTER_URL.into(),
-                    last_error: Some("旧地址下载失败".into()),
-                    ..FilterSubscription::default()
-                },
-                FilterSubscription {
-                    id: "adaway-default-blocklist".into(),
-                    url: LEGACY_ADAWAY_FILTER_URL.into(),
+                    url: old_adguard_url.into(),
                     ..FilterSubscription::default()
                 },
                 FilterSubscription {
@@ -2383,16 +2408,30 @@ mod tests {
                     ..FilterSubscription::default()
                 },
             ],
+            filter_max_size_mb: 50,
             ..AppConfig::default()
         };
 
         migrate_legacy_defaults(&mut config);
 
         assert_eq!(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
-        assert_eq!(config.filters[0].url, DEFAULT_ADGUARD_DNS_FILTER_URL);
-        assert!(config.filters[0].last_error.is_none());
-        assert_eq!(config.filters[1].url, DEFAULT_ADAWAY_FILTER_URL);
-        assert_eq!(config.filters[2].url, "https://example.com/custom.txt");
+        assert_eq!(config.filters[0].url, old_adguard_url);
+        assert_eq!(config.filters[1].url, "https://example.com/custom.txt");
+        // 默认值的调整同样只作用于全新安装，不回头改写已有配置。
+        assert_eq!(config.filter_max_size_mb, 50);
+    }
+
+    #[test]
+    fn keeps_manually_lowered_filter_size_limit() {
+        let mut config = AppConfig {
+            schema_version: 17,
+            filter_max_size_mb: 16,
+            ..AppConfig::default()
+        };
+
+        migrate_legacy_defaults(&mut config);
+
+        assert_eq!(config.filter_max_size_mb, 16);
     }
 
     #[test]

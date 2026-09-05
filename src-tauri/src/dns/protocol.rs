@@ -6,7 +6,7 @@ use std::{
 use crate::config::{AppConfig, BlockingMode};
 use serde::{Deserialize, Serialize};
 
-use super::rewrites::RewriteTarget;
+use super::{rewrites::RewriteTarget, rules::DnsRewriteAction};
 
 pub(crate) const DNS_HEADER_LEN: usize = 12;
 pub(crate) const MAX_DNS_PACKET_SIZE: usize = u16::MAX as usize;
@@ -21,11 +21,16 @@ pub(crate) const TYPE_NS: u16 = 2;
 pub(crate) const TYPE_CNAME: u16 = 5;
 pub(crate) const TYPE_SOA: u16 = 6;
 pub(crate) const TYPE_AAAA: u16 = 28;
+const TYPE_PTR: u16 = 12;
+const TYPE_MX: u16 = 15;
+const TYPE_TXT: u16 = 16;
+const TYPE_SRV: u16 = 33;
 pub(crate) const TYPE_OPT: u16 = 41;
 const TYPE_SVCB: u16 = 64;
 const TYPE_HTTPS: u16 = 65;
 pub(crate) const TYPE_ANY: u16 = 255;
 pub(crate) const RCODE_NOERROR: u8 = 0;
+pub(crate) const RCODE_SERVFAIL: u8 = 2;
 pub(crate) const RCODE_REFUSED: u8 = 5;
 pub(crate) const RCODE_NXDOMAIN: u8 = 3;
 
@@ -313,12 +318,9 @@ pub(crate) fn build_rewrite_response(
 }
 
 pub(crate) fn build_cname_response(query: &[u8], question: &Question, target: &str) -> Vec<u8> {
-    let mut encoded_target = Vec::with_capacity(target.len() + 2);
-    for label in target.trim_end_matches('.').split('.') {
-        encoded_target.push(label.len() as u8);
-        encoded_target.extend_from_slice(label.as_bytes());
-    }
-    encoded_target.push(0);
+    let Some(encoded_target) = encode_dns_name(target) else {
+        return build_ip_response(query, question, RCODE_SERVFAIL, None, None, 0);
+    };
 
     let mut response = Vec::with_capacity(question.question_end + encoded_target.len() + 16);
     response.extend_from_slice(&query[0..2]);
@@ -335,6 +337,172 @@ pub(crate) fn build_cname_response(query: &[u8], question: &Question, target: &s
     response.extend_from_slice(&REWRITE_RESPONSE_TTL.to_be_bytes());
     write_u16(&mut response, encoded_target.len() as u16);
     response.extend_from_slice(&encoded_target);
+    response
+}
+
+/// 按 `$dnsrewrite` 规则构造应答。查询类型与重写记录类型不一致时返回空 NOERROR，
+/// 与 AdGuard 的行为保持一致（例如对 TXT 重写发起 A 查询）。
+pub(crate) fn build_dnsrewrite_response(
+    query: &[u8],
+    question: &Question,
+    action: &DnsRewriteAction,
+    policy: &BlockingPolicy,
+) -> Vec<u8> {
+    let blocking_ttl = policy.ttl;
+    match action {
+        DnsRewriteAction::Multiple(actions) => {
+            let mut response = build_ip_response(query, question, 0, None, None, 0);
+            let mut count = 0_u16;
+            for action in actions.iter() {
+                let part = build_dnsrewrite_response(query, question, action, policy);
+                if part[3] & 0x0f != 0 {
+                    return part;
+                }
+                let answers = read_u16(&part, 6).unwrap_or(0);
+                if answers == 0 {
+                    continue;
+                }
+                let records = &part[question.question_end..];
+                if response.len() + records.len() > MAX_DNS_PACKET_SIZE {
+                    return build_ip_response(query, question, RCODE_SERVFAIL, None, None, 0);
+                }
+                let Some(next) = count.checked_add(answers) else {
+                    return build_ip_response(query, question, RCODE_SERVFAIL, None, None, 0);
+                };
+                count = next;
+                response.extend_from_slice(records);
+            }
+            response[6..8].copy_from_slice(&count.to_be_bytes());
+            response
+        }
+        DnsRewriteAction::RCode(RCODE_NXDOMAIN) => {
+            build_nxdomain_response(query, question, blocking_ttl)
+        }
+        DnsRewriteAction::RCode(rcode) => build_ip_response(query, question, *rcode, None, None, 0),
+        DnsRewriteAction::Address(IpAddr::V4(addr)) if question.qtype == TYPE_ANY => {
+            build_record_response(query, question, TYPE_A, &addr.octets())
+        }
+        DnsRewriteAction::Address(IpAddr::V6(addr)) if question.qtype == TYPE_ANY => {
+            build_record_response(query, question, TYPE_AAAA, &addr.octets())
+        }
+        DnsRewriteAction::Address(IpAddr::V4(addr)) => build_ip_response(
+            query,
+            question,
+            RCODE_NOERROR,
+            Some(*addr),
+            None,
+            REWRITE_RESPONSE_TTL,
+        ),
+        DnsRewriteAction::Address(IpAddr::V6(addr)) => build_ip_response(
+            query,
+            question,
+            RCODE_NOERROR,
+            None,
+            Some(*addr),
+            REWRITE_RESPONSE_TTL,
+        ),
+        DnsRewriteAction::Cname(target) => build_cname_response(query, question, target),
+        DnsRewriteAction::Record { rtype, value } => {
+            if question.qtype != *rtype && question.qtype != TYPE_ANY {
+                return build_ip_response(query, question, 0, None, None, 0);
+            }
+            match encode_rewrite_rdata(*rtype, value, question.qtype) {
+                Some(rdata) => build_record_response(query, question, *rtype, &rdata),
+                // 无法编码的配置返回 SERVFAIL，避免将错误伪装为不存在记录。
+                None => build_ip_response(query, question, RCODE_SERVFAIL, None, None, 0),
+            }
+        }
+    }
+}
+
+/// 把域名编码成 DNS 线格式的 label 序列。
+pub(crate) fn encode_dns_name(name: &str) -> Option<Vec<u8>> {
+    if name == "." {
+        return Some(vec![0]);
+    }
+    let name = name.trim_end_matches('.');
+    if name.is_empty() || name.len() > 253 {
+        return None;
+    }
+    let mut encoded = Vec::with_capacity(name.len() + 2);
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        encoded.push(label.len() as u8);
+        encoded.extend_from_slice(label.as_bytes());
+    }
+    encoded.push(0);
+    Some(encoded)
+}
+
+pub(crate) fn encode_rewrite_rdata(rtype: u16, value: &str, qtype: u16) -> Option<Vec<u8>> {
+    if qtype != rtype && qtype != TYPE_ANY {
+        return None;
+    }
+    match rtype {
+        TYPE_TXT => {
+            // TXT rdata 是若干 character-string，每段最长 255 字节。
+            let bytes = value.as_bytes();
+            if bytes.len() + bytes.len().div_ceil(255) > usize::from(u16::MAX) {
+                return None;
+            }
+            let mut rdata = Vec::with_capacity(bytes.len() + bytes.len() / 255 + 1);
+            for chunk in bytes.chunks(255) {
+                rdata.push(chunk.len() as u8);
+                rdata.extend_from_slice(chunk);
+            }
+            Some(rdata)
+        }
+        TYPE_PTR => encode_dns_name(value),
+        TYPE_MX => {
+            let (preference, exchange) = value.split_once(char::is_whitespace)?;
+            let preference = preference.trim().parse::<u16>().ok()?;
+            let mut rdata = preference.to_be_bytes().to_vec();
+            rdata.extend_from_slice(&encode_dns_name(exchange.trim())?);
+            Some(rdata)
+        }
+        TYPE_SRV => {
+            let mut parts = value.split_whitespace();
+            let priority = parts.next()?.parse::<u16>().ok()?;
+            let weight = parts.next()?.parse::<u16>().ok()?;
+            let port = parts.next()?.parse::<u16>().ok()?;
+            let target = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            let mut rdata = Vec::with_capacity(target.len() + 8);
+            rdata.extend_from_slice(&priority.to_be_bytes());
+            rdata.extend_from_slice(&weight.to_be_bytes());
+            rdata.extend_from_slice(&port.to_be_bytes());
+            rdata.extend_from_slice(&encode_dns_name(target)?);
+            Some(rdata)
+        }
+        _ => None,
+    }
+}
+
+fn build_record_response(query: &[u8], question: &Question, rtype: u16, rdata: &[u8]) -> Vec<u8> {
+    if rdata.len() > usize::from(u16::MAX)
+        || question.question_end + 12 + rdata.len() > MAX_DNS_PACKET_SIZE
+    {
+        return build_ip_response(query, question, RCODE_SERVFAIL, None, None, 0);
+    }
+    let mut response = Vec::with_capacity(question.question_end + rdata.len() + 16);
+    response.extend_from_slice(&query[0..2]);
+    response.push(0x80 | (query[2] & 0x01));
+    response.push(0x80 | RCODE_NOERROR);
+    write_u16(&mut response, 1);
+    write_u16(&mut response, 1);
+    write_u16(&mut response, 0);
+    write_u16(&mut response, 0);
+    response.extend_from_slice(&query[DNS_HEADER_LEN..question.question_end]);
+    response.extend_from_slice(&[0xC0, 0x0C]);
+    write_u16(&mut response, rtype);
+    write_u16(&mut response, question.qclass);
+    response.extend_from_slice(&REWRITE_RESPONSE_TTL.to_be_bytes());
+    write_u16(&mut response, rdata.len() as u16);
+    response.extend_from_slice(rdata);
     response
 }
 

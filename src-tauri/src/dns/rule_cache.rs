@@ -18,7 +18,7 @@ use crate::{config, config::AppConfig, storage};
 
 use super::rules::{CompiledRules, compile_rules, custom_rules_have_badfilter};
 
-const RULE_CACHE_FORMAT_VERSION: u32 = 3;
+const RULE_CACHE_FORMAT_VERSION: u32 = 5;
 const RULE_CACHE_MAGIC: [u8; 8] = *b"DNSBRC03";
 const RULE_CACHE_FILE: &str = ".compiled-rules-v3.postcard";
 const LEGACY_RULE_CACHE_FILES: [&str; 2] =

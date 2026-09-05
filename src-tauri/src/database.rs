@@ -18,8 +18,8 @@ use tauri::AppHandle;
 use crate::{
     config::{self, AppConfig, MAX_STATISTICS_RETENTION_HOURS},
     dns::{
-        DnsResponseAnswer, DnsResponseSummary, TrafficBucket, UpstreamLatencyStat,
-        UpstreamRequestStat,
+        DnsResponseAnswer, DnsResponseSummary, DnsTransport, SecurityEvent, SecurityEventType,
+        TrafficBucket, UpstreamLatencyStat, UpstreamRequestStat,
     },
 };
 
@@ -29,6 +29,16 @@ use rankings::{
     blocklist_hit_counts, client_counts, grouped_domain_counts, traffic_buckets,
     upstream_avg_latency, upstream_request_counts,
 };
+
+const UPSERT_SECURITY_EVENT_SQL: &str = "
+    INSERT INTO security_events
+        (event_type, protocol, client_ip, reason, first_seen_at, last_seen_at, count)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    ON CONFLICT(event_type, protocol, client_ip, reason, first_seen_at)
+    DO UPDATE SET
+        last_seen_at = max(last_seen_at, excluded.last_seen_at),
+        count = count + excluded.count
+";
 
 const INSERT_QUERY_LOG_SQL: &str = "
     INSERT INTO query_logs
@@ -486,6 +496,90 @@ impl Database {
         Ok(())
     }
 
+    /// 批量追加安全事件增量；事务保证一个批次全部成功或全部回滚。
+    pub fn append_security_events(&self, events: &[SecurityEvent]) -> Result<(), String> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("创建安全事件写入事务失败：{e}"))?;
+        {
+            let mut statement = tx
+                .prepare(UPSERT_SECURITY_EVENT_SQL)
+                .map_err(|e| format!("准备写入安全事件失败：{e}"))?;
+            for event in events {
+                statement
+                    .execute(params![
+                        security_event_type_to_db(event.event_type),
+                        dns_transport_to_db(event.protocol),
+                        event.client_ip,
+                        event.reason,
+                        u64_to_db_i64(event.first_seen_at, "安全事件首次时间")?,
+                        u64_to_db_i64(event.last_seen_at, "安全事件末次时间")?,
+                        u64_to_db_i64(event.count, "安全事件次数")?,
+                    ])
+                    .map_err(|e| format!("写入安全事件失败：{e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("提交安全事件写入失败：{e}"))?;
+        Ok(())
+    }
+
+    /// 读取最近的安全事件，用于启动后回填内存队列。返回值按 last_seen_at 升序。
+    pub fn recent_security_events(&self, limit: usize) -> Result<Vec<SecurityEvent>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT event_type, protocol, client_ip, reason, first_seen_at, last_seen_at, count
+                 FROM security_events
+                 ORDER BY last_seen_at DESC, id DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| format!("准备读取安全事件失败：{e}"))?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok(SecurityEvent {
+                    event_type: security_event_type_from_db(&row.get::<_, String>(0)?),
+                    protocol: dns_transport_from_db(&row.get::<_, String>(1)?),
+                    client_ip: row.get(2)?,
+                    reason: row.get(3)?,
+                    first_seen_at: read_u64(row, 4)?,
+                    last_seen_at: read_u64(row, 5)?,
+                    count: read_u64(row, 6)?,
+                })
+            })
+            .map_err(|e| format!("读取安全事件失败：{e}"))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(|e| format!("解析安全事件失败：{e}"))?);
+        }
+        events.reverse();
+        Ok(events)
+    }
+
+    pub(crate) fn prune_security_events(&self, since: u64) -> Result<(), String> {
+        self.lock()?
+            .execute(
+                "DELETE FROM security_events WHERE last_seen_at < ?1",
+                params![u64_to_db_i64(since, "安全事件清理时间戳")?],
+            )
+            .map_err(|error| format!("清理安全事件失败：{error}"))?;
+        Ok(())
+    }
+
+    pub fn clear_security_events(&self) -> Result<(), String> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM security_events", [])
+            .map_err(|e| format!("清除安全事件失败：{e}"))?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn insert_query_logs(&self, entries: &[(QueryLogEntry, bool)]) -> Result<(), String> {
         let events = entries
@@ -504,6 +598,7 @@ impl Database {
         &self,
         query_log_retention_hours: u32,
         statistics_retention_hours: u32,
+        security_event_retention_hours: u32,
     ) -> Result<(), String> {
         let now = unix_now();
         let query_since_raw = now.saturating_sub(u64::from(query_log_retention_hours) * 3600);
@@ -573,6 +668,15 @@ impl Database {
             params![legacy_statistics_since_minute],
         )
         .map_err(|e| format!("清理黑名单统计失败：{e}"))?;
+        let security_since = u64_to_db_i64(
+            now.saturating_sub(u64::from(security_event_retention_hours) * 3600),
+            "安全事件清理时间戳",
+        )?;
+        tx.execute(
+            "DELETE FROM security_events WHERE last_seen_at < ?1",
+            params![security_since],
+        )
+        .map_err(|e| format!("清理安全事件失败：{e}"))?;
         tx.commit()
             .map_err(|e| format!("提交查询数据清理失败：{e}"))?;
         // external content 的 FTS 删除会留下旧倒排段。正数 merge 可能因没有足够
@@ -1611,6 +1715,19 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             value TEXT NOT NULL
         ) WITHOUT ROWID;
 
+        -- 安全事件此前只存在内存里，重启即丢。这里落盘保存聚合后的条目：
+        -- (类型, 协议, 客户端, 原因, 首次时间) 天然唯一，增量写入累加计数并更新末次时间。
+        CREATE TABLE IF NOT EXISTS security_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            client_ip TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            count INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS query_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp INTEGER NOT NULL,
@@ -1814,6 +1931,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             WHERE requests > 0;
         CREATE INDEX IF NOT EXISTS idx_statistics_hourly_dimension_window
             ON statistics_hourly(dimension, hour, value);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_security_events_identity
+            ON security_events(event_type, protocol, client_ip, reason, first_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_security_events_last_seen
+            ON security_events(last_seen_at DESC, id DESC);
         ",
     )
     .map_err(|e| format!("初始化数据库索引失败：{e}"))?;
@@ -2375,6 +2496,34 @@ fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
 
+fn security_event_type_to_db(value: SecurityEventType) -> &'static str {
+    match value {
+        SecurityEventType::AccessDenied => "access_denied",
+        SecurityEventType::RateLimited => "rate_limited",
+    }
+}
+
+fn security_event_type_from_db(value: &str) -> SecurityEventType {
+    match value {
+        "rate_limited" => SecurityEventType::RateLimited,
+        _ => SecurityEventType::AccessDenied,
+    }
+}
+
+fn dns_transport_to_db(value: DnsTransport) -> &'static str {
+    match value {
+        DnsTransport::Udp => "udp",
+        DnsTransport::Tcp => "tcp",
+    }
+}
+
+fn dns_transport_from_db(value: &str) -> DnsTransport {
+    match value {
+        "tcp" => DnsTransport::Tcp,
+        _ => DnsTransport::Udp,
+    }
+}
+
 fn u64_to_db_i64(value: u64, field: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("{field}超出数据库 INTEGER 范围"))
 }
@@ -2755,11 +2904,97 @@ mod tests {
             conn.execute("UPDATE query_log_blocklist_stats SET minute = 0", [])
                 .expect("blocklist stats should become expired");
         }
-        db.prune_expired(1, 1).expect("expired data should prune");
+        db.prune_expired(1, 1, 1)
+            .expect("expired data should prune");
         let expired = db.log_stats(1).expect("expired stats should prune");
         assert_eq!(expired.queries, 0);
         assert_eq!(expired.blocked, 0);
         assert!(expired.query_domains.is_empty());
+    }
+
+    fn sample_security_event(client_ip: &str, first_seen_at: u64, count: u64) -> SecurityEvent {
+        SecurityEvent {
+            event_type: SecurityEventType::AccessDenied,
+            protocol: DnsTransport::Udp,
+            client_ip: client_ip.to_string(),
+            reason: "客户端不在允许网段".to_string(),
+            first_seen_at,
+            last_seen_at: first_seen_at + 1,
+            count,
+        }
+    }
+
+    #[test]
+    fn security_event_deltas_accumulate_without_duplicate_rows() {
+        let db = Database::open_in_memory().expect("db should open");
+        let now = unix_now();
+        let event = sample_security_event("192.168.1.9", now, 3);
+
+        db.append_security_events(std::slice::from_ref(&event))
+            .expect("first flush should succeed");
+        // 同一条聚合事件的新增计数只累加到原行。
+        let mut grown = event.clone();
+        grown.count = 8;
+        grown.last_seen_at = now + 5;
+        db.append_security_events(std::slice::from_ref(&grown))
+            .expect("second flush should succeed");
+
+        let restored = db.recent_security_events(200).expect("events should load");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].count, 11);
+        assert_eq!(restored[0].last_seen_at, now + 5);
+        assert_eq!(restored[0].client_ip, "192.168.1.9");
+        assert_eq!(restored[0].event_type, SecurityEventType::AccessDenied);
+        assert_eq!(restored[0].protocol, DnsTransport::Udp);
+    }
+
+    #[test]
+    fn security_events_are_returned_oldest_first_and_capped_by_limit() {
+        let db = Database::open_in_memory().expect("db should open");
+        let now = unix_now();
+        let events = (0..5)
+            .map(|index| sample_security_event(&format!("10.0.0.{index}"), now + index, 1))
+            .collect::<Vec<_>>();
+        db.append_security_events(&events)
+            .expect("flush should succeed");
+
+        let restored = db.recent_security_events(3).expect("events should load");
+        assert_eq!(restored.len(), 3);
+        // 取最近 3 条，但返回顺序与内存队列一致（旧 -> 新）。
+        assert_eq!(restored[0].client_ip, "10.0.0.2");
+        assert_eq!(restored[2].client_ip, "10.0.0.4");
+    }
+
+    #[test]
+    fn expired_security_events_are_pruned_by_retention() {
+        let db = Database::open_in_memory().expect("db should open");
+        let now = unix_now();
+        let fresh = sample_security_event("10.0.0.1", now, 1);
+        let mut stale = sample_security_event("10.0.0.2", now.saturating_sub(48 * 3600), 1);
+        stale.last_seen_at = now.saturating_sub(48 * 3600);
+        db.append_security_events(&[fresh, stale])
+            .expect("flush should succeed");
+
+        db.prune_expired(24 * 365, 0, 24)
+            .expect("prune should succeed");
+
+        let restored = db.recent_security_events(200).expect("events should load");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].client_ip, "10.0.0.1");
+    }
+
+    #[test]
+    fn clearing_security_events_empties_the_table() {
+        let db = Database::open_in_memory().expect("db should open");
+        let now = unix_now();
+        db.append_security_events(&[sample_security_event("10.0.0.1", now, 1)])
+            .expect("flush should succeed");
+        db.clear_security_events().expect("clear should succeed");
+        assert!(
+            db.recent_security_events(200)
+                .expect("events should load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3008,7 +3243,7 @@ mod tests {
                 .expect("hourly detail should become old");
         }
 
-        db.prune_expired(24, 0)
+        db.prune_expired(24, 0, 24)
             .expect("permanent statistics should prune bounded detail");
         let permanent = db.log_stats(0).expect("permanent statistics should load");
         assert_eq!(permanent.queries, 1);
@@ -3207,7 +3442,7 @@ mod tests {
             conn.execute("UPDATE statistics_hourly SET hour = 24", [])
                 .expect("statistics should become old");
         }
-        db.prune_expired(1, 0)
+        db.prune_expired(1, 0, 1)
             .expect("permanent statistics should not prune");
         assert_eq!(
             db.query_logs(1, "all", "", 1, 20)
@@ -3288,7 +3523,7 @@ mod tests {
             .expect("old statistics should insert");
         }
 
-        db.prune_expired(1, 24)
+        db.prune_expired(1, 24, 1)
             .expect("short statistics retention should prune");
         let stats = db.log_stats(24).expect("statistics should load");
 
@@ -3601,7 +3836,7 @@ mod tests {
             optimize_query_log_search(&conn).expect("baseline FTS should optimize");
         }
 
-        db.prune_expired(1, 0).expect("prune should succeed");
+        db.prune_expired(1, 0, 1).expect("prune should succeed");
 
         let conn = db.lock().expect("db should lock");
         let remaining: i64 = conn

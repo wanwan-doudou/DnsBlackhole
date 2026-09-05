@@ -22,6 +22,7 @@ use super::{
     cache::{DnsCacheConfig, DnsCacheStatsSnapshot, DnsCacheStore},
     filter_runtime::{FilterRuntime, SharedFilterRuntime, share_filter_runtime},
     protocol::MAX_DNS_PACKET_SIZE,
+    security_events::SecurityEventWriter,
     stats::{
         DnsStats, record_error, record_tcp_connection_rejected, record_worker_queue_drop,
         reset_stats,
@@ -60,6 +61,7 @@ pub struct DnsServer {
     threads: Vec<JoinHandle<()>>,
     cache: Option<Arc<DnsCacheStore>>,
     filter_runtime: SharedFilterRuntime,
+    security_event_writer: Option<SecurityEventWriter>,
 }
 
 impl DnsServer {
@@ -139,8 +141,23 @@ impl DnsServer {
 
         let threads_started = Instant::now();
         reset_stats(&stats);
+        // reset_stats 会清空内存队列，这里把落盘的历史安全事件放回去，
+        // 让「安全防护」页在重启后仍能显示既有记录。
+        match database.recent_security_events(super::SECURITY_EVENT_CAPACITY) {
+            Ok(mut events) => {
+                let since = super::stats::current_second()
+                    .saturating_sub(u64::from(config.security_event_retention_hours) * 3600);
+                events.retain(|event| event.last_seen_at >= since);
+                super::restore_security_events(&stats, events);
+            }
+            Err(error) => eprintln!("读取历史安全事件失败：{error}"),
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
+        let security_event_writer = Some(SecurityEventWriter::start(
+            Arc::clone(&stats),
+            Arc::clone(&database),
+        ));
         if let Some(listener) = monitoring_listener {
             threads.push(super::monitoring::spawn(
                 listener,
@@ -231,6 +248,7 @@ impl DnsServer {
             threads,
             cache: dns_cache,
             filter_runtime,
+            security_event_writer,
         };
         crate::performance::log_service("DNS 服务实例", "工作线程启动", threads_started);
         crate::performance::log_service("DNS 服务实例", "总计", total_started);
@@ -261,12 +279,19 @@ impl DnsServer {
 
     pub fn has_finished_threads(&self) -> bool {
         self.threads.iter().any(JoinHandle::is_finished)
+            || self
+                .security_event_writer
+                .as_ref()
+                .is_some_and(SecurityEventWriter::is_finished)
     }
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         for thread in self.threads.drain(..) {
             let _ = thread.join();
+        }
+        if let Some(writer) = self.security_event_writer.take() {
+            writer.stop();
         }
     }
 }
@@ -949,6 +974,7 @@ mod tests {
         let server = DnsServer {
             stop: Arc::new(AtomicBool::new(false)),
             threads: vec![finished_thread],
+            security_event_writer: None,
             cache: None,
             filter_runtime: share_filter_runtime(build_filter_runtime(&AppConfig::default(), "")),
         };
@@ -1021,6 +1047,78 @@ mod tests {
         }));
 
         server.stop();
+    }
+
+    #[test]
+    fn dnsrewrite_udp_and_tcp_responses_are_logged_without_blocking() {
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            dns_cache_enabled: false,
+            statistics_enabled: true,
+            query_log_enabled: true,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let mut query = example_a_query();
+        let domain = super::super::protocol::parse_question(&query)
+            .unwrap()
+            .domain;
+        let rules = format!(
+            "||{domain}^\n||{domain}^$dnsrewrite=1.2.3.4\n||{domain}^$dnsrewrite=5.6.7.8\n||{domain}^$dnsrewrite=2001:db8::1"
+        );
+        let server =
+            DnsServer::start(config, &rules, Arc::clone(&stats), Arc::clone(&database)).unwrap();
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        udp.send_to(&query, (Ipv4Addr::LOCALHOST, port)).unwrap();
+        let mut response = [0_u8; 512];
+        let (len, _) = udp.recv_from(&mut response).unwrap();
+        let summary = super::super::protocol::summarize_response(&response[..len]).unwrap();
+        assert_eq!(summary.answer_count, 2);
+        assert_eq!(
+            summary
+                .answers
+                .iter()
+                .map(|answer| answer.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1.2.3.4", "5.6.7.8"]
+        );
+        let qtype_offset = query.len() - 4;
+        query[qtype_offset..qtype_offset + 2].copy_from_slice(&28_u16.to_be_bytes());
+        let mut tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        tcp.write_all(&(query.len() as u16).to_be_bytes()).unwrap();
+        tcp.write_all(&query).unwrap();
+        let mut length = [0_u8; 2];
+        tcp.read_exact(&mut length).unwrap();
+        let mut response = vec![0; usize::from(u16::from_be_bytes(length))];
+        tcp.read_exact(&mut response).unwrap();
+        let summary = super::super::protocol::summarize_response(&response).unwrap();
+        assert_eq!(summary.answer_count, 1);
+        assert_eq!(summary.answers[0].value, "2001:db8::1");
+        drop(tcp);
+        server.stop();
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.queries, 2);
+        assert_eq!(stats.blocked, 0);
+        assert_eq!(stats.forwarded, 0);
+        assert_eq!(stats.failed, 0);
+        let logs = database.query_logs(24, "all", "", 1, 20).unwrap();
+        assert_eq!(logs.records.len(), 2);
+        for log in logs.records {
+            assert!(!log.blocked && !log.failed && !log.forwarded);
+            assert_eq!(log.response_source.as_deref(), Some("rewrite"));
+            assert!(log.matched_rule.is_some());
+        }
+        let persisted = database.log_stats(24).unwrap();
+        assert_eq!(persisted.queries, 2);
+        assert_eq!(persisted.blocked, 0);
     }
 
     #[test]

@@ -48,6 +48,9 @@ jobs:
       - name: 前端单元测试
         run: pnpm test
 
+      - name: 英文字典覆盖检查
+        run: python scripts/check-i18n.py
+
       - name: Rust 格式检查
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
@@ -56,3 +59,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      # 共享 CI 机器噪声太大，无法做真正的性能门禁；这里只保证基准始终可编译，
+      # 避免热路径重构后基准悄悄失效。实际性能对比在本地跑：
+      # cargo bench --manifest-path src-tauri/Cargo.toml --features bench --bench dns_hot_path
+      - name: 性能基准编译检查
+        run: cargo bench --manifest-path src-tauri/Cargo.toml --features bench --bench dns_hot_path --no-run

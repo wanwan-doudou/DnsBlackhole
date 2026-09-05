@@ -1,5 +1,6 @@
 import { exportQueryLogFile, getQueryLogs } from "./api";
 import type { QueryLogQuery, QueryLogRecord } from "./types";
+import { t } from "./i18n";
 
 const EXPORT_PAGE_SIZE = 200;
 const EXPORT_RECORD_LIMIT = 50_000;
@@ -16,9 +17,9 @@ export async function exportFilteredQueryLogs(
 ): Promise<QueryLogExportResult | null> {
   const { save } = await import("@tauri-apps/plugin-dialog");
   const path = await save({
-    title: "导出查询日志",
+    title: t("导出查询日志"),
     defaultPath: `DnsBlackhole-query-logs-${dateStamp()}.csv`,
-    filters: [{ name: "CSV 表格", extensions: ["csv"] }],
+    filters: [{ name: t("CSV 表格"), extensions: ["csv"] }],
   });
   if (!path) {
     return null;
@@ -53,21 +54,21 @@ export async function exportFilteredQueryLogs(
 
 export function serializeQueryLogsCsv(records: QueryLogRecord[]): string {
   const header = [
-    "时间",
-    "域名",
-    "查询类型",
-    "传输协议",
-    "客户端",
-    "状态",
-    "响应来源",
-    "上游服务器",
-    "上游耗时(ms)",
-    "总耗时(ms)",
-    "响应代码",
-    "响应记录",
-    "命中规则",
-    "规则来源",
-    "错误",
+    t("时间"),
+    t("域名"),
+    t("查询类型"),
+    t("传输协议"),
+    t("客户端"),
+    t("状态"),
+    t("响应来源"),
+    t("上游服务器"),
+    t("上游耗时(ms)"),
+    t("总耗时(ms)"),
+    t("响应代码"),
+    t("响应记录"),
+    t("命中规则"),
+    t("规则来源"),
+    t("错误"),
   ];
   const rows = records.map((record) => [
     new Date(record.timestamp * 1000).toISOString(),
@@ -75,7 +76,7 @@ export function serializeQueryLogsCsv(records: QueryLogRecord[]): string {
     record.query_type ?? "",
     record.transport?.toUpperCase() ?? "",
     record.client_ip ?? "",
-    record.failed ? "失败" : record.blocked ? "已拦截" : "已处理",
+    record.failed ? t("失败") : record.blocked ? t("已拦截") : t("已处理"),
     record.response_source ?? "",
     record.upstream_server ?? "",
     record.upstream_duration_ms ?? "",

@@ -64,10 +64,12 @@ Bootstrap DNS 只接受 IP 或 `IP:端口`，不能填写域名或 DoH 地址，
 
 ### 过滤与重写
 
-- 默认包含 AdGuard DNS filter、AdAway Default Blocklist 和 AdBlock DNS Filters 三条订阅。
+- 默认包含五条订阅：AdGuard DNS filter、AdBlock DNS Filters、HaGeZi Threat Intelligence Feeds、HaGeZi NSFW 和 HaGeZi Gambling，全部取自上游仓库官方标注的原始地址，不使用任何加速镜像。
 - 可添加、启用、停用、更新和删除远程清单；自动更新失败时采用指数退避，并保留上一版有效缓存。
 - 支持本地自定义规则、allowlist、`important`、`badfilter`、DNS 类型限制和 `denyallow`。
 - 支持 DNS 重写，格式为 `域名 IP`；`*.example.org` 可匹配子域，优先于黑名单生效。
+- 规则可用 `$dnsrewrite` 直接指定应答，覆盖全局拦截方式；查询类型与重写记录类型不一致时返回空 NOERROR。
+- 可选把系统 hosts 文件并入 DNS 重写表；界面里显式写出的重写优先，修改 hosts 后需重新保存配置才会读取。
 - 支持零地址、NXDOMAIN、REFUSED 和自定义 IP 四种拦截响应。
 - 拦截响应 TTL 可配置；NXDOMAIN 会携带同 TTL 的 SOA 负缓存信息，减少客户端对同一被拦域名的重复查询。
 - 支持按客户端分配命名策略组、周期计划、家庭安全搜索及常用服务分类拦截。
@@ -84,6 +86,12 @@ Bootstrap DNS 只接受 IP 或 `IP:端口`，不能填写域名或 DoH 地址，
 - 可清理远程过滤器磁盘缓存，不影响配置、查询日志和统计数据库。
 - 查询日志、统计数据库和过滤器数据可迁移到自定义目录，并在重装后接管保留的现有数据。
 
+### 界面
+
+- 支持浅色、深色和跟随系统三种主题；配色基于统一的设计令牌，深色下的正文对比度达到 WCAG AA。
+- 界面语言支持简体中文和 English，默认跟随系统；主题与语言保存在本机，立即生效，不属于需要保存的 DNS 配置。
+- 托盘菜单文案跟随界面语言。
+
 ### 安全与运行维护
 
 - 允许/拒绝客户端列表支持单个 IP 和 CIDR，拒绝列表优先。
@@ -92,9 +100,9 @@ Bootstrap DNS 只接受 IP 或 `IP:端口`，不能填写域名或 DoH 地址，
 - DNS Rebinding Protection 会拦截公共域名返回的私有、回环、链路本地和组播地址；可信域名及域名分流上游可安全豁免。
 - CNAME cloaking 检测会对响应别名目标再次执行现有黑白名单判定。
 - UDP 访问拒绝和限速请求会静默丢弃；TCP 会尝试返回 `REFUSED`。
-- “安全防护”页面展示访问拒绝、限速、UDP 丢弃和 ANY 拒绝统计，并在内存中保留最近 200 条聚合事件；应用重启后事件历史会清空。
+- “安全防护”页面展示访问拒绝、限速、UDP 丢弃和 ANY 拒绝统计，并保留最近 200 条聚合事件。事件会落盘保存，重启后仍可查看，保留时间可配置，也可一键清除。
 - 远程清单和 DoH 默认只允许 HTTPS；HTTP 必须在安全防护中显式开启。
-- 单个远程清单默认限制为解压后 50 MB，超限立即中断并保留旧缓存。
+- 单个远程清单默认限制为解压后 200 MB，超限立即中断并保留旧缓存。
 - 支持运行状态监控与异常自动恢复、系统托盘、开机启动和关闭窗口后后台运行。
 - 可选启用只读 REST 与 Prometheus 监控接口；默认仅监听本机，且不暴露域名或客户端明细。
 
@@ -107,7 +115,7 @@ Bootstrap DNS 只接受 IP 或 `IP:端口`，不能填写域名或 DoH 地址，
 | 每客户端限速 | 持续 2000 次/秒，允许约 10 秒短时突发 |
 | ANY 查询 | 拒绝 |
 | 不安全 HTTP | 禁止 |
-| 单个远程清单上限 | 50 MB |
+| 单个远程清单上限 | 200 MB |
 | DNS 缓存 | 启用，16 MB，最小 TTL 60 秒，最大 TTL 24 小时，启用乐观缓存与热门域名预取 |
 | 响应安全 | 启用 DNS Rebinding Protection 与 CNAME cloaking 检测 |
 | 拦截响应 TTL | 60 秒 |
@@ -130,6 +138,8 @@ Bootstrap DNS 只接受 IP 或 `IP:端口`，不能填写域名或 DoH 地址，
 | `$badfilter` | 禁用文本和其他修饰符完全匹配的目标规则 |
 | `$dnstype=A|AAAA`、`$dnstype=~AAAA` | 按 DNS question 类型包含或排除匹配 |
 | `$denyallow=safe.example.org` | 匹配父域时排除指定域名及其子域名 |
+| `$dnsrewrite=1.2.3.4`、`$dnsrewrite=NXDOMAIN` | 按规则给出自定义应答，短写法支持 IP、CNAME 目标和 RCODE |
+| `$dnsrewrite=NOERROR;TXT;hello` | 完整写法，支持 A、AAAA、CNAME、TXT、MX、SRV、PTR 和各 RCODE |
 | 空行、`#` 注释、`!` 注释 | 忽略并计入注释/空行统计 |
 | `/regex/` | 暂不支持，忽略并计入正则统计 |
 | 其他未知 `$` 高级修饰符 | 暂不支持，整条忽略并计入高级修饰符统计 |
@@ -187,6 +197,16 @@ pnpm tauri build
 pnpm build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+### 性能基准
+
+DNS 热路径（规则编译、规则匹配、报文解析与拦截应答、缓存读写）有一套 criterion 基准：
+
+```bash
+cargo bench --manifest-path src-tauri/Cargo.toml --features bench --bench dns_hot_path
+```
+
+对比改动前后用 `--save-baseline` 和 `--baseline`。CI 只做编译检查——共享构建机的噪声太大，跑不出可信的性能门禁，实际对比需要在固定机器上进行。
 
 ## 发布维护
 
