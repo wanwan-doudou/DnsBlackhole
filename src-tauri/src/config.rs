@@ -2392,8 +2392,7 @@ mod tests {
     /// 升级不得替用户改配置：默认清单和默认上限都只作用于全新安装。
     #[test]
     fn upgrade_never_rewrites_existing_filter_settings() {
-        let old_adguard_url =
-            "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/assets/filter_1.txt";
+        let old_adguard_url = "https://raw.githubusercontent.com/AdguardTeam/HostlistsRegistry/main/assets/filter_1.txt";
         let mut config = AppConfig {
             schema_version: 17,
             filters: vec![
