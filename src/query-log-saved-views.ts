@@ -82,7 +82,15 @@ function parseQuery(value: unknown): QueryLogQuery | null {
     return null;
   }
   const filters = ["all", "processed", "blocked", "failed"] as const;
-  const sources = ["all", "upstream", "cache", "rewrite", "blocked", "refused"] as const;
+  const sources = [
+    "all",
+    "upstream",
+    "cache",
+    "rewrite",
+    "blocked",
+    "refused",
+    "local_reverse",
+  ] as const;
   const queryTypes = ["all", "a", "aaaa", "https", "other"] as const;
   const sorts = ["newest", "oldest", "slowest"] as const;
   const hours = value.hours;

@@ -42,8 +42,16 @@ import {
   updateFilters as updateFiltersCommand,
 } from "./api";
 import appIconUrl from "./app-icon.png";
-import { buildDailyTrafficSeries, renderSparkline, trendDayCountForHours } from "./charts";
+import { buildTrafficSeries, renderSparkline } from "./charts";
 import { query } from "./dom";
+import {
+  createSearchCompositionState,
+  onSearchBlur,
+  onSearchCompositionEnd,
+  onSearchCompositionStart,
+  onSearchInput,
+  type SearchScheduleDecision,
+} from "./query-log-search";
 import {
   escapeHtml,
   formatCount,
@@ -53,7 +61,9 @@ import {
   formatLogTime,
   formatPercent,
   formatRate,
+  formatRetentionScope,
   formatTime,
+  retentionWindowIsShorter,
 } from "./format";
 import {
   queryLogPaginationState,
@@ -179,11 +189,12 @@ let queryLogNextCursor: string | null = null;
 let queryLogRefreshInFlight = false;
 let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
-let queryLogSearchComposing = false;
+const queryLogSearchComposition = createSearchCompositionState();
 let queryLogLivePaused = false;
 let lastDashboardRefreshAt: number | null = null;
 let currentConfigSchemaVersion = CURRENT_CONFIG_SCHEMA_VERSION;
 let currentStatisticsRetentionHours = 30 * 24;
+let currentQueryLogRetentionHours = 90 * 24;
 let dashboardStatisticsHours: number | undefined;
 let dashboardStatisticsRevision = 0;
 let latestDashboardStartedAt: number | null | undefined;
@@ -473,6 +484,7 @@ const rebindingProtectionEnabledInput = query<HTMLInputElement>(
 );
 const rebindingAllowedDomainsInput = query<HTMLTextAreaElement>("#rebinding_allowed_domains");
 const cnameCloakingEnabledInput = query<HTMLInputElement>("#cname_cloaking_enabled");
+const privateReverseDnsEnabledInput = query<HTMLInputElement>("#private_reverse_dns_enabled");
 const dnsRewritesInput = query<HTMLTextAreaElement>("#dns_rewrites");
 const clientNamesInput = query<HTMLTextAreaElement>("#client_names");
 const queryLogIgnoredInput = query<HTMLTextAreaElement>("#query_log_ignored_domains");
@@ -965,8 +977,19 @@ queryLogRefreshButton.addEventListener("click", async () => {
   await refreshQueryLogs({ button: queryLogRefreshButton });
 });
 
-queryLogSearchInput.addEventListener("input", () => {
-  scheduleQueryLogSearch();
+function applySearchScheduleDecision(decision: SearchScheduleDecision): void {
+  if (decision === "cancel") {
+    window.clearTimeout(queryLogSearchTimer);
+    return;
+  }
+  if (decision === "schedule") {
+    scheduleQueryLogSearch();
+  }
+}
+
+queryLogSearchInput.addEventListener("input", (event) => {
+  const isComposing = event instanceof InputEvent && event.isComposing;
+  applySearchScheduleDecision(onSearchInput(queryLogSearchComposition, isComposing));
 });
 
 queryLogSearchInput.addEventListener("keydown", (event) => {
@@ -980,13 +1003,16 @@ queryLogSearchInput.addEventListener("keydown", (event) => {
 });
 
 queryLogSearchInput.addEventListener("compositionstart", () => {
-  queryLogSearchComposing = true;
-  window.clearTimeout(queryLogSearchTimer);
+  applySearchScheduleDecision(onSearchCompositionStart(queryLogSearchComposition));
 });
 
 queryLogSearchInput.addEventListener("compositionend", () => {
-  queryLogSearchComposing = false;
-  scheduleQueryLogSearch();
+  applySearchScheduleDecision(onSearchCompositionEnd(queryLogSearchComposition));
+});
+
+// compositionend 不是必达事件，失焦时兜底解锁，避免搜索框永久失效
+queryLogSearchInput.addEventListener("blur", () => {
+  applySearchScheduleDecision(onSearchBlur(queryLogSearchComposition));
 });
 
 queryLogFilterInput.addEventListener("change", () => {
@@ -1413,6 +1439,7 @@ importConfigButton.addEventListener("click", () => {
       return;
     }
     currentStatisticsRetentionHours = imported.statistics_retention_hours;
+    currentQueryLogRetentionHours = imported.query_log_retention_hours;
     const status = await saveConfigCommand(imported);
     await loadConfig();
     renderStatus(status);
@@ -2200,7 +2227,7 @@ function shouldAutoRefreshQueryLogs(): boolean {
     query.filter === DEFAULT_QUERY_LOG_QUERY.filter &&
     query.search === DEFAULT_QUERY_LOG_QUERY.search &&
     activeAdvancedQueryFilterCount(query) === 0 &&
-    !queryLogSearchComposing
+    !queryLogSearchComposition.composing
   );
 }
 
@@ -2221,6 +2248,7 @@ async function loadConfig(): Promise<boolean> {
     }
     currentConfigSchemaVersion = Math.max(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
     currentStatisticsRetentionHours = config.statistics_retention_hours;
+    currentQueryLogRetentionHours = config.query_log_retention_hours;
     updateDashboardRangeOptions();
     enabledInput.checked = config.enabled;
     launchAtStartupInput.checked = config.launch_at_startup;
@@ -2281,6 +2309,7 @@ async function loadConfig(): Promise<boolean> {
     rebindingProtectionEnabledInput.checked = config.rebinding_protection_enabled;
     rebindingAllowedDomainsInput.value = config.rebinding_allowed_domains;
     cnameCloakingEnabledInput.checked = config.cname_cloaking_enabled;
+    privateReverseDnsEnabledInput.checked = config.private_reverse_dns_enabled;
     dnsRewritesInput.value = config.dns_rewrites;
     clientNamesInput.value = config.client_names;
     queryLogIgnoredInput.value = config.query_log_ignored_domains;
@@ -2898,7 +2927,9 @@ async function saveConfig(): Promise<void> {
 async function saveConfigOnly(): Promise<RuntimeStatus> {
   const config = collectConfig();
   const previousStatisticsRetentionHours = currentStatisticsRetentionHours;
+  const previousQueryLogRetentionHours = currentQueryLogRetentionHours;
   currentStatisticsRetentionHours = config.statistics_retention_hours;
+  currentQueryLogRetentionHours = config.query_log_retention_hours;
   try {
     const status = await saveConfigCommand(config);
     savedConfigFingerprint = configFingerprint(config);
@@ -2907,6 +2938,7 @@ async function saveConfigOnly(): Promise<RuntimeStatus> {
     return status;
   } catch (error) {
     currentStatisticsRetentionHours = previousStatisticsRetentionHours;
+    currentQueryLogRetentionHours = previousQueryLogRetentionHours;
     throw error;
   }
 }
@@ -2967,6 +2999,7 @@ function collectConfig(): AppConfig {
     rebinding_protection_enabled: rebindingProtectionEnabledInput.checked,
     rebinding_allowed_domains: rebindingAllowedDomainsInput.value,
     cname_cloaking_enabled: cnameCloakingEnabledInput.checked,
+    private_reverse_dns_enabled: privateReverseDnsEnabledInput.checked,
     dns_rewrites: dnsRewritesInput.value,
     system_hosts_enabled: systemHostsEnabledInput.checked,
     client_names: clientNamesInput.value,
@@ -3154,10 +3187,6 @@ function refreshQueryLogAdvancedState(): void {
 }
 
 function scheduleQueryLogSearch(): void {
-  if (queryLogSearchComposing) {
-    return;
-  }
-
   window.clearTimeout(queryLogSearchTimer);
   queryLogSearchTimer = window.setTimeout(() => {
     resetQueryLogPagination();
@@ -3623,14 +3652,13 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
     : allTraffic.filter(
         (bucket) => bucket.minute >= Math.floor(Date.now() / 60_000) - effectiveStatisticsHours * 60,
       );
-  const trendDayCount = trendDayCountForHours(effectiveStatisticsHours);
   renderSparkline(
     "#query_sparkline",
-    buildDailyTrafficSeries(traffic, "queries", trendDayCount),
+    buildTrafficSeries(traffic, "queries", effectiveStatisticsHours),
   );
   renderSparkline(
     "#blocked_sparkline",
-    buildDailyTrafficSeries(traffic, "blocked", trendDayCount),
+    buildTrafficSeries(traffic, "blocked", effectiveStatisticsHours),
   );
   renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries);
   renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked);
@@ -3761,9 +3789,19 @@ function renderQueryLogs(page: QueryLogPage): void {
       query.search.length > 0 ||
       query.filter !== DEFAULT_QUERY_LOG_QUERY.filter ||
       activeAdvancedQueryFilterCount(query) > 0;
+    const hint =
+      hasSearch &&
+      retentionWindowIsShorter(currentQueryLogRetentionHours, currentStatisticsRetentionHours)
+        ? t("<small>查询日志只{p0}，仪表盘统计的时间范围更长；排行榜里的域名可能已经超出日志保留期。</small>", {
+            p0: formatRetentionScope(currentQueryLogRetentionHours),
+          })
+        : "";
     setHtmlIfChanged(
       queryLogBody,
-      t("<div class=\"query-log-empty\">{p0}</div>", { p0: hasSearch ? t("没有匹配的查询记录") : t("暂无查询记录") }),
+      t("<div class=\"query-log-empty\">{p0}{p1}</div>", {
+        p0: hasSearch ? t("没有匹配的查询记录") : t("暂无查询记录"),
+        p1: hint,
+      }),
     );
     return;
   }
@@ -3781,10 +3819,11 @@ function renderQueryLogPagination(page: QueryLogPage): void {
     page.page_size,
     queryLogRefreshInFlight,
   );
-  queryLogPageInfo.textContent =
+  const totalLabel =
     page.total === 0
       ? t("0 条记录")
       : t("{p0}-{p1} / {p2} 条", { p0: formatCount(pagination.start), p1: formatCount(pagination.end), p2: formatCount(page.total) });
+  queryLogPageInfo.textContent = `${totalLabel} · ${formatRetentionScope(currentQueryLogRetentionHours)}`;
   queryLogPrevButton.disabled = queryLogRefreshInFlight || page.page <= 1;
   queryLogNextButton.disabled = queryLogUsesCursor()
     ? queryLogRefreshInFlight || page.next_cursor === null

@@ -1,8 +1,11 @@
 import { query } from "./dom";
-import { escapeHtml, formatCount, formatSparkDayLabel } from "./format";
+import { escapeHtml, formatCount, formatSparkDayLabel, formatSparkHourLabel } from "./format";
 import type { ChartPoint, HistoryPoint, TrafficBucket } from "./types";
 
 export const DAILY_TREND_DAYS = 30;
+// 统计窗口不超过这个小时数时改用小时粒度。后端本来就是按分钟存桶，
+// 一律按自然日聚合会把「最近 24 小时」压成 2 个点，曲线等于一条直线。
+export const HOURLY_TREND_MAX_HOURS = 48;
 
 export function trendDayCountForHours(hours: number): number {
   if (hours === 0) {
@@ -41,6 +44,52 @@ export function buildDailyTrafficSeries(
     date.setHours(0, 0, 0, 0);
     const index = dayIndex.get(date.getTime());
     if (index !== undefined) {
+      values[index].value += bucket[field];
+    }
+  }
+
+  return values;
+}
+
+/// 按统计窗口自动选择趋势粒度：短窗口用小时，长窗口用自然日。
+export function buildTrafficSeries(
+  buckets: TrafficBucket[] | undefined,
+  field: "queries" | "blocked",
+  hours: number,
+  now = Date.now(),
+): HistoryPoint[] {
+  // hours 为 0 表示"全部历史"，只能按天
+  if (hours > 0 && hours <= HOURLY_TREND_MAX_HOURS) {
+    return buildHourlyTrafficSeries(buckets, field, hours, now);
+  }
+  return buildDailyTrafficSeries(buckets, field, trendDayCountForHours(hours), now);
+}
+
+export function buildHourlyTrafficSeries(
+  buckets: TrafficBucket[] | undefined,
+  field: "queries" | "blocked",
+  hourCount: number,
+  now = Date.now(),
+): HistoryPoint[] {
+  const pointCount = Math.max(1, Math.floor(hourCount));
+  const currentHour = new Date(now);
+  currentHour.setMinutes(0, 0, 0);
+  const currentHourStart = currentHour.getTime();
+  const hourStarts = Array.from(
+    { length: pointCount },
+    (_, index) => currentHourStart - (pointCount - index - 1) * 3_600_000,
+  );
+  const firstHourStart = hourStarts[0];
+  const values = hourStarts.map((timestamp, index) => ({
+    index,
+    value: 0,
+    label: formatSparkHourLabel(Math.floor(timestamp / 60_000)),
+  }));
+
+  for (const bucket of buckets ?? []) {
+    const timestamp = bucket.minute * 60_000;
+    const index = Math.floor((timestamp - firstHourStart) / 3_600_000);
+    if (index >= 0 && index < values.length) {
       values[index].value += bucket[field];
     }
   }

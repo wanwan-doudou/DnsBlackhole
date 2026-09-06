@@ -4,6 +4,7 @@ mod client_policy;
 mod diagnostics;
 mod filter_runtime;
 mod ip_network;
+mod local_reverse;
 mod monitoring;
 mod protocol;
 mod rewrites;
@@ -52,10 +53,10 @@ mod tests {
         protocol::{
             BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_CNAME, TYPE_SOA,
             build_block_response, build_dnsrewrite_response, build_error_response,
-            build_rewrite_response, extract_response_ips, parse_query, parse_question,
-            prepare_cached_response, read_u16, response_is_truncated, response_min_record_ttl,
-            response_security_data, summarize_response, truncate_response_for_udp,
-            udp_payload_size, validate_response_for_query,
+            build_rewrite_response, extract_response_ips, normalize_cached_response, parse_query,
+            parse_question, prepare_cached_response, read_u16, response_is_truncated,
+            response_min_record_ttl, response_security_data, summarize_response,
+            truncate_response_for_udp, udp_payload_size, validate_response_for_query,
         },
         rewrites::compile_rewrites,
         rules::{
@@ -823,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn query_context_isolates_cache_and_bypasses_edns_options() {
+    fn query_context_isolates_cache_and_bypasses_response_affecting_edns_options() {
         let query = a_query("example.org");
         let parsed = parse_query(&query).expect("query should parse");
         let base_key = QueryCacheKey::from_query(&parsed).expect("plain query should be cacheable");
@@ -853,6 +854,134 @@ mod tests {
         let with_option = parse_query(&option_query).expect("EDNS option query should parse");
         assert!(!with_option.cache_safe);
         assert!(QueryCacheKey::from_query(&with_option).is_none());
+    }
+
+    #[test]
+    fn transport_only_edns_options_stay_cacheable() {
+        let plain = edns_query("example.org", 1232, false, &[]);
+        let plain_key = QueryCacheKey::from_query(&parse_query(&plain).unwrap())
+            .expect("plain EDNS query should be cacheable");
+
+        // Keepalive / Padding 可以在移除 OPT 后和无选项查询共用同一条缓存
+        for options in [vec![0, 11, 0, 2, 0x00, 0x64], vec![0, 12, 0, 4, 0, 0, 0, 0]] {
+            let query = edns_query("example.org", 1232, false, &options);
+            let parsed = parse_query(&query).expect("query should parse");
+            assert!(parsed.cache_safe, "选项 {options:?} 不应禁用缓存");
+            assert_eq!(
+                plain_key,
+                QueryCacheKey::from_query(&parsed).expect("should be cacheable"),
+                "选项 {options:?} 不应产生独立缓存键",
+            );
+        }
+
+        // Cookie 响应必须由客户端校验，不能用无 Cookie 的缓存响应代替。
+        let cookie =
+            parse_query(&edns_query("example.org", 1232, false, &cookie_option())).unwrap();
+        assert!(!cookie.cache_safe);
+        assert!(QueryCacheKey::from_query(&cookie).is_none());
+
+        // 混入 ECS（会改变应答内容）时仍然必须放弃缓存
+        let mut mixed = vec![0, 12, 0, 4, 0, 0, 0, 0];
+        mixed.extend_from_slice(&[0, 8, 0, 0]);
+        let ecs = parse_query(&edns_query("example.org", 1232, false, &mixed)).unwrap();
+        assert!(!ecs.cache_safe);
+
+        // 截断的选项头必须按不可缓存处理，不能读越界
+        let truncated = parse_query(&edns_query("example.org", 1232, false, &[0, 10, 0])).unwrap();
+        assert!(!truncated.cache_safe);
+        // 声明长度超过实际 rdata 的选项同样不可缓存
+        let overflowing = parse_query(&edns_query(
+            "example.org",
+            1232,
+            false,
+            &[0, 10, 0, 9, 1, 2],
+        ))
+        .unwrap();
+        assert!(!overflowing.cache_safe);
+    }
+
+    #[test]
+    fn cookie_bearing_queries_bypass_cache() {
+        let client_cookie = cookie_option();
+        let client_query = edns_query("example.org", 1232, false, &client_cookie);
+        assert!(QueryCacheKey::from_query(&parse_query(&client_query).unwrap()).is_none());
+
+        // 已知 server cookie 的后续查询也必须直达上游，不能被旧缓存响应截获。
+        let mut known_server_cookie = client_cookie;
+        known_server_cookie[2..4].copy_from_slice(&16_u16.to_be_bytes());
+        known_server_cookie.extend_from_slice(&[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
+        let retry_query = edns_query("example.org", 1232, false, &known_server_cookie);
+        assert!(QueryCacheKey::from_query(&parse_query(&retry_query).unwrap()).is_none());
+    }
+
+    #[test]
+    fn cache_key_ignores_client_udp_payload_size() {
+        // 同一问题的应答与客户端声明的 UDP 大小无关，出站尺寸由 send_dns_response 单独截断。
+        // 一旦入键，混合客户端的局域网会把同一域名拆成多份，每种客户端各吃一次冷 miss。
+        let keys: Vec<_> = [512, 1232, 4096]
+            .into_iter()
+            .map(|size| {
+                let query = edns_query("example.org", size, false, &[]);
+                assert_eq!(udp_payload_size(&query), usize::from(size));
+                QueryCacheKey::from_query(&parse_query(&query).unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(keys[1], keys[2]);
+
+        // 但"是否使用 EDNS"必须继续分键：RFC 6891 §6.1.1 规定请求没有 OPT 时
+        // 响应也不能带 OPT，两类客户端不能共用同一条缓存条目。
+        let without_edns =
+            QueryCacheKey::from_query(&parse_query(&a_query("example.org")).unwrap()).unwrap();
+        assert_ne!(keys[1], without_edns);
+
+        // DO 位真的会改变应答内容，必须继续分键
+        let with_do = QueryCacheKey::from_query(
+            &parse_query(&edns_query("example.org", 1232, true, &[])).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(keys[1], with_do);
+    }
+
+    #[test]
+    fn cached_response_drops_opt_and_rebuilds_it_for_current_query() {
+        let mut response = a_response("example.org", [1, 2, 3, 4]);
+        response[11] = 1; // ARCOUNT
+        response.push(0);
+        response.extend_from_slice(&41_u16.to_be_bytes());
+        response.extend_from_slice(&1232_u16.to_be_bytes());
+        response.extend_from_slice(&0_u32.to_be_bytes());
+        let cookie = cookie_option();
+        response.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+        response.extend_from_slice(&cookie);
+
+        let original_len = response.len();
+        assert!(normalize_cached_response(&mut response));
+        assert_eq!(response.len(), original_len - cookie.len() - 11);
+        assert_eq!(read_u16(&response, 10), Some(0), "缓存中不应保留 OPT");
+        assert_eq!(response_min_record_ttl(&response), Some(60));
+        assert!(
+            !response
+                .windows(8)
+                .any(|w| w == [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+            "缓存条目里不能残留任何客户端 cookie",
+        );
+
+        let query = edns_query("example.org", 512, true, &[]);
+        let prepared = prepare_cached_response(&response, &query, 30).unwrap();
+        assert_eq!(read_u16(&prepared, 10), Some(1));
+        assert_eq!(response_min_record_ttl(&prepared), Some(30));
+        assert_eq!(
+            &prepared[prepared.len() - 11..],
+            &[0, 0, 41, 0x02, 0x00, 0, 0, 0x80, 0, 0, 0],
+            "OPT 应使用当前请求的 UDP 大小和 DO 位重建",
+        );
+
+        // 没有 OPT 的响应无需改动，直接可缓存
+        let mut plain = a_response("example.org", [1, 2, 3, 4]);
+        let before = plain.clone();
+        assert!(normalize_cached_response(&mut plain));
+        assert_eq!(plain, before);
     }
 
     #[test]
@@ -1060,6 +1189,9 @@ mod tests {
 
     #[test]
     fn upstream_failure_backoff_can_be_marked_and_cleared() {
+        let _probe_guard = super::upstream::HALF_OPEN_PROBE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let upstream =
             RuntimeUpstream::new(UpstreamServer::Udp("127.0.0.1:53".parse().unwrap()), &[]);
 
@@ -1095,6 +1227,26 @@ mod tests {
         packet.extend_from_slice(&qtype.to_be_bytes());
         packet.extend_from_slice(&1_u16.to_be_bytes());
         packet
+    }
+
+    /// 构造带 EDNS OPT 的查询。`options` 是 OPT rdata 的原始字节。
+    fn edns_query(domain: &str, udp_size: u16, dnssec_ok: bool, options: &[u8]) -> Vec<u8> {
+        let mut packet = a_query(domain);
+        packet[11] = 1; // ARCOUNT
+        packet.push(0); // OPT 的 owner 必须是根
+        packet.extend_from_slice(&41_u16.to_be_bytes());
+        packet.extend_from_slice(&udp_size.to_be_bytes());
+        packet.extend_from_slice(&if dnssec_ok { 0x0000_8000_u32 } else { 0 }.to_be_bytes());
+        packet.extend_from_slice(&(options.len() as u16).to_be_bytes());
+        packet.extend_from_slice(options);
+        packet
+    }
+
+    /// RFC 7873 的 8 字节 client cookie，dig / kdig / BIND / Unbound 默认都会带。
+    fn cookie_option() -> Vec<u8> {
+        let mut option = vec![0, 10, 0, 8];
+        option.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        option
     }
 
     fn append_dns_name(packet: &mut Vec<u8>, domain: &str) {

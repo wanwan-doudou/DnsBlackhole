@@ -120,6 +120,7 @@ impl DnsServer {
         let anonymize_client_ip = config.anonymize_client_ip;
         let access = Arc::new(ClientAccess::from_config(&config)?);
         let refuse_any = config.refuse_any;
+        let private_reverse_dns_enabled = config.private_reverse_dns_enabled;
         let dns_cache_config = DnsCacheConfig::from_config(&config);
         let dns_cache =
             DnsCacheStore::from_config(dns_cache_config.clone(), DNS_CACHE_SHARDS).map(Arc::new);
@@ -185,6 +186,7 @@ impl DnsServer {
             fallback_next_upstream: AtomicUsize::new(0),
             access,
             refuse_any,
+            private_reverse_dns_enabled,
             protection_paused_until,
             filter_runtime: Arc::clone(&filter_runtime),
             stats: Arc::clone(&stats),
@@ -797,6 +799,7 @@ mod tests {
 
     use crate::{config::AppConfig, database::Database};
 
+    use super::super::protocol::{RCODE_NXDOMAIN, parse_question, read_u16};
     use super::super::stats::{DnsStats, DnsTransport, SecurityEventType};
     use super::*;
 
@@ -1121,8 +1124,353 @@ mod tests {
         assert_eq!(persisted.blocked, 0);
     }
 
+    fn ptr_query(name: &str) -> Vec<u8> {
+        let mut packet = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for label in name.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
+        packet.extend_from_slice(&12_u16.to_be_bytes()); // PTR
+        packet.extend_from_slice(&1_u16.to_be_bytes()); // IN
+        packet
+    }
+
+    #[test]
+    fn private_reverse_dnsrewrite_takes_priority_over_local_nxdomain() {
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            dns_cache_enabled: false,
+            query_log_enabled: false,
+            statistics_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
+        let rules = "||17.1.168.192.in-addr.arpa^$dnsrewrite=NOERROR;PTR;printer.lan";
+        let server =
+            DnsServer::start(config, rules, stats, database).expect("测试 DNS 服务应可启动");
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP 客户端应可绑定");
+        udp.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("应可设置 UDP 读取超时");
+        udp.send_to(
+            &ptr_query("17.1.168.192.in-addr.arpa"),
+            (Ipv4Addr::LOCALHOST, port),
+        )
+        .expect("应可发送私有反查");
+        let mut response = [0_u8; 512];
+        let (len, _) = udp.recv_from(&mut response).expect("应收到 PTR 重写应答");
+        let summary = super::super::protocol::summarize_response(&response[..len]).unwrap();
+        assert_eq!(summary.code, 0);
+        assert_eq!(summary.answer_count, 1);
+        assert_eq!(summary.answers[0].record_type, 12);
+        assert_eq!(summary.answers[0].value, "printer.lan");
+
+        server.stop();
+    }
+
+    /// 带 RFC 7873 cookie 的 example.com A 查询。
+    fn cookie_a_query(id: u16, include_server_cookie: bool) -> Vec<u8> {
+        let mut packet = example_a_query();
+        packet[0..2].copy_from_slice(&id.to_be_bytes());
+        packet[11] = 1; // ARCOUNT
+        packet.push(0); // OPT owner = root
+        packet.extend_from_slice(&41_u16.to_be_bytes());
+        packet.extend_from_slice(&1232_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u32.to_be_bytes());
+        let mut cookie = vec![0, 10, 0, if include_server_cookie { 16 } else { 8 }];
+        cookie.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        if include_server_cookie {
+            cookie.extend_from_slice(&[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]);
+        }
+        packet.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&cookie);
+        packet
+    }
+
+    #[test]
+    fn repeated_cookie_queries_always_reach_the_upstream() {
+        let _probe_guard = super::super::upstream::HALF_OPEN_PROBE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let upstream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("模拟上游应可绑定");
+        upstream
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .expect("应可设置模拟上游超时");
+        let upstream_address = upstream.local_addr().expect("应可读取模拟上游地址");
+        let upstream_thread = thread::spawn(move || {
+            let mut request = [0_u8; 512];
+            let mut served = 0_usize;
+            for _ in 0..2 {
+                let Ok((len, peer)) = upstream.recv_from(&mut request) else {
+                    break;
+                };
+                served += 1;
+                let question_end = super::super::protocol::parse_question(&request[..len])
+                    .expect("模拟上游应能解析问题段")
+                    .question_end;
+                let mut response = request[..question_end].to_vec();
+                response[2] = 0x81;
+                response[3] = 0x80;
+                response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+                response[10..12].copy_from_slice(&1_u16.to_be_bytes());
+                response.extend_from_slice(&[
+                    0xc0, 0x0c, // NAME 指向问题域名
+                    0x00, 0x01, // A
+                    0x00, 0x01, // IN
+                    0x00, 0x00, 0x01, 0x2c, // TTL 300
+                    0x00, 0x04, // RDLENGTH
+                    93, 184, 216, 34,
+                ]);
+                response.extend_from_slice(&[
+                    0x00, // OPT owner = root
+                    0x00, 0x29, // OPT
+                    0x04, 0xd0, // UDP 1232
+                    0x00, 0x00, 0x00, 0x00, // extended RCODE / version / flags
+                    0x00, 0x14, // RDLENGTH: option header + 16-byte cookie
+                    0x00, 0x0a, 0x00, 0x10, // COOKIE, length 16
+                    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // client cookie
+                    0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, // server cookie
+                ]);
+                let _ = upstream.send_to(&response, peer);
+            }
+            served
+        });
+
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: upstream_address.to_string(),
+            fallback_dns: String::new(),
+            use_filters: false,
+            dns_cache_enabled: true,
+            dns_cache_prefetch_enabled: false,
+            dns_cache_optimistic: false,
+            query_log_enabled: false,
+            statistics_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
+        let server = DnsServer::start(config, "", Arc::clone(&stats), database)
+            .expect("测试 DNS 服务应可启动");
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP 客户端应可绑定");
+        udp.set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("应可设置 UDP 读取超时");
+        let mut response = [0_u8; 512];
+
+        // 第一次：冷查询，必然打上游
+        udp.send_to(&cookie_a_query(0x1111, false), (Ipv4Addr::LOCALHOST, port))
+            .expect("应可发送首次 cookie 查询");
+        let (first_len, _) = udp.recv_from(&mut response).expect("应收到首次应答");
+        assert_eq!(response[3] & 0x0f, 0, "首次查询应返回 NOERROR");
+        let first = response[..first_len].to_vec();
+
+        // 第二次携带第一次拿到的 server cookie，仍然必须直达上游接受校验。
+        udp.send_to(&cookie_a_query(0x2222, true), (Ipv4Addr::LOCALHOST, port))
+            .expect("应可发送第二次 cookie 查询");
+        let (second_len, _) = udp.recv_from(&mut response).expect("应收到第二次应答");
+        let second = response[..second_len].to_vec();
+
+        assert_eq!(&second[0..2], &0x2222_u16.to_be_bytes(), "应改写事务 ID");
+        assert!(
+            first
+                .windows(8)
+                .any(|w| w == [0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97])
+                && second
+                    .windows(8)
+                    .any(|w| w == [0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]),
+            "两次应答都应包含上游生成的 server cookie",
+        );
+
+        server.stop();
+        let served = upstream_thread.join().expect("模拟上游线程应正常结束");
+        assert_eq!(
+            served, 2,
+            "带 cookie 的查询不能命中普通 DNS 缓存，实际只转发了 {served} 次",
+        );
+    }
+
+    #[test]
+    fn private_reverse_queries_never_reach_the_upstream() {
+        let _probe_guard = super::super::upstream::HALF_OPEN_PROBE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let upstream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("模拟上游应可绑定");
+        upstream
+            .set_read_timeout(Some(Duration::from_millis(800)))
+            .expect("应可设置模拟上游超时");
+        let upstream_address = upstream.local_addr().expect("应可读取模拟上游地址");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let upstream_seen = Arc::clone(&seen);
+        let upstream_thread = thread::spawn(move || {
+            let mut request = [0_u8; 512];
+            // 收两轮：私有反查不应该到这里，公网反查应该到
+            for _ in 0..2 {
+                let Ok((len, peer)) = upstream.recv_from(&mut request) else {
+                    break;
+                };
+                let domain = parse_question(&request[..len])
+                    .map(|question| question.domain)
+                    .unwrap_or_else(|_| "<解析失败>".to_string());
+                upstream_seen.lock().expect("记录锁不应中毒").push(domain);
+                let mut response = request[..len].to_vec();
+                response[2] = 0x81;
+                response[3] = 0x83; // NXDOMAIN
+                let _ = upstream.send_to(&response, peer);
+            }
+        });
+
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: upstream_address.to_string(),
+            fallback_dns: String::new(),
+            dns_cache_enabled: false,
+            query_log_enabled: false,
+            statistics_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
+        let server = DnsServer::start(config, "", Arc::clone(&stats), database)
+            .expect("测试 DNS 服务应可启动");
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP 客户端应可绑定");
+        udp.set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("应可设置 UDP 读取超时");
+
+        // 私有地址反查：必须本地应答，且带 SOA 供客户端负缓存
+        udp.send_to(
+            &ptr_query("17.1.168.192.in-addr.arpa"),
+            (Ipv4Addr::LOCALHOST, port),
+        )
+        .expect("应可发送私有反查");
+        let mut response = [0_u8; 512];
+        let (len, _) = udp.recv_from(&mut response).expect("应收到本地反查应答");
+        assert_eq!(
+            response[3] & 0x0f,
+            RCODE_NXDOMAIN,
+            "私有反查应返回 NXDOMAIN"
+        );
+        assert_eq!(
+            read_u16(&response[..len], 8),
+            Some(1),
+            "应带 1 条 SOA 权威记录，客户端才能负缓存",
+        );
+
+        // 公网地址反查：不能被误拦，必须照常转发
+        udp.send_to(
+            &ptr_query("8.8.8.8.in-addr.arpa"),
+            (Ipv4Addr::LOCALHOST, port),
+        )
+        .expect("应可发送公网反查");
+        let _ = udp.recv_from(&mut response);
+
+        server.stop();
+        upstream_thread.join().expect("模拟上游线程应正常结束");
+
+        let seen = seen.lock().expect("记录锁不应中毒").clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|domain| domain.ends_with("168.192.in-addr.arpa")),
+            "私有地址反查绝不能出网，实际到达上游的是：{seen:?}",
+        );
+        assert!(
+            seen.iter().any(|domain| domain == "8.8.8.8.in-addr.arpa"),
+            "公网反查应正常转发，实际到达上游的是：{seen:?}",
+        );
+    }
+
+    #[test]
+    fn private_reverse_domain_route_overrides_client_route() {
+        let _probe_guard = super::super::upstream::HALF_OPEN_PROBE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let internal = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("内网上游应可绑定");
+        let public = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("公共上游应可绑定");
+        for socket in [&internal, &public] {
+            socket
+                .set_read_timeout(Some(Duration::from_millis(1200)))
+                .expect("应可设置模拟上游超时");
+        }
+        let internal_address = internal.local_addr().unwrap();
+        let public_address = public.local_addr().unwrap();
+        let internal_thread = thread::spawn(move || {
+            let mut request = [0_u8; 512];
+            let Ok((len, peer)) = internal.recv_from(&mut request) else {
+                return false;
+            };
+            let mut response = request[..len].to_vec();
+            response[2] = 0x81;
+            response[3] = 0x83;
+            internal.send_to(&response, peer).is_ok()
+        });
+        let public_thread = thread::spawn(move || {
+            let mut request = [0_u8; 512];
+            public.recv_from(&mut request).is_ok()
+        });
+
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: public_address.to_string(),
+            fallback_dns: String::new(),
+            domain_upstream_rules: format!("*.168.192.in-addr.arpa => {internal_address}"),
+            client_upstream_rules: format!("127.0.0.1/32 => {public_address}"),
+            dns_cache_enabled: false,
+            query_log_enabled: false,
+            statistics_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
+        let server = DnsServer::start(config, "", stats, database).expect("测试 DNS 服务应可启动");
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP 客户端应可绑定");
+        udp.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("应可设置 UDP 读取超时");
+        udp.send_to(
+            &ptr_query("17.1.168.192.in-addr.arpa"),
+            (Ipv4Addr::LOCALHOST, port),
+        )
+        .expect("应可发送私有反查");
+        let mut response = [0_u8; 512];
+        let (len, _) = udp.recv_from(&mut response).expect("应收到内网上游应答");
+        assert_eq!(response[..len][3] & 0x0f, RCODE_NXDOMAIN);
+
+        server.stop();
+        assert!(
+            internal_thread.join().expect("内网上游线程应正常结束"),
+            "私有反查应命中显式域名分流",
+        );
+        assert!(
+            !public_thread.join().expect("公共上游线程应正常结束"),
+            "客户端分流不能覆盖私有反查的显式域名分流",
+        );
+    }
+
     #[test]
     fn udp_rebinding_response_is_blocked_before_reaching_the_client() {
+        let _probe_guard = super::super::upstream::HALF_OPEN_PROBE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let upstream =
             UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("模拟上游 UDP 服务应可绑定");
         upstream

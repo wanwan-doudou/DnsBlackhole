@@ -23,12 +23,14 @@ use super::{
         lookup_cached_response,
     },
     filter_runtime::{FilterRuntime, SharedFilterRuntime, current_filter_runtime},
+    local_reverse::is_local_reverse_name,
     protocol::{
-        Question, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_ANY, build_block_response,
+        Question, RCODE_NXDOMAIN, RCODE_REFUSED, RCODE_SERVFAIL, TYPE_ANY, build_block_response,
         build_cname_response, build_dnsrewrite_response, build_error_response,
         build_rewrite_response, parse_query, prepare_response_for_query, response_security_data,
         summarize_response, truncate_response_for_udp, udp_payload_size,
     },
+    rules::DnsRewriteAction,
     stats::{
         DnsStats, DnsTransport, ResponseProtectionKind, current_second, record_access_denied,
         record_blocked_query, record_error, record_forwarded, record_persistence_queue_drop,
@@ -86,6 +88,7 @@ pub(crate) struct DnsWorkerContext {
     pub(crate) fallback_next_upstream: AtomicUsize,
     pub(crate) access: Arc<ClientAccess>,
     pub(crate) refuse_any: bool,
+    pub(crate) private_reverse_dns_enabled: bool,
     pub(crate) protection_paused_until: Arc<AtomicU64>,
     pub(crate) filter_runtime: SharedFilterRuntime,
     pub(crate) stats: Arc<Mutex<DnsStats>>,
@@ -165,6 +168,8 @@ enum QueryResponseSource {
     Rewrite,
     Blocked,
     Refused,
+    /// 私有地址反查的本地应答，从不出网
+    LocalReverse,
 }
 
 impl QueryResponseSource {
@@ -175,6 +180,7 @@ impl QueryResponseSource {
             Self::Rewrite => "rewrite",
             Self::Blocked => "blocked",
             Self::Refused => "refused",
+            Self::LocalReverse => "local_reverse",
         }
     }
 }
@@ -569,6 +575,64 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         return;
     }
 
+    // 用户规则（包括 $dnsrewrite）优先。没有显式内网域名分流时，私有地址反查留在本地，
+    // 避免把内网网段逐个泄漏给公共上游。
+    let is_local_reverse =
+        context.private_reverse_dns_enabled && is_local_reverse_name(&question.domain);
+    let local_reverse_route = if is_local_reverse {
+        context.upstream_routes.select_domain(&question.domain)
+    } else {
+        None
+    };
+    if is_local_reverse && local_reverse_route.is_none() {
+        record_query(
+            &context.stats,
+            &question.domain,
+            client_addr.ip(),
+            context.detailed_runtime_stats,
+        );
+        // NXDOMAIN 带同 TTL 的 SOA，客户端按 RFC 2308 负缓存，同一地址不会反复查询
+        let response = build_dnsrewrite_response(
+            query,
+            question,
+            &DnsRewriteAction::RCode(RCODE_NXDOMAIN),
+            &filter.blocking,
+        );
+        if let Err(error) = send_dns_response(response_target, query, &response) {
+            let message = format!("返回私有地址反查响应失败：{error}");
+            record_error(&context.stats, message.clone());
+            queue_query_log(
+                context,
+                &filter,
+                &log_metadata,
+                client_addr,
+                QueryResponseSource::LocalReverse,
+                false,
+                false,
+                true,
+                None,
+                None,
+                Some(message),
+            );
+        } else {
+            queue_query_log_with_response(
+                context,
+                &filter,
+                &log_metadata,
+                client_addr,
+                QueryResponseSource::LocalReverse,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                Some(&response),
+            );
+        }
+        return;
+    }
+
     record_query(
         &context.stats,
         &question.domain,
@@ -576,9 +640,11 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         context.detailed_runtime_stats,
     );
 
-    let routed_upstream = context
-        .upstream_routes
-        .select(&question.domain, client_addr.ip());
+    let routed_upstream = local_reverse_route.or_else(|| {
+        context
+            .upstream_routes
+            .select(&question.domain, client_addr.ip())
+    });
     let route_key = routed_upstream.as_deref().map(RouteUpstreamPool::key);
     let cache_scope = if client_filtering_enabled {
         route_key.map(str::to_string)

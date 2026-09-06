@@ -15,7 +15,8 @@ export type QueryLogSourceFilter =
   | "cache"
   | "rewrite"
   | "blocked"
-  | "refused";
+  | "refused"
+  | "local_reverse";
 export type QueryLogTypeFilter = "all" | "a" | "aaaa" | "https" | "other";
 export type QueryLogSort = "newest" | "oldest" | "slowest";
 
@@ -177,6 +178,7 @@ export type AppConfig = {
   rebinding_protection_enabled: boolean;
   rebinding_allowed_domains: string;
   cname_cloaking_enabled: boolean;
+  private_reverse_dns_enabled: boolean;
   dns_rewrites: string;
   system_hosts_enabled: boolean;
   client_names: string;
@@ -298,7 +300,14 @@ export type QueryLogRecord = {
   query_type: number | null;
   query_class: number | null;
   transport: "udp" | "tcp" | null;
-  response_source: "upstream" | "cache" | "rewrite" | "blocked" | "refused" | null;
+  response_source:
+    | "upstream"
+    | "cache"
+    | "rewrite"
+    | "blocked"
+    | "refused"
+    | "local_reverse"
+    | null;
   response: QueryLogResponseSummary | null;
   client_ip: string | null;
   blocked: boolean;

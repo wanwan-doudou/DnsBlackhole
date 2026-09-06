@@ -467,7 +467,12 @@
   --app-bg: var(--info-0);
   --card-bg: var(--neutral-0);
   --border: rgb(var(--info-rgb) / 0.12);
-  --border-strong: var(--neutral-7);
+  /* 表单控件（输入框、文本域、下拉触发器）的静息边框。
+     这类控件有自己的填充色，边框只需要勾出边界，压淡才不会显得笨重。
+     小尺寸的单选框和开关另用 --control-border：那类控件的边框就是它的形状本身，压淡会看不见。
+     token 引用 --info-1 / --neutral-9，深色下会自动跟随各主题的重定义。 */
+  --field-border: var(--info-1);
+  --field-border-hover: var(--neutral-9);
   --control-border: var(--neutral-17);
   --text: var(--neutral-27);
   --muted: var(--neutral-23);
@@ -546,7 +551,7 @@ textarea {
 
 button {
   height: 36px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--field-border);
   border-radius: 6px;
   padding: 0 14px;
   color: var(--neutral-26);
@@ -2684,7 +2689,7 @@ button.refreshing:disabled {
 textarea,
 select {
   width: 100%;
-  border: 1px solid var(--control-border);
+  border: 1px solid var(--field-border);
   border-radius: 4px;
   color: var(--info-6);
   background: var(--control-bg);
@@ -2737,7 +2742,7 @@ select.custom-select-native {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  border-color: var(--control-border);
+  border-color: var(--field-border);
   border-radius: 7px;
   padding: 0 13px;
   color: var(--info-5);
@@ -2748,7 +2753,7 @@ select.custom-select-native {
 }
 
 .custom-select-trigger:hover:not(:disabled) {
-  border-color: var(--neutral-9);
+  border-color: var(--field-border-hover);
   color: var(--info-5);
   background: var(--control-hover-bg);
 }
@@ -2866,6 +2871,13 @@ textarea {
   font-family:
     "Cascadia Code", "JetBrains Mono", Consolas, "Microsoft YaHei UI", monospace;
   font-size: 13px;
+}
+
+/* 静息边框压淡后，靠 hover 提供可发现性；键盘用户仍由下面的 focus 环覆盖。 */
+.field input:hover:not(:disabled):not(:focus),
+textarea:hover:not(:disabled):not(:focus),
+select:hover:not(:disabled):not(:focus) {
+  border-color: var(--field-border-hover);
 }
 
 .field input:focus,

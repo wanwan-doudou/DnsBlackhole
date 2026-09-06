@@ -56,6 +56,11 @@ impl UpstreamRoutes {
             return Some(Arc::clone(&route.pool));
         }
 
+        self.select_domain(domain)
+    }
+
+    /// 只选择显式匹配该域名的域名分流规则，不受客户端分流优先级影响。
+    pub(crate) fn select_domain(&self, domain: &str) -> Option<Arc<RouteUpstreamPool>> {
         self.domains
             .iter()
             .filter(|route| route.matches(domain))
@@ -140,6 +145,35 @@ mod tests {
             .select("www.example.com", "192.168.1.8".parse().unwrap())
             .expect("应命中客户端规则");
         assert_eq!(route.key(), "client:192.168.1.0/24");
+    }
+
+    #[test]
+    fn domain_route_can_be_selected_explicitly_when_client_route_exists() {
+        let config = AppConfig {
+            domain_upstream_rules: "*.168.192.in-addr.arpa => 192.168.1.1".into(),
+            client_upstream_rules: "192.168.0.0/16 => 8.8.8.8".into(),
+            ..AppConfig::default()
+        };
+        let routes = UpstreamRoutes::from_config(&config).expect("分流配置应有效");
+        let client = "192.168.1.8".parse().unwrap();
+
+        assert_eq!(
+            routes
+                .select("17.1.168.192.in-addr.arpa", client)
+                .unwrap()
+                .key(),
+            "client:192.168.0.0/16",
+        );
+        assert_eq!(
+            routes
+                .select_domain("17.1.168.192.in-addr.arpa")
+                .unwrap()
+                .key(),
+            "domain:*.168.192.in-addr.arpa",
+        );
+        assert!(routes.select_domain("168.192.in-addr.arpa").is_some());
+        assert!(routes.select_domain("7.3.0.10.in-addr.arpa").is_none());
+        assert!(routes.select_domain("example.org").is_none());
     }
 
     #[test]

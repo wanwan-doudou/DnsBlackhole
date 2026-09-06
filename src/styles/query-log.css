@@ -104,7 +104,7 @@
 .query-log-advanced-panel select,
 .query-log-advanced-panel input {
   height: 36px;
-  border: 1px solid var(--info-1);
+  border: 1px solid var(--field-border);
   border-radius: 3px;
   color: var(--neutral-27);
   background: var(--neutral-0);
@@ -119,6 +119,12 @@
 
 #query_log_filter {
   display: none;
+}
+
+.query-log-search input:hover:not(:focus),
+.query-log-advanced-panel select:hover:not(:focus),
+.query-log-advanced-panel input:hover:not(:focus) {
+  border-color: var(--field-border-hover);
 }
 
 .query-log-search input:focus,
@@ -355,8 +361,30 @@
 }
 
 .query-log-body {
+  display: flex;
   min-height: 320px;
+  flex-direction: column;
   background: var(--neutral-0);
+}
+
+/* 记录很少或为空时让面板撑满可视高度，避免面板下面露出一大片背景色。
+   内容超过一屏时 min-height 不生效，照常滚动。 */
+.query-log-view.active {
+  display: flex;
+  min-height: 100%;
+  flex-direction: column;
+}
+
+.query-log-view .query-log-panel {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.query-log-view .query-log-body {
+  min-height: 0;
+  flex: 1;
 }
 
 .query-log-row {
@@ -459,7 +487,10 @@
 }
 
 .log-request-meta>span {
-  min-width: 0;
+  /* 固定协议段的最小宽度，让后面的操作按钮在所有行上对齐到同一水平位置。
+     否则 "A · UDP" 和 "HTTPS · UDP" 宽度不同，会把按钮逐行推到不同的 x。
+     96px 覆盖 A / AAAA / HTTPS / CNAME / SVCB 等常见类型加传输协议。 */
+  min-width: 96px;
   margin-top: 0;
 }
 
@@ -831,10 +862,25 @@
 }
 
 .query-log-empty {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   padding: 54px 24px;
   color: var(--neutral-15);
   text-align: center;
   font-size: 13px;
+}
+
+.query-log-empty small {
+  display: block;
+  /* 比正文宽一些：这句话较长，收得太窄会在末行留下一两个字的孤字 */
+  max-width: 52em;
+  margin: 8px auto 0;
+  color: var(--neutral-13);
+  line-height: 1.6;
+  font-size: 12px;
 }
 
 .query-log-pagination {

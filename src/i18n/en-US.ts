@@ -96,6 +96,11 @@ export const enUS: Record<string, string> = {
   "请求": "Request",
   "响应": "Response",
   "0 条记录": "0 records",
+  "保留全部历史": "all history retained",
+  "保留最近 {p0} 天": "last {p0} days retained",
+  "保留最近 {p0} 小时": "last {p0} hours retained",
+  "<small>查询日志只{p0}，仪表盘统计的时间范围更长；排行榜里的域名可能已经超出日志保留期。</small>":
+    "<small>The query log has {p0}, while dashboard statistics cover a longer period; domains in the rankings may already have fallen outside the log retention window.</small>",
   "上一页": "Previous",
   "下一页": "Next",
   "查询日志快捷操作": "Query log quick actions",
@@ -264,6 +269,8 @@ export const enUS: Record<string, string> = {
   "公共域名返回私有、回环、链路本地或组播地址时改为拦截响应；域名分流上游自动视为可信。":
     "Blocks public domains that resolve to private, loopback, link-local or multicast addresses. Domain-routed upstreams are trusted automatically.",
   "CNAME cloaking 检测": "CNAME cloaking detection",
+  "私有地址反查不出网": "Keep private reverse lookups local",
+  "私有、回环、链路本地地址的反向解析（in-addr.arpa / ip6.arpa）改为本地返回 NXDOMAIN，避免内网网段泄漏给上游；需要内网 DNS 解析反查时用“域名分流上游”放行。": "Reverse lookups for private, loopback and link-local addresses (in-addr.arpa / ip6.arpa) are answered locally with NXDOMAIN so internal subnets are not leaked upstream; use a domain-specific upstream rule to let an internal DNS server resolve them.",
   "解析响应中的 CNAME 目标，并用当前黑白名单再次判定，阻止首方别名隐藏被拦截域名。":
     "Re-checks CNAME targets against the current block and allow lists so first-party aliases cannot hide a blocked domain.",
   "Rebinding 可信域名": "Rebinding-trusted domains",
@@ -616,7 +623,7 @@ export const enUS: Record<string, string> = {
   "暂无查询记录": "No queries yet",
   "<div class=\"query-log-empty\">查询日志未启用，请在设置中开启日志配置。</div>":
     "<div class=\"query-log-empty\">The query log is disabled. Enable it under Settings.</div>",
-  "<div class=\"query-log-empty\">{p0}</div>": "<div class=\"query-log-empty\">{p0}</div>",
+  "<div class=\"query-log-empty\">{p0}{p1}</div>": "<div class=\"query-log-empty\">{p0}{p1}</div>",
 
   // ---------- 配置保存与备份 ----------
   "导出中…": "Exporting…",
@@ -946,6 +953,8 @@ export const enUS: Record<string, string> = {
   "已拒绝": "Refused",
   "本地 DNS 重写": "Local DNS rewrite",
   "本地拒绝": "Refused locally",
+  "本地反查": "Local reverse lookup",
+  "私有地址反查，未向上游转发": "Private-address reverse lookup, not forwarded upstream",
   "本地响应（旧日志未记录来源）": "Answered locally (source not recorded in older logs)",
   "上游：{p0}": "Upstream: {p0}",
   "上游 DNS 解析": "Resolved upstream",

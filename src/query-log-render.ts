@@ -66,11 +66,25 @@ export function renderQueryLogRow(
         </div>
       </div>
       <div class="log-client" role="cell">
-        <strong>${escapeHtml(options.clientDisplayName(record.client_ip) ?? record.client_ip ?? "-")}</strong>
-        <span>${escapeHtml(record.client_ip || t("未知客户端"))}</span>
+        ${renderClientCell(record.client_ip, options.clientDisplayName)}
       </div>
     </div>
   `;
+}
+
+// 只有存在名称映射时才渲染副行。否则主副两行会显示同一个 IP，
+// 而绝大多数客户端本来就没有映射，等于每行都重复一遍 IP。
+function renderClientCell(
+  ip: string | null,
+  clientDisplayName: (ip: string | null) => string | null,
+): string {
+  const name = clientDisplayName(ip);
+  if (!ip) {
+    return `<strong>${escapeHtml(name ?? t("未知客户端"))}</strong>`;
+  }
+  const label = name && name !== ip ? name : null;
+  const primary = `<strong>${escapeHtml(label ?? ip)}</strong>`;
+  return label ? `${primary}<span>${escapeHtml(ip)}</span>` : primary;
 }
 
 function renderLogEyeIcon(className: string): string {
@@ -222,6 +236,7 @@ type ResolvedQueryResponseSource =
   | "rewrite"
   | "blocked"
   | "refused"
+  | "local_reverse"
   | "local";
 
 function queryLogResponseSource(record: QueryLogRecord): ResolvedQueryResponseSource {
@@ -240,6 +255,7 @@ function queryLogResponseSourceLabel(record: QueryLogRecord): string {
     case "rewrite": return t("本地 DNS 重写");
     case "blocked": return t("过滤器");
     case "refused": return t("本地拒绝");
+    case "local_reverse": return t("本地反查");
     default: return t("本地响应（旧日志未记录来源）");
   }
 }
@@ -253,6 +269,7 @@ function queryLogResponseDetail(record: QueryLogRecord): string {
     case "rewrite": return t("本地 DNS 重写");
     case "blocked": return record.rule_source ? t("过滤器：{p0}", { p0: record.rule_source }) : t("过滤器拦截");
     case "refused": return record.error ?? t("本地拒绝响应");
+    case "local_reverse": return t("私有地址反查，未向上游转发");
     default: return t("本地响应（旧日志）");
   }
 }

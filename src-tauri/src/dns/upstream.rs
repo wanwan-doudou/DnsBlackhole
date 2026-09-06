@@ -2015,6 +2015,7 @@ mod tests {
 
     #[test]
     fn load_balanced_query_tries_remaining_healthy_upstreams() {
+        let _guard = lock_half_open_probe();
         let (first, first_received, first_handle) = spawn_udp_upstream(Duration::ZERO, false);
         let (second, second_received, second_handle) = spawn_udp_upstream(Duration::ZERO, false);
         let (third, third_received, third_handle) = spawn_udp_upstream(Duration::ZERO, true);
@@ -2221,6 +2222,7 @@ mod tests {
 
     #[test]
     fn parallel_requests_hedge_only_after_primary_wait() {
+        let _guard = lock_half_open_probe();
         // 完整测试套件会共享弹性 I/O 线程池。低核数 runner 上任务可能排队超过
         // 固定的模拟延迟，所以由测试显式阻塞主上游，避免把调度快慢误判为逻辑失败。
         let (slow, slow_received, slow_release, slow_handle) = spawn_blocked_udp_upstream();

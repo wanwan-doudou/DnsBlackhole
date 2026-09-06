@@ -26,6 +26,8 @@ const TYPE_MX: u16 = 15;
 const TYPE_TXT: u16 = 16;
 const TYPE_SRV: u16 = 33;
 pub(crate) const TYPE_OPT: u16 = 41;
+const EDNS_OPTION_TCP_KEEPALIVE: u16 = 11;
+const EDNS_OPTION_PADDING: u16 = 12;
 const TYPE_SVCB: u16 = 64;
 const TYPE_HTTPS: u16 = 65;
 pub(crate) const TYPE_ANY: u16 = 255;
@@ -102,8 +104,11 @@ pub(crate) fn parse_query(packet: &[u8]) -> Result<ParsedQuery, String> {
         if record.record_type == TYPE_OPT && edns_udp_size.is_none() && owner_is_root {
             edns_udp_size = Some(record.record_class.max(512));
             dnssec_ok = record.ttl & 0x0000_8000 != 0;
-            if record.data_len != 0 || record.ttl & 0xffff_7fff != 0 {
-                // ECS、Cookie 等 EDNS 选项会影响响应，不参与缓存或重复请求合并。
+            if record.ttl & 0xffff_7fff != 0
+                || !edns_options_are_cache_safe(packet, record.data_offset, record.data_len)
+            {
+                // ECS 等会改变应答内容的选项不参与缓存或重复请求合并；
+                // Cookie 还要求客户端校验响应，不能用无 Cookie 的缓存响应代替。
                 cache_safe = false;
             }
         } else {
@@ -1042,14 +1047,104 @@ pub(crate) fn response_min_record_ttl(packet: &[u8]) -> Option<u32> {
     response_cache_ttl(packet)
 }
 
+/// 判断 OPT 记录里的选项是否可以在移除 OPT 后安全复用应答。
+/// 未知选项一律按"会影响"处理——宁可少缓存，也不能返回错的应答。
+fn edns_options_are_cache_safe(packet: &[u8], data_offset: usize, data_len: usize) -> bool {
+    let Some(mut rest) = packet.get(data_offset..data_offset.saturating_add(data_len)) else {
+        return false;
+    };
+
+    while !rest.is_empty() {
+        if rest.len() < 4 {
+            return false;
+        }
+        let code = u16::from_be_bytes([rest[0], rest[1]]);
+        let option_len = usize::from(u16::from_be_bytes([rest[2], rest[3]]));
+        let Some(next) = rest.get(4usize.saturating_add(option_len)..) else {
+            return false;
+        };
+        if !matches!(code, EDNS_OPTION_TCP_KEEPALIVE | EDNS_OPTION_PADDING) {
+            return false;
+        }
+        rest = next;
+    }
+
+    true
+}
+
+/// 入缓存前移除 OPT，让缓存条目不保存逐事务的 EDNS 伪记录。
+/// 命中时会按当前查询重新生成一个空 OPT；Cookie 查询本身不会进入缓存。
+/// 返回 false 表示无法保证条目与客户端无关，调用方应放弃缓存。
+pub(crate) fn normalize_cached_response(response: &mut Vec<u8>) -> bool {
+    let Ok(question) = parse_question(response) else {
+        return false;
+    };
+    let (Some(answer_count), Some(authority_count), Some(additional_count)) = (
+        read_u16(response, 6),
+        read_u16(response, 8),
+        read_u16(response, 10),
+    ) else {
+        return false;
+    };
+    if additional_count == 0 {
+        return true;
+    }
+
+    let mut offset = question.question_end;
+    for _ in 0..answer_count.saturating_add(authority_count) {
+        let Some(record) = read_dns_record(response, offset) else {
+            return false;
+        };
+        offset = record.next_offset;
+    }
+
+    for _ in 0..additional_count {
+        let record_offset = offset;
+        let Some(record) = read_dns_record(response, offset) else {
+            return false;
+        };
+        if record.record_type == TYPE_OPT {
+            // OPT 之后还有记录时不做原地裁剪：后续记录可能带压缩指针，位移会破坏它们。
+            if record.next_offset != response.len() {
+                return false;
+            }
+            response[10..12].copy_from_slice(&(additional_count - 1).to_be_bytes());
+            response.truncate(record_offset);
+            return true;
+        }
+        offset = record.next_offset;
+    }
+
+    true
+}
+
 pub(crate) fn prepare_cached_response(
     cached_response: &[u8],
     query: &[u8],
     ttl: u32,
 ) -> Option<Vec<u8>> {
+    let parsed_query = parse_query(query).ok()?;
     let mut response = prepare_response_for_query(cached_response, query)?;
     rewrite_response_ttls(&mut response, ttl)?;
+    if let Some(udp_size) = parsed_query.edns_udp_size {
+        append_empty_opt(&mut response, udp_size, parsed_query.dnssec_ok)?;
+    }
     Some(response)
+}
+
+fn append_empty_opt(response: &mut Vec<u8>, udp_size: u16, dnssec_ok: bool) -> Option<()> {
+    const EMPTY_OPT_LEN: usize = 11;
+    if response.len().checked_add(EMPTY_OPT_LEN)? > MAX_DNS_PACKET_SIZE {
+        return None;
+    }
+    let additional_count = read_u16(response, 10)?.checked_add(1)?;
+    response[10..12].copy_from_slice(&additional_count.to_be_bytes());
+    response.push(0);
+    response.extend_from_slice(&TYPE_OPT.to_be_bytes());
+    response.extend_from_slice(&udp_size.to_be_bytes());
+    response.extend_from_slice(&if dnssec_ok { 0x0000_8000_u32 } else { 0 }.to_be_bytes());
+    response.extend_from_slice(&0_u16.to_be_bytes());
+    Some(())
 }
 
 pub(crate) fn prepare_response_for_query(response: &[u8], query: &[u8]) -> Option<Vec<u8>> {

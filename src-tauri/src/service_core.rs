@@ -612,6 +612,7 @@ pub(crate) fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool 
         || previous.blocked_clients != next.blocked_clients
         || previous.rate_limit_per_second != next.rate_limit_per_second
         || previous.refuse_any != next.refuse_any
+        || previous.private_reverse_dns_enabled != next.private_reverse_dns_enabled
         || previous.query_log_enabled != next.query_log_enabled
         || previous.statistics_enabled != next.statistics_enabled
         || previous.anonymize_client_ip != next.anonymize_client_ip

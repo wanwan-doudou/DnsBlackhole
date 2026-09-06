@@ -160,6 +160,11 @@ pub struct AppConfig {
     pub rebinding_allowed_domains: String,
     #[serde(default = "default_cname_cloaking_enabled")]
     pub cname_cloaking_enabled: bool,
+    /// 是否把私有地址的反查（in-addr.arpa / ip6.arpa）留在本地应答。
+    /// 默认开启：转发这类查询会把内网网段逐个泄漏给公共上游。
+    /// 需要让内网 DNS 解析反查时，用"域名分流上游"把 in-addr.arpa 显式指向内网服务器即可。
+    #[serde(default = "default_private_reverse_dns_enabled")]
+    pub private_reverse_dns_enabled: bool,
     #[serde(default)]
     pub dns_rewrites: String,
     #[serde(default)]
@@ -353,6 +358,7 @@ impl Default for AppConfig {
             rebinding_protection_enabled: default_rebinding_protection_enabled(),
             rebinding_allowed_domains: default_rebinding_allowed_domains(),
             cname_cloaking_enabled: default_cname_cloaking_enabled(),
+            private_reverse_dns_enabled: default_private_reverse_dns_enabled(),
             dns_rewrites: String::new(),
             client_names: String::new(),
             query_log_ignored_domains: String::new(),
@@ -770,6 +776,10 @@ fn default_rebinding_allowed_domains() -> String {
 }
 
 fn default_cname_cloaking_enabled() -> bool {
+    true
+}
+
+fn default_private_reverse_dns_enabled() -> bool {
     true
 }
 

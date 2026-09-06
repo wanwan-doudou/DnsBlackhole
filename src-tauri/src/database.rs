@@ -808,6 +808,7 @@ impl Database {
             "rewrite" => " AND response_source = 'rewrite'",
             "blocked" => " AND response_source = 'blocked'",
             "refused" => " AND response_source = 'refused'",
+            "local_reverse" => " AND response_source = 'local_reverse'",
             _ => "",
         };
         let query_type_sql = match query_type {

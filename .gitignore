@@ -18,6 +18,7 @@ dist-ssr
 artifacts/
 .release-bench/
 RELEASE_PROCESS.local.md
+HANDOFF.local.md
 
 # 机器本地的 cargo 配置（含本机 Windows SDK 路径，勿入库）
 src-tauri/.cargo/

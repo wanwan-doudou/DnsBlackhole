@@ -1385,6 +1385,18 @@ mod tests {
     }
 
     #[test]
+    fn private_reverse_setting_restarts_dns_runtime() {
+        let previous = AppConfig::default();
+        let next = AppConfig {
+            private_reverse_dns_enabled: !previous.private_reverse_dns_enabled,
+            ..previous.clone()
+        };
+
+        assert!(!service_core::filter_runtime_changed(&previous, &next));
+        assert!(service_core::needs_dns_restart(&previous, &next));
+    }
+
+    #[test]
     fn configured_summary_uses_filter_metadata_without_reading_cache() {
         let config = AppConfig {
             filters: vec![FilterSubscription {

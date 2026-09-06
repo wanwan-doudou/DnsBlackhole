@@ -11,7 +11,9 @@ use crate::config::AppConfig;
 
 #[cfg(test)]
 use super::protocol::Question;
-use super::protocol::{ParsedQuery, prepare_cached_response, response_cache_ttl};
+use super::protocol::{
+    ParsedQuery, normalize_cached_response, prepare_cached_response, response_cache_ttl,
+};
 
 const DNS_CACHE_ENTRY_OVERHEAD_BYTES: usize = 96;
 // 淘汰时从迭代起点抽样对比 last_used，避免全表扫描找最旧条目
@@ -40,7 +42,10 @@ pub(crate) struct QueryCacheKey {
     authentic_data: bool,
     checking_disabled: bool,
     dnssec_ok: bool,
-    edns_udp_size: Option<u16>,
+    // 只记录"客户端是否使用 EDNS"，不记录它声明的 UDP 大小。
+    // RFC 6891 §6.1.1 要求请求里没有 OPT 时响应也不能带 OPT，所以这一位必须留；
+    // 但 512/1232/4096 的应答内容完全相同，按大小分键只会让每种客户端各吃一次冷 miss。
+    edns: bool,
     route: Option<String>,
 }
 
@@ -144,7 +149,8 @@ impl QueryCacheKey {
             authentic_data: query.authentic_data,
             checking_disabled: query.checking_disabled,
             dnssec_ok: query.dnssec_ok,
-            edns_udp_size: query.edns_udp_size,
+            // 出站尺寸适配由 send_dns_response 按每个客户端独立截断，不需要进键。
+            edns: query.edns_udp_size.is_some(),
             route: None,
         })
     }
@@ -164,7 +170,7 @@ impl QueryCacheKey {
             authentic_data: false,
             checking_disabled: false,
             dnssec_ok: false,
-            edns_udp_size: None,
+            edns: false,
             route: None,
         }
     }
@@ -567,6 +573,11 @@ pub(crate) fn insert_cached_response(
     let Some(ttl) = cache_ttl_seconds(&response, config) else {
         return false;
     };
+    let mut response = response;
+    // 归一化失败说明无法保证条目与客户端无关（例如 OPT 后面还有记录），此时宁可不缓存。
+    if !normalize_cached_response(&mut response) {
+        return false;
+    }
     cache.insert_with_ttl(cache_key, response, now, ttl)
 }
 

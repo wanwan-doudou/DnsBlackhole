@@ -283,6 +283,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <option value="upstream">${t("上游服务器")}</option>
                 <option value="cache">${t("DNS 缓存")}</option>
                 <option value="rewrite">${t("DNS 重写")}</option>
+                <option value="local_reverse">${t("本地反查")}</option>
                 <option value="blocked">${t("过滤规则")}</option>
                 <option value="refused">${t("拒绝响应")}</option>
               </select>
@@ -743,6 +744,13 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <span>
                     <strong>${t("CNAME cloaking 检测")}</strong>
                     <small>${t("解析响应中的 CNAME 目标，并用当前黑白名单再次判定，阻止首方别名隐藏被拦截域名。")}</small>
+                  </span>
+                </label>
+                <label class="check-row">
+                  <input id="private_reverse_dns_enabled" type="checkbox" />
+                  <span>
+                    <strong>${t("私有地址反查不出网")}</strong>
+                    <small>${t("私有、回环、链路本地地址的反向解析（in-addr.arpa / ip6.arpa）改为本地返回 NXDOMAIN，避免内网网段泄漏给上游；需要内网 DNS 解析反查时用“域名分流上游”放行。")}</small>
                   </span>
                 </label>
               </div>
