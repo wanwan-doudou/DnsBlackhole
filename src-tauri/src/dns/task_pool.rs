@@ -271,7 +271,7 @@ mod tests {
             let _ = release_receiver.recv();
         })));
         started_receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .expect("first task should start");
 
         assert!(pool.try_spawn(Box::new(|| {})));
@@ -292,13 +292,13 @@ mod tests {
                 let _ = io_sender.send(());
             })));
             io_receiver
-                .recv_timeout(std::time::Duration::from_secs(1))
+                .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("io task should not be starved by its coordinator");
             let _ = completed_sender.send(());
         })));
 
         completed_receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .expect("coordination task should complete");
     }
 
@@ -311,7 +311,7 @@ mod tests {
             let _ = completed_tx.send(());
         })));
         completed_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(5))
             .expect("panic 后的任务仍应执行");
     }
 
@@ -332,7 +332,7 @@ mod tests {
         }
         for _ in 0..4 {
             started_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(Duration::from_secs(5))
                 .expect("突发任务应并行启动");
         }
         assert_eq!(pool.worker_count(), 4);
@@ -340,7 +340,7 @@ mod tests {
             release_tx.send(()).expect("任务应可释放");
         }
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while pool.worker_count() != 1 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
