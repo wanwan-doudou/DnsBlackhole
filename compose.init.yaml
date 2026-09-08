@@ -1,0 +1,15 @@
+services:
+  dnsblackhole:
+    volumes:
+      - type: bind
+        source: ./docker/bootstrap-config.json
+        target: /etc/dnsblackhole/config.json
+        read_only: true
+    command:
+      - serve
+      - --data-dir
+      - /var/lib/dnsblackhole
+      - --web-listen
+      - 0.0.0.0:3000
+      - --bootstrap-config
+      - /etc/dnsblackhole/config.json

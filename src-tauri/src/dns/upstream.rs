@@ -61,7 +61,6 @@ const FASTEST_ADDR_MAX_IPS_PER_RESPONSE: usize = 8;
 const FASTEST_ADDR_MAX_PROBES: usize = 32;
 const FASTEST_ADDR_PROBE_WAIT: Duration = Duration::from_secs(1);
 const MAX_PARALLEL_UPSTREAMS_PER_QUERY: usize = 8;
-const PARALLEL_HEDGE_DELAY: Duration = Duration::from_millis(25);
 // 上游整体等待需要覆盖单次超时加上线程池排队的余量
 const PARALLEL_RESULT_WAIT: Duration = Duration::from_secs(6);
 const UDP_SOCKET_POOL_CAPACITY: usize = 8;
@@ -790,74 +789,36 @@ fn forward_parallel(
         return Err("没有可用的上游 DNS".into());
     }
     let start = next_upstream.fetch_add(1, Ordering::Relaxed) % upstream_servers.len();
-    let mut selected_upstreams = select_parallel_upstreams(upstream_servers, start);
+    let selected_upstreams = select_parallel_upstreams(upstream_servers, start);
     if selected_upstreams.is_empty() {
         return Err("所有上游 DNS 暂不可用".into());
     }
 
     let deadline = (Instant::now() + PARALLEL_RESULT_WAIT).min(query_deadline);
-    let (sender, receiver) = mpsc::channel();
-    let shared_query = Arc::new(query.to_vec());
-    let control = Arc::new(ParallelRequestControl::new(deadline));
-    let primary = selected_upstreams.remove(0);
-    let mut pending = 0;
+    let batch = spawn_parallel_forwards(query, selected_upstreams, deadline, true, stats);
     let mut last_error = None;
-
-    match spawn_parallel_forward_task(&shared_query, primary, &sender, &control, true, stats) {
-        Ok(()) => {
-            pending = 1;
-            let hedge_deadline = (Instant::now() + PARALLEL_HEDGE_DELAY).min(deadline);
-            match recv_until(&receiver, hedge_deadline) {
-                Some(Ok(response)) => {
-                    control.cancel();
-                    return Ok(response);
-                }
-                Some(Err(error)) => {
-                    pending = 0;
-                    last_error = Some(error);
-                }
-                None => {}
-            }
-        }
-        Err(upstream) => match forward_to_upstream(query, &upstream, deadline) {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
-        },
-    }
-
-    let mut synchronous_fallback = None;
-    for upstream in selected_upstreams {
-        match spawn_parallel_forward_task(&shared_query, upstream, &sender, &control, true, stats) {
-            Ok(()) => pending += 1,
-            Err(upstream) => {
-                synchronous_fallback = Some(*upstream);
-                break;
-            }
-        }
-    }
-    drop(sender);
 
     // 队列满时立即在当前线程执行一个兜底；其他已提交任务仍在并行运行。
     // 不能等到批次 deadline 后再执行，否则会在最拥塞时额外增加一个网络超时。
-    if let Some(upstream) = synchronous_fallback.take() {
-        match forward_to_upstream(query, &upstream, deadline) {
+    if let Some(upstream) = batch.synchronous_fallback.as_ref() {
+        match forward_to_upstream(query, upstream, deadline) {
             Ok(response) => {
-                control.cancel();
+                batch.control.cancel();
                 return Ok(response);
             }
             Err(error) => last_error = Some(error),
         }
     }
 
-    if pending == 0 {
-        control.cancel();
+    if batch.expected == 0 {
+        batch.control.cancel();
         return Err(last_error.unwrap_or_else(|| "并发任务队列已满".to_string()));
     }
 
-    for _ in 0..pending {
-        match recv_until(&receiver, deadline) {
+    for _ in 0..batch.expected {
+        match recv_until(&batch.receiver, deadline) {
             Some(Ok(response)) => {
-                control.cancel();
+                batch.control.cancel();
                 return Ok(response);
             }
             Some(Err(error)) => last_error = Some(error),
@@ -866,7 +827,7 @@ fn forward_parallel(
     }
 
     // 调用方不再等待后，尚未开始的同组任务应直接丢弃，避免网络异常时积压旧请求。
-    control.cancel();
+    batch.control.cancel();
     Err(last_error.unwrap_or_else(|| "并行请求上游 DNS 超时".into()))
 }
 
@@ -2230,16 +2191,15 @@ mod tests {
     }
 
     #[test]
-    fn parallel_requests_hedge_only_after_primary_wait() {
+    fn parallel_requests_fan_out_before_primary_response() {
         let _guard = lock_half_open_probe();
         // 完整测试套件会共享弹性 I/O 线程池。低核数 runner 上任务可能排队超过
-        // 固定的模拟延迟，所以由测试显式阻塞主上游，避免把调度快慢误判为逻辑失败。
+        // 固定的模拟延迟，所以由测试显式阻塞第一个上游，避免把调度快慢误判为逻辑失败。
         let (slow, slow_received, slow_release, slow_handle) = spawn_blocked_udp_upstream();
         let (fast, fast_received, fast_handle) = spawn_udp_upstream(Duration::ZERO, true);
         let fast_label = fast.label.clone();
         let upstreams = vec![slow, fast];
 
-        let forward_started_at = Instant::now();
         let response = forward_parallel(
             &example_a_query(),
             &upstreams,
@@ -2248,22 +2208,16 @@ mod tests {
             None,
         );
         let primary_received_at = slow_received.recv_timeout(Duration::from_secs(1));
-        let hedge_received_at = fast_received.recv_timeout(Duration::from_secs(1));
+        let parallel_received_at = fast_received.recv_timeout(Duration::from_secs(1));
         let _ = slow_release.send(());
 
         slow_handle.join().unwrap();
         fast_handle.join().unwrap();
 
-        let response = response.expect("hedged 上游应成功响应");
-        primary_received_at.expect("主上游应收到请求");
-        let hedge_received_at = hedge_received_at.expect("备用上游应收到 hedged 请求");
+        let response = response.expect("并行上游应成功响应");
+        primary_received_at.expect("第一个上游应收到请求");
+        parallel_received_at.expect("第二个上游应在第一个上游响应前收到同批请求");
 
         assert_eq!(response.upstream, fast_label);
-        assert!(
-            hedge_received_at
-                .checked_duration_since(forward_started_at)
-                .is_some_and(|delay| delay >= Duration::from_millis(10)),
-            "备用请求不应与主请求同时投递"
-        );
     }
 }

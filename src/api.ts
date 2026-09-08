@@ -7,6 +7,7 @@ import type {
   FilterCacheClearResult,
   FilterUpdateProgress,
   FilterUpdateResult,
+  LinuxSystemDnsStatus,
   MacosServiceStatus,
   QueryLogQuery,
   QueryLogPage,
@@ -30,9 +31,65 @@ export type QueryLogRequest = QueryLogQuery & {
   cursor: string | null;
 };
 
+type WebRoute = {
+  method: "GET" | "POST" | "PUT" | "DELETE";
+  path: string;
+  body?: (args: Record<string, unknown>) => unknown;
+  contentType?: "application/json" | "text/plain";
+};
+
+const WEB_ROUTES: Record<string, WebRoute> = {
+  get_web_version: { method: "GET", path: "/api/v1/admin/version" },
+  analyze_custom_rules: { method: "POST", path: "/api/v1/admin/rules/analyze" },
+  get_config: { method: "GET", path: "/api/v1/admin/config" },
+  save_config: {
+    method: "PUT",
+    path: "/api/v1/admin/config",
+    body: (args) => args.config,
+  },
+  import_config_content: {
+    method: "POST",
+    path: "/api/v1/admin/config/import",
+    body: (args) => args.content,
+    contentType: "text/plain",
+  },
+  get_status: { method: "POST", path: "/api/v1/admin/status/query" },
+  get_query_logs: { method: "POST", path: "/api/v1/admin/query-logs/search" },
+  clear_query_logs: { method: "DELETE", path: "/api/v1/admin/query-logs" },
+  apply_query_log_rule: { method: "POST", path: "/api/v1/admin/query-logs/rule" },
+  run_dns_diagnostic: { method: "POST", path: "/api/v1/admin/diagnostics/query" },
+  export_diagnostic_report: { method: "POST", path: "/api/v1/admin/diagnostics/export" },
+  clear_statistics: { method: "DELETE", path: "/api/v1/admin/statistics" },
+  clear_security_events: { method: "DELETE", path: "/api/v1/admin/security-events" },
+  update_filters: {
+    method: "POST",
+    path: "/api/v1/admin/filters/update",
+    body: (args) => args.config,
+  },
+  get_filter_update_progress: { method: "GET", path: "/api/v1/admin/filters/progress" },
+  cancel_filter_update: { method: "POST", path: "/api/v1/admin/filters/cancel" },
+  start_dns: { method: "POST", path: "/api/v1/admin/dns/start" },
+  stop_dns: { method: "POST", path: "/api/v1/admin/dns/stop" },
+  pause_protection: { method: "POST", path: "/api/v1/admin/dns/pause" },
+  resume_protection: { method: "POST", path: "/api/v1/admin/dns/resume" },
+  clear_dns_cache: { method: "DELETE", path: "/api/v1/admin/dns/cache" },
+  clear_filter_cache: { method: "DELETE", path: "/api/v1/admin/filters/cache" },
+  get_storage_info: { method: "GET", path: "/api/v1/admin/storage" },
+  get_linux_system_dns_status: { method: "GET", path: "/api/v1/admin/system-dns" },
+  take_over_linux_system_dns: { method: "POST", path: "/api/v1/admin/system-dns/takeover" },
+  restore_linux_system_dns: { method: "POST", path: "/api/v1/admin/system-dns/restore" },
+};
+
+export function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
 function timedInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const started = performance.now();
-  return invoke<T>(command, args).then(
+  const request = isTauriRuntime()
+    ? invoke<T>(command, args)
+    : webInvoke<T>(command, args ?? {});
+  return request.then(
     (result) => {
       console.info(`[加载耗时][前端 IPC] ${command}：${(performance.now() - started).toFixed(1)} ms`);
       return result;
@@ -45,6 +102,62 @@ function timedInvoke<T>(command: string, args?: Record<string, unknown>): Promis
       throw error;
     },
   );
+}
+
+async function webInvoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
+  if (["record_frontend_timing", "set_tray_locale", "set_tray_runtime_status"].includes(command)) {
+    return undefined as T;
+  }
+  if (command === "detect_system_proxy") {
+    return null as T;
+  }
+  const route = WEB_ROUTES[command];
+  if (!route) {
+    throw new Error(`Web 管理后台不支持桌面专属操作：${command}`);
+  }
+  const headers = new Headers({ Accept: "application/json" });
+  const mutation = route.method !== "GET";
+  if (mutation) {
+    headers.set("Content-Type", route.contentType ?? "application/json");
+  }
+  const requestBody = route.body ? route.body(args) : args;
+  const body = mutation
+    ? route.contentType === "text/plain"
+      ? String(requestBody ?? "")
+      : JSON.stringify(requestBody)
+    : undefined;
+  const response = await fetch(route.path, {
+    method: route.method,
+    headers,
+    body,
+  });
+  const payload = await readWebResponse(response);
+  if (!response.ok) {
+    throw new Error(webErrorMessage(payload, response.status));
+  }
+  return payload as T;
+}
+
+async function readWebResponse(response: Response): Promise<unknown> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    return response.json();
+  }
+  return response.text();
+}
+
+function webErrorMessage(payload: unknown, status: number): string {
+  if (payload && typeof payload === "object" && "error" in payload) {
+    return String((payload as { error: unknown }).error);
+  }
+  return `Web 管理请求失败（HTTP ${status}）`;
+}
+
+export function getWebVersion(): Promise<string> {
+  if (isTauriRuntime()) {
+    throw new Error("桌面运行时不使用 Web 版本接口");
+  }
+  return webInvoke<string>("get_web_version", {});
 }
 
 export function getConfig(): Promise<AppConfig> {
@@ -107,12 +220,23 @@ export function importConfigFile(path: string): Promise<AppConfig> {
   return timedInvoke<AppConfig>("import_config_file", { path });
 }
 
+export function importConfigContent(content: string): Promise<AppConfig> {
+  return timedInvoke<AppConfig>("import_config_content", { content });
+}
+
 export function exportDiagnosticFile(
   path: string,
   config: AppConfig,
   status: RuntimeStatus | null,
 ): Promise<void> {
   return timedInvoke<void>("export_diagnostic_file", { path, config, status });
+}
+
+export function exportDiagnosticReport(
+  config: AppConfig,
+  status: RuntimeStatus | null,
+): Promise<unknown> {
+  return timedInvoke<unknown>("export_diagnostic_report", { config, status });
 }
 
 export function exportQueryLogFile(path: string, content: string): Promise<void> {
@@ -168,7 +292,7 @@ export function setTrayRuntimeStatus(
   protectionPaused: boolean,
   pausedUntil: number | null,
 ): Promise<void> {
-  return invoke<void>("set_tray_runtime_status", {
+  return timedInvoke<void>("set_tray_runtime_status", {
     running,
     protectionPaused,
     pausedUntil,
@@ -263,10 +387,22 @@ export function recordFrontendTiming(
   sinceStartMs: number,
   detail?: string,
 ): Promise<void> {
-  return invoke<void>("record_frontend_timing", {
+  return timedInvoke<void>("record_frontend_timing", {
     module,
     durationMs,
     sinceStartMs,
     detail,
   });
+}
+
+export function getLinuxSystemDnsStatus(): Promise<LinuxSystemDnsStatus> {
+  return timedInvoke<LinuxSystemDnsStatus>("get_linux_system_dns_status");
+}
+
+export function takeOverLinuxSystemDns(): Promise<LinuxSystemDnsStatus> {
+  return timedInvoke<LinuxSystemDnsStatus>("take_over_linux_system_dns");
+}
+
+export function restoreLinuxSystemDns(): Promise<LinuxSystemDnsStatus> {
+  return timedInvoke<LinuxSystemDnsStatus>("restore_linux_system_dns");
 }

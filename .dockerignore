@@ -1,0 +1,15 @@
+.git
+.github
+.claude
+.codex*.tar
+.pnpm-store
+.signing
+.vscode
+artifacts
+dist
+dist-linux
+node_modules
+src-tauri/binaries
+src-tauri/target
+docker/bootstrap-config.json
+新版本规划

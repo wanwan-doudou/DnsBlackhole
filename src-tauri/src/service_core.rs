@@ -1211,6 +1211,29 @@ pub(crate) fn stop_dns_blocking(state: Arc<AppState>) -> Result<RuntimeStatus, S
     Ok(state.status(true))
 }
 
+/// 系统 DNS 接管事务专用：在 resolved stub 释放之后把监听端口切到 53。
+///
+/// 不走 `save_config_blocking`，因为这里只需要落库加热替换，不需要它的过滤器重载、
+/// 保留期清理等完整语义；也不能提前走，通配 53 只有在 stub 让开之后才绑得上。
+/// 返回原端口，供接管失败时回滚。
+#[cfg(all(feature = "system-service", target_os = "linux"))]
+pub(crate) fn apply_listen_port_blocking(state: Arc<AppState>, port: u16) -> Result<u16, String> {
+    let _runtime_guard = state
+        .runtime_update_lock
+        .lock()
+        .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
+    let mut config = state.current_config()?;
+    let previous = config.listen_port;
+    if previous == port {
+        return Ok(previous);
+    }
+    config.listen_port = port;
+    config.validate()?;
+    state.database.save_config(&config)?;
+    state.replace_config(config)?;
+    Ok(previous)
+}
+
 pub(crate) fn pause_protection_blocking(
     state: &AppState,
     duration_seconds: u64,

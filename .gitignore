@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-linux
 dist-ssr
 *.local
 
@@ -24,6 +25,9 @@ HANDOFF.local.md
 src-tauri/.cargo/
 src-tauri/target/
 
+# Docker 本地首次配置（由用户导出的真实配置不可提交）
+docker/bootstrap-config.json
+
 # macOS 后台服务 sidecar 构建产物（由 scripts/build-macos-service.sh 生成）
 src-tauri/binaries/
 
@@ -31,7 +35,10 @@ src-tauri/binaries/
 MACOS_PORTING_PLAN.md
 
 # 新版本规划只在本地维护，不进入公开仓库
-新版本规划/v0.2.4.md
+新版本规划/
+
+# 测试虚拟机资料含明文凭据，只在本地维护
+docs/development/linux-vm.md
 
 # Editor directories and files
 .vscode/*

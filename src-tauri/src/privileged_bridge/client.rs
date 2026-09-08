@@ -1,10 +1,10 @@
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use serde::{Serialize, de::DeserializeOwned};
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use super::BRIDGE_SOCKET_PATH;
 #[cfg(windows)]
 use super::windows_pipe::WindowsPipeStream;
@@ -13,11 +13,11 @@ use super::{
     write_message,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPECTED_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 type ServiceStream = UnixStream;
 #[cfg(windows)]
 type ServiceStream = WindowsPipeStream;
@@ -25,7 +25,7 @@ type ServiceStream = WindowsPipeStream;
 pub(crate) struct ServiceClient;
 
 impl ServiceClient {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     pub(crate) fn probe() -> Result<HelloResult, String> {
         let (mut stream, hello) = connect_and_hello()?;
         verify_connection_alive(&mut stream)?;
@@ -53,6 +53,7 @@ impl ServiceClient {
         Self::call_with_version_policy(method, params, true)
     }
 
+    // 只有 macOS 的服务管理在重装后需要请求服务自重启
     #[cfg(target_os = "macos")]
     pub(crate) fn request_restart() -> Result<(), String> {
         Self::call_with_version_policy("restart_service", &serde_json::json!({}), false)
@@ -123,10 +124,11 @@ fn verify_connection_alive(stream: &mut ServiceStream) -> Result<(), String> {
 }
 
 fn connect_and_hello() -> Result<(ServiceStream, HelloResult), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     let stream = UnixStream::connect(BRIDGE_SOCKET_PATH).map_err(|error| {
         // 区分“服务根本没在运行”（socket 不存在或无人监听）与其他连接故障，
         // 前者最常见的原因是服务尚未安装、等待系统设置批准或正在启动。
+        #[cfg(target_os = "macos")]
         let hint = match error.kind() {
             std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
                 "后台服务未在运行。若已安装，请在“系统设置 → 通用 → 登录项与扩展”中\
@@ -134,7 +136,14 @@ fn connect_and_hello() -> Result<(ServiceStream, HelloResult), String> {
             }
             _ => "请先在设置中安装或修复后台服务",
         };
-        format!("无法连接 macOS DNS 后台服务，{hint}：{error}")
+        #[cfg(target_os = "linux")]
+        let hint = match error.kind() {
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+                "后台服务未在运行，请检查 systemctl status dnsblackhole"
+            }
+            _ => "请检查本机后台服务与 /run/dnsblackhole/service.sock 权限",
+        };
+        format!("无法连接 DNS 后台服务，{hint}：{error}")
     })?;
     #[cfg(windows)]
     let stream = WindowsPipeStream::connect()?;
@@ -148,11 +157,11 @@ fn connect_and_hello_with_timeout(timeout_ms: u32) -> Result<(ServiceStream, Hel
 }
 
 fn finish_hello(mut stream: ServiceStream) -> Result<(ServiceStream, HelloResult), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     stream
         .set_read_timeout(Some(RPC_TIMEOUT))
         .map_err(|error| format!("设置后台服务读取超时失败：{error}"))?;
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     stream
         .set_write_timeout(Some(RPC_TIMEOUT))
         .map_err(|error| format!("设置后台服务写入超时失败：{error}"))?;

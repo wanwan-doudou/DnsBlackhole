@@ -1,21 +1,23 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
+#[cfg(feature = "desktop")]
+use std::path::PathBuf;
+#[cfg(any(feature = "desktop", feature = "web-admin"))]
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, path::Path};
 
+#[cfg(feature = "desktop")]
 use serde::Serialize;
-use serde_json::json;
+#[cfg(any(feature = "desktop", feature = "web-admin"))]
+use serde_json::{Value, json};
 
-use crate::{
-    config::{AppConfig, CURRENT_CONFIG_SCHEMA_VERSION, migrate_legacy_defaults},
-    dns::RuntimeStatus,
-};
+use crate::config::{AppConfig, CURRENT_CONFIG_SCHEMA_VERSION, migrate_legacy_defaults};
+#[cfg(any(feature = "desktop", feature = "web-admin"))]
+use crate::dns::RuntimeStatus;
 
-const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(feature = "desktop")]
 const MAX_CSV_EXPORT_BYTES: usize = 32 * 1024 * 1024;
 
-#[tauri::command]
+#[cfg(feature = "desktop")]
 pub(crate) async fn export_config_file(path: String, config: AppConfig) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         config.validate()?;
@@ -25,23 +27,30 @@ pub(crate) async fn export_config_file(path: String, config: AppConfig) -> Resul
     .map_err(|error| format!("导出配置任务异常：{error}"))?
 }
 
-#[tauri::command]
+#[cfg(feature = "desktop")]
 pub(crate) async fn import_config_file(path: String) -> Result<AppConfig, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(path);
-        let metadata = fs::metadata(&path).map_err(|error| format!("读取配置文件失败：{error}"))?;
-        if metadata.len() > MAX_IMPORT_BYTES {
-            return Err("配置文件超过 4 MiB，已拒绝导入".to_string());
-        }
-        let content = fs::read_to_string(&path)
-            .map_err(|error| format!("配置文件必须是有效的 UTF-8 文本：{error}"))?;
-        parse_imported_config(&content)
+        read_imported_config_file(&path)
     })
     .await
     .map_err(|error| format!("导入配置任务异常：{error}"))?
 }
 
-fn parse_imported_config(content: &str) -> Result<AppConfig, String> {
+pub(crate) fn read_imported_config_file(path: &Path) -> Result<AppConfig, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("读取配置文件失败：{error}"))?;
+    if !metadata.is_file() {
+        return Err("配置路径必须指向普通文件".to_string());
+    }
+    if metadata.len() > MAX_IMPORT_BYTES {
+        return Err("配置文件超过 4 MiB，已拒绝导入".to_string());
+    }
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("配置文件必须是有效的 UTF-8 文本：{error}"))?;
+    parse_imported_config(&content)
+}
+
+pub(crate) fn parse_imported_config(content: &str) -> Result<AppConfig, String> {
     let mut config: AppConfig =
         serde_json::from_str(content).map_err(|error| format!("配置 JSON 格式无效：{error}"))?;
     if config.schema_version > CURRENT_CONFIG_SCHEMA_VERSION {
@@ -55,35 +64,39 @@ fn parse_imported_config(content: &str) -> Result<AppConfig, String> {
     Ok(config)
 }
 
-#[tauri::command]
+#[cfg(feature = "desktop")]
 pub(crate) async fn export_diagnostic_file(
     path: String,
     config: AppConfig,
     status: Option<RuntimeStatus>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut sanitized_config = config;
-        redact_config(&mut sanitized_config);
-        let sanitized_status = status.map(sanitize_status);
-        let report = json!({
-            "format": "dnsblackhole-diagnostic-v1",
-            "generated_at_unix": unix_now(),
-            "application": {
-                "version": env!("CARGO_PKG_VERSION"),
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
-            },
-            "privacy": "域名、客户端地址、访问列表、代理地址、上游地址、规则内容和过滤器 URL 已隐藏",
-            "config": sanitized_config,
-            "runtime": sanitized_status,
-        });
+        let report = diagnostic_report(config, status);
         write_json(Path::new(&path), &report)
     })
     .await
     .map_err(|error| format!("导出诊断信息任务异常：{error}"))?
 }
 
-#[tauri::command]
+#[cfg(any(feature = "desktop", feature = "web-admin"))]
+pub(crate) fn diagnostic_report(mut config: AppConfig, status: Option<RuntimeStatus>) -> Value {
+    redact_config(&mut config);
+    let sanitized_status = status.map(sanitize_status);
+    json!({
+        "format": "dnsblackhole-diagnostic-v1",
+        "generated_at_unix": unix_now(),
+        "application": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        },
+        "privacy": "域名、客户端地址、访问列表、代理地址、上游地址、规则内容和过滤器 URL 已隐藏",
+        "config": config,
+        "runtime": sanitized_status,
+    })
+}
+
+#[cfg(feature = "desktop")]
 pub(crate) async fn export_query_log_file(path: String, content: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         if content.len() > MAX_CSV_EXPORT_BYTES {
@@ -99,6 +112,7 @@ pub(crate) async fn export_query_log_file(path: String, content: String) -> Resu
     .map_err(|error| format!("导出查询日志任务异常：{error}"))?
 }
 
+#[cfg(any(feature = "desktop", feature = "web-admin", test))]
 fn redact_config(config: &mut AppConfig) {
     redact_lines(&mut config.upstream_dns);
     redact_lines(&mut config.fallback_dns);
@@ -131,6 +145,7 @@ fn redact_config(config: &mut AppConfig) {
     }
 }
 
+#[cfg(any(feature = "desktop", feature = "web-admin"))]
 fn sanitize_status(mut status: RuntimeStatus) -> RuntimeStatus {
     status.listen_addr = "<已隐藏>".to_string();
     status.upstream_dns = "<已隐藏>".to_string();
@@ -156,6 +171,7 @@ fn sanitize_status(mut status: RuntimeStatus) -> RuntimeStatus {
     status
 }
 
+#[cfg(any(feature = "desktop", feature = "web-admin", test))]
 fn redact_lines(value: &mut String) {
     let count = value
         .lines()
@@ -171,6 +187,7 @@ fn redact_lines(value: &mut String) {
     };
 }
 
+#[cfg(any(feature = "desktop", feature = "web-admin", test))]
 fn redact_value(value: &str) -> String {
     if value.trim().is_empty() {
         String::new()
@@ -179,6 +196,7 @@ fn redact_value(value: &str) -> String {
     }
 }
 
+#[cfg(feature = "desktop")]
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("请选择导出文件位置".to_string());
@@ -189,6 +207,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     fs::write(path, content).map_err(|error| format!("写入导出文件失败：{error}"))
 }
 
+#[cfg(any(feature = "desktop", feature = "web-admin"))]
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

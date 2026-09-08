@@ -4,19 +4,98 @@
 
 [下载最新版](https://github.com/wanwan-doudou/DnsBlackhole/releases/latest) · [查看发布记录](https://github.com/wanwan-doudou/DnsBlackhole/releases) · [MIT License](LICENSE)
 
-DnsBlackhole 可以运行在 Windows 或 macOS 主机上，通过远程黑名单、自定义规则和 DNS 重写过滤广告、跟踪及指定域名，同时提供查询日志、统计、客户端访问控制和 DNS 缓存。它是一个带图形界面的本地转发器，不是完整的权威 DNS 或递归解析器。
+DnsBlackhole 可以作为 Windows/macOS 桌面应用、Ubuntu Server 服务或 Linux Docker 容器运行，通过远程黑名单、自定义规则和 DNS 重写过滤广告、跟踪及指定域名，同时提供查询日志、统计、客户端访问控制和 DNS 缓存。它是本地或局域网 DNS 转发器，不是完整的权威 DNS 或递归解析器。
 
-> 当前 GitHub Release 同时提供 Windows x64 的 NSIS/MSI 安装包和 macOS Universal DMG。
+> v0.2.4 及以前的 Release 提供 Windows x64 的 NSIS/MSI 和 macOS Universal DMG。从 v0.2.5 起，Release 还提供 Ubuntu 26.04 amd64 Server DEB，以及发布到 GHCR 的 Linux amd64 容器镜像。
 
 ## 安装
 
 1. 打开 [最新 Release](https://github.com/wanwan-doudou/DnsBlackhole/releases/latest)。
 2. Windows 普通用户下载 `DnsBlackhole_<版本>_x64-setup.exe`；需要 MSI 部署时下载 `DnsBlackhole_<版本>_x64_en-US.msi`。
 3. macOS 用户下载 `DnsBlackhole_<版本>_universal.dmg`，将应用拖入“应用程序”文件夹；首次启动后，在“设置”中安装后台 DNS 服务，并按系统提示批准后台项目。
-4. 启动应用，在“DNS 黑名单”中检查更新，下载已启用的远程清单。
-5. 将本机、路由器或局域网设备的 DNS 地址指向运行 DnsBlackhole 的主机。
+4. Ubuntu 26.04 Server amd64 用户从 v0.2.5 Release 下载 `dnsblackhole-server_<版本>_amd64.deb`；其它带 Docker 的 Linux amd64 环境可按下方 Compose 说明拉取 `ghcr.io/wanwan-doudou/dnsblackhole:<版本>`。
+5. 启动服务，在“DNS 黑名单”中检查更新，下载已启用的远程清单。
+6. 将本机、路由器或局域网设备的 DNS 地址指向运行 DnsBlackhole 的主机。
 
-Windows 版本支持在“关于”中检查、下载并安装带签名的新版本。
+Windows 和 macOS 桌面版支持在“关于”中检查、下载并安装带 updater 签名的新版本。Ubuntu Server 与 Docker 不使用桌面自动更新：Server 通过新版 DEB 升级，Docker 拉取新版镜像并替换容器，两者都会保留既有数据。
+
+### Ubuntu Server / 无图形环境
+
+v0.2.5 的 Server DEB 首发只以 Ubuntu 26.04 amd64 为构建与验收基线；Ubuntu 22.04/24.04 暂不在本版支持范围。Server 包只装 headless 服务和内嵌的 Web 管理后台，不依赖 GTK 或 WebKitGTK：
+
+```bash
+sudo dpkg -i dnsblackhole-server_<版本>_amd64.deb
+```
+
+安装后服务会自动启用并启动，但**不会自动接管宿主 DNS**。浏览器可直接访问
+`http://<主机地址>:3000`。v0.2.5 暂不内置 Web 登录，任何能访问 3000 端口的客户端都能
+操作后台，因此只应在可信内网开放；跨越不可信网络时必须由反向代理提供 HTTPS 和身份认证。
+
+需要让本机解析走 DnsBlackhole 时，在后台显式接管，或用本机 CLI：
+
+   ```bash
+   sudo dnsblackhole-cli system-dns takeover
+   sudo dnsblackhole-cli system-dns status
+   ```
+
+接管会关闭 `systemd-resolved` 的 stub 监听、把 `/etc/resolv.conf` 指向 resolved 的运行时文件，
+并把监听端口设为 53。原有配置在接管前已事务化备份，任何一步失败都会自动回滚。
+
+恢复原 DNS：
+
+```bash
+sudo dnsblackhole-cli system-dns restore
+```
+
+后台服务因配置错误或升级失败起不来时，用不依赖服务的离线救援路径（需要 root，且要求
+DnsBlackhole 已释放 53 端口）：
+
+```bash
+sudo systemctl stop dnsblackhole
+sudo /usr/lib/dnsblackhole/dnsblackhole-service system-dns restore --offline
+```
+
+日志与脚本入口：
+
+```bash
+sudo journalctl -u dnsblackhole -f
+dnsblackhole-cli status --json
+```
+
+### Docker
+
+Docker 版直接复用 Server 的 DNS 核心和内嵌 Web 管理后台，以固定非 root 用户运行。默认 bridge 示例同时发布 TCP/UDP 53 和 TCP 3000：
+
+```bash
+git clone https://github.com/wanwan-doudou/DnsBlackhole.git
+cd DnsBlackhole
+git checkout v0.2.5
+docker compose pull
+docker compose up -d --no-build
+docker compose logs dnsblackhole
+```
+
+Compose 默认拉取不可变版本标签 `ghcr.io/wanwan-doudou/dnsblackhole:0.2.5`；`latest` 也会随正式发布更新，但生产部署建议固定具体版本。仓库仍保留 Dockerfile 作为源码构建回退，完整命令见部署文档。
+
+浏览器可直接访问 `http://<宿主地址>:3000`。v0.2.5 暂不内置 Web 登录，因此 3000 端口只应发布到可信内网；导出的完整 JSON 配置可只读挂载，并且只在数据卷没有既有数据库时应用。Linux host network 示例、首次配置、升级、数据持久化和宿主 DNS 边界见 [Docker 部署文档](docs/deployment/docker.md)。
+
+容器不会修改或恢复宿主的 `/etc/resolv.conf`、systemd-resolved 或 NetworkManager。停止容器前，如果宿主、路由器或其它客户端正把它作为 DNS，需先在容器外切换这些客户端的 DNS 设置。
+
+### Linux 卸载与数据清理
+
+卸载会先恢复宿主 DNS 再停用服务，并且**不会删除应用数据**——查询历史和配置都保留，
+`purge` 也一样不动它们：
+
+```bash
+sudo dpkg -r dnsblackhole-server     # 卸载，保留数据
+sudo dpkg -P dnsblackhole-server     # 连配置文件一起清除，仍保留 /var/lib/dnsblackhole
+```
+
+确实要清空查询历史与配置时，显式删除数据目录：
+
+```bash
+sudo rm -rf /var/lib/dnsblackhole
+```
 
 ## 快速开始
 
@@ -46,7 +125,7 @@ Windows 版本支持在“关于”中检查、下载并安装带签名的新版
 - 可请求上游执行 DNSSEC 验证并检查 AD/SERVFAIL 结果；建议搭配可信的加密 DNS 上游。
 - 支持三种请求模式：
   - 负载均衡：每次选择一台上游，失败后尝试其他服务器。
-  - 并行请求：同时请求所有上游，采用最先成功的响应。
+  - 并行请求：同时请求最多 8 个当前可用的上游，采用最先成功的响应。
   - 最快的 IP 地址：收集上游响应并探测结果地址，优先返回可达性更好的结果。
 
 支持的上游格式：
@@ -217,10 +296,12 @@ cargo bench --manifest-path src-tauri/Cargo.toml --features bench --bench dns_ho
 项目使用 `tauri-plugin-updater` 和 Tauri updater 签名。维护者发布新版本时：
 
 1. 同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的版本号。
-2. 完成前端构建、Rust 测试和 Clippy 检查。
+2. 完成前端构建、Rust 测试、Clippy、静态检查，以及 Ubuntu 26.04 的 Server/Docker 最终矩阵。
 3. 在 Windows 执行 `./scripts/release.ps1`，生成签名的 NSIS、MSI 安装包与 `latest.json`。
-4. 推送 `main` 并等待 macOS CI 完成，下载 `DnsBlackhole-macos-universal-release` artifact。
-5. 创建一个 `v<版本号>` GitHub Release，统一上传 NSIS、MSI、Windows `latest.json`，以及 macOS artifact 中的 Universal DMG、`.app.tar.gz`、`.sig` 和 `latest-darwin-universal.json`。
+4. 推送 `main` 并等待 Windows CI、macOS CI 和 Linux CI 全部完成；下载 `DnsBlackhole-macos-universal-release` 与 `DnsBlackhole-linux-amd64-server-deb` artifact。
+5. 手动运行 `Linux Container Release` 的非推送验证；创建 Draft Release 并上传桌面安装包、两个 updater 清单和 Server DEB。
+6. 对同一最终提交以发布模式运行 `Linux Container Release`，把 Linux amd64 镜像推送为 `<版本>` 与 `latest`，核对 digest、来源证明和匿名拉取，再把 `container-release.json` 上传到 Draft。
+7. 所有平台与资产门禁通过后，才把 `v<版本号>` Draft 转为正式 Release。
 
 更新私钥位于维护者机器的 `%USERPROFILE%\.tauri\dnsblackhole.key`。macOS CI 需要把同一私钥配置为 `TAURI_SIGNING_PRIVATE_KEY` Secret；如果私钥有密码，再配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。未配置私钥时 CI 仍会生成 DMG，但不会生成自动更新产物。私钥丢失后，旧版本将无法验证后续自动更新，必须妥善离线备份且不得提交到仓库。
 

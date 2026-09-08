@@ -7,7 +7,7 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use serde::{Deserialize, Serialize};
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(all(feature = "desktop", not(any(target_os = "macos", windows))))]
 use tauri::{AppHandle, Manager};
 
 const DATABASE_FILE: &str = "dnsblackhole.sqlite3";
@@ -64,7 +64,7 @@ struct StorageLocator {
     last_migration_error: Option<String>,
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(all(feature = "desktop", not(any(target_os = "macos", windows))))]
 pub fn initialize(app: &AppHandle) -> Result<StorageBootstrap, String> {
     let default_dir = default_data_dir(app)?;
     initialize_at(default_dir)
@@ -184,6 +184,9 @@ pub fn inspect_storage_target(
     })
 }
 
+/// 跨目录迁移只对 macOS/Windows 开放。规划第 3.2 节明确 Linux 固定使用
+/// `/var/lib/dnsblackhole`，不向普通用户暴露这条 RPC。
+#[cfg(any(target_os = "macos", windows))]
 pub fn request_storage_change(
     default_dir: &Path,
     current_data_dir: &Path,
@@ -228,7 +231,7 @@ pub fn filters_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(FILTERS_DIR)
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(all(feature = "desktop", not(any(target_os = "macos", windows))))]
 fn default_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
@@ -886,6 +889,7 @@ mod tests {
         fs::remove_dir_all(root).expect("temporary directory should remove");
     }
 
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn adopts_existing_data_without_removing_current_data() {
         let root = temporary_directory("adopt-existing");

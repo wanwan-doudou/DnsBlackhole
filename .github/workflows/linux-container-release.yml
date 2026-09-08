@@ -1,0 +1,240 @@
+name: Linux Container Release
+run-name: GHCR ${{ inputs.publish && '发布' || '验证' }} v${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "不带 v 前缀的正式版本号，例如 0.2.5"
+        required: true
+        type: string
+      publish:
+        description: "推送版本标签与 latest；关闭时只构建并冒烟验证"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  # `latest` 是共享可变标签，所有容器发布必须串行。
+  group: linux-container-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_IMAGE: ghcr.io/wanwan-doudou/dnsblackhole
+
+jobs:
+  build-and-publish:
+    name: Linux amd64 镜像${{ inputs.publish && '发布' || '验证' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 校验版本号与发布提交
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const expected = process.env.RELEASE_VERSION;
+          if (!/^\d+\.\d+\.\d+$/.test(expected ?? "")) {
+            throw new Error(`版本号格式无效：${expected}`);
+          }
+
+          const packageVersion = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+          const tauriVersion = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8")).version;
+          const cargoToml = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
+          const cargoLock = fs.readFileSync("src-tauri/Cargo.lock", "utf8");
+          const cargoVersion = /^version\s*=\s*"([^"]+)"/m.exec(cargoToml)?.[1];
+          const lockVersion = /\[\[package\]\]\s*name\s*=\s*"dnsblackhole"\s*version\s*=\s*"([^"]+)"/m.exec(cargoLock)?.[1];
+          const versions = { packageVersion, tauriVersion, cargoVersion, lockVersion };
+          const mismatches = Object.entries(versions).filter(([, value]) => value !== expected);
+          if (mismatches.length > 0) {
+            throw new Error(`项目版本号未统一为 ${expected}：${JSON.stringify(versions)}`);
+          }
+          NODE
+          test "${GITHUB_REF}" = "refs/heads/main"
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1)"
+
+      - name: 准备 Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 GitHub Container Registry
+        if: inputs.publish
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 拒绝覆盖已发布的版本标签
+        if: inputs.publish
+        shell: bash
+        run: |
+          set +e
+          inspect_output="$(docker buildx imagetools inspect "${RELEASE_IMAGE}:${RELEASE_VERSION}" 2>&1)"
+          inspect_status=$?
+          set -e
+
+          if [ "${inspect_status}" -eq 0 ]; then
+            echo "${RELEASE_IMAGE}:${RELEASE_VERSION} 已存在；正式版本标签不得覆盖。" >&2
+            exit 1
+          fi
+          if ! grep -Eqi 'manifest unknown|not found' <<<"${inspect_output}"; then
+            printf '%s\n' "${inspect_output}" >&2
+            echo "无法可靠确认版本标签不存在，停止发布。" >&2
+            exit "${inspect_status}"
+          fi
+
+      - name: 生成 OCI 标签与元数据
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.RELEASE_IMAGE }}
+          tags: |
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=DnsBlackhole
+            org.opencontainers.image.description=轻量的 DNS 转发、过滤与 Web 管理服务
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: 构建并按需推送 Linux amd64 镜像
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: ${{ inputs.publish }}
+          load: ${{ !inputs.publish }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=dnsblackhole-linux-amd64-release
+          cache-to: type=gha,mode=max,scope=dnsblackhole-linux-amd64-release
+          provenance: ${{ inputs.publish && 'mode=max' || 'false' }}
+          sbom: ${{ inputs.publish }}
+
+      - name: 拉取刚发布的不可变镜像
+        if: inputs.publish
+        shell: bash
+        run: docker pull --platform linux/amd64 "${RELEASE_IMAGE}@${{ steps.image.outputs.digest }}"
+
+      - name: 核对版本标签与 latest 的摘要
+        if: inputs.publish
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for tag in "${RELEASE_VERSION}" latest; do
+            actual_digest="$(
+              docker buildx imagetools inspect "${RELEASE_IMAGE}:${tag}" --format '{{json .Manifest}}' |
+                node -e 'const fs = require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(0, "utf8")).digest)'
+            )"
+            if [ "${actual_digest}" != "${IMAGE_DIGEST}" ]; then
+              echo "${RELEASE_IMAGE}:${tag} 指向 ${actual_digest}，预期 ${IMAGE_DIGEST}。" >&2
+              exit 1
+            fi
+          done
+
+      - name: 运行时健康与版本冒烟
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image_ref="${RELEASE_IMAGE}:${RELEASE_VERSION}"
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            image_ref="${RELEASE_IMAGE}@${IMAGE_DIGEST}"
+          fi
+
+          docker volume create dnsblackhole-release-data >/dev/null
+          docker run --detach \
+            --name dnsblackhole-release-smoke \
+            --read-only \
+            --cap-drop ALL \
+            --cap-add NET_BIND_SERVICE \
+            --tmpfs /run/dnsblackhole:mode=0755,uid=10001,gid=10001 \
+            --mount type=volume,source=dnsblackhole-release-data,target=/var/lib/dnsblackhole \
+            --publish 127.0.0.1:3000:3000 \
+            "${image_ref}" >/dev/null
+
+          for _ in $(seq 1 45); do
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' dnsblackhole-release-smoke)"
+            if [ "${health}" = "healthy" ]; then
+              break
+            fi
+            if [ "${health}" = "unhealthy" ] || [ "$(docker inspect --format '{{.State.Running}}' dnsblackhole-release-smoke)" != "true" ]; then
+              docker inspect dnsblackhole-release-smoke
+              docker logs dnsblackhole-release-smoke
+              exit 1
+            fi
+            sleep 2
+          done
+
+          test "$(docker inspect --format '{{.State.Health.Status}}' dnsblackhole-release-smoke)" = "healthy"
+          docker exec dnsblackhole-release-smoke /usr/local/bin/dnsblackhole-service healthcheck
+          test "$(curl --fail --silent --show-error http://127.0.0.1:3000/api/v1/admin/version)" = "\"${RELEASE_VERSION}\""
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3000/api/v1/admin/auth/state)" = "404"
+
+      - name: 生成容器发布元数据
+        if: inputs.publish
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const metadata = {
+            version: process.env.RELEASE_VERSION,
+            image: process.env.RELEASE_IMAGE,
+            digest: process.env.IMAGE_DIGEST,
+            platforms: ["linux/amd64"],
+            tags: [process.env.RELEASE_VERSION, "latest"],
+            commit: process.env.GITHUB_SHA,
+          };
+          fs.writeFileSync("container-release.json", `${JSON.stringify(metadata, null, 2)}\n`);
+          NODE
+          cat container-release.json >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: 生成镜像来源证明
+        if: inputs.publish
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.RELEASE_IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+          # Artifact Metadata storage record 目前只支持组织仓库；本项目是个人仓库。
+          create-storage-record: false
+
+      - name: 上传容器发布元数据
+        if: inputs.publish
+        uses: actions/upload-artifact@v6
+        with:
+          name: DnsBlackhole-linux-amd64-container-metadata
+          path: container-release.json
+          if-no-files-found: error
+
+      - name: 输出容器日志
+        if: always()
+        run: docker logs dnsblackhole-release-smoke 2>&1 || true
+
+      - name: 清理冒烟资源
+        if: always()
+        run: |
+          docker rm --force dnsblackhole-release-smoke >/dev/null 2>&1 || true
+          docker volume rm dnsblackhole-release-data >/dev/null 2>&1 || true

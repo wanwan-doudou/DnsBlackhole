@@ -1,5 +1,3 @@
-import { getVersion } from "@tauri-apps/api/app";
-import { listen } from "@tauri-apps/api/event";
 import type { Update } from "@tauri-apps/plugin-updater";
 import {
   analyzeCustomRules,
@@ -13,15 +11,19 @@ import {
   detectSystemProxy,
   getConfig,
   getFilterUpdateProgress,
+  getWebVersion,
   getMacosServiceStatus,
+  getLinuxSystemDnsStatus,
   getWindowsSystemDnsStatus,
   getWindowsServiceStatus,
   getStorageInfo,
   inspectDataStorageTarget,
+  isTauriRuntime,
   getQueryLogs,
   getStatus,
   saveConfig as saveConfigCommand,
   requestDataMigration,
+  restoreLinuxSystemDns,
   restoreWindowsSystemDns,
   installMacosService,
   installWindowsService,
@@ -36,6 +38,7 @@ import {
   setTrayRuntimeStatus,
   startDns,
   stopDns,
+  takeOverLinuxSystemDns,
   takeOverWindowsSystemDns,
   uninstallMacosService,
   uninstallWindowsService,
@@ -158,6 +161,7 @@ import type {
   ViewName,
   WindowsServiceState,
   WindowsServiceStatus,
+  LinuxSystemDnsStatus,
   WindowsSystemDnsFallback,
   WindowsSystemDnsStatus,
 } from "./types";
@@ -198,6 +202,14 @@ const templateStarted = performance.now();
 app.innerHTML = renderAppTemplate(appIconUrl);
 logLoadTime("页面模板渲染", templateStarted);
 
+const isDesktopRuntime = isTauriRuntime();
+document.documentElement.dataset.runtime = isDesktopRuntime ? "desktop" : "web";
+if (!isDesktopRuntime) {
+  document.querySelectorAll<HTMLElement>("[data-desktop-only]").forEach((element) => {
+    element.classList.add("hidden");
+  });
+}
+
 let activeView: ViewName = "dashboard";
 let filtersState: FilterSubscription[] = [];
 let editingFilterIds = new Set<string>();
@@ -234,8 +246,12 @@ let selectedStorageTarget: StorageTargetInfo | null = null;
 let storageSelectionError = "";
 let storageInspectionToken = 0;
 let configLoaded = false;
-const isMacOS = navigator.userAgent.includes("Macintosh");
-const isWindows = navigator.userAgent.includes("Windows");
+const isMacOS = isDesktopRuntime && navigator.userAgent.includes("Macintosh");
+const isWindows = isDesktopRuntime && navigator.userAgent.includes("Windows");
+const isLinuxDesktop = isDesktopRuntime && !isWindows && !isMacOS;
+// Web 管理后台只随 Linux Server/Docker 交付，因此浏览器模式下同样展示 Linux 系统 DNS 区域；
+// 容器由后端返回 supported=false，界面据此显示不支持。
+const hasLinuxSystemDns = isLinuxDesktop || !isDesktopRuntime;
 let currentMacosServiceStatus: MacosServiceStatus | null = null;
 let currentWindowsServiceStatus: WindowsServiceStatus | null = null;
 let currentWindowsSystemDnsStatus: WindowsSystemDnsStatus | null = null;
@@ -243,6 +259,8 @@ let initialBootstrapComplete = false;
 let backgroundServiceRefreshInFlight = false;
 let windowsServiceStatusInFlight: Promise<WindowsServiceStatus | null> | null = null;
 let windowsSystemDnsStatusInFlight: Promise<WindowsSystemDnsStatus | null> | null = null;
+let currentLinuxSystemDnsStatus: LinuxSystemDnsStatus | null = null;
+let linuxSystemDnsStatusInFlight: Promise<LinuxSystemDnsStatus | null> | null = null;
 let windowsServiceUnavailableSince: number | null = null;
 let detectedSystemProxy: string | null = null;
 let savedSystemProxyUrl = "";
@@ -282,22 +300,45 @@ const CHECK_RETRY_DELAYS_MS = [800, 2_000, 5_000];
 const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 2_500, 5_000];
 const CHECK_TIMEOUT_MS = 20_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
+const LATEST_VERSION_STATUS_AUTO_HIDE_MS = 5_000;
 const WINDOWS_SERVICE_STARTUP_RETRY_DELAYS_MS = [150, 250, 400, 700, 1_100, 1_800, 2_500, 3_000];
 const WINDOWS_SERVICE_ERROR_GRACE_MS = 10_000;
 // 切换语言要重载页面，重载前把当前页面暂存在这里，重载后接着看，不跳回仪表盘。
 const PENDING_VIEW_KEY = "dnsblackhole.pendingView";
 
 async function openExternalUrl(url: string): Promise<void> {
+  if (!isDesktopRuntime) {
+    const link = document.createElement("a");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.click();
+    return;
+  }
   const { openUrl } = await import("@tauri-apps/plugin-opener");
   await openUrl(url);
 }
 
+async function getApplicationVersion(): Promise<string> {
+  if (!isDesktopRuntime) {
+    return getWebVersion();
+  }
+  const { getVersion } = await import("@tauri-apps/api/app");
+  return getVersion();
+}
+
 function aboutPlatformLabel(): string {
+  if (!isDesktopRuntime) {
+    return t("Web 管理后台");
+  }
   if (isWindows) {
     return "Windows";
   }
   if (isMacOS) {
     return "macOS";
+  }
+  if (isLinuxDesktop) {
+    return "Linux";
   }
   return t("当前桌面平台");
 }
@@ -323,8 +364,10 @@ function renderAboutRuntimeInfo(): void {
         : service.state === "not_registered" || service.state === "not_found"
           ? t("尚未安装")
           : t("需要处理");
-  } else {
+  } else if (isDesktopRuntime) {
     aboutRuntimeServiceElement.textContent = t("当前平台无需系统服务");
+  } else {
+    aboutRuntimeServiceElement.textContent = t("由服务端提供");
   }
 
   aboutRuntimeCoreElement.textContent = !latestRuntimeStatus
@@ -418,11 +461,18 @@ async function copyAboutSupportInfo(): Promise<void> {
 }
 
 async function relaunchApplication(): Promise<void> {
+  if (!isDesktopRuntime) {
+    window.location.reload();
+    return;
+  }
   const { relaunch } = await import("@tauri-apps/plugin-process");
   await relaunch();
 }
 
 async function checkApplicationUpdate(): Promise<Update | null> {
+  if (!isDesktopRuntime) {
+    return null;
+  }
   const { check } = await import("@tauri-apps/plugin-updater");
   return check({ timeout: CHECK_TIMEOUT_MS });
 }
@@ -606,6 +656,11 @@ const takeOverWindowsSystemDnsButton = query<HTMLButtonElement>(
   "#take_over_windows_system_dns_btn",
 );
 const restoreWindowsSystemDnsButton = query<HTMLButtonElement>("#restore_windows_system_dns_btn");
+const linuxSystemDnsSection = query<HTMLElement>("#linux_system_dns_section");
+const linuxSystemDnsStatusElement = query<HTMLElement>("#linux_system_dns_status");
+const linuxSystemDnsDetailElement = query<HTMLElement>("#linux_system_dns_detail");
+const takeOverLinuxSystemDnsButton = query<HTMLButtonElement>("#take_over_linux_system_dns_btn");
+const restoreLinuxSystemDnsButton = query<HTMLButtonElement>("#restore_linux_system_dns_btn");
 const dnsFallbackDialog = query<HTMLDialogElement>("#dns_fallback_dialog");
 const dnsFallbackDialogCloseButton = query<HTMLButtonElement>(
   "#dns_fallback_dialog_close_btn",
@@ -932,6 +987,8 @@ function syncCustomSelect(select: HTMLSelectElement): void {
   queryLogQueryType,
   queryLogSort,
   queryLogSavedViewSelect,
+  clientPolicyProfileInput,
+  clientPolicyGroupModeInput,
 ].forEach(initializeCustomSelect);
 
 document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
@@ -1952,7 +2009,7 @@ checkUpdateButton.addEventListener("click", async () => {
   manualDownloadUrl = "";
 
   try {
-    const currentVersion = await getVersion();
+    const currentVersion = await getApplicationVersion();
     pendingUpdate = await checkForUpdateWithRetry();
     if (pendingUpdate) {
       let notes = pendingUpdate.body ?? "";
@@ -1970,7 +2027,11 @@ checkUpdateButton.addEventListener("click", async () => {
       installUpdateButton.disabled = false;
       manualDownloadButton.disabled = false;
     } else {
-      setUpdateStatus("ok", t("已是最新版本 v{p0}", { p0: currentVersion }));
+      setUpdateStatus(
+        "ok",
+        t("已是最新版本 v{p0}", { p0: currentVersion }),
+        LATEST_VERSION_STATUS_AUTO_HIDE_MS,
+      );
     }
   } catch (error) {
     console.error("检查更新失败", error);
@@ -2262,6 +2323,66 @@ uninstallWindowsServiceButton.addEventListener("click", async () => {
   }
 });
 
+takeOverLinuxSystemDnsButton.addEventListener("click", async () => {
+  const repairing = currentLinuxSystemDnsStatus?.desired === true;
+  const confirmed = await confirmAction({
+    title: repairing ? t("修复系统 DNS 接管") : t("接管系统 DNS"),
+    message: repairing
+      ? t("将按事务备份重新核验并接管：关闭 systemd-resolved 的 stub 监听，启用并启动 DnsBlackhole 的 DNS 服务并把监听端口设为 53，再把系统解析指向 127.0.0.1。任何一步失败都会自动回滚到原 DNS。是否继续？")
+      : t("接管后会启用并启动 DnsBlackhole 的 DNS 服务、把监听端口设为 53，写入 systemd-resolved 配置片段并把 /etc/resolv.conf 指向 resolved 运行时文件，系统解析改为 127.0.0.1。原有配置会先事务化备份，可随时恢复；任何一步失败都会自动回滚。是否继续？"),
+    confirmLabel: repairing ? t("修复接管") : t("接管系统 DNS"),
+  });
+  if (!confirmed) {
+    return;
+  }
+  setLinuxSystemDnsBusy(true);
+  try {
+    const status = await takeOverLinuxSystemDns();
+    renderLinuxSystemDnsStatus(status);
+    showMessage(
+      status.effective
+        ? t("系统 DNS 已接管，所有 DNS 查询将交给 DnsBlackhole")
+        : t("系统 DNS 接管未生效，请查看状态说明"),
+      !status.effective,
+    );
+  } catch (error) {
+    showMessage(String(error), true);
+    await loadLinuxSystemDnsStatus();
+  } finally {
+    setLinuxSystemDnsBusy(false);
+  }
+});
+
+restoreLinuxSystemDnsButton.addEventListener("click", async () => {
+  const confirmed = await confirmAction({
+    title: t("恢复系统 DNS"),
+    message: t("恢复会停止 DnsBlackhole 的 DNS 服务并关闭自动运行，再还原原有 /etc/resolv.conf 与 systemd-resolved 配置。由于通配 53 端口与 resolved stub 冲突，恢复后 DnsBlackhole 不会继续监听 53。是否继续？"),
+    confirmLabel: t("恢复 DNS"),
+    danger: true,
+  });
+  if (!confirmed) {
+    return;
+  }
+  setLinuxSystemDnsBusy(true);
+  try {
+    const status = await restoreLinuxSystemDns();
+    renderLinuxSystemDnsStatus(status);
+    showMessage(
+      status.effective ? t("系统 DNS 恢复未完成，请查看状态说明") : t("原系统 DNS 已恢复"),
+      status.effective,
+    );
+    if (!status.effective) {
+      await loadConfig();
+      await refreshStatus();
+    }
+  } catch (error) {
+    showMessage(String(error), true);
+    await loadLinuxSystemDnsStatus();
+  } finally {
+    setLinuxSystemDnsBusy(false);
+  }
+});
+
 takeOverWindowsSystemDnsButton.addEventListener("click", async () => {
   const synchronizing = currentWindowsSystemDnsStatus?.managed === true;
   const confirmed = await confirmAction({
@@ -2422,7 +2543,8 @@ filtersBody.addEventListener("click", (event) => {
 });
 
 async function bootstrapApplication(): Promise<void> {
-  void getVersion().then((version) => {
+  const versionReady = getApplicationVersion();
+  void versionReady.then((version) => {
     appVersionElement.textContent = version;
     aboutRuntimeAppVersionElement.textContent = `v${version}`;
   });
@@ -2444,7 +2566,10 @@ async function bootstrapApplication(): Promise<void> {
   const windowsCoreReady = !isWindows || (initialWindowsServiceStatus?.ready ?? false);
   const initialDataStarted = performance.now();
   const [configReady] = windowsCoreReady
-    ? await Promise.all([loadConfig(), loadStorageInfo()])
+    ? await Promise.all([
+        loadConfig(),
+        isDesktopRuntime ? loadStorageInfo() : Promise.resolve(),
+      ])
     : [false];
   await systemProxyReady;
   updateFilterProxyControls();
@@ -2454,6 +2579,23 @@ async function bootstrapApplication(): Promise<void> {
   if (!windowsCoreReady && !configReady) {
     initialView = "settings";
   }
+  if (isDesktopRuntime) {
+    void installDesktopEventListeners();
+  }
+  if (configReady) {
+    await refreshStatus();
+  }
+  const initialViewStarted = performance.now();
+  setActiveView(initialView);
+  logLoadTime("初始页面切换与渲染", initialViewStarted, `view=${initialView}`);
+  initialBootstrapComplete = true;
+  logLoadTime("前端启动总计", frontendStartedAt);
+
+  startBackgroundRefresh();
+}
+
+async function installDesktopEventListeners(): Promise<void> {
+  const { listen } = await import("@tauri-apps/api/event");
   void listen<FilterSubscription[]>("filters-updated", ({ payload }) => {
     syncFilterUpdateMetadata(payload);
   }).catch((error) => {
@@ -2476,16 +2618,6 @@ async function bootstrapApplication(): Promise<void> {
   }).catch((error) => {
     console.error("监听托盘过滤控制失败", error);
   });
-  if (configReady) {
-    await refreshStatus();
-  }
-  const initialViewStarted = performance.now();
-  setActiveView(initialView);
-  logLoadTime("初始页面切换与渲染", initialViewStarted, `view=${initialView}`);
-  initialBootstrapComplete = true;
-  logLoadTime("前端启动总计", frontendStartedAt);
-
-  startBackgroundRefresh();
 }
 
 async function loadDetectedSystemProxy(): Promise<void> {
@@ -2682,6 +2814,9 @@ async function loadConfig(force = false): Promise<boolean> {
 }
 
 async function loadStorageInfo(): Promise<void> {
+  if (!isDesktopRuntime) {
+    return;
+  }
   const started = performance.now();
   let succeeded = false;
   try {
@@ -2714,6 +2849,7 @@ async function refreshSettingsRuntimeStatus(): Promise<void> {
   const [, windowsStatus] = await Promise.all([
     loadMacosServiceStatus(),
     loadWindowsServiceStatus(),
+    loadLinuxSystemDnsStatus(),
   ]);
   if (windowsStatus?.ready) {
     await loadWindowsSystemDnsStatus();
@@ -2757,6 +2893,7 @@ async function refreshAfterBackgroundServiceEnabled(): Promise<void> {
       loadConfig(),
       loadStorageInfo(),
       loadWindowsSystemDnsStatus(),
+      loadLinuxSystemDnsStatus(),
     ]);
     if (configReady) {
       await refreshStatus();
@@ -2960,6 +3097,92 @@ function renderWindowsSystemDnsStatus(status: WindowsSystemDnsStatus): void {
       : t("同步接管")
     : t("接管 DNS");
   updateWindowsSystemDnsButtons();
+}
+
+async function loadLinuxSystemDnsStatus(): Promise<LinuxSystemDnsStatus | null> {
+  if (!hasLinuxSystemDns) {
+    return null;
+  }
+  linuxSystemDnsSection.classList.remove("hidden");
+  if (linuxSystemDnsStatusInFlight) {
+    return linuxSystemDnsStatusInFlight;
+  }
+  const request = (async (): Promise<LinuxSystemDnsStatus | null> => {
+    try {
+      const status = await getLinuxSystemDnsStatus();
+      renderLinuxSystemDnsStatus(status);
+      return status;
+    } catch (error) {
+      currentLinuxSystemDnsStatus = null;
+      linuxSystemDnsSection.classList.remove("is-ready");
+      linuxSystemDnsSection.classList.add("needs-repair");
+      linuxSystemDnsStatusElement.textContent = t("读取系统 DNS 状态失败：{p0}", { p0: String(error) });
+      linuxSystemDnsDetailElement.textContent = t("请确认 DnsBlackhole 后台服务正在运行。");
+      takeOverLinuxSystemDnsButton.disabled = true;
+      restoreLinuxSystemDnsButton.disabled = true;
+      return null;
+    }
+  })();
+  linuxSystemDnsStatusInFlight = request;
+  try {
+    return await request;
+  } finally {
+    linuxSystemDnsStatusInFlight = null;
+  }
+}
+
+function renderLinuxSystemDnsStatus(status: LinuxSystemDnsStatus): void {
+  currentLinuxSystemDnsStatus = status;
+  linuxSystemDnsSection.classList.remove("hidden");
+  linuxSystemDnsSection.classList.toggle("is-ready", status.effective && !status.conflict);
+  linuxSystemDnsSection.classList.toggle(
+    "needs-repair",
+    status.conflict || status.pending || (status.desired && !status.effective),
+  );
+  linuxSystemDnsStatusElement.textContent = status.message;
+  const resolvConfText = status.resolvConfTarget
+    ? t("/etc/resolv.conf → {p0}", { p0: status.resolvConfTarget })
+    : t("/etc/resolv.conf 不是符号链接");
+  const resolvedText = status.resolvedActive
+    ? t("systemd-resolved 运行中")
+    : t("systemd-resolved 未运行");
+  if (status.conflict) {
+    linuxSystemDnsDetailElement.textContent = t("接管后的文件已被外部修改，已停止自动覆盖。请人工检查后再恢复。当前：{p0}；{p1}。", { p0: resolvConfText, p1: resolvedText });
+  } else if (status.pending) {
+    linuxSystemDnsDetailElement.textContent = t("上次事务未完成。请先执行恢复；后台服务不可用时可用 sudo dnsblackhole-service system-dns restore --offline。当前：{p0}；{p1}。", { p0: resolvConfText, p1: resolvedText });
+  } else if (status.effective) {
+    linuxSystemDnsDetailElement.textContent = t("系统解析已指向 127.0.0.1，resolved 的 stub 监听已关闭。当前：{p0}；{p1}。", { p0: resolvConfText, p1: resolvedText });
+  } else if (!status.supported) {
+    linuxSystemDnsDetailElement.textContent = t("当前环境不支持自动管理系统 DNS，请手动配置。当前：{p0}；{p1}。", { p0: resolvConfText, p1: resolvedText });
+  } else {
+    linuxSystemDnsDetailElement.textContent = t("首版只支持 systemd 与 systemd-resolved；接管会自动把监听端口设为 53，但监听地址必须覆盖回环、上游不能指回本机。当前：{p0}；{p1}。", { p0: resolvConfText, p1: resolvedText });
+  }
+  takeOverLinuxSystemDnsButton.textContent = status.effective
+    ? t("已接管")
+    : status.desired
+      ? t("修复接管")
+      : t("接管 DNS");
+  updateLinuxSystemDnsButtons();
+}
+
+function setLinuxSystemDnsBusy(busy: boolean): void {
+  takeOverLinuxSystemDnsButton.classList.toggle("loading", busy);
+  restoreLinuxSystemDnsButton.classList.toggle("loading", busy);
+  if (busy) {
+    takeOverLinuxSystemDnsButton.disabled = true;
+    restoreLinuxSystemDnsButton.disabled = true;
+    return;
+  }
+  updateLinuxSystemDnsButtons();
+}
+
+function updateLinuxSystemDnsButtons(): void {
+  const status = currentLinuxSystemDnsStatus;
+  // 冲突和未完成事务只能先恢复，不允许再叠加一次接管。
+  takeOverLinuxSystemDnsButton.disabled =
+    !status || !status.supported || status.conflict || status.pending || status.effective;
+  restoreLinuxSystemDnsButton.disabled =
+    !status || (!status.desired && !status.effective && !status.pending);
 }
 
 function renderWindowsSystemDnsUnavailable(message: string): void {

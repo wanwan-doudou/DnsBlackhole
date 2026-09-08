@@ -1,0 +1,245 @@
+# Linux 正式交付只以 Ubuntu 26.04 amd64 为基线：构建 Server DEB 和同源 Docker，
+# Linux desktop feature 仅保留开发编译检查，不生成桌面安装包。
+name: Linux CI
+
+on:
+  push:
+    branches: [main, "agent/**", "codex/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-package:
+    name: Ubuntu 26.04 测试与 Server DEB
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 校验 Linux 构建基线
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat /etc/os-release
+          uname -a
+          . /etc/os-release
+          test "${VERSION_ID}" = "26.04"
+          test "$(dpkg --print-architecture)" = "amd64"
+
+      - name: 安装 Linux 构建与静态检查依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            shellcheck \
+            wget
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.20.0
+          cache: pnpm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: linux-ubuntu-26.04-amd64
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 前端类型检查与构建
+        run: pnpm build
+
+      - name: 前端单元测试
+        run: pnpm test
+
+      - name: 前端静态防回归检查
+        run: |
+          python3 scripts/check-i18n.py
+          python3 scripts/check-controls.py
+
+      - name: Rust 格式检查
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      # desktop 只作为 Linux 开发构建能力保留，不生成 Desktop DEB。
+      - name: Linux desktop feature 测试与 Clippy
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Linux system-service feature 测试与 Clippy
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --locked \
+            --no-default-features --features system-service
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked \
+            --no-default-features --features system-service -- -D warnings
+
+      # 必须测试 lib（或完整目标）；只测试 dnsblackhole-service bin 会得到 0 tests。
+      - name: Linux web-admin headless 测试与 Clippy
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --locked \
+            --no-default-features --features web-admin
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked \
+            --no-default-features --features web-admin -- -D warnings
+
+      - name: 维护脚本静态检查
+        run: |
+          set -euo pipefail
+          shellcheck -s bash scripts/build-linux-server-deb.sh
+          shellcheck -s sh \
+            src-tauri/packages/linux/postinst.sh \
+            src-tauri/packages/linux/prerm.sh \
+            src-tauri/packages/linux/postrm.sh
+          dash -n src-tauri/packages/linux/postinst.sh
+          dash -n src-tauri/packages/linux/prerm.sh
+          dash -n src-tauri/packages/linux/postrm.sh
+
+      - name: 构建 Ubuntu Server DEB
+        run: bash scripts/build-linux-server-deb.sh
+
+      - name: 校验 DEB 元数据、内容与 headless 依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(dist-linux/dnsblackhole-server_*_amd64.deb)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "预期找到一个 amd64 Server DEB，实际为 ${#packages[@]} 个" >&2
+            exit 1
+          fi
+          package="${packages[0]}"
+          test "$(dpkg-deb --field "${package}" Package)" = "dnsblackhole-server"
+          test "$(dpkg-deb --field "${package}" Architecture)" = "amd64"
+          dpkg-deb --field "${package}" Depends | grep -Eq '(^|,)[[:space:]]*systemd([[:space:]]|,|$)'
+          test "$(dpkg-deb --field "${package}" Provides)" = "dnsblackhole-dns-service"
+          test "$(dpkg-deb --field "${package}" Conflicts)" = "dnsblackhole"
+          test "$(dpkg-deb --field "${package}" Replaces)" = "dnsblackhole"
+
+          package_root="$(mktemp -d)"
+          control_root="$(mktemp -d)"
+          trap 'rm -rf "${package_root}" "${control_root}"' EXIT
+          dpkg-deb --extract "${package}" "${package_root}"
+          dpkg-deb --control "${package}" "${control_root}"
+
+          binary="${package_root}/usr/lib/dnsblackhole/dnsblackhole-service"
+          unit="${package_root}/usr/lib/systemd/system/dnsblackhole.service"
+          test -x "${binary}"
+          test -f "${unit}"
+          test ! -e "${package_root}/usr/bin/dnsblackhole-cli"
+          test "$(stat -c '%a' "${binary}")" = "755"
+          test "$(stat -c '%a' "${unit}")" = "644"
+          file "${binary}" | grep -q 'ELF 64-bit LSB.*x86-64'
+
+          for script in postinst prerm postrm; do
+            test -x "${control_root}/${script}"
+            test "$(stat -c '%a' "${control_root}/${script}")" = "755"
+          done
+
+          offenders="$(ldd "${binary}" | grep -iE 'webkit2gtk|libgtk|libgdk|appindicator|javascriptcore' || true)"
+          if [ -n "${offenders}" ]; then
+            echo "Server DEB 的 headless binary 意外链接了 GUI 库：" >&2
+            echo "${offenders}" >&2
+            exit 1
+          fi
+
+          mapfile -t payload < <(find "${package_root}" -type f -printf '%P\n' | sort)
+          expected=(
+            usr/lib/dnsblackhole/dnsblackhole-service
+            usr/lib/systemd/system/dnsblackhole.service
+          )
+          if [ "${payload[*]}" != "${expected[*]}" ]; then
+            echo "Server DEB 包含非预期文件：" >&2
+            printf '  %s\n' "${payload[@]}" >&2
+            exit 1
+          fi
+
+      - name: 上传 Ubuntu Server DEB
+        uses: actions/upload-artifact@v6
+        with:
+          name: DnsBlackhole-linux-amd64-server-deb
+          path: dist-linux/dnsblackhole-server_*_amd64.deb
+          if-no-files-found: error
+
+  docker-smoke:
+    name: Linux amd64 Docker 健康冒烟
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 校验 Docker 构建基线
+        shell: bash
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${VERSION_ID}" = "26.04"
+          test "$(dpkg --print-architecture)" = "amd64"
+          docker version
+
+      - name: 构建 Linux amd64 镜像
+        run: docker build --platform linux/amd64 --tag dnsblackhole:ci .
+
+      - name: 校验镜像运行约束
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect dnsblackhole:ci --format '{{.Architecture}}')" = "amd64"
+          test "$(docker image inspect dnsblackhole:ci --format '{{.Config.User}}')" = "10001:10001"
+          test "$(docker image inspect dnsblackhole:ci --format '{{json .Config.Entrypoint}}')" \
+            = '["/usr/local/bin/dnsblackhole-service"]'
+          test "$(docker image inspect dnsblackhole:ci --format '{{json .Config.Healthcheck.Test}}')" \
+            = '["CMD","/usr/local/bin/dnsblackhole-service","healthcheck"]'
+
+      - name: 启动容器并等待 healthcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker volume create dnsblackhole-ci-data >/dev/null
+          docker run --detach \
+            --name dnsblackhole-ci \
+            --read-only \
+            --cap-drop ALL \
+            --cap-add NET_BIND_SERVICE \
+            --tmpfs /run/dnsblackhole:mode=0755,uid=10001,gid=10001 \
+            --mount type=volume,source=dnsblackhole-ci-data,target=/var/lib/dnsblackhole \
+            dnsblackhole:ci >/dev/null
+
+          for attempt in $(seq 1 45); do
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' dnsblackhole-ci)"
+            if [ "${health}" = "healthy" ]; then
+              docker exec dnsblackhole-ci /usr/local/bin/dnsblackhole-service healthcheck
+              exit 0
+            fi
+            if [ "${health}" = "unhealthy" ] || [ "$(docker inspect --format '{{.State.Running}}' dnsblackhole-ci)" != "true" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          docker inspect dnsblackhole-ci
+          docker logs dnsblackhole-ci
+          exit 1
+
+      - name: 输出容器日志
+        if: always()
+        run: docker logs dnsblackhole-ci 2>&1 || true
+
+      - name: 清理 Docker 冒烟资源
+        if: always()
+        run: |
+          docker rm --force dnsblackhole-ci >/dev/null 2>&1 || true
+          docker volume rm dnsblackhole-ci-data >/dev/null 2>&1 || true

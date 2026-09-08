@@ -92,6 +92,19 @@ export type WindowsSystemDnsBackupAdapter = {
   ipv6Servers: string[] | null;
 };
 
+/// Linux 系统 DNS 由 root 服务事务管理：`desired` 是用户的接管意图，
+/// `effective` 是当前实际接管，`pending` 表示上次事务未完成，`conflict` 表示接管后被外部修改。
+export type LinuxSystemDnsStatus = {
+  supported: boolean;
+  desired: boolean;
+  effective: boolean;
+  pending: boolean;
+  conflict: boolean;
+  message: string;
+  resolvConfTarget: string | null;
+  resolvedActive: boolean;
+};
+
 export type WindowsSystemDnsFallback = "automatic" | "dns114" | "google" | "custom";
 
 export type WindowsSystemDnsFallbackSelection = {

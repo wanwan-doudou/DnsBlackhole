@@ -17,7 +17,8 @@ build_service() {
     --manifest-path src-tauri/Cargo.toml \
     --release \
     --bin dnsblackhole-service \
-    --features macos-service \
+    --no-default-features \
+    --features system-service \
     --target "${target}"
 }
 

@@ -23,10 +23,15 @@ pub(crate) use filter_runtime::{
     FilterRuntime, build_filter_runtime_with_rules, current_filter_runtime, replace_filter_runtime,
 };
 pub(crate) use protocol::{DnsResponseAnswer, DnsResponseSummary};
-#[cfg(test)]
+// 这两个只给 lib.rs 里 desktop 的规则加载测试用
+#[cfg(all(test, feature = "desktop"))]
 pub(crate) use rule_cache::{RULE_LOAD_TEST_GUARD, forget_active_rules};
 pub(crate) use rule_cache::{RuleLoadSource, clear_rule_cache, load_or_compile_rules};
-pub use rules::{RuleAnalysis, RuleSummary, analyze_rules, summarize_rules};
+// RuleAnalysis 只有 desktop 的 analyze_custom_rules 命令按名字用到；
+// 服务端只序列化 analyze_rules 的返回值，不需要这个名字。
+#[cfg(feature = "desktop")]
+pub use rules::RuleAnalysis;
+pub use rules::{RuleSummary, analyze_rules, summarize_rules};
 pub(crate) use security_events::flush_security_events;
 pub use server::DnsServer;
 pub(crate) use stats::apply_cache_stats;

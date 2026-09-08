@@ -1,14 +1,19 @@
 use std::{
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Instant,
 };
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+use std::path::Path;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+use crate::config_transfer;
+#[cfg(unix)]
 use crate::service_core::spawn_initial_runtime;
 use crate::{
     config::AppConfig,
@@ -24,6 +29,8 @@ use crate::{
     storage,
 };
 
+#[cfg(target_os = "linux")]
+use super::linux_system_dns;
 #[cfg(windows)]
 use super::windows_system_dns;
 use super::{
@@ -81,19 +88,41 @@ struct DnsDiagnosticParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct AnalyzeRulesParams {
+    rules: String,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug, Deserialize)]
 struct MigrationParams {
     target_path: String,
 }
 
-pub(crate) fn initialize_state(default_dir: PathBuf) -> Result<Arc<AppState>, String> {
+pub(crate) fn initialize_state(
+    default_dir: PathBuf,
+    #[cfg(target_os = "linux")] bootstrap_config: Option<&Path>,
+) -> Result<Arc<AppState>, String> {
     let total_started = Instant::now();
     let storage_started = Instant::now();
     let bootstrap = storage::initialize_at(default_dir)?;
     crate::performance::log_service("服务启动", "存储目录初始化", storage_started);
+    #[cfg(target_os = "linux")]
+    let database_existed = storage::database_path(&bootstrap.data_dir).exists();
+    #[cfg(target_os = "linux")]
+    let bootstrap_config = prepare_linux_bootstrap_config(bootstrap_config, database_existed)?;
     let database_started = Instant::now();
     let database = Arc::new(Database::open(&bootstrap.data_dir)?);
     crate::performance::log_service("服务启动", "数据库打开与结构检查", database_started);
     let config_started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let config = if let Some((config, path)) = bootstrap_config {
+        database.save_config(&config)?;
+        eprintln!("已应用首次引导配置：{}", path.display());
+        config
+    } else {
+        database.load_or_default_config()?
+    };
+    #[cfg(not(target_os = "linux"))]
     let config = database.load_or_default_config()?;
     crate::performance::log_service("服务启动", "配置读取", config_started);
     let cleanup_started = Instant::now();
@@ -112,7 +141,24 @@ pub(crate) fn initialize_state(default_dir: PathBuf) -> Result<Arc<AppState>, St
     Ok(state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+fn prepare_linux_bootstrap_config(
+    bootstrap_config: Option<&Path>,
+    database_existed: bool,
+) -> Result<Option<(AppConfig, PathBuf)>, String> {
+    if let Some(path) = bootstrap_config {
+        if database_existed {
+            eprintln!("已存在数据库，忽略首次引导配置：{}", path.display());
+        } else {
+            let config = config_transfer::read_imported_config_file(path)
+                .map_err(|error| format!("读取首次引导配置失败（{}）：{error}", path.display()))?;
+            return Ok(Some((config, path.to_path_buf())));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
 pub(crate) fn start_background_tasks(state: &Arc<AppState>) {
     spawn_initial_runtime(Arc::clone(state));
     start_maintenance_tasks(state);
@@ -200,18 +246,23 @@ where
     Ok(true)
 }
 
-fn dispatch_request(
+pub(crate) fn dispatch_request(
     state: &Arc<AppState>,
     method: &str,
     params: Value,
 ) -> Result<(Value, bool), String> {
     let result = match method {
         "ping" => Value::Null,
+        "analyze_custom_rules" => {
+            let params: AnalyzeRulesParams = parse_params(params)?;
+            to_value(crate::dns::analyze_rules(&params.rules))?
+        }
         "get_config" => to_value(state.current_config()?)?,
         "get_storage_info" => to_value(storage::storage_info(
             &state.default_data_dir,
             &state.data_dir,
         )?)?,
+        #[cfg(any(target_os = "macos", windows))]
         "inspect_data_storage_target" => {
             let params: MigrationParams = parse_params(params)?;
             let target_path = Path::new(params.target_path.trim());
@@ -223,6 +274,7 @@ fn dispatch_request(
                 target_path,
             )?)?
         }
+        #[cfg(any(target_os = "macos", windows))]
         "request_data_migration" => {
             let params: MigrationParams = parse_params(params)?;
             let target_path = Path::new(params.target_path.trim());
@@ -241,6 +293,18 @@ fn dispatch_request(
             let params: ConfigParams = parse_params(params)?;
             #[cfg(windows)]
             validate_managed_system_dns_config(state, &params.config)?;
+            // Linux 下校验与保存必须在同一个系统 DNS 临界区内完成，
+            // 否则并发接管可能在校验通过后写入与接管要求冲突的配置。
+            #[cfg(target_os = "linux")]
+            let _system_dns_guard = {
+                let guard = linux_system_dns::lock_operations()?;
+                linux_system_dns::validate_managed_config(
+                    &guard,
+                    &state.default_data_dir,
+                    &params.config,
+                )?;
+                guard
+            };
             to_value(save_config_blocking(Arc::clone(state), params.config)?)?
         }
         "get_status" => {
@@ -303,6 +367,12 @@ fn dispatch_request(
         "stop_dns" => {
             #[cfg(windows)]
             ensure_system_dns_not_managed(state)?;
+            #[cfg(target_os = "linux")]
+            let _system_dns_guard = {
+                let guard = linux_system_dns::lock_operations()?;
+                linux_system_dns::ensure_system_dns_not_managed(&guard, &state.default_data_dir)?;
+                guard
+            };
             to_value(stop_dns_blocking(Arc::clone(state))?)?
         }
         "clear_dns_cache" => to_value(clear_dns_cache_blocking(state)?)?,
@@ -338,6 +408,19 @@ fn dispatch_request(
                 &params,
             )?)?
         }
+        #[cfg(target_os = "linux")]
+        "get_linux_system_dns_status" => to_value(linux_system_dns::system_dns_status(
+            &state.default_data_dir,
+        )?)?,
+        #[cfg(target_os = "linux")]
+        "take_over_linux_system_dns" => {
+            to_value(linux_system_dns::take_over_system_dns(Arc::clone(state))?)?
+        }
+        #[cfg(target_os = "linux")]
+        "restore_linux_system_dns" => to_value(linux_system_dns::restore_system_dns(
+            Arc::clone(state),
+            false,
+        )?)?,
         "restart_service" => return Ok((Value::Null, true)),
         _ => return Err(format!("未知的后台服务方法：{method}")),
     };
@@ -451,4 +534,51 @@ fn connection_closed(error: &str) -> bool {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::{fs, time::SystemTime};
+
+    fn temporary_config_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "dnsblackhole-bootstrap-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("系统时间应有效")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn loads_bootstrap_config_only_without_existing_database() {
+        let path = temporary_config_path("new");
+        let expected = AppConfig {
+            blacklist: "||bootstrap-test.invalid^".to_string(),
+            ..AppConfig::default()
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&expected).expect("配置应可序列化"),
+        )
+        .expect("应能写入引导配置");
+
+        let (actual, actual_path) = prepare_linux_bootstrap_config(Some(&path), false)
+            .expect("新数据目录应读取引导配置")
+            .expect("应返回引导配置");
+        assert_eq!(actual.blacklist, expected.blacklist);
+        assert_eq!(actual_path, path);
+
+        fs::remove_file(path).expect("应能清理引导配置");
+    }
+
+    #[test]
+    fn existing_database_ignores_even_unreadable_bootstrap_path() {
+        let missing = temporary_config_path("missing");
+        let selected = prepare_linux_bootstrap_config(Some(&missing), true)
+            .expect("已有数据库时不应读取引导文件");
+        assert!(selected.is_none());
+    }
 }

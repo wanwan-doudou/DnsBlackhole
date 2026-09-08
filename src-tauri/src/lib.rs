@@ -1,1115 +1,1243 @@
 #[cfg(feature = "bench")]
 pub mod bench_api;
-mod config;
+
+// Linux 与 macOS 的纯桌面构建里，DNS 核心和持久化层整体不参与运行：GUI 只通过本机 socket
+// 调用 root 服务，核心跑在独立的 dnsblackhole-service 二进制里。于是这半个 crate 在这两个
+// 平台上会被整体判成死代码（Ubuntu 26.04 实测 730 条，覆盖 dns/*、database、service_core、
+// storage、config、filters）。
+//
+// Windows 的服务与 GUI 共用同一个可执行文件（dnsblackhole.exe --windows-service），其它平台
+// 仍走 GuiState.local 的本机路径，这些组合照旧保留 dead_code 检查，所以真实的死代码不会被漏掉。
+//
+// 根治办法是把核心拆成独立 crate，让桌面包根本不编译它——规划第 3.1 节明确把拆 crate 留到
+// 后续版本，本版只关掉这一组合下的误报，避免 730 条噪声把发布门禁里真实的告警淹掉。
+macro_rules! core_module {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[cfg_attr(
+            all(
+                feature = "desktop",
+                not(feature = "system-service"),
+                any(target_os = "linux", target_os = "macos")
+            ),
+            allow(dead_code)
+        )]
+        mod $name;
+    };
+}
+
+core_module!(config);
+core_module!(database);
+core_module!(dns);
+core_module!(filters);
+core_module!(service_core);
+core_module!(storage);
+
+#[cfg(any(feature = "desktop", feature = "system-service"))]
 mod config_transfer;
-mod database;
-mod dns;
-mod filters;
+#[cfg(all(feature = "system-service", target_os = "linux"))]
+pub mod headless;
 mod performance;
 pub mod privileged_bridge;
-mod service_core;
-mod storage;
+#[cfg(feature = "desktop")]
 mod tray;
+#[cfg(all(feature = "web-admin", target_os = "linux"))]
+mod web_admin;
 
-#[cfg(not(any(target_os = "macos", windows)))]
-use std::path::Path;
-use std::{io, sync::Arc, time::Instant};
-
-use config::AppConfig;
-use config_transfer::{
-    export_config_file, export_diagnostic_file, export_query_log_file, import_config_file,
-};
-#[cfg(not(any(target_os = "macos", windows)))]
-use database::Database;
-use database::QueryLogPage;
-use dns::RuntimeStatus;
-use dns::{DnsDiagnosticReport, RuleAnalysis};
-use service_core::QueryLogRuleActionResult;
-#[cfg(not(any(target_os = "macos", windows)))]
-use service_core::{
-    AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, clear_query_logs_blocking,
-    clear_security_events_blocking, clear_statistics_blocking, pause_protection_blocking,
-    query_logs_blocking, resume_protection_blocking, save_config_blocking,
-    spawn_database_maintenance, spawn_filter_auto_update, spawn_initial_runtime,
-    spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking, update_filters_blocking,
-};
-use service_core::{FilterCacheClearResult, FilterUpdateProgressState, FilterUpdateResult};
-use storage::{StorageInfo, StorageTargetInfo};
-use tauri::{Emitter, Manager, WindowEvent};
-#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-use tauri_plugin_autostart::MacosLauncher;
-#[cfg(all(
-    any(target_os = "macos", windows, target_os = "linux"),
-    not(debug_assertions)
-))]
-use tauri_plugin_autostart::ManagerExt;
-
-struct GuiState {
-    #[cfg(not(any(target_os = "macos", windows)))]
-    local: Option<Arc<AppState>>,
-}
-
-#[tauri::command]
-fn record_frontend_timing(
-    module: String,
-    duration_ms: f64,
-    since_start_ms: f64,
-    detail: Option<String>,
-) {
-    let detail = detail
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("，{value}"))
-        .unwrap_or_default();
-    eprintln!("[加载耗时][前端 +{since_start_ms:.1} ms] {module}：{duration_ms:.1} ms{detail}");
-}
-
-#[tauri::command]
-async fn analyze_custom_rules(rules: String) -> Result<RuleAnalysis, String> {
-    tauri::async_runtime::spawn_blocking(move || dns::analyze_rules(&rules))
-        .await
-        .map_err(|error| format!("分析自定义规则任务异常：{error}"))
-}
-
-#[tauri::command]
-fn detect_system_proxy() -> Result<Option<String>, String> {
-    #[cfg(windows)]
-    {
-        use winreg::{RegKey, enums::HKEY_CURRENT_USER};
-
-        let internet_settings = RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
-            .map_err(|error| format!("读取当前用户系统代理失败：{error}"))?;
-        let enabled = internet_settings
-            .get_value::<u32, _>("ProxyEnable")
-            .unwrap_or_default()
-            != 0;
-        if !enabled {
-            return Ok(None);
-        }
-        let setting = internet_settings
-            .get_value::<String, _>("ProxyServer")
-            .unwrap_or_default();
-        Ok(proxy_url_from_setting(&setting))
-    }
-
-    #[cfg(not(windows))]
-    {
-        for name in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
-            if let Some(value) = std::env::var_os(name)
-                && let Some(proxy) = proxy_url_from_setting(&value.to_string_lossy())
-            {
-                return Ok(Some(proxy));
-            }
-        }
-        Ok(None)
-    }
-}
-
-fn proxy_url_from_setting(setting: &str) -> Option<String> {
-    let trimmed = setting.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let candidate = if trimmed.contains('=') {
-        let entries = trimmed
-            .split(';')
-            .filter_map(|entry| entry.split_once('='))
-            .map(|(scheme, value)| (scheme.trim().to_ascii_lowercase(), value.trim()))
-            .collect::<Vec<_>>();
-        entries
-            .iter()
-            .find(|(scheme, _)| scheme == "https")
-            .or_else(|| entries.iter().find(|(scheme, _)| scheme == "http"))
-            .map(|(_, value)| *value)?
-    } else {
-        trimmed
+#[cfg(feature = "desktop")]
+mod desktop {
+    use crate::{
+        config, config_transfer, database, dns, performance, privileged_bridge, service_core,
+        storage, tray,
     };
-    if candidate.is_empty() {
-        return None;
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    use std::path::Path;
+    use std::{io, sync::Arc, time::Instant};
+
+    use config::AppConfig;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    use database::Database;
+    use database::QueryLogPage;
+    use dns::RuntimeStatus;
+    use dns::{DnsDiagnosticReport, RuleAnalysis};
+    use service_core::QueryLogRuleActionResult;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    use service_core::{
+        AppState, clear_dns_cache_blocking, clear_filter_cache_blocking, clear_query_logs_blocking,
+        clear_security_events_blocking, clear_statistics_blocking, pause_protection_blocking,
+        query_logs_blocking, resume_protection_blocking, save_config_blocking,
+        spawn_database_maintenance, spawn_filter_auto_update, spawn_initial_runtime,
+        spawn_runtime_watchdog, start_dns_blocking, stop_dns_blocking, update_filters_blocking,
+    };
+    use service_core::{FilterCacheClearResult, FilterUpdateProgressState, FilterUpdateResult};
+    use storage::{StorageInfo, StorageTargetInfo};
+    use tauri::{Emitter, Manager, WindowEvent};
+    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+    use tauri_plugin_autostart::MacosLauncher;
+    #[cfg(all(
+        any(target_os = "macos", windows, target_os = "linux"),
+        not(debug_assertions)
+    ))]
+    use tauri_plugin_autostart::ManagerExt;
+
+    struct GuiState {
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        local: Option<Arc<AppState>>,
     }
-    Some(if candidate.contains("://") {
-        candidate.to_string()
-    } else {
-        format!("http://{candidate}")
-    })
-}
 
-#[cfg(not(any(target_os = "macos", windows)))]
-impl GuiState {
-    fn local(&self) -> Result<Arc<AppState>, String> {
-        self.local
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "当前平台的 DNS 核心由后台服务承载".to_string())
+    #[tauri::command]
+    async fn export_config_file(path: String, config: AppConfig) -> Result<(), String> {
+        config_transfer::export_config_file(path, config).await
     }
-}
 
-#[tauri::command]
-async fn get_config(state: tauri::State<'_, Arc<GuiState>>) -> Result<AppConfig, String> {
-    let started = Instant::now();
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("get_config", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            state.local()?.current_config()
-        }
-    })
-    .await
-    .map_err(|error| format!("读取配置任务异常：{error}"))?;
-    performance::log("GUI 命令", "get_config", started);
-    result
-}
-
-#[tauri::command]
-async fn get_storage_info(state: tauri::State<'_, Arc<GuiState>>) -> Result<StorageInfo, String> {
-    let started = Instant::now();
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("get_storage_info", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            let state = state.local()?;
-            storage::storage_info(&state.default_data_dir, &state.data_dir)
-        }
-    })
-    .await
-    .map_err(|error| format!("读取存储信息任务异常：{error}"))?;
-    performance::log("GUI 命令", "get_storage_info", started);
-    result
-}
-
-#[tauri::command]
-async fn inspect_data_storage_target(
-    state: tauri::State<'_, Arc<GuiState>>,
-    target_path: String,
-) -> Result<StorageTargetInfo, String> {
-    let target_path = target_path.trim().to_string();
-    if target_path.is_empty() {
-        return Err("请选择数据存储目录".to_string());
+    #[tauri::command]
+    async fn import_config_file(path: String) -> Result<AppConfig, String> {
+        config_transfer::import_config_file(path).await
     }
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    match tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
+
+    #[tauri::command]
+    async fn export_diagnostic_file(
+        path: String,
+        config: AppConfig,
+        status: Option<RuntimeStatus>,
+    ) -> Result<(), String> {
+        config_transfer::export_diagnostic_file(path, config, status).await
+    }
+
+    #[tauri::command]
+    async fn export_query_log_file(path: String, content: String) -> Result<(), String> {
+        config_transfer::export_query_log_file(path, content).await
+    }
+
+    #[tauri::command]
+    fn record_frontend_timing(
+        module: String,
+        duration_ms: f64,
+        since_start_ms: f64,
+        detail: Option<String>,
+    ) {
+        let detail = detail
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("，{value}"))
+            .unwrap_or_default();
+        eprintln!("[加载耗时][前端 +{since_start_ms:.1} ms] {module}：{duration_ms:.1} ms{detail}");
+    }
+
+    #[tauri::command]
+    async fn analyze_custom_rules(rules: String) -> Result<RuleAnalysis, String> {
+        tauri::async_runtime::spawn_blocking(move || dns::analyze_rules(&rules))
+            .await
+            .map_err(|error| format!("分析自定义规则任务异常：{error}"))
+    }
+
+    #[tauri::command]
+    fn detect_system_proxy() -> Result<Option<String>, String> {
+        #[cfg(windows)]
         {
+            use winreg::{RegKey, enums::HKEY_CURRENT_USER};
+
+            let internet_settings = RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+                .map_err(|error| format!("读取当前用户系统代理失败：{error}"))?;
+            let enabled = internet_settings
+                .get_value::<u32, _>("ProxyEnable")
+                .unwrap_or_default()
+                != 0;
+            if !enabled {
+                return Ok(None);
+            }
+            let setting = internet_settings
+                .get_value::<String, _>("ProxyServer")
+                .unwrap_or_default();
+            Ok(proxy_url_from_setting(&setting))
+        }
+
+        #[cfg(not(windows))]
+        {
+            for name in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+                if let Some(value) = std::env::var_os(name)
+                    && let Some(proxy) = proxy_url_from_setting(&value.to_string_lossy())
+                {
+                    return Ok(Some(proxy));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    fn proxy_url_from_setting(setting: &str) -> Option<String> {
+        let trimmed = setting.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let candidate = if trimmed.contains('=') {
+            let entries = trimmed
+                .split(';')
+                .filter_map(|entry| entry.split_once('='))
+                .map(|(scheme, value)| (scheme.trim().to_ascii_lowercase(), value.trim()))
+                .collect::<Vec<_>>();
+            entries
+                .iter()
+                .find(|(scheme, _)| scheme == "https")
+                .or_else(|| entries.iter().find(|(scheme, _)| scheme == "http"))
+                .map(|(_, value)| *value)?
+        } else {
+            trimmed
+        };
+        if candidate.is_empty() {
+            return None;
+        }
+        Some(if candidate.contains("://") {
+            candidate.to_string()
+        } else {
+            format!("http://{candidate}")
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    impl GuiState {
+        fn local(&self) -> Result<Arc<AppState>, String> {
+            self.local
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "当前平台的 DNS 核心由后台服务承载".to_string())
+        }
+    }
+
+    #[tauri::command]
+    async fn get_config(state: tauri::State<'_, Arc<GuiState>>) -> Result<AppConfig, String> {
+        let started = Instant::now();
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call("get_config", &serde_json::json!({}))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                state.local()?.current_config()
+            }
+        })
+        .await
+        .map_err(|error| format!("读取配置任务异常：{error}"))?;
+        performance::log("GUI 命令", "get_config", started);
+        result
+    }
+
+    #[tauri::command]
+    async fn get_storage_info(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<StorageInfo, String> {
+        let started = Instant::now();
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call("get_storage_info", &serde_json::json!({}))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let state = state.local()?;
+                storage::storage_info(&state.default_data_dir, &state.data_dir)
+            }
+        })
+        .await
+        .map_err(|error| format!("读取存储信息任务异常：{error}"))?;
+        performance::log("GUI 命令", "get_storage_info", started);
+        result
+    }
+
+    #[tauri::command]
+    async fn inspect_data_storage_target(
+        state: tauri::State<'_, Arc<GuiState>>,
+        target_path: String,
+    ) -> Result<StorageTargetInfo, String> {
+        let target_path = target_path.trim().to_string();
+        if target_path.is_empty() {
+            return Err("请选择数据存储目录".to_string());
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        match tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "inspect_data_storage_target",
+                    &serde_json::json!({ "target_path": target_path }),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let state = state.local()?;
+                storage::inspect_storage_target(&state.data_dir, Path::new(&target_path))
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(format!("检查数据目录任务异常：{error}")),
+        }
+    }
+
+    #[tauri::command]
+    fn request_data_migration(
+        state: tauri::State<'_, Arc<GuiState>>,
+        target_path: String,
+    ) -> Result<StorageInfo, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        {
+            let _ = state;
             privileged_bridge::ServiceClient::call(
-                "inspect_data_storage_target",
+                "request_data_migration",
                 &serde_json::json!({ "target_path": target_path }),
             )
         }
-        #[cfg(not(any(target_os = "macos", windows)))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             let state = state.local()?;
-            storage::inspect_storage_target(&state.data_dir, Path::new(&target_path))
-        }
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(format!("检查数据目录任务异常：{error}")),
-    }
-}
-
-#[tauri::command]
-fn request_data_migration(
-    state: tauri::State<'_, Arc<GuiState>>,
-    target_path: String,
-) -> Result<StorageInfo, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        let _ = state;
-        privileged_bridge::ServiceClient::call(
-            "request_data_migration",
-            &serde_json::json!({ "target_path": target_path }),
-        )
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        let state = state.local()?;
-        let target_path = Path::new(target_path.trim());
-        if target_path.as_os_str().is_empty() {
-            return Err("请选择新的数据存储目录".to_string());
-        }
-        storage::request_storage_change(&state.default_data_dir, &state.data_dir, target_path)
-    }
-}
-
-#[tauri::command]
-fn get_macos_service_status() -> Result<privileged_bridge::MacosServiceStatus, String> {
-    #[cfg(target_os = "macos")]
-    {
-        privileged_bridge::ensure_macos_service_current()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("当前平台不支持 macOS DNS 后台服务".to_string())
-    }
-}
-
-#[tauri::command]
-fn install_macos_service(
-    force: Option<bool>,
-) -> Result<privileged_bridge::MacosServiceStatus, String> {
-    #[cfg(target_os = "macos")]
-    {
-        privileged_bridge::macos_service_install(force.unwrap_or(false))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = force;
-        Err("当前平台不支持 macOS DNS 后台服务".to_string())
-    }
-}
-
-#[tauri::command]
-fn uninstall_macos_service() -> Result<privileged_bridge::MacosServiceStatus, String> {
-    #[cfg(target_os = "macos")]
-    {
-        privileged_bridge::macos_service_uninstall()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("当前平台不支持 macOS DNS 后台服务".to_string())
-    }
-}
-
-#[tauri::command]
-fn open_macos_service_settings() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        privileged_bridge::macos_service_open_settings();
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("当前平台不支持 macOS DNS 后台服务".to_string())
-    }
-}
-
-#[cfg(windows)]
-fn serialize_windows_service_status(
-    status: privileged_bridge::WindowsServiceStatus,
-) -> Result<serde_json::Value, String> {
-    serde_json::to_value(status)
-        .map_err(|error| format!("序列化 Windows DNS 服务状态失败：{error}"))
-}
-
-#[cfg(windows)]
-#[tauri::command]
-async fn get_windows_service_status() -> Result<serde_json::Value, String> {
-    let started = Instant::now();
-    let result = tauri::async_runtime::spawn_blocking(|| {
-        serialize_windows_service_status(privileged_bridge::windows_service_status()?)
-    })
-    .await
-    .map_err(|error| format!("读取 Windows 后台服务状态任务异常：{error}"))?;
-    performance::log("GUI 命令", "get_windows_service_status", started);
-    result
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn get_windows_service_status() -> Result<serde_json::Value, String> {
-    Err("当前平台不支持 Windows DNS 后台服务".to_string())
-}
-
-#[cfg(windows)]
-#[tauri::command]
-async fn install_windows_service(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let legacy_default_dir = app.path().app_config_dir().ok();
-    tauri::async_runtime::spawn_blocking(move || {
-        serialize_windows_service_status(privileged_bridge::install_windows_service(
-            legacy_default_dir.as_deref(),
-        )?)
-    })
-    .await
-    .map_err(|error| format!("安装 Windows 后台服务任务异常：{error}"))?
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn install_windows_service(_app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    Err("当前平台不支持 Windows DNS 后台服务".to_string())
-}
-
-#[cfg(windows)]
-#[tauri::command]
-async fn uninstall_windows_service() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        serialize_windows_service_status(privileged_bridge::uninstall_windows_service()?)
-    })
-    .await
-    .map_err(|error| format!("卸载 Windows 后台服务任务异常：{error}"))?
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn uninstall_windows_service() -> Result<serde_json::Value, String> {
-    Err("当前平台不支持 Windows DNS 后台服务".to_string())
-}
-
-#[cfg(windows)]
-fn call_windows_system_dns(method: &'static str) -> Result<serde_json::Value, String> {
-    let status: privileged_bridge::WindowsSystemDnsStatus =
-        privileged_bridge::ServiceClient::call(method, &serde_json::json!({}))?;
-    serde_json::to_value(status)
-        .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
-}
-
-#[cfg(windows)]
-#[tauri::command]
-async fn get_windows_system_dns_status() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        call_windows_system_dns("get_windows_system_dns_status")
-    })
-    .await
-    .map_err(|error| format!("读取 Windows 系统 DNS 状态任务异常：{error}"))?
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn get_windows_system_dns_status() -> Result<serde_json::Value, String> {
-    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
-}
-
-#[cfg(windows)]
-#[tauri::command]
-async fn take_over_windows_system_dns() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(|| call_windows_system_dns("take_over_windows_system_dns"))
-        .await
-        .map_err(|error| format!("接管 Windows 系统 DNS 任务异常：{error}"))?
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn take_over_windows_system_dns() -> Result<serde_json::Value, String> {
-    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
-}
-
-#[cfg(windows)]
-#[tauri::command]
-async fn restore_windows_system_dns() -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(|| call_windows_system_dns("restore_windows_system_dns"))
-        .await
-        .map_err(|error| format!("恢复 Windows 系统 DNS 任务异常：{error}"))?
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn restore_windows_system_dns() -> Result<serde_json::Value, String> {
-    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
-}
-
-#[cfg(windows)]
-#[tauri::command]
-async fn replace_unmanaged_windows_system_dns(
-    preset: String,
-    ipv4_servers: Vec<String>,
-    ipv6_servers: Vec<String>,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let status: privileged_bridge::WindowsSystemDnsStatus =
-            privileged_bridge::ServiceClient::call(
-                "replace_unmanaged_windows_system_dns",
-                &serde_json::json!({
-                    "preset": preset,
-                    "ipv4Servers": ipv4_servers,
-                    "ipv6Servers": ipv6_servers,
-                }),
-            )?;
-        serde_json::to_value(status)
-            .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
-    })
-    .await
-    .map_err(|error| format!("解除 Windows 本机 DNS 任务异常：{error}"))?
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn replace_unmanaged_windows_system_dns(
-    _preset: String,
-    _ipv4_servers: Vec<String>,
-    _ipv6_servers: Vec<String>,
-) -> Result<serde_json::Value, String> {
-    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
-}
-
-#[cfg(windows)]
-#[tauri::command]
-async fn restore_windows_system_dns_with_fallback(
-    preset: String,
-    ipv4_servers: Vec<String>,
-    ipv6_servers: Vec<String>,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let status: privileged_bridge::WindowsSystemDnsStatus =
-            privileged_bridge::ServiceClient::call(
-                "restore_windows_system_dns_with_fallback",
-                &serde_json::json!({
-                    "preset": preset,
-                    "ipv4Servers": ipv4_servers,
-                    "ipv6Servers": ipv6_servers,
-                }),
-            )?;
-        serde_json::to_value(status)
-            .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
-    })
-    .await
-    .map_err(|error| format!("设置 Windows 外部 DNS 任务异常：{error}"))?
-}
-
-#[cfg(not(windows))]
-#[tauri::command]
-async fn restore_windows_system_dns_with_fallback(
-    _preset: String,
-    _ipv4_servers: Vec<String>,
-    _ipv6_servers: Vec<String>,
-) -> Result<serde_json::Value, String> {
-    Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
-}
-
-#[tauri::command]
-async fn save_config(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<GuiState>>,
-    mut config: AppConfig,
-) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        config::migrate_legacy_defaults(&mut config);
-        config.validate()?;
-        let previous_autostart = read_autostart_config(&app)?;
-        apply_autostart_config(&app, config.launch_at_startup)?;
-        let result: Result<RuntimeStatus, String> = {
-            #[cfg(any(target_os = "macos", windows))]
-            {
-                privileged_bridge::ServiceClient::call(
-                    "save_config",
-                    &serde_json::json!({ "config": config }),
-                )
+            let target_path = Path::new(target_path.trim());
+            if target_path.as_os_str().is_empty() {
+                return Err("请选择新的数据存储目录".to_string());
             }
-            #[cfg(not(any(target_os = "macos", windows)))]
-            {
-                save_config_blocking(state.local()?, config)
-            }
-        };
-        match result {
-            Ok(status) => Ok(status),
-            Err(error) => {
-                if let Some(previous) = previous_autostart
-                    && let Err(rollback_error) = apply_autostart_config(&app, previous)
-                {
-                    return Err(format!(
-                        "{error}；恢复保存前的开机自启状态失败：{rollback_error}"
-                    ));
-                }
-                Err(error)
-            }
+            storage::request_storage_change(&state.default_data_dir, &state.data_dir, target_path)
         }
-    })
-    .await
-    .map_err(|error| format!("保存配置任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn get_status(
-    state: tauri::State<'_, Arc<GuiState>>,
-    force: Option<bool>,
-    include_log_stats: Option<bool>,
-    statistics_hours: Option<u32>,
-) -> Result<RuntimeStatus, String> {
-    let started = Instant::now();
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "get_status",
-                &serde_json::json!({
-                    "force_log_stats": force.unwrap_or(false),
-                    "include_log_stats": include_log_stats.unwrap_or(true),
-                    "statistics_hours": statistics_hours,
-                }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            Ok(state.local()?.status_with_log_stats_window(
-                force.unwrap_or(false),
-                include_log_stats.unwrap_or(true),
-                statistics_hours,
-            ))
-        }
-    })
-    .await
-    .map_err(|error| format!("获取状态失败：{error}"))?;
-    performance::log("GUI 命令", "get_status", started);
-    result
-}
-
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-async fn get_query_logs(
-    state: tauri::State<'_, Arc<GuiState>>,
-    filter: Option<String>,
-    search: Option<String>,
-    domain: Option<String>,
-    hours: Option<u32>,
-    source: Option<String>,
-    query_type: Option<String>,
-    sort: Option<String>,
-    cursor: Option<String>,
-    page: Option<u32>,
-    page_size: Option<u32>,
-) -> Result<QueryLogPage, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "get_query_logs",
-                &serde_json::json!({
-                    "filter": filter,
-                    "search": search,
-                    "domain": domain,
-                    "hours": hours,
-                    "source": source,
-                    "query_type": query_type,
-                    "sort": sort,
-                    "cursor": cursor,
-                    "page": page,
-                    "page_size": page_size,
-                }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            query_logs_blocking(
-                state.local()?,
-                filter,
-                search,
-                domain,
-                hours,
-                source,
-                query_type,
-                sort,
-                cursor,
-                page,
-                page_size,
-            )
-        }
-    })
-    .await
-    .map_err(|error| format!("获取查询日志失败：{error}"))?
-}
-
-#[tauri::command]
-async fn clear_query_logs(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("clear_query_logs", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            clear_query_logs_blocking(state.local()?)
-        }
-    })
-    .await
-    .map_err(|error| format!("清除查询日志任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn apply_query_log_rule(
-    state: tauri::State<'_, Arc<GuiState>>,
-    domain: String,
-    action: String,
-    target: Option<String>,
-) -> Result<QueryLogRuleActionResult, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "apply_query_log_rule",
-                &serde_json::json!({
-                    "domain": domain,
-                    "action": action,
-                    "target": target,
-                }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            service_core::apply_query_log_rule_blocking(state.local()?, domain, action, target)
-        }
-    })
-    .await
-    .map_err(|error| format!("应用查询日志规则任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn run_dns_diagnostic(
-    state: tauri::State<'_, Arc<GuiState>>,
-    domain: String,
-    query_type: String,
-    client_ip: Option<String>,
-) -> Result<DnsDiagnosticReport, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "run_dns_diagnostic",
-                &serde_json::json!({
-                    "domain": domain,
-                    "query_type": query_type,
-                    "client_ip": client_ip,
-                }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            service_core::run_dns_diagnostic_blocking(
-                &state.local()?,
-                domain,
-                query_type,
-                client_ip,
-            )
-        }
-    })
-    .await
-    .map_err(|error| format!("DNS 诊断任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn clear_statistics(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("clear_statistics", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            clear_statistics_blocking(state.local()?)
-        }
-    })
-    .await
-    .map_err(|error| format!("清除统计数据任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn clear_security_events(
-    state: tauri::State<'_, Arc<GuiState>>,
-) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("clear_security_events", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            clear_security_events_blocking(state.local()?)
-        }
-    })
-    .await
-    .map_err(|error| format!("清除安全事件任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn update_filters(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<GuiState>>,
-    config: AppConfig,
-) -> Result<FilterUpdateResult, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        let result = privileged_bridge::ServiceClient::call(
-            "update_filters",
-            &serde_json::json!({ "config": config }),
-        )?;
-        #[cfg(not(any(target_os = "macos", windows)))]
-        let result = update_filters_blocking(state.local()?, config)?;
-
-        let latest = {
-            #[cfg(any(target_os = "macos", windows))]
-            {
-                privileged_bridge::ServiceClient::call::<_, AppConfig>(
-                    "get_config",
-                    &serde_json::json!({}),
-                )?
-            }
-            #[cfg(not(any(target_os = "macos", windows)))]
-            {
-                state.local()?.current_config()?
-            }
-        };
-        let _ = app.emit("filters-updated", &latest.filters);
-        Ok(result)
-    })
-    .await
-    .map_err(|error| format!("过滤器更新任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn get_filter_update_progress(
-    state: tauri::State<'_, Arc<GuiState>>,
-) -> Result<FilterUpdateProgressState, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "get_filter_update_progress",
-                &serde_json::json!({}),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            state.local()?.filter_update_progress()
-        }
-    })
-    .await
-    .map_err(|error| format!("读取过滤器更新进度任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn cancel_filter_update(
-    state: tauri::State<'_, Arc<GuiState>>,
-) -> Result<FilterUpdateProgressState, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("cancel_filter_update", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            state.local()?.request_filter_update_cancel()
-        }
-    })
-    .await
-    .map_err(|error| format!("取消过滤器更新任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn start_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("start_dns", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            start_dns_blocking(state.local()?)
-        }
-    })
-    .await
-    .map_err(|error| format!("启动 DNS 服务任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn stop_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("stop_dns", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            stop_dns_blocking(state.local()?)
-        }
-    })
-    .await
-    .map_err(|error| format!("停止 DNS 服务任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn pause_protection(
-    state: tauri::State<'_, Arc<GuiState>>,
-    duration_seconds: u64,
-) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "pause_protection",
-                &serde_json::json!({ "duration_seconds": duration_seconds }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            pause_protection_blocking(&state.local()?, duration_seconds)
-        }
-    })
-    .await
-    .map_err(|error| format!("暂停过滤保护任务异常：{error}"))?
-}
-
-#[tauri::command]
-async fn resume_protection(
-    state: tauri::State<'_, Arc<GuiState>>,
-) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call("resume_protection", &serde_json::json!({}))
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            resume_protection_blocking(&state.local()?)
-        }
-    })
-    .await
-    .map_err(|error| format!("恢复过滤保护任务异常：{error}"))?
-}
-
-#[tauri::command]
-fn set_tray_runtime_status(
-    app: tauri::AppHandle,
-    running: bool,
-    protection_paused: bool,
-    paused_until: Option<u64>,
-) -> Result<(), String> {
-    tray::update_runtime_status(&app, running, protection_paused, paused_until)
-        .map_err(|error| format!("更新托盘运行状态失败：{error}"))
-}
-
-#[tauri::command]
-fn set_tray_locale(app: tauri::AppHandle, locale: String) -> Result<(), String> {
-    tray::set_locale(&app, &locale).map_err(|error| format!("更新托盘语言失败：{error}"))
-}
-
-#[tauri::command]
-fn clear_dns_cache(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        let _ = state;
-        privileged_bridge::ServiceClient::call("clear_dns_cache", &serde_json::json!({}))
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        let state = state.local()?;
-        clear_dns_cache_blocking(&state)
+
+    #[tauri::command]
+    fn get_macos_service_status() -> Result<privileged_bridge::MacosServiceStatus, String> {
+        #[cfg(target_os = "macos")]
+        {
+            privileged_bridge::ensure_macos_service_current()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("当前平台不支持 macOS DNS 后台服务".to_string())
+        }
     }
-}
 
-#[tauri::command]
-async fn clear_filter_cache(
-    state: tauri::State<'_, Arc<GuiState>>,
-) -> Result<FilterCacheClearResult, String> {
-    #[cfg(any(target_os = "macos", windows))]
-    let _ = state;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(any(target_os = "macos", windows))]
+    #[tauri::command]
+    fn install_macos_service(
+        force: Option<bool>,
+    ) -> Result<privileged_bridge::MacosServiceStatus, String> {
+        #[cfg(target_os = "macos")]
         {
-            privileged_bridge::ServiceClient::call("clear_filter_cache", &serde_json::json!({}))
+            privileged_bridge::macos_service_install(force.unwrap_or(false))
         }
-        #[cfg(not(any(target_os = "macos", windows)))]
+        #[cfg(not(target_os = "macos"))]
         {
-            clear_filter_cache_blocking(state.local()?)
+            let _ = force;
+            Err("当前平台不支持 macOS DNS 后台服务".to_string())
         }
-    })
-    .await
-    .map_err(|error| format!("清理缓存任务异常：{error}"))?
-}
+    }
 
-#[cfg(all(
-    any(target_os = "macos", windows, target_os = "linux"),
-    not(debug_assertions)
-))]
-fn read_autostart_config(app: &tauri::AppHandle) -> Result<Option<bool>, String> {
-    app.autolaunch()
-        .is_enabled()
-        .map(Some)
-        .map_err(|error| format!("读取开机自启状态失败：{error}"))
-}
+    #[tauri::command]
+    fn uninstall_macos_service() -> Result<privileged_bridge::MacosServiceStatus, String> {
+        #[cfg(target_os = "macos")]
+        {
+            privileged_bridge::macos_service_uninstall()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("当前平台不支持 macOS DNS 后台服务".to_string())
+        }
+    }
 
-#[cfg(all(
-    any(target_os = "macos", windows, target_os = "linux"),
-    debug_assertions
-))]
-fn read_autostart_config(_app: &tauri::AppHandle) -> Result<Option<bool>, String> {
-    Ok(None)
-}
-
-#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
-fn read_autostart_config(_app: &tauri::AppHandle) -> Result<Option<bool>, String> {
-    Ok(None)
-}
-
-#[cfg(all(
-    any(target_os = "macos", windows, target_os = "linux"),
-    not(debug_assertions)
-))]
-fn apply_autostart_config(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    let manager = app.autolaunch();
-    let current = manager
-        .is_enabled()
-        .map_err(|error| format!("读取开机自启状态失败：{error}"))?;
+    #[tauri::command]
+    fn open_macos_service_settings() -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            privileged_bridge::macos_service_open_settings();
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("当前平台不支持 macOS DNS 后台服务".to_string())
+        }
+    }
 
     #[cfg(windows)]
-    {
-        // Windows 自启项可能仍指向旧安装目录或开发版。启用时始终刷新为当前 exe，
-        // 不能只根据注册表中是否存在同名项来判断。
-        if enabled {
-            return manager
-                .enable()
-                .map_err(|error| format!("启用开机自启失败：{error}"));
-        }
-        if current {
-            return manager
-                .disable()
-                .map_err(|error| format!("关闭开机自启失败：{error}"));
-        }
-        return Ok(());
+    fn serialize_windows_service_status(
+        status: privileged_bridge::WindowsServiceStatus,
+    ) -> Result<serde_json::Value, String> {
+        serde_json::to_value(status)
+            .map_err(|error| format!("序列化 Windows DNS 服务状态失败：{error}"))
+    }
+
+    #[cfg(windows)]
+    #[tauri::command]
+    async fn get_windows_service_status() -> Result<serde_json::Value, String> {
+        let started = Instant::now();
+        let result = tauri::async_runtime::spawn_blocking(|| {
+            serialize_windows_service_status(privileged_bridge::windows_service_status()?)
+        })
+        .await
+        .map_err(|error| format!("读取 Windows 后台服务状态任务异常：{error}"))?;
+        performance::log("GUI 命令", "get_windows_service_status", started);
+        result
     }
 
     #[cfg(not(windows))]
-    match (enabled, current) {
-        (true, false) => manager
-            .enable()
-            .map_err(|error| format!("启用开机自启失败：{error}")),
-        (false, true) => manager
-            .disable()
-            .map_err(|error| format!("关闭开机自启失败：{error}")),
-        _ => Ok(()),
-    }
-}
-
-#[cfg(all(
-    any(target_os = "macos", windows, target_os = "linux"),
-    debug_assertions
-))]
-fn apply_autostart_config(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), String> {
-    // 开发版依赖 Vite dev server，不能注册为系统自启程序。
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
-fn apply_autostart_config(_app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    if enabled {
-        Err("当前平台不支持开机自启".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(all(windows, debug_assertions))]
-fn cleanup_legacy_debug_autostart(app: &tauri::AppHandle) -> Result<(), String> {
-    use winreg::{
-        RegKey,
-        enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE},
-    };
-
-    const RUN_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
-
-    let current_exe =
-        std::env::current_exe().map_err(|error| format!("读取开发版程序路径失败：{error}"))?;
-    let current_exe = current_exe.to_string_lossy();
-    let key = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_SET_VALUE)
-        .map_err(|error| format!("读取开机自启注册表失败：{error}"))?;
-
-    let mut app_names = vec![app.package_info().name.clone()];
-    if !app_names.iter().any(|name| name == "DnsBlackhole") {
-        app_names.push("DnsBlackhole".to_string());
+    #[tauri::command]
+    async fn get_windows_service_status() -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Windows DNS 后台服务".to_string())
     }
 
-    for app_name in app_names {
-        let Ok(command) = key.get_value::<String, _>(&app_name) else {
-            continue;
-        };
-        let registered_exe = command.trim().trim_matches('"');
-        if registered_exe.eq_ignore_ascii_case(&current_exe) {
-            key.delete_value(&app_name)
-                .map_err(|error| format!("清理开发版开机自启项失败：{error}"))?;
+    #[cfg(windows)]
+    #[tauri::command]
+    async fn install_windows_service(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+        let legacy_default_dir = app.path().app_config_dir().ok();
+        tauri::async_runtime::spawn_blocking(move || {
+            serialize_windows_service_status(privileged_bridge::install_windows_service(
+                legacy_default_dir.as_deref(),
+            )?)
+        })
+        .await
+        .map_err(|error| format!("安装 Windows 后台服务任务异常：{error}"))?
+    }
+
+    #[cfg(not(windows))]
+    #[tauri::command]
+    async fn install_windows_service(_app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Windows DNS 后台服务".to_string())
+    }
+
+    #[cfg(windows)]
+    #[tauri::command]
+    async fn uninstall_windows_service() -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(|| {
+            serialize_windows_service_status(privileged_bridge::uninstall_windows_service()?)
+        })
+        .await
+        .map_err(|error| format!("卸载 Windows 后台服务任务异常：{error}"))?
+    }
+
+    #[cfg(not(windows))]
+    #[tauri::command]
+    async fn uninstall_windows_service() -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Windows DNS 后台服务".to_string())
+    }
+
+    #[cfg(windows)]
+    fn call_windows_system_dns(method: &'static str) -> Result<serde_json::Value, String> {
+        let status: privileged_bridge::WindowsSystemDnsStatus =
+            privileged_bridge::ServiceClient::call(method, &serde_json::json!({}))?;
+        serde_json::to_value(status)
+            .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
+    }
+
+    #[cfg(windows)]
+    #[tauri::command]
+    async fn get_windows_system_dns_status() -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(|| {
+            call_windows_system_dns("get_windows_system_dns_status")
+        })
+        .await
+        .map_err(|error| format!("读取 Windows 系统 DNS 状态任务异常：{error}"))?
+    }
+
+    #[cfg(not(windows))]
+    #[tauri::command]
+    async fn get_windows_system_dns_status() -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+    }
+
+    #[cfg(windows)]
+    #[tauri::command]
+    async fn take_over_windows_system_dns() -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(|| {
+            call_windows_system_dns("take_over_windows_system_dns")
+        })
+        .await
+        .map_err(|error| format!("接管 Windows 系统 DNS 任务异常：{error}"))?
+    }
+
+    #[cfg(not(windows))]
+    #[tauri::command]
+    async fn take_over_windows_system_dns() -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+    }
+
+    #[cfg(windows)]
+    #[tauri::command]
+    async fn restore_windows_system_dns() -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(|| {
+            call_windows_system_dns("restore_windows_system_dns")
+        })
+        .await
+        .map_err(|error| format!("恢复 Windows 系统 DNS 任务异常：{error}"))?
+    }
+
+    #[cfg(not(windows))]
+    #[tauri::command]
+    async fn restore_windows_system_dns() -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn call_linux_system_dns(method: &'static str) -> Result<serde_json::Value, String> {
+        // Linux 桌面 GUI 不自己改系统 DNS，全部交给 root 服务的同一套事务与串行锁。
+        privileged_bridge::ServiceClient::call(method, &serde_json::json!({}))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tauri::command]
+    async fn get_linux_system_dns_status() -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(|| {
+            call_linux_system_dns("get_linux_system_dns_status")
+        })
+        .await
+        .map_err(|error| format!("读取 Linux 系统 DNS 状态任务异常：{error}"))?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tauri::command]
+    async fn get_linux_system_dns_status() -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Linux 系统 DNS 管理".to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tauri::command]
+    async fn take_over_linux_system_dns() -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(|| call_linux_system_dns("take_over_linux_system_dns"))
+            .await
+            .map_err(|error| format!("接管 Linux 系统 DNS 任务异常：{error}"))?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tauri::command]
+    async fn take_over_linux_system_dns() -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Linux 系统 DNS 管理".to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tauri::command]
+    async fn restore_linux_system_dns() -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(|| call_linux_system_dns("restore_linux_system_dns"))
+            .await
+            .map_err(|error| format!("恢复 Linux 系统 DNS 任务异常：{error}"))?
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tauri::command]
+    async fn restore_linux_system_dns() -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Linux 系统 DNS 管理".to_string())
+    }
+
+    #[cfg(windows)]
+    #[tauri::command]
+    async fn replace_unmanaged_windows_system_dns(
+        preset: String,
+        ipv4_servers: Vec<String>,
+        ipv6_servers: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            let status: privileged_bridge::WindowsSystemDnsStatus =
+                privileged_bridge::ServiceClient::call(
+                    "replace_unmanaged_windows_system_dns",
+                    &serde_json::json!({
+                        "preset": preset,
+                        "ipv4Servers": ipv4_servers,
+                        "ipv6Servers": ipv6_servers,
+                    }),
+                )?;
+            serde_json::to_value(status)
+                .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
+        })
+        .await
+        .map_err(|error| format!("解除 Windows 本机 DNS 任务异常：{error}"))?
+    }
+
+    #[cfg(not(windows))]
+    #[tauri::command]
+    async fn replace_unmanaged_windows_system_dns(
+        _preset: String,
+        _ipv4_servers: Vec<String>,
+        _ipv6_servers: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+    }
+
+    #[cfg(windows)]
+    #[tauri::command]
+    async fn restore_windows_system_dns_with_fallback(
+        preset: String,
+        ipv4_servers: Vec<String>,
+        ipv6_servers: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            let status: privileged_bridge::WindowsSystemDnsStatus =
+                privileged_bridge::ServiceClient::call(
+                    "restore_windows_system_dns_with_fallback",
+                    &serde_json::json!({
+                        "preset": preset,
+                        "ipv4Servers": ipv4_servers,
+                        "ipv6Servers": ipv6_servers,
+                    }),
+                )?;
+            serde_json::to_value(status)
+                .map_err(|error| format!("序列化 Windows 系统 DNS 状态失败：{error}"))
+        })
+        .await
+        .map_err(|error| format!("设置 Windows 外部 DNS 任务异常：{error}"))?
+    }
+
+    #[cfg(not(windows))]
+    #[tauri::command]
+    async fn restore_windows_system_dns_with_fallback(
+        _preset: String,
+        _ipv4_servers: Vec<String>,
+        _ipv6_servers: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        Err("当前平台不支持 Windows 系统 DNS 管理".to_string())
+    }
+
+    #[tauri::command]
+    async fn save_config(
+        app: tauri::AppHandle,
+        state: tauri::State<'_, Arc<GuiState>>,
+        mut config: AppConfig,
+    ) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            config::migrate_legacy_defaults(&mut config);
+            config.validate()?;
+            let previous_autostart = read_autostart_config(&app)?;
+            apply_autostart_config(&app, config.launch_at_startup)?;
+            let result: Result<RuntimeStatus, String> = {
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+                {
+                    privileged_bridge::ServiceClient::call(
+                        "save_config",
+                        &serde_json::json!({ "config": config }),
+                    )
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+                {
+                    save_config_blocking(state.local()?, config)
+                }
+            };
+            match result {
+                Ok(status) => Ok(status),
+                Err(error) => {
+                    if let Some(previous) = previous_autostart
+                        && let Err(rollback_error) = apply_autostart_config(&app, previous)
+                    {
+                        return Err(format!(
+                            "{error}；恢复保存前的开机自启状态失败：{rollback_error}"
+                        ));
+                    }
+                    Err(error)
+                }
+            }
+        })
+        .await
+        .map_err(|error| format!("保存配置任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn get_status(
+        state: tauri::State<'_, Arc<GuiState>>,
+        force: Option<bool>,
+        include_log_stats: Option<bool>,
+        statistics_hours: Option<u32>,
+    ) -> Result<RuntimeStatus, String> {
+        let started = Instant::now();
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "get_status",
+                    &serde_json::json!({
+                        "force_log_stats": force.unwrap_or(false),
+                        "include_log_stats": include_log_stats.unwrap_or(true),
+                        "statistics_hours": statistics_hours,
+                    }),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                Ok(state.local()?.status_with_log_stats_window(
+                    force.unwrap_or(false),
+                    include_log_stats.unwrap_or(true),
+                    statistics_hours,
+                ))
+            }
+        })
+        .await
+        .map_err(|error| format!("获取状态失败：{error}"))?;
+        performance::log("GUI 命令", "get_status", started);
+        result
+    }
+
+    #[tauri::command]
+    #[allow(clippy::too_many_arguments)]
+    async fn get_query_logs(
+        state: tauri::State<'_, Arc<GuiState>>,
+        filter: Option<String>,
+        search: Option<String>,
+        domain: Option<String>,
+        hours: Option<u32>,
+        source: Option<String>,
+        query_type: Option<String>,
+        sort: Option<String>,
+        cursor: Option<String>,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<QueryLogPage, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "get_query_logs",
+                    &serde_json::json!({
+                        "filter": filter,
+                        "search": search,
+                        "domain": domain,
+                        "hours": hours,
+                        "source": source,
+                        "query_type": query_type,
+                        "sort": sort,
+                        "cursor": cursor,
+                        "page": page,
+                        "page_size": page_size,
+                    }),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                query_logs_blocking(
+                    state.local()?,
+                    filter,
+                    search,
+                    domain,
+                    hours,
+                    source,
+                    query_type,
+                    sort,
+                    cursor,
+                    page,
+                    page_size,
+                )
+            }
+        })
+        .await
+        .map_err(|error| format!("获取查询日志失败：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn clear_query_logs(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call("clear_query_logs", &serde_json::json!({}))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let local = state.local()?;
+                clear_query_logs_blocking(&local)
+            }
+        })
+        .await
+        .map_err(|error| format!("清除查询日志任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn apply_query_log_rule(
+        state: tauri::State<'_, Arc<GuiState>>,
+        domain: String,
+        action: String,
+        target: Option<String>,
+    ) -> Result<QueryLogRuleActionResult, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "apply_query_log_rule",
+                    &serde_json::json!({
+                        "domain": domain,
+                        "action": action,
+                        "target": target,
+                    }),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                service_core::apply_query_log_rule_blocking(state.local()?, domain, action, target)
+            }
+        })
+        .await
+        .map_err(|error| format!("应用查询日志规则任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn run_dns_diagnostic(
+        state: tauri::State<'_, Arc<GuiState>>,
+        domain: String,
+        query_type: String,
+        client_ip: Option<String>,
+    ) -> Result<DnsDiagnosticReport, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "run_dns_diagnostic",
+                    &serde_json::json!({
+                        "domain": domain,
+                        "query_type": query_type,
+                        "client_ip": client_ip,
+                    }),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let local = state.local()?;
+                service_core::run_dns_diagnostic_blocking(&local, domain, query_type, client_ip)
+            }
+        })
+        .await
+        .map_err(|error| format!("DNS 诊断任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn clear_statistics(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call("clear_statistics", &serde_json::json!({}))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let local = state.local()?;
+                clear_statistics_blocking(&local)
+            }
+        })
+        .await
+        .map_err(|error| format!("清除统计数据任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn clear_security_events(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "clear_security_events",
+                    &serde_json::json!({}),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let local = state.local()?;
+                clear_security_events_blocking(&local)
+            }
+        })
+        .await
+        .map_err(|error| format!("清除安全事件任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn update_filters(
+        app: tauri::AppHandle,
+        state: tauri::State<'_, Arc<GuiState>>,
+        config: AppConfig,
+    ) -> Result<FilterUpdateResult, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            let result = privileged_bridge::ServiceClient::call(
+                "update_filters",
+                &serde_json::json!({ "config": config }),
+            )?;
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            let result = update_filters_blocking(state.local()?, config)?;
+
+            let latest = {
+                #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+                {
+                    privileged_bridge::ServiceClient::call::<_, AppConfig>(
+                        "get_config",
+                        &serde_json::json!({}),
+                    )?
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+                {
+                    state.local()?.current_config()?
+                }
+            };
+            let _ = app.emit("filters-updated", &latest.filters);
+            Ok(result)
+        })
+        .await
+        .map_err(|error| format!("过滤器更新任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn get_filter_update_progress(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<FilterUpdateProgressState, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "get_filter_update_progress",
+                    &serde_json::json!({}),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                state.local()?.filter_update_progress()
+            }
+        })
+        .await
+        .map_err(|error| format!("读取过滤器更新进度任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn cancel_filter_update(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<FilterUpdateProgressState, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "cancel_filter_update",
+                    &serde_json::json!({}),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                state.local()?.request_filter_update_cancel()
+            }
+        })
+        .await
+        .map_err(|error| format!("取消过滤器更新任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn start_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call("start_dns", &serde_json::json!({}))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                start_dns_blocking(state.local()?)
+            }
+        })
+        .await
+        .map_err(|error| format!("启动 DNS 服务任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn stop_dns(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call("stop_dns", &serde_json::json!({}))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                stop_dns_blocking(state.local()?)
+            }
+        })
+        .await
+        .map_err(|error| format!("停止 DNS 服务任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn pause_protection(
+        state: tauri::State<'_, Arc<GuiState>>,
+        duration_seconds: u64,
+    ) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "pause_protection",
+                    &serde_json::json!({ "duration_seconds": duration_seconds }),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let local = state.local()?;
+                pause_protection_blocking(&local, duration_seconds)
+            }
+        })
+        .await
+        .map_err(|error| format!("暂停过滤保护任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    async fn resume_protection(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call("resume_protection", &serde_json::json!({}))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                let local = state.local()?;
+                resume_protection_blocking(&local)
+            }
+        })
+        .await
+        .map_err(|error| format!("恢复过滤保护任务异常：{error}"))?
+    }
+
+    #[tauri::command]
+    fn set_tray_runtime_status(
+        app: tauri::AppHandle,
+        running: bool,
+        protection_paused: bool,
+        paused_until: Option<u64>,
+    ) -> Result<(), String> {
+        tray::update_runtime_status(&app, running, protection_paused, paused_until)
+            .map_err(|error| format!("更新托盘运行状态失败：{error}"))
+    }
+
+    #[tauri::command]
+    fn set_tray_locale(app: tauri::AppHandle, locale: String) -> Result<(), String> {
+        tray::set_locale(&app, &locale).map_err(|error| format!("更新托盘语言失败：{error}"))
+    }
+
+    #[tauri::command]
+    fn clear_dns_cache(state: tauri::State<'_, Arc<GuiState>>) -> Result<RuntimeStatus, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        {
+            let _ = state;
+            privileged_bridge::ServiceClient::call("clear_dns_cache", &serde_json::json!({}))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            let state = state.local()?;
+            clear_dns_cache_blocking(&state)
         }
     }
 
-    Ok(())
-}
+    #[tauri::command]
+    async fn clear_filter_cache(
+        state: tauri::State<'_, Arc<GuiState>>,
+    ) -> Result<FilterCacheClearResult, String> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let _ = state;
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let state = Arc::clone(state.inner());
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            {
+                privileged_bridge::ServiceClient::call("clear_filter_cache", &serde_json::json!({}))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            {
+                clear_filter_cache_blocking(state.local()?)
+            }
+        })
+        .await
+        .map_err(|error| format!("清理缓存任务异常：{error}"))?
+    }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    let application_started = Instant::now();
-    #[cfg(target_os = "macos")]
-    // Universal 安装包同时覆盖 Apple Silicon 与 Intel，使用固定目标读取同一份更新清单。
-    let updater = tauri_plugin_updater::Builder::new().target("darwin-universal");
-    #[cfg(not(target_os = "macos"))]
-    let updater = tauri_plugin_updater::Builder::new();
+    #[cfg(all(
+        any(target_os = "macos", windows, target_os = "linux"),
+        not(debug_assertions)
+    ))]
+    fn read_autostart_config(app: &tauri::AppHandle) -> Result<Option<bool>, String> {
+        app.autolaunch()
+            .is_enabled()
+            .map(Some)
+            .map_err(|error| format!("读取开机自启状态失败：{error}"))
+    }
 
-    tauri::Builder::default()
+    #[cfg(all(
+        any(target_os = "macos", windows, target_os = "linux"),
+        debug_assertions
+    ))]
+    fn read_autostart_config(_app: &tauri::AppHandle) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
+
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    fn read_autostart_config(_app: &tauri::AppHandle) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
+
+    #[cfg(all(
+        any(target_os = "macos", windows, target_os = "linux"),
+        not(debug_assertions)
+    ))]
+    fn apply_autostart_config(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+        let manager = app.autolaunch();
+        let current = manager
+            .is_enabled()
+            .map_err(|error| format!("读取开机自启状态失败：{error}"))?;
+
+        #[cfg(windows)]
+        {
+            // Windows 自启项可能仍指向旧安装目录或开发版。启用时始终刷新为当前 exe，
+            // 不能只根据注册表中是否存在同名项来判断。
+            if enabled {
+                return manager
+                    .enable()
+                    .map_err(|error| format!("启用开机自启失败：{error}"));
+            }
+            if current {
+                return manager
+                    .disable()
+                    .map_err(|error| format!("关闭开机自启失败：{error}"));
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(windows))]
+        match (enabled, current) {
+            (true, false) => manager
+                .enable()
+                .map_err(|error| format!("启用开机自启失败：{error}")),
+            (false, true) => manager
+                .disable()
+                .map_err(|error| format!("关闭开机自启失败：{error}")),
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(all(
+        any(target_os = "macos", windows, target_os = "linux"),
+        debug_assertions
+    ))]
+    fn apply_autostart_config(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), String> {
+        // 开发版依赖 Vite dev server，不能注册为系统自启程序。
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    fn apply_autostart_config(_app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+        if enabled {
+            Err("当前平台不支持开机自启".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(windows, debug_assertions))]
+    fn cleanup_legacy_debug_autostart(app: &tauri::AppHandle) -> Result<(), String> {
+        use winreg::{
+            RegKey,
+            enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE},
+        };
+
+        const RUN_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+        let current_exe =
+            std::env::current_exe().map_err(|error| format!("读取开发版程序路径失败：{error}"))?;
+        let current_exe = current_exe.to_string_lossy();
+        let key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_SET_VALUE)
+            .map_err(|error| format!("读取开机自启注册表失败：{error}"))?;
+
+        let mut app_names = vec![app.package_info().name.clone()];
+        if !app_names.iter().any(|name| name == "DnsBlackhole") {
+            app_names.push("DnsBlackhole".to_string());
+        }
+
+        for app_name in app_names {
+            let Ok(command) = key.get_value::<String, _>(&app_name) else {
+                continue;
+            };
+            let registered_exe = command.trim().trim_matches('"');
+            if registered_exe.eq_ignore_ascii_case(&current_exe) {
+                key.delete_value(&app_name)
+                    .map_err(|error| format!("清理开发版开机自启项失败：{error}"))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg_attr(mobile, tauri::mobile_entry_point)]
+    pub fn run() {
+        let application_started = Instant::now();
+        #[cfg(target_os = "macos")]
+        // Universal 安装包同时覆盖 Apple Silicon 与 Intel，使用固定目标读取同一份更新清单。
+        let updater = tauri_plugin_updater::Builder::new().target("darwin-universal");
+        #[cfg(not(target_os = "macos"))]
+        let updater = tauri_plugin_updater::Builder::new();
+
+        tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main_window(app);
@@ -1141,6 +1269,9 @@ pub fn run() {
             restore_windows_system_dns,
             replace_unmanaged_windows_system_dns,
             restore_windows_system_dns_with_fallback,
+            get_linux_system_dns_status,
+            take_over_linux_system_dns,
+            restore_linux_system_dns,
             save_config,
             get_status,
             get_query_logs,
@@ -1226,7 +1357,31 @@ pub fn run() {
                 );
             }
 
-            #[cfg(not(any(target_os = "macos", windows)))]
+            #[cfg(target_os = "linux")]
+            {
+                app.manage(Arc::new(GuiState {}));
+                let service_status_started = Instant::now();
+                match privileged_bridge::ServiceClient::probe() {
+                    Ok(_) => {
+                        if let Ok(config) = privileged_bridge::ServiceClient::call::<_, AppConfig>(
+                            "get_config",
+                            &serde_json::json!({}),
+                        ) && let Err(error) =
+                            apply_autostart_config(app.handle(), config.launch_at_startup)
+                        {
+                            eprintln!("{error}");
+                        }
+                    }
+                    Err(error) => eprintln!("读取 Linux DNS 后台服务状态失败：{error}"),
+                }
+                performance::log(
+                    "GUI 启动",
+                    "Linux 服务状态与配置同步",
+                    service_status_started,
+                );
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
             {
                 let storage = storage::initialize(app.handle())
                     .map_err(|error| io::Error::other(format!("数据目录初始化失败：{error}")))?;
@@ -1295,357 +1450,361 @@ pub fn run() {
                 tray::show_main_window(_app);
             }
         });
-}
+    }
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        net::{Ipv4Addr, TcpListener},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    #[cfg(test)]
+    mod tests {
+        use std::{
+            fs,
+            net::{Ipv4Addr, TcpListener},
+            time::{SystemTime, UNIX_EPOCH},
+        };
 
-    use super::*;
-    use crate::{config::FilterSubscription, database::Database, service_core::AppState};
+        use super::*;
+        use crate::{config::FilterSubscription, database::Database, service_core::AppState};
 
-    /// TCP 端口空闲不代表同号 UDP 端口也空闲，而 DNS 服务要同时监听两者。
-    /// 这里探测到一个双协议都能绑的端口再交给测试，避免偶发 WSAEACCES。
-    fn free_dns_port() -> u16 {
-        for _ in 0..32 {
-            let Ok(probe) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
-                continue;
-            };
-            let Ok(port) = probe.local_addr().map(|addr| addr.port()) else {
-                continue;
-            };
-            drop(probe);
-            let udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port));
-            let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, port));
-            if udp.is_ok() && tcp.is_ok() {
-                return port;
+        /// TCP 端口空闲不代表同号 UDP 端口也空闲，而 DNS 服务要同时监听两者。
+        /// 这里探测到一个双协议都能绑的端口再交给测试，避免偶发 WSAEACCES。
+        fn free_dns_port() -> u16 {
+            for _ in 0..32 {
+                let Ok(probe) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+                    continue;
+                };
+                let Ok(port) = probe.local_addr().map(|addr| addr.port()) else {
+                    continue;
+                };
+                drop(probe);
+                let udp = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port));
+                let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, port));
+                if udp.is_ok() && tcp.is_ok() {
+                    return port;
+                }
+            }
+            panic!("找不到 UDP 与 TCP 同时空闲的端口");
+        }
+
+        #[test]
+        fn parses_windows_system_proxy_settings() {
+            assert_eq!(
+                proxy_url_from_setting("http=127.0.0.1:7897;https=127.0.0.1:7898"),
+                Some("http://127.0.0.1:7898".into())
+            );
+            assert_eq!(
+                proxy_url_from_setting("127.0.0.1:7897"),
+                Some("http://127.0.0.1:7897".into())
+            );
+            assert_eq!(proxy_url_from_setting("  "), None);
+        }
+
+        #[test]
+        fn unrelated_config_change_does_not_rebuild_filter_runtime() {
+            let previous = AppConfig::default();
+            let mut next = previous.clone();
+            next.launch_at_startup = !next.launch_at_startup;
+            next.query_log_retention_hours = 24;
+
+            assert!(!service_core::filter_runtime_changed(&previous, &next));
+            assert!(!service_core::needs_dns_restart(&previous, &next));
+        }
+
+        #[test]
+        fn dashboard_statistics_range_preserves_explicit_lifetime_request() {
+            assert_eq!(
+                service_core::resolve_statistics_hours(None, 30 * 24),
+                30 * 24
+            );
+            assert_eq!(service_core::resolve_statistics_hours(Some(0), 30 * 24), 0);
+            assert_eq!(
+                service_core::resolve_statistics_hours(Some(30 * 24), 7 * 24),
+                7 * 24
+            );
+            assert_eq!(
+                service_core::resolve_statistics_hours(Some(u32::MAX), 0),
+                crate::config::MAX_STATISTICS_RETENTION_HOURS,
+            );
+        }
+
+        #[test]
+        fn filtering_config_change_rebuilds_filter_runtime() {
+            let previous = AppConfig::default();
+            for next in [
+                AppConfig {
+                    dns_rewrites: "nas.lan 192.168.1.10".into(),
+                    ..previous.clone()
+                },
+                AppConfig {
+                    client_filtering_rules: "192.168.1.50 => bypass".into(),
+                    ..previous.clone()
+                },
+            ] {
+                assert!(service_core::filter_runtime_changed(&previous, &next));
+                assert!(!service_core::needs_dns_restart(&previous, &next));
             }
         }
-        panic!("找不到 UDP 与 TCP 同时空闲的端口");
-    }
 
-    #[test]
-    fn parses_windows_system_proxy_settings() {
-        assert_eq!(
-            proxy_url_from_setting("http=127.0.0.1:7897;https=127.0.0.1:7898"),
-            Some("http://127.0.0.1:7898".into())
-        );
-        assert_eq!(
-            proxy_url_from_setting("127.0.0.1:7897"),
-            Some("http://127.0.0.1:7897".into())
-        );
-        assert_eq!(proxy_url_from_setting("  "), None);
-    }
-
-    #[test]
-    fn unrelated_config_change_does_not_rebuild_filter_runtime() {
-        let previous = AppConfig::default();
-        let mut next = previous.clone();
-        next.launch_at_startup = !next.launch_at_startup;
-        next.query_log_retention_hours = 24;
-
-        assert!(!service_core::filter_runtime_changed(&previous, &next));
-        assert!(!service_core::needs_dns_restart(&previous, &next));
-    }
-
-    #[test]
-    fn dashboard_statistics_range_preserves_explicit_lifetime_request() {
-        assert_eq!(
-            service_core::resolve_statistics_hours(None, 30 * 24),
-            30 * 24
-        );
-        assert_eq!(service_core::resolve_statistics_hours(Some(0), 30 * 24), 0);
-        assert_eq!(
-            service_core::resolve_statistics_hours(Some(30 * 24), 7 * 24),
-            7 * 24
-        );
-        assert_eq!(
-            service_core::resolve_statistics_hours(Some(u32::MAX), 0),
-            crate::config::MAX_STATISTICS_RETENTION_HOURS,
-        );
-    }
-
-    #[test]
-    fn filtering_config_change_rebuilds_filter_runtime() {
-        let previous = AppConfig::default();
-        for next in [
-            AppConfig {
-                dns_rewrites: "nas.lan 192.168.1.10".into(),
-                ..previous.clone()
-            },
-            AppConfig {
-                client_filtering_rules: "192.168.1.50 => bypass".into(),
-                ..previous.clone()
-            },
-        ] {
-            assert!(service_core::filter_runtime_changed(&previous, &next));
-            assert!(!service_core::needs_dns_restart(&previous, &next));
+        #[test]
+        fn response_protection_changes_are_hot_swapped() {
+            let previous = AppConfig::default();
+            for next in [
+                AppConfig {
+                    blocking_response_ttl: 120,
+                    ..previous.clone()
+                },
+                AppConfig {
+                    rebinding_allowed_domains: "router.example".into(),
+                    ..previous.clone()
+                },
+                AppConfig {
+                    cname_cloaking_enabled: false,
+                    ..previous.clone()
+                },
+            ] {
+                assert!(service_core::filter_runtime_changed(&previous, &next));
+                assert!(!service_core::needs_dns_restart(&previous, &next));
+            }
         }
-    }
 
-    #[test]
-    fn response_protection_changes_are_hot_swapped() {
-        let previous = AppConfig::default();
-        for next in [
-            AppConfig {
-                blocking_response_ttl: 120,
-                ..previous.clone()
-            },
-            AppConfig {
-                rebinding_allowed_domains: "router.example".into(),
-                ..previous.clone()
-            },
-            AppConfig {
-                cname_cloaking_enabled: false,
-                ..previous.clone()
-            },
-        ] {
-            assert!(service_core::filter_runtime_changed(&previous, &next));
-            assert!(!service_core::needs_dns_restart(&previous, &next));
+        #[test]
+        fn cache_settings_changes_restart_dns_runtime() {
+            let previous = AppConfig::default();
+            for next in [
+                AppConfig {
+                    dns_cache_prefetch_hit_threshold: 20,
+                    ..previous.clone()
+                },
+                AppConfig {
+                    dns_cache_optimistic_max_stale_seconds: 3600,
+                    ..previous.clone()
+                },
+            ] {
+                assert!(!service_core::filter_runtime_changed(&previous, &next));
+                assert!(service_core::needs_dns_restart(&previous, &next));
+            }
         }
-    }
 
-    #[test]
-    fn cache_settings_changes_restart_dns_runtime() {
-        let previous = AppConfig::default();
-        for next in [
-            AppConfig {
-                dns_cache_prefetch_hit_threshold: 20,
+        #[test]
+        fn private_reverse_setting_restarts_dns_runtime() {
+            let previous = AppConfig::default();
+            let next = AppConfig {
+                private_reverse_dns_enabled: !previous.private_reverse_dns_enabled,
                 ..previous.clone()
-            },
-            AppConfig {
-                dns_cache_optimistic_max_stale_seconds: 3600,
-                ..previous.clone()
-            },
-        ] {
+            };
+
             assert!(!service_core::filter_runtime_changed(&previous, &next));
             assert!(service_core::needs_dns_restart(&previous, &next));
         }
-    }
 
-    #[test]
-    fn private_reverse_setting_restarts_dns_runtime() {
-        let previous = AppConfig::default();
-        let next = AppConfig {
-            private_reverse_dns_enabled: !previous.private_reverse_dns_enabled,
-            ..previous.clone()
-        };
-
-        assert!(!service_core::filter_runtime_changed(&previous, &next));
-        assert!(service_core::needs_dns_restart(&previous, &next));
-    }
-
-    #[test]
-    fn configured_summary_uses_filter_metadata_without_reading_cache() {
-        let config = AppConfig {
-            filters: vec![FilterSubscription {
-                block_rule_count: 12,
-                allow_rule_count: 3,
-                ignored_rule_count: 2,
-                ignored_comment_count: 1,
-                ignored_regex_count: 1,
-                ..FilterSubscription::default()
-            }],
-            blacklist: "||custom.example^".into(),
-            ..AppConfig::default()
-        };
-
-        let summary = service_core::configured_rule_summary(&config);
-        assert_eq!(summary.block_rules, 13);
-        assert_eq!(summary.allow_rules, 3);
-        assert_eq!(summary.ignored_rules, 2);
-    }
-
-    /// 实测真实规模清单下"保存配置"（规则未变的热替换）的等待时间。默认跳过：
-    ///   $env:DNSBLACKHOLE_BENCH_DIR="<含 filters 子目录的数据目录>"
-    ///   cargo test --release --lib measures_real_scale_hot_swap -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn measures_real_scale_hot_swap_save() {
-        let _rule_load_guard = crate::dns::RULE_LOAD_TEST_GUARD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let data_dir = std::path::PathBuf::from(
-            std::env::var("DNSBLACKHOLE_BENCH_DIR")
-                .expect("需要设置 DNSBLACKHOLE_BENCH_DIR 指向含 filters 子目录的数据目录"),
-        );
-        let mut filters: Vec<_> = fs::read_dir(crate::storage::filters_dir(&data_dir))
-            .expect("filters 目录应可读")
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
-                    return None;
-                }
-                let id = path.file_stem()?.to_string_lossy().into_owned();
-                Some(FilterSubscription {
-                    name: id.clone(),
-                    // 实测只读本地缓存文件，地址仅用于通过配置校验
-                    url: format!("https://filters.invalid/{id}.txt"),
-                    id,
-                    enabled: true,
+        #[test]
+        fn configured_summary_uses_filter_metadata_without_reading_cache() {
+            let config = AppConfig {
+                filters: vec![FilterSubscription {
+                    block_rule_count: 12,
+                    allow_rule_count: 3,
+                    ignored_rule_count: 2,
+                    ignored_comment_count: 1,
+                    ignored_regex_count: 1,
                     ..FilterSubscription::default()
+                }],
+                blacklist: "||custom.example^".into(),
+                ..AppConfig::default()
+            };
+
+            let summary = service_core::configured_rule_summary(&config);
+            assert_eq!(summary.block_rules, 13);
+            assert_eq!(summary.allow_rules, 3);
+            assert_eq!(summary.ignored_rules, 2);
+        }
+
+        /// 实测真实规模清单下"保存配置"（规则未变的热替换）的等待时间。默认跳过：
+        ///   $env:DNSBLACKHOLE_BENCH_DIR="<含 filters 子目录的数据目录>"
+        ///   cargo test --release --lib measures_real_scale_hot_swap -- --ignored --nocapture
+        #[test]
+        #[ignore]
+        fn measures_real_scale_hot_swap_save() {
+            let _rule_load_guard = crate::dns::RULE_LOAD_TEST_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let data_dir = std::path::PathBuf::from(
+                std::env::var("DNSBLACKHOLE_BENCH_DIR")
+                    .expect("需要设置 DNSBLACKHOLE_BENCH_DIR 指向含 filters 子目录的数据目录"),
+            );
+            let mut filters: Vec<_> = fs::read_dir(crate::storage::filters_dir(&data_dir))
+                .expect("filters 目录应可读")
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+                        return None;
+                    }
+                    let id = path.file_stem()?.to_string_lossy().into_owned();
+                    Some(FilterSubscription {
+                        name: id.clone(),
+                        // 实测只读本地缓存文件，地址仅用于通过配置校验
+                        url: format!("https://filters.invalid/{id}.txt"),
+                        id,
+                        enabled: true,
+                        ..FilterSubscription::default()
+                    })
                 })
-            })
-            .collect();
-        filters.sort_by(|left, right| left.id.cmp(&right.id));
-        assert!(!filters.is_empty(), "filters 目录里没有 .txt 清单");
+                .collect();
+            filters.sort_by(|left, right| left.id.cmp(&right.id));
+            assert!(!filters.is_empty(), "filters 目录里没有 .txt 清单");
 
-        let port = free_dns_port();
-        let base = AppConfig {
-            listen_host: Ipv4Addr::LOCALHOST.to_string(),
-            listen_port: port,
-            listen_ipv6: false,
-            upstream_dns: "127.0.0.1:9".into(),
-            fallback_dns: String::new(),
-            query_log_enabled: false,
-            blacklist: String::new(),
-            filters,
-            ..AppConfig::default()
-        };
-        let database = Arc::new(Database::open_in_memory().unwrap());
-        let state = AppState::new(base.clone(), database, data_dir.clone(), data_dir.clone());
-        state.start_current().expect("DNS 应能启动");
+            let port = free_dns_port();
+            let base = AppConfig {
+                listen_host: Ipv4Addr::LOCALHOST.to_string(),
+                listen_port: port,
+                listen_ipv6: false,
+                upstream_dns: "127.0.0.1:9".into(),
+                fallback_dns: String::new(),
+                query_log_enabled: false,
+                blacklist: String::new(),
+                filters,
+                ..AppConfig::default()
+            };
+            let database = Arc::new(Database::open_in_memory().unwrap());
+            let state = AppState::new(base.clone(), database, data_dir.clone(), data_dir.clone());
+            state.start_current().expect("DNS 应能启动");
 
-        const ROUNDS: usize = 3;
-        fn measure(rounds: usize, mut run: impl FnMut(usize) -> u128) -> Vec<u128> {
-            (0..rounds).map(&mut run).collect()
+            const ROUNDS: usize = 3;
+            fn measure(rounds: usize, mut run: impl FnMut(usize) -> u128) -> Vec<u128> {
+                (0..rounds).map(&mut run).collect()
+            }
+            fn median(values: &[u128]) -> u128 {
+                let mut sorted = values.to_vec();
+                sorted.sort_unstable();
+                sorted[sorted.len() / 2]
+            }
+
+            // 场景一：改 DNS 重写。规则内容没变，是最常见的保存动作。
+            // forget_active_rules 复现优化前"内存里的编译结果用不上"的条件。
+            let mut prev = base.clone();
+            let rewrite_before = measure(ROUNDS, |round| {
+                let mut next = prev.clone();
+                next.dns_rewrites = format!("nas-before{round}.lan 192.168.1.10");
+                crate::dns::forget_active_rules();
+                let started = std::time::Instant::now();
+                assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
+                let elapsed = started.elapsed().as_millis();
+                prev = next;
+                elapsed
+            });
+            let rewrite_after = measure(ROUNDS, |round| {
+                let mut next = prev.clone();
+                next.dns_rewrites = format!("nas-after{round}.lan 192.168.1.11");
+                let started = std::time::Instant::now();
+                assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
+                let elapsed = started.elapsed().as_millis();
+                prev = next;
+                elapsed
+            });
+
+            // 场景二：改自定义规则。优化前 blacklist 参与整份指纹，缓存必然失效，
+            // 要重编全部清单规则；现在清单指纹不含 blacklist，缓存依旧可用。
+            // clear_rule_cache 复现"缓存对新指纹无效"这一优化前的等效条件。
+            let custom_before = measure(ROUNDS, |round| {
+                let mut next = prev.clone();
+                next.blacklist = format!("||before-{round}.example^");
+                crate::dns::clear_rule_cache(&data_dir).expect("规则缓存应可清理");
+                let started = std::time::Instant::now();
+                assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
+                let elapsed = started.elapsed().as_millis();
+                prev = next;
+                elapsed
+            });
+            let custom_after = measure(ROUNDS, |round| {
+                let domain = format!("after-{round}.example");
+                let mut next = prev.clone();
+                next.blacklist = format!("||{domain}^");
+                let started = std::time::Instant::now();
+                assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
+                let elapsed = started.elapsed().as_millis();
+                prev = next;
+                elapsed
+            });
+
+            // 场景三：重启路径（改上游/监听/缓存走这里）。停止旧实例前先保活，
+            // 规则未变时同样复用内存。注意这一项还包含 DNS 工作线程 join 的时间，
+            // 与规则加载无关且抖动较大，规则部分看日志里的"规则加载"。
+            let restart = measure(ROUNDS, |_| {
+                let started = std::time::Instant::now();
+                state.start_current().expect("DNS 应能重启");
+                started.elapsed().as_millis()
+            });
+
+            let summary = state.status(false).summary;
+            println!("\n===== 保存配置端到端实测（{ROUNDS} 轮取中位）=====");
+            println!(
+                "清单 {} 份，生效拦截规则 {} 条",
+                prev.filters.len(),
+                summary.block_rules
+            );
+            println!("【改 DNS 重写等·规则未变】优化点 1");
+            println!(
+                "  优化前（回磁盘反序列化）：{:>6} ms   {rewrite_before:?}",
+                median(&rewrite_before)
+            );
+            println!(
+                "  优化后（复用内存）：      {:>6} ms   {rewrite_after:?}",
+                median(&rewrite_after)
+            );
+            println!("【改自定义规则】优化点 2");
+            println!(
+                "  优化前（重编全部清单）：  {:>6} ms   {custom_before:?}",
+                median(&custom_before)
+            );
+            println!(
+                "  优化后（缓存+增量合并）： {:>6} ms   {custom_after:?}",
+                median(&custom_after)
+            );
+            println!("【重启路径·含线程 join 抖动】");
+            println!(
+                "  优化后：                  {:>6} ms   {restart:?}",
+                median(&restart)
+            );
+
+            state.stop_current().unwrap();
         }
-        fn median(values: &[u128]) -> u128 {
-            let mut sorted = values.to_vec();
-            sorted.sort_unstable();
-            sorted[sorted.len() / 2]
+
+        #[test]
+        fn filter_state_can_be_hot_swapped_without_restarting_server() {
+            // 规则加载的内存复用记录是进程级单例，与 rule_cache 的测试串行执行
+            let _rule_load_guard = crate::dns::RULE_LOAD_TEST_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let port = free_dns_port();
+            let previous = AppConfig {
+                listen_host: Ipv4Addr::LOCALHOST.to_string(),
+                listen_port: port,
+                listen_ipv6: false,
+                upstream_dns: "127.0.0.1:9".into(),
+                fallback_dns: String::new(),
+                query_log_enabled: false,
+                ..AppConfig::default()
+            };
+            let database = Arc::new(Database::open_in_memory().unwrap());
+            let data_dir = std::env::temp_dir().join(format!(
+                "dnsblackhole-hot-swap-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&data_dir).unwrap();
+            let state = AppState::new(previous.clone(), database, data_dir.clone(), data_dir);
+            state.start_current().unwrap();
+
+            let mut next = previous.clone();
+            next.blacklist = "||example.org^".into();
+            assert!(state.try_hot_swap(&previous, &next).unwrap());
+            assert_eq!(state.status(false).summary.block_rules, 1);
+            assert!(!state.server_needs_start().unwrap());
+
+            state.stop_current().unwrap();
+            fs::remove_dir_all(&state.data_dir).unwrap();
         }
-
-        // 场景一：改 DNS 重写。规则内容没变，是最常见的保存动作。
-        // forget_active_rules 复现优化前"内存里的编译结果用不上"的条件。
-        let mut prev = base.clone();
-        let rewrite_before = measure(ROUNDS, |round| {
-            let mut next = prev.clone();
-            next.dns_rewrites = format!("nas-before{round}.lan 192.168.1.10");
-            crate::dns::forget_active_rules();
-            let started = std::time::Instant::now();
-            assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
-            let elapsed = started.elapsed().as_millis();
-            prev = next;
-            elapsed
-        });
-        let rewrite_after = measure(ROUNDS, |round| {
-            let mut next = prev.clone();
-            next.dns_rewrites = format!("nas-after{round}.lan 192.168.1.11");
-            let started = std::time::Instant::now();
-            assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
-            let elapsed = started.elapsed().as_millis();
-            prev = next;
-            elapsed
-        });
-
-        // 场景二：改自定义规则。优化前 blacklist 参与整份指纹，缓存必然失效，
-        // 要重编全部清单规则；现在清单指纹不含 blacklist，缓存依旧可用。
-        // clear_rule_cache 复现"缓存对新指纹无效"这一优化前的等效条件。
-        let custom_before = measure(ROUNDS, |round| {
-            let mut next = prev.clone();
-            next.blacklist = format!("||before-{round}.example^");
-            crate::dns::clear_rule_cache(&data_dir).expect("规则缓存应可清理");
-            let started = std::time::Instant::now();
-            assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
-            let elapsed = started.elapsed().as_millis();
-            prev = next;
-            elapsed
-        });
-        let custom_after = measure(ROUNDS, |round| {
-            let domain = format!("after-{round}.example");
-            let mut next = prev.clone();
-            next.blacklist = format!("||{domain}^");
-            let started = std::time::Instant::now();
-            assert!(state.try_hot_swap(&prev, &next).expect("热替换应成功"));
-            let elapsed = started.elapsed().as_millis();
-            prev = next;
-            elapsed
-        });
-
-        // 场景三：重启路径（改上游/监听/缓存走这里）。停止旧实例前先保活，
-        // 规则未变时同样复用内存。注意这一项还包含 DNS 工作线程 join 的时间，
-        // 与规则加载无关且抖动较大，规则部分看日志里的"规则加载"。
-        let restart = measure(ROUNDS, |_| {
-            let started = std::time::Instant::now();
-            state.start_current().expect("DNS 应能重启");
-            started.elapsed().as_millis()
-        });
-
-        let summary = state.status(false).summary;
-        println!("\n===== 保存配置端到端实测（{ROUNDS} 轮取中位）=====");
-        println!(
-            "清单 {} 份，生效拦截规则 {} 条",
-            prev.filters.len(),
-            summary.block_rules
-        );
-        println!("【改 DNS 重写等·规则未变】优化点 1");
-        println!(
-            "  优化前（回磁盘反序列化）：{:>6} ms   {rewrite_before:?}",
-            median(&rewrite_before)
-        );
-        println!(
-            "  优化后（复用内存）：      {:>6} ms   {rewrite_after:?}",
-            median(&rewrite_after)
-        );
-        println!("【改自定义规则】优化点 2");
-        println!(
-            "  优化前（重编全部清单）：  {:>6} ms   {custom_before:?}",
-            median(&custom_before)
-        );
-        println!(
-            "  优化后（缓存+增量合并）： {:>6} ms   {custom_after:?}",
-            median(&custom_after)
-        );
-        println!("【重启路径·含线程 join 抖动】");
-        println!(
-            "  优化后：                  {:>6} ms   {restart:?}",
-            median(&restart)
-        );
-
-        state.stop_current().unwrap();
-    }
-
-    #[test]
-    fn filter_state_can_be_hot_swapped_without_restarting_server() {
-        // 规则加载的内存复用记录是进程级单例，与 rule_cache 的测试串行执行
-        let _rule_load_guard = crate::dns::RULE_LOAD_TEST_GUARD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let port = free_dns_port();
-        let previous = AppConfig {
-            listen_host: Ipv4Addr::LOCALHOST.to_string(),
-            listen_port: port,
-            listen_ipv6: false,
-            upstream_dns: "127.0.0.1:9".into(),
-            fallback_dns: String::new(),
-            query_log_enabled: false,
-            ..AppConfig::default()
-        };
-        let database = Arc::new(Database::open_in_memory().unwrap());
-        let data_dir = std::env::temp_dir().join(format!(
-            "dnsblackhole-hot-swap-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&data_dir).unwrap();
-        let state = AppState::new(previous.clone(), database, data_dir.clone(), data_dir);
-        state.start_current().unwrap();
-
-        let mut next = previous.clone();
-        next.blacklist = "||example.org^".into();
-        assert!(state.try_hot_swap(&previous, &next).unwrap());
-        assert_eq!(state.status(false).summary.block_rules, 1);
-        assert!(!state.server_needs_start().unwrap());
-
-        state.stop_current().unwrap();
-        fs::remove_dir_all(&state.data_dir).unwrap();
     }
 }
+
+#[cfg(feature = "desktop")]
+pub use desktop::run;

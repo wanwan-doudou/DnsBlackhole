@@ -1,0 +1,39 @@
+name: dnsblackhole
+
+services:
+  dnsblackhole:
+    build:
+      context: .
+    image: ${DNSBLACKHOLE_IMAGE:-ghcr.io/wanwan-doudou/dnsblackhole:0.2.5}
+    restart: unless-stopped
+    environment:
+      DNSBLACKHOLE_CONTAINER: "1"
+    ports:
+      - "${DNSBLACKHOLE_BIND_ADDRESS:-0.0.0.0}:53:53/udp"
+      - "${DNSBLACKHOLE_BIND_ADDRESS:-0.0.0.0}:53:53/tcp"
+      - "${DNSBLACKHOLE_BIND_ADDRESS:-0.0.0.0}:3000:3000/tcp"
+      - target: 53
+        published: "53"
+        host_ip: "${DNSBLACKHOLE_BIND_ADDRESS_V6:-::}"
+        protocol: udp
+      - target: 53
+        published: "53"
+        host_ip: "${DNSBLACKHOLE_BIND_ADDRESS_V6:-::}"
+        protocol: tcp
+      - target: 3000
+        published: "3000"
+        host_ip: "${DNSBLACKHOLE_BIND_ADDRESS_V6:-::}"
+        protocol: tcp
+    volumes:
+      - dnsblackhole-data:/var/lib/dnsblackhole
+    tmpfs:
+      - /run/dnsblackhole:mode=0755,uid=10001,gid=10001
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    stop_grace_period: 20s
+
+volumes:
+  dnsblackhole-data:

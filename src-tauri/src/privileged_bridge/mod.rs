@@ -2,12 +2,20 @@ use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod client;
 #[cfg(target_os = "macos")]
 mod daemon;
-#[cfg(any(target_os = "macos", windows))]
-mod rpc_server;
+#[cfg(all(feature = "system-service", target_os = "linux"))]
+mod linux_daemon;
+#[cfg(all(feature = "system-service", target_os = "linux"))]
+pub(crate) mod linux_system_dns;
+#[cfg(any(
+    target_os = "macos",
+    windows,
+    all(feature = "system-service", target_os = "linux")
+))]
+pub(crate) mod rpc_server;
 #[cfg(target_os = "macos")]
 mod service_management;
 #[cfg(windows)]
@@ -19,10 +27,12 @@ mod windows_service_management;
 #[cfg(windows)]
 mod windows_system_dns;
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(crate) use client::ServiceClient;
 #[cfg(target_os = "macos")]
 pub use daemon::run_daemon;
+#[cfg(all(feature = "system-service", target_os = "linux"))]
+pub use linux_daemon::run_daemon as run_linux_daemon;
 #[cfg(target_os = "macos")]
 pub(crate) use service_management::{
     ensure_macos_service_current, macos_service_install, macos_service_open_settings,
@@ -93,7 +103,7 @@ pub fn handle_windows_service_command() -> Option<Result<(), String>> {
 // 协议 6：系统 DNS 状态包含活动/备份网卡详情，并支持自定义恢复地址。
 // GUI 只通过本协议做配置、状态查询和日志读取，不再转发 DNS 查询。
 pub const BRIDGE_PROTOCOL_VERSION: u16 = 6;
-pub const BRIDGE_SOCKET_PATH: &str = "/var/run/dnsblackhole/service.sock";
+pub const BRIDGE_SOCKET_PATH: &str = "/run/dnsblackhole/service.sock";
 // 单帧上限：查询日志分页（最多 200 条记录）与统计快照都远小于该值
 const MAX_FRAME_SIZE: usize = 512 * 1024;
 

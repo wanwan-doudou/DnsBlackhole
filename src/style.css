@@ -488,6 +488,9 @@
   --control-green-bg: var(--brand-0);
   --button-bg: var(--neutral-0);
   --button-hover-bg: var(--info-0);
+  --field-height: 38px;
+  --field-radius: 7px;
+  --field-padding-inline: 13px;
   --layout-max-width: 1180px;
   --layout-gutter: clamp(18px, 2vw, 24px);
   --header-gap: clamp(14px, 2vw, 24px);
@@ -2869,20 +2872,20 @@ textarea,
 select {
   width: 100%;
   border: 1px solid var(--field-border);
-  border-radius: 4px;
+  border-radius: var(--field-radius);
   color: var(--info-6);
   background: var(--control-bg);
   outline: none;
 }
 
 .field input {
-  height: 36px;
-  padding: 0 10px;
+  height: var(--field-height);
+  padding: 0 var(--field-padding-inline);
 }
 
 select {
-  height: 36px;
-  padding: 0 10px;
+  height: var(--field-height);
+  padding: 0 var(--field-padding-inline);
 }
 
 .compact-select {
@@ -2917,13 +2920,13 @@ select.custom-select-native {
   width: 100%;
   max-width: 100%;
   min-width: 0;
-  height: 38px;
+  height: var(--field-height);
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   border-color: var(--field-border);
-  border-radius: 7px;
-  padding: 0 13px;
+  border-radius: var(--field-radius);
+  padding: 0 var(--field-padding-inline);
   color: var(--info-5);
   background: var(--control-bg);
   text-align: left;
@@ -3171,11 +3174,6 @@ select:focus {
   gap: 14px;
 }
 
-.client-policy-form-grid select {
-  width: 100%;
-  height: 42px;
-}
-
 .client-policy-schedule-toggle,
 .client-policy-custom {
   margin-top: 14px;
@@ -3224,6 +3222,15 @@ select:focus {
   font-size: 12px;
 }
 
+.weekday-options input[type="checkbox"],
+#client_policy_services input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--control-green);
+}
+
 .client-service-search {
   max-width: 360px;
   margin-top: 14px;
@@ -3265,10 +3272,38 @@ select:focus {
 }
 
 .client-policy-advanced summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  list-style: none;
   color: var(--neutral-24);
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
+}
+
+.client-policy-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.client-policy-advanced summary::after {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-right: 1.5px solid var(--neutral-21);
+  border-bottom: 1.5px solid var(--neutral-21);
+  content: "";
+  transform: rotate(45deg) translate(-1px, -1px);
+  transition: transform 0.16s ease;
+}
+
+.client-policy-advanced[open] summary::after {
+  transform: rotate(225deg) translate(-1px, -1px);
+}
+
+.client-policy-advanced summary:hover {
+  color: var(--green-hover);
 }
 
 .client-policy-advanced > p {

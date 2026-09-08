@@ -1,4 +1,5 @@
-import { exportQueryLogFile, getQueryLogs } from "./api";
+import { exportQueryLogFile, getQueryLogs, isTauriRuntime } from "./api";
+import { downloadBrowserFile } from "./browser-file";
 import type { QueryLogPage, QueryLogQuery, QueryLogRecord } from "./types";
 import { t } from "./i18n";
 
@@ -27,19 +28,30 @@ export async function exportFilteredQueryLogs(
   query: QueryLogQuery,
   onProgress?: (exported: number, total: number) => void,
 ): Promise<QueryLogExportResult | null> {
-  const { save } = await import("@tauri-apps/plugin-dialog");
-  const path = await save({
-    title: t("导出查询日志"),
-    defaultPath: `DnsBlackhole-query-logs-${dateStamp()}.csv`,
-    filters: [{ name: t("CSV 表格"), extensions: ["csv"] }],
-  });
-  if (!path) {
-    return null;
+  let path: string | null = null;
+  if (isTauriRuntime()) {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    path = await save({
+      title: t("导出查询日志"),
+      defaultPath: `DnsBlackhole-query-logs-${dateStamp()}.csv`,
+      filters: [{ name: t("CSV 表格"), extensions: ["csv"] }],
+    });
+    if (!path) {
+      return null;
+    }
   }
 
   const collected = await collectQueryLogExportRecords(query, getQueryLogs, onProgress);
   const content = serializeQueryLogsCsv(collected.records);
-  await exportQueryLogFile(path, content);
+  if (path) {
+    await exportQueryLogFile(path, content);
+  } else {
+    downloadBrowserFile(
+      `DnsBlackhole-query-logs-${dateStamp()}.csv`,
+      content,
+      "text/csv;charset=utf-8",
+    );
+  }
   return {
     exported: collected.exported,
     total: collected.total,

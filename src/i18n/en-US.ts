@@ -194,8 +194,8 @@ export const enUS: Record<string, string> = {
   "一次查询一台上游服务器，失败后尝试其它服务器。":
     "Queries one upstream at a time and falls back to the others on failure.",
   "并行请求": "Parallel requests",
-  "优先查询一个上游；25 毫秒内未成功时并发查询其余上游，并使用最先成功的响应。":
-    "Queries one upstream first; if it has not answered within 25 ms the rest are queried in parallel and the first success wins.",
+  "同时查询最多 8 个可用上游，并使用最先成功的响应。":
+    "Queries up to 8 available upstreams simultaneously and uses the first successful response.",
   "最快的 IP 地址": "Fastest IP address",
   "等待上游服务器响应，测速返回的 IP 地址，并优先采用最快的可用结果。":
     "Collects upstream answers, probes the returned addresses and prefers the fastest reachable result.",
@@ -481,6 +481,38 @@ export const enUS: Record<string, string> = {
     "Original DNS settings are saved per wired and wireless adapter. After switching networks the active adapter can be brought under management too.",
   "接管 DNS": "Take over DNS",
   "恢复 DNS": "Restore DNS",
+  "接管期间会关闭 systemd-resolved 的 stub 监听，并把系统解析指向 127.0.0.1；恢复时按事务备份还原。":
+    "While managed, the systemd-resolved stub listener is disabled and system resolution points at 127.0.0.1. Restoring reverts everything from the transaction backup.",
+  "修复系统 DNS 接管": "Repair system DNS takeover",
+  "修复接管": "Repair takeover",
+  "将按事务备份重新核验并接管：关闭 systemd-resolved 的 stub 监听，启用并启动 DnsBlackhole 的 DNS 服务并把监听端口设为 53，再把系统解析指向 127.0.0.1。任何一步失败都会自动回滚到原 DNS。是否继续？":
+    "The takeover will be re-verified against the transaction backup: the systemd-resolved stub listener is disabled, the DnsBlackhole DNS service is enabled and started with the listen port set to 53, and system resolution points at 127.0.0.1. Any failing step rolls back to the original DNS automatically. Continue?",
+  "接管后会启用并启动 DnsBlackhole 的 DNS 服务、把监听端口设为 53，写入 systemd-resolved 配置片段并把 /etc/resolv.conf 指向 resolved 运行时文件，系统解析改为 127.0.0.1。原有配置会先事务化备份，可随时恢复；任何一步失败都会自动回滚。是否继续？":
+    "Taking over enables and starts the DnsBlackhole DNS service, sets the listen port to 53, writes a systemd-resolved drop-in, points /etc/resolv.conf at the resolved runtime file, and switches system resolution to 127.0.0.1. The current settings are backed up in a transaction first and can be restored at any time; any failing step rolls back automatically. Continue?",
+  "系统 DNS 接管未生效，请查看状态说明":
+    "The system DNS takeover did not take effect. Check the status message.",
+  "恢复系统 DNS": "Restore system DNS",
+  "恢复会停止 DnsBlackhole 的 DNS 服务并关闭自动运行，再还原原有 /etc/resolv.conf 与 systemd-resolved 配置。由于通配 53 端口与 resolved stub 冲突，恢复后 DnsBlackhole 不会继续监听 53。是否继续？":
+    "Restoring stops the DnsBlackhole DNS service, turns off automatic startup, and reverts the original /etc/resolv.conf and systemd-resolved settings. Because a wildcard port 53 bind conflicts with the resolved stub, DnsBlackhole will not keep listening on 53 afterwards. Continue?",
+  "系统 DNS 恢复未完成，请查看状态说明":
+    "The system DNS restore did not finish. Check the status message.",
+  "原系统 DNS 已恢复": "The original system DNS has been restored",
+  "请确认 DnsBlackhole 后台服务正在运行。":
+    "Make sure the DnsBlackhole background service is running.",
+  "/etc/resolv.conf → {p0}": "/etc/resolv.conf → {p0}",
+  "/etc/resolv.conf 不是符号链接": "/etc/resolv.conf is not a symlink",
+  "systemd-resolved 运行中": "systemd-resolved is running",
+  "systemd-resolved 未运行": "systemd-resolved is not running",
+  "接管后的文件已被外部修改，已停止自动覆盖。请人工检查后再恢复。当前：{p0}；{p1}。":
+    "The managed files were changed outside DnsBlackhole, so automatic overwriting has stopped. Check them manually before restoring. Current state: {p0}; {p1}.",
+  "上次事务未完成。请先执行恢复；后台服务不可用时可用 sudo dnsblackhole-service system-dns restore --offline。当前：{p0}；{p1}。":
+    "The previous transaction did not finish. Restore first; when the background service is unavailable, use sudo dnsblackhole-service system-dns restore --offline. Current state: {p0}; {p1}.",
+  "系统解析已指向 127.0.0.1，resolved 的 stub 监听已关闭。当前：{p0}；{p1}。":
+    "System resolution points at 127.0.0.1 and the resolved stub listener is disabled. Current state: {p0}; {p1}.",
+  "当前环境不支持自动管理系统 DNS，请手动配置。当前：{p0}；{p1}。":
+    "This environment does not support automatic system DNS management. Configure it manually. Current state: {p0}; {p1}.",
+  "首版只支持 systemd 与 systemd-resolved；接管会自动把监听端口设为 53，但监听地址必须覆盖回环、上游不能指回本机。当前：{p0}；{p1}。":
+    "The first release supports only systemd with systemd-resolved. Taking over sets the listen port to 53 for you, but the listen address must cover loopback and no upstream may point back at this machine. Current state: {p0}; {p1}.",
   "解除本机 DNS": "Release local DNS",
   "当前没有原 DNS 备份，请选择解除后使用的 DNS。只会修改仍指向 127.0.0.1 或 ::1 的设置。":
     "No original DNS backup exists. Choose what to use after releasing. Only adapters still pointing at 127.0.0.1 or ::1 are changed.",
@@ -643,12 +675,14 @@ export const enUS: Record<string, string> = {
   // ---------- 运行状态与平台 ----------
   "缺少应用挂载节点": "Application mount point is missing",
   "当前桌面平台": "This desktop platform",
+  "Web 管理后台": "Web admin",
   "已连接{p0}": "Connected{p0}",
   "需要修复{p0}": "Needs repair{p0}",
   "尚未安装": "Not installed",
   "已启用{p0}": "Enabled{p0}",
   "需要处理": "Needs attention",
   "当前平台无需系统服务": "No system service is needed on this platform",
+  "由服务端提供": "Provided by the server",
   "保护已暂停": "Protection paused",
   "保护运行中": "Protection active",
   "当前未运行": "Not running",

@@ -465,7 +465,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                   <input name="upstream_mode" type="radio" value="parallel_requests" />
                   <span>
                     <strong>${t("并行请求")}</strong>
-                    <small>${t("优先查询一个上游；25 毫秒内未成功时并发查询其余上游，并使用最先成功的响应。")}</small>
+                    <small>${t("同时查询最多 8 个可用上游，并使用最先成功的响应。")}</small>
                   </span>
                 </label>
                 <label class="radio-row">
@@ -761,7 +761,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                     </label>
                   </div>
                   <label class="check-row"><input id="client_policy_safe_search" type="checkbox" /><span><strong>${t("启用安全搜索")}</strong></span></label>
-                  <label class="field client-service-search"><span>${t("搜索常用服务")}</span><input id="client_policy_service_search" type="search" autocomplete="off" placeholder="YouTube" /></label>
+                  <label class="field client-service-search"><span>${t("搜索常用服务")}</span><input id="client_policy_service_search" type="search" autocomplete="off" spellcheck="false" placeholder="YouTube" /></label>
                   <fieldset class="client-service-picker">
                     <legend>${t("需要拦截的服务")}</legend>
                     <div id="client_policy_services"></div>
@@ -1028,7 +1028,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <input id="enabled" type="checkbox" />
                 <span>${t("启动时自动运行 DNS 服务")}</span>
               </label>
-              <label class="toggle-row">
+              <label class="toggle-row" data-desktop-only>
                 <input id="launch_at_startup" type="checkbox" />
                 <span>${t("开机时启动应用")}</span>
               </label>
@@ -1090,6 +1090,18 @@ export function renderAppTemplate(appIconUrl: string): string {
               <div class="button-group background-service-actions">
                 <button class="primary" id="install_windows_service_btn" type="button">${t("安装或修复")}</button>
                 <button id="uninstall_windows_service_btn" type="button">${t("卸载服务")}</button>
+              </div>
+            </section>
+
+            <section class="settings-section settings-section-wide background-service-section hidden" id="linux_system_dns_section">
+              <div>
+                <h3>${t("系统 DNS")}</h3>
+                <p id="linux_system_dns_status">${t("正在读取系统 DNS 状态…")}</p>
+                <small id="linux_system_dns_detail">${t("接管期间会关闭 systemd-resolved 的 stub 监听，并把系统解析指向 127.0.0.1；恢复时按事务备份还原。")}</small>
+              </div>
+              <div class="button-group background-service-actions">
+                <button class="primary" id="take_over_linux_system_dns_btn" type="button">${t("接管 DNS")}</button>
+                <button id="restore_linux_system_dns_btn" type="button">${t("恢复 DNS")}</button>
               </div>
             </section>
 
@@ -1199,7 +1211,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </div>
             </section>
 
-            <section class="settings-section data-storage-section settings-section-wide">
+            <section class="settings-section data-storage-section settings-section-wide" data-desktop-only>
               <div class="section-heading">
                 <h3>${t("数据存储")}</h3>
                 <span>${t("查询日志、统计数据库和过滤器数据会保存在此目录。可迁移到空目录，也可在重装系统后安全使用保留的现有数据。")}</span>
@@ -1375,7 +1387,7 @@ export function renderAppTemplate(appIconUrl: string): string {
               </dl>
             </section>
 
-            <section class="about-update-section" aria-labelledby="about_update_title">
+            <section class="about-update-section" aria-labelledby="about_update_title" data-desktop-only>
               <div class="about-update-copy">
                 <span class="about-update-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 20h14" /></svg>
