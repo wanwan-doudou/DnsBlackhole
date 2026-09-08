@@ -46,6 +46,9 @@ function readStoredPreference(): LocalePreference {
 
 let preference: LocalePreference = readStoredPreference();
 let active: Locale = preference === "system" ? detectSystemLocale() : preference;
+if (typeof document !== "undefined") {
+  document.documentElement.lang = active;
+}
 
 export function getLocalePreference(): LocalePreference {
   return preference;

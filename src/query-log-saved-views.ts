@@ -94,10 +94,16 @@ function parseQuery(value: unknown): QueryLogQuery | null {
   const queryTypes = ["all", "a", "aaaa", "https", "other"] as const;
   const sorts = ["newest", "oldest", "slowest"] as const;
   const hours = value.hours;
+  const domain = value.domain;
   if (
     !filters.includes(value.filter as (typeof filters)[number]) ||
     typeof value.search !== "string" ||
     value.search.length > 512 ||
+    !(
+      domain === undefined ||
+      domain === null ||
+      (typeof domain === "string" && domain.trim().length > 0 && domain.length <= 253)
+    ) ||
     !(hours === null || (typeof hours === "number" && Number.isFinite(hours) && hours > 0)) ||
     !sources.includes(value.source as (typeof sources)[number]) ||
     !queryTypes.includes(value.queryType as (typeof queryTypes)[number]) ||
@@ -105,7 +111,15 @@ function parseQuery(value: unknown): QueryLogQuery | null {
   ) {
     return null;
   }
-  return value as QueryLogQuery;
+  return {
+    filter: value.filter as QueryLogQuery["filter"],
+    search: value.search,
+    domain: typeof domain === "string" ? domain.trim() : null,
+    hours,
+    source: value.source as QueryLogQuery["source"],
+    queryType: value.queryType as QueryLogQuery["queryType"],
+    sort: value.sort as QueryLogQuery["sort"],
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

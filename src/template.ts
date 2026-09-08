@@ -51,6 +51,16 @@ export function renderAppTemplate(appIconUrl: string): string {
     </header>
 
     <main class="content">
+      <aside class="config-change-bar hidden" id="config_change_bar" aria-live="polite">
+        <div>
+          <strong>${t("有未保存的更改")}</strong>
+          <span id="config_change_modules"></span>
+        </div>
+        <div class="button-group">
+          <button id="discard_config_btn" type="button">${t("放弃更改")}</button>
+          <button class="primary" id="save_all_config_btn" type="button">${t("保存全部更改")}</button>
+        </div>
+      </aside>
       <section class="view active" data-view-panel="dashboard">
         <div class="dashboard-controls">
           <div>
@@ -67,6 +77,9 @@ export function renderAppTemplate(appIconUrl: string): string {
               <option value="0">${t("全部历史")}</option>
             </select>
           </label>
+        </div>
+        <div class="dashboard-state loading" id="dashboard_state" role="status" aria-live="polite">
+          ${t("正在加载统计数据…")}
         </div>
         <div class="dashboard-summary" aria-label="${t("统计趋势")}">
           <article class="spark-card">
@@ -131,7 +144,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <span>${t("域名")}</span>
                 <span>${t("请求数")}</span>
               </div>
-              <div class="rank-body" id="query_rank"></div>
+              <div class="rank-body is-empty" id="query_rank"></div>
             </div>
           </section>
 
@@ -148,7 +161,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <span>${t("域名")}</span>
                 <span>${t("请求数")}</span>
               </div>
-              <div class="rank-body" id="blocked_rank"></div>
+              <div class="rank-body is-empty" id="blocked_rank"></div>
             </div>
           </section>
         </div>
@@ -165,10 +178,11 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="rank-table client-rank-table">
               <div class="rank-head client-rank-head">
                 <span>${t("客户端")}</span>
+                <span>${t("当前策略")}</span>
                 <span>${t("请求数")}</span>
                 <span>${t("拦截率")}</span>
               </div>
-              <div class="rank-body" id="client_rank"></div>
+              <div class="rank-body is-empty" id="client_rank"></div>
             </div>
           </section>
 
@@ -185,7 +199,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <span>${t("黑名单")}</span>
                 <span>${t("拦截数")}</span>
               </div>
-              <div class="rank-body" id="blocklist_rank"></div>
+              <div class="rank-body is-empty" id="blocklist_rank"></div>
             </div>
           </section>
         </div>
@@ -204,7 +218,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <span>${t("上游服务器")}</span>
                 <span>${t("请求数")}</span>
               </div>
-              <div class="rank-body" id="upstream_rank"></div>
+              <div class="rank-body is-empty" id="upstream_rank"></div>
             </div>
           </section>
 
@@ -221,7 +235,7 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <span>${t("上游服务器")}</span>
                 <span>${t("响应时间")}</span>
               </div>
-              <div class="rank-body" id="upstream_latency_rank"></div>
+              <div class="rank-body is-empty" id="upstream_latency_rank"></div>
             </div>
           </section>
         </div>
@@ -266,61 +280,69 @@ export function renderAppTemplate(appIconUrl: string): string {
             </button>
           </div>
           <div class="query-log-advanced-panel" id="query_log_advanced_panel" hidden>
-            <label>
-              <span>${t("时间范围")}</span>
-              <select id="query_log_time_range">
-                <option value="configured">${t("按日志保留设置")}</option>
-                <option value="1">${t("最近 1 小时")}</option>
-                <option value="24">${t("最近 24 小时")}</option>
-                <option value="168">${t("最近 7 天")}</option>
-                <option value="720">${t("最近 30 天")}</option>
-              </select>
-            </label>
-            <label>
-              <span>${t("响应来源")}</span>
-              <select id="query_log_source">
-                <option value="all">${t("全部来源")}</option>
-                <option value="upstream">${t("上游服务器")}</option>
-                <option value="cache">${t("DNS 缓存")}</option>
-                <option value="rewrite">${t("DNS 重写")}</option>
-                <option value="local_reverse">${t("本地反查")}</option>
-                <option value="blocked">${t("过滤规则")}</option>
-                <option value="refused">${t("拒绝响应")}</option>
-              </select>
-            </label>
-            <label>
-              <span>${t("查询类型")}</span>
-              <select id="query_log_query_type">
-                <option value="all">${t("全部类型")}</option>
-                <option value="a">${t("A（IPv4）")}</option>
-                <option value="aaaa">${t("AAAA（IPv6）")}</option>
-                <option value="https">HTTPS</option>
-                <option value="other">${t("其他类型")}</option>
-              </select>
-            </label>
-            <label>
-              <span>${t("排序方式")}</span>
-              <select id="query_log_sort">
-                <option value="newest">${t("最新优先")}</option>
-                <option value="oldest">${t("最早优先")}</option>
-                <option value="slowest">${t("最慢优先")}</option>
-              </select>
-            </label>
-            <label class="query-log-saved-view-select">
-              <span>${t("保存的视图")}</span>
-              <select id="query_log_saved_view">
-                <option value="">${t("选择已保存视图")}</option>
-              </select>
-            </label>
-            <label class="query-log-view-name">
-              <span>${t("视图名称")}</span>
-              <input id="query_log_view_name" type="text" maxlength="40" autocomplete="off" placeholder="${t("例如 夜间失败查询")}" />
-            </label>
-            <div class="query-log-view-actions">
-              <button id="query_log_save_view_btn" type="button">${t("保存当前")}</button>
-              <button id="query_log_delete_view_btn" type="button" disabled>${t("删除")}</button>
+            <div class="query-log-filter-fields">
+              <label>
+                <span>${t("时间范围")}</span>
+                <select id="query_log_time_range">
+                  <option value="configured">${t("按日志保留设置")}</option>
+                  <option value="1">${t("最近 1 小时")}</option>
+                  <option value="24">${t("最近 24 小时")}</option>
+                  <option value="168">${t("最近 7 天")}</option>
+                  <option value="720">${t("最近 30 天")}</option>
+                </select>
+              </label>
+              <label>
+                <span>${t("响应来源")}</span>
+                <select id="query_log_source">
+                  <option value="all">${t("全部来源")}</option>
+                  <option value="upstream">${t("上游服务器")}</option>
+                  <option value="cache">${t("DNS 缓存")}</option>
+                  <option value="rewrite">${t("DNS 重写")}</option>
+                  <option value="local_reverse">${t("本地反查")}</option>
+                  <option value="blocked">${t("过滤规则")}</option>
+                  <option value="refused">${t("拒绝响应")}</option>
+                </select>
+              </label>
+              <label>
+                <span>${t("查询类型")}</span>
+                <select id="query_log_query_type">
+                  <option value="all">${t("全部类型")}</option>
+                  <option value="a">${t("A（IPv4）")}</option>
+                  <option value="aaaa">${t("AAAA（IPv6）")}</option>
+                  <option value="https">HTTPS</option>
+                  <option value="other">${t("其他类型")}</option>
+                </select>
+              </label>
+              <label>
+                <span>${t("排序方式")}</span>
+                <select id="query_log_sort">
+                  <option value="newest">${t("最新优先")}</option>
+                  <option value="oldest">${t("最早优先")}</option>
+                  <option value="slowest">${t("最慢优先")}</option>
+                </select>
+              </label>
             </div>
-            <button class="query-log-reset-button" id="query_log_reset_btn" type="button">${t("重置筛选")}</button>
+            <div class="query-log-saved-views">
+              <label class="query-log-saved-view-select">
+                <span>${t("保存的视图")}</span>
+                <select id="query_log_saved_view">
+                  <option value="">${t("选择已保存视图")}</option>
+                </select>
+              </label>
+              <label class="query-log-view-name">
+                <span>${t("视图名称")}</span>
+                <input id="query_log_view_name" type="text" maxlength="40" autocomplete="off" placeholder="${t("例如 夜间失败查询")}" />
+              </label>
+              <div class="query-log-view-actions">
+                <button class="primary" id="query_log_save_view_btn" type="button">${t("保存当前")}</button>
+                <button id="query_log_delete_view_btn" type="button" disabled>${t("删除")}</button>
+              </div>
+              <button class="query-log-reset-button" id="query_log_reset_btn" type="button">${t("重置筛选")}</button>
+            </div>
+          </div>
+          <div class="query-log-drilldown hidden" id="query_log_drilldown" role="status">
+            <span id="query_log_drilldown_text"></span>
+            <button id="query_log_drilldown_clear_btn" type="button">${t("清除排行筛选")}</button>
           </div>
         </div>
 
@@ -374,7 +396,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <h2>${t("DNS 设置")}</h2>
             <div class="button-group">
               <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
-              <button class="primary" id="save_btn" type="button">${t("保存更改")}</button>
+              <button class="primary" id="save_btn" type="button">${t("保存全部更改")}</button>
               <button id="start_btn" type="button">${t("启动")}</button>
               <button id="stop_btn" type="button">${t("停止")}</button>
             </div>
@@ -402,8 +424,13 @@ export function renderAppTemplate(appIconUrl: string): string {
                     <input id="listen_ipv6" type="checkbox" />
                     <span>
                       <strong>${t("监听 IPv6")}</strong>
-                      <small>${t("开启后额外绑定 [::]:同一端口，同时接受 IPv4 与 IPv6 DNS 请求。")}</small>
+                      <small>${t("开启后在下方地址绑定同一端口，同时接受 IPv4 与 IPv6 DNS 请求。")}</small>
                     </span>
+                  </label>
+                  <label class="field ipv6-listen-address-field">
+                    <span>${t("IPv6 监听地址")}</span>
+                    <small id="listen_ipv6_host_hint">${t("使用 :: 监听所有本机 IPv6 地址，或填写 ::1、指定的本机 IPv6 地址。")}</small>
+                    <input id="listen_ipv6_host" autocomplete="off" spellcheck="false" placeholder="::" aria-describedby="listen_ipv6_host_hint" disabled />
                   </label>
                 </div>
               </div>
@@ -650,7 +677,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <h2>${t("安全防护")}</h2>
             <div class="button-group">
               <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
-              <button class="primary" id="save_security_btn" type="button">${t("保存更改")}</button>
+              <button class="primary" id="save_security_btn" type="button">${t("保存全部更改")}</button>
             </div>
           </div>
 
@@ -677,18 +704,94 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <small>${t("每行一条“IP 名称”，例如 192.168.1.23 客厅电视。查询日志会用名称代替 IP 展示。")}</small>
                 <textarea id="client_names" autocomplete="off" spellcheck="false" placeholder="${t("192.168.1.23 客厅电视")}"></textarea>
               </label>
-              <label class="field access-list-field client-names-field">
-                <span>${t("客户端过滤策略")}</span>
-                <small>${t("每行一条“IP/CIDR =&gt; 策略组 [@ 周期 时间]”，最长 CIDR 优先。周期使用 mon-sun 或 daily，支持跨午夜时段。")}</small>
-                <textarea id="client_filtering_rules" autocomplete="off" spellcheck="false" placeholder="192.168.1.50 =&gt; family @ mon-fri 20:00-07:00&#10;192.168.1.0/24 =&gt; filter"></textarea>
-              </label>
-              <div class="dns-security-grid client-policy-grid">
-                <label class="field access-list-field">
-                  <span>${t("自定义策略组")}</span>
-                  <small>${t("格式：名称 =&gt; filter|bypass, safe_search, block:服务|服务。可用服务见右侧说明。")}</small>
-                  <textarea id="client_policy_groups" autocomplete="off" spellcheck="false" placeholder="study =&gt; filter, safe_search, block:youtube|tiktok"></textarea>
+              <section class="client-policy-builder" aria-labelledby="client_policy_builder_title">
+                <div class="section-heading compact-heading">
+                  <h4 id="client_policy_builder_title">${t("添加或编辑客户端策略")}</h4>
+                  <span>${t("同一客户端或网段再次应用会更新原规则；更具体的网段优先匹配。")}</span>
+                </div>
+                <div class="client-policy-form-grid">
+                  <label class="field">
+                    <span>${t("客户端或网段")}</span>
+                    <input id="client_policy_target" autocomplete="off" spellcheck="false" placeholder="192.168.1.50 或 192.168.1.0/24" aria-describedby="client_policy_target_error" />
+                    <small class="field-error hidden" id="client_policy_target_error"></small>
+                  </label>
+                  <label class="field">
+                    <span>${t("策略组")}</span>
+                    <select id="client_policy_profile">
+                      <option value="filter">${t("标准过滤")}</option>
+                      <option value="bypass">${t("不过滤")}</option>
+                      <option value="family">${t("家庭保护")}</option>
+                      <option value="__custom__">${t("新建或编辑自定义组…")}</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="check-row client-policy-schedule-toggle">
+                  <input id="client_policy_schedule_enabled" type="checkbox" />
+                  <span>
+                    <strong>${t("仅在指定时段使用此策略")}</strong>
+                    <small>${t("时段外继续按其它匹配规则处理；没有其它规则时使用标准过滤。结束时间早于开始时间表示跨午夜。")}</small>
+                  </span>
                 </label>
-                <div class="family-policy-fields">
+                <div class="client-policy-schedule hidden" id="client_policy_schedule">
+                  <fieldset>
+                    <legend>${t("生效日期")}</legend>
+                    <div class="weekday-options">
+                      <label><input type="checkbox" value="mon" checked />${t("一")}</label>
+                      <label><input type="checkbox" value="tue" checked />${t("二")}</label>
+                      <label><input type="checkbox" value="wed" checked />${t("三")}</label>
+                      <label><input type="checkbox" value="thu" checked />${t("四")}</label>
+                      <label><input type="checkbox" value="fri" checked />${t("五")}</label>
+                      <label><input type="checkbox" value="sat" checked />${t("六")}</label>
+                      <label><input type="checkbox" value="sun" checked />${t("日")}</label>
+                    </div>
+                  </fieldset>
+                  <label class="field"><span>${t("开始时间")}</span><input id="client_policy_start" type="time" value="20:00" /></label>
+                  <label class="field"><span>${t("结束时间")}</span><input id="client_policy_end" type="time" value="07:00" /></label>
+                </div>
+                <div class="client-policy-custom hidden" id="client_policy_custom">
+                  <div class="client-policy-form-grid">
+                    <label class="field">
+                      <span>${t("自定义组名称")}</span>
+                      <input id="client_policy_group_name" autocomplete="off" spellcheck="false" placeholder="study" aria-describedby="client_policy_group_name_error" />
+                      <small class="field-error hidden" id="client_policy_group_name_error"></small>
+                    </label>
+                    <label class="field">
+                      <span>${t("过滤模式")}</span>
+                      <select id="client_policy_group_mode"><option value="filter">${t("标准过滤")}</option><option value="bypass">${t("不过滤")}</option></select>
+                    </label>
+                  </div>
+                  <label class="check-row"><input id="client_policy_safe_search" type="checkbox" /><span><strong>${t("启用安全搜索")}</strong></span></label>
+                  <label class="field client-service-search"><span>${t("搜索常用服务")}</span><input id="client_policy_service_search" type="search" autocomplete="off" placeholder="YouTube" /></label>
+                  <fieldset class="client-service-picker">
+                    <legend>${t("需要拦截的服务")}</legend>
+                    <div id="client_policy_services"></div>
+                  </fieldset>
+                </div>
+                <div class="client-policy-actions">
+                  <span id="client_policy_form_status" role="status" aria-live="polite"></span>
+                  <div class="button-group">
+                    <button id="client_policy_clear_btn" type="button">${t("清空表单")}</button>
+                    <button class="primary" id="client_policy_apply_btn" type="button">${t("应用到草稿")}</button>
+                  </div>
+                </div>
+              </section>
+              <details class="client-policy-advanced">
+                <summary>${t("高级文本编辑")}</summary>
+                <p>${t("表单会生成现有配置语法；高级规则可继续在此直接编辑。")}</p>
+                <div class="dns-security-grid client-policy-grid">
+                  <label class="field access-list-field">
+                    <span>${t("客户端过滤策略")}</span>
+                    <small>${t("格式：IP/CIDR =&gt; 策略组 [@ 周期 时间]。周期使用 mon-sun 或 daily，支持跨午夜时段。")}</small>
+                    <textarea id="client_filtering_rules" autocomplete="off" spellcheck="false" placeholder="192.168.1.50 =&gt; family @ mon-fri 20:00-07:00&#10;192.168.1.0/24 =&gt; filter"></textarea>
+                  </label>
+                  <label class="field access-list-field">
+                    <span>${t("自定义策略组")}</span>
+                    <small>${t("格式：名称 =&gt; filter|bypass, safe_search, block:服务|服务。")}</small>
+                    <textarea id="client_policy_groups" autocomplete="off" spellcheck="false" placeholder="study =&gt; filter, safe_search, block:youtube|tiktok"></textarea>
+                  </label>
+                </div>
+              </details>
+              <div class="family-policy-fields">
                   <label class="check-row">
                     <input id="family_safe_search" type="checkbox" />
                     <span>
@@ -701,7 +804,6 @@ export function renderAppTemplate(appIconUrl: string): string {
                     <small>${t("逗号或换行分隔：youtube、tiktok、instagram、facebook、x、reddit、twitch、discord、steam、epic、roblox。")}</small>
                     <textarea id="family_blocked_services" autocomplete="off" spellcheck="false"></textarea>
                   </label>
-                </div>
               </div>
             </section>
 
@@ -895,7 +997,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             </div>
             <div class="button-group">
               <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
-              <button class="primary" id="save_settings_btn" type="button">${t("保存更改")}</button>
+              <button class="primary" id="save_settings_btn" type="button">${t("保存全部更改")}</button>
             </div>
           </div>
 
@@ -1367,7 +1469,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <div class="button-group">
               <span class="filter-update-progress hidden" id="filter_update_progress" role="status"></span>
               <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
-              <button id="save_filters_btn" type="button">${t("保存更改")}</button>
+              <button id="save_filters_btn" type="button">${t("保存全部更改")}</button>
               <button id="add_filter_btn" type="button">${t("添加黑名单")}</button>
               <button class="hidden" id="cancel_filter_update_btn" type="button">${t("取消更新")}</button>
               <button class="primary" id="update_filters_btn" type="button">${t("检查更新")}</button>
@@ -1393,7 +1495,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <h2>${t("自定义过滤规则")}</h2>
             <div class="button-group">
               <span class="save-state-label" aria-live="polite">${t("正在读取配置")}</span>
-              <button class="primary" id="save_custom_btn" type="button">${t("保存更改")}</button>
+              <button class="primary" id="save_custom_btn" type="button">${t("保存全部更改")}</button>
             </div>
           </div>
           <div class="rule-editor-toolbar">
@@ -1426,6 +1528,24 @@ export function renderAppTemplate(appIconUrl: string): string {
         </section>
       </section>
     </main>
+
+    <dialog class="update-dialog confirm-dialog" id="confirm_dialog" aria-labelledby="confirm_dialog_title" aria-describedby="confirm_dialog_message">
+      <div class="update-dialog-panel">
+        <div class="update-dialog-header">
+          <div>
+            <span class="update-dialog-kicker" id="confirm_dialog_kicker">${t("确认操作")}</span>
+            <h3 id="confirm_dialog_title">${t("确认操作")}</h3>
+          </div>
+        </div>
+        <div class="update-dialog-body">
+          <p id="confirm_dialog_message"></p>
+        </div>
+        <div class="update-dialog-footer">
+          <button id="confirm_dialog_cancel_btn" type="button">${t("取消")}</button>
+          <button class="primary confirm-dialog-accept" id="confirm_dialog_accept_btn" type="button">${t("确定")}</button>
+        </div>
+      </div>
+    </dialog>
   </div>
 `;
 }

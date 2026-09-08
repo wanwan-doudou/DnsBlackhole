@@ -116,6 +116,7 @@ fn redact_config(config: &mut AppConfig) {
     redact_lines(&mut config.statistics_ignored_domains);
     redact_lines(&mut config.blacklist);
     config.listen_host = "<已隐藏>".to_string();
+    config.listen_ipv6_host = "<已隐藏>".to_string();
     config.monitoring_api_listen_host = "<已隐藏>".to_string();
     config.monitoring_api_token = redact_value(&config.monitoring_api_token);
     config.blocking_custom_ipv4 = redact_value(&config.blocking_custom_ipv4);

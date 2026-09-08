@@ -2139,6 +2139,15 @@ mod tests {
         println!("\n===== 上游完全不可达时的查询等待（{QUERIES} 次 / 10 秒窗口，4 个上游）=====");
         summarize("修复前（每上游各一个探测名额）：", &legacy);
         summarize("修复后（全局共享名额，5 秒一次）：", &fixed);
+        let legacy_slow = legacy.iter().filter(|wait| **wait >= 100).count();
+        let fixed_slow = fixed.iter().filter(|wait| **wait >= 100).count();
+        let legacy_total: u128 = legacy.iter().sum();
+        let fixed_total: u128 = fixed.iter().sum();
+        assert!(fixed_slow < legacy_slow / 2, "受控探测应显著减少超时查询");
+        assert!(
+            fixed_total < legacy_total / 2,
+            "故障窗口总等待应至少降低一半"
+        );
     }
 
     /// 探测名额必须是全局的：多个上游同时退避时，一轮里也只放行一个探测。

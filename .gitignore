@@ -30,6 +30,9 @@ src-tauri/binaries/
 # 内部移植执行清单，只在本地维护，不进入公开仓库
 MACOS_PORTING_PLAN.md
 
+# 新版本规划只在本地维护，不进入公开仓库
+新版本规划/v0.2.4.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

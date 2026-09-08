@@ -114,7 +114,56 @@ export const enUS: Record<string, string> = {
 
   // ---------- 通用操作 ----------
   "正在读取配置": "Loading configuration",
-  "保存更改": "Save changes",
+  "保存全部更改": "Save all changes",
+  "放弃更改": "Discard changes",
+  "已放弃未保存的更改": "Unsaved changes discarded",
+
+  // ---------- 确认对话框 ----------
+  "确认操作": "Confirm",
+  "危险操作": "Destructive action",
+  "确定": "OK",
+  "放弃未保存的更改": "Discard unsaved changes",
+  "将丢弃以下模块的未保存更改并重新载入已保存配置：{p0}。此操作无法撤销。":
+    "Unsaved changes in these sections will be discarded and the saved configuration reloaded: {p0}. This cannot be undone.",
+  "将丢弃全部未保存更改并重新载入已保存配置。此操作无法撤销。":
+    "All unsaved changes will be discarded and the saved configuration reloaded. This cannot be undone.",
+  "删除查询视图": "Delete saved view",
+  "删除查询视图“{p0}”？该视图只保存在本机，删除后无法恢复。":
+    "Delete the view \"{p0}\"? It is stored only on this machine and cannot be recovered.",
+  "继续导出": "Export",
+  "从备份恢复配置": "Restore configuration from backup",
+  "继续恢复": "Restore",
+  "清理规则编译缓存": "Clear compiled rule cache",
+  "接管现有数据目录": "Adopt existing data directory",
+  "迁移数据目录": "Migrate data directory",
+  "接管并重启": "Adopt and restart",
+  "卸载 macOS 后台服务": "Uninstall macOS background service",
+  "卸载 Windows DNS 系统服务": "Uninstall Windows DNS system service",
+  "清除日志": "Clear log",
+  "清除统计": "Clear statistics",
+  "清除事件": "Clear events",
+  "同步接管系统 DNS": "Sync system DNS takeover",
+  "接管系统 DNS": "Take over system DNS",
+  "切换界面语言": "Switch interface language",
+  "切换语言需要重新载入界面，当前未保存的配置更改会丢失。建议先保存再切换。":
+    "Switching the language reloads the interface and discards unsaved configuration changes. Save them first if you want to keep them.",
+  "放弃更改并切换": "Discard and switch",
+  "请先修正标出的配置字段": "Correct the highlighted configuration fields first",
+  "请输入有效的 IP 地址；DNS 的 IPv4 监听地址必须为 IPv4":
+    "Enter a valid IP address. The DNS IPv4 listener must use IPv4.",
+  "请输入有效的 IPv4 或 IPv6 地址": "Enter a valid IPv4 or IPv6 address",
+  "请输入有效的 IPv6 地址，例如 ::、::1 或 fd00::1":
+    "Enter a valid IPv6 address, such as ::, ::1, or fd00::1",
+  "端口必须是 1–65535 之间的整数": "The port must be an integer from 1 to 65535",
+  "监控接口端口不能与 DNS 监听端口相同": "The monitoring API port must differ from the DNS listener port",
+  "每客户端限速必须是 0–100000 之间的整数": "The per-client rate limit must be an integer from 0 to 100000",
+  "启用缓存时，缓存大小必须是 1 字节到 512 MB": "When caching is enabled, its size must be between 1 byte and 512 MB",
+  "缓存 TTL 必须在 0–604800 秒内，且最小值不能大于最大值":
+    "Cache TTL values must be within 0–604800 seconds, and the minimum cannot exceed the maximum",
+  "乐观缓存最大陈旧时间必须在 60–604800 秒之间": "Maximum optimistic-cache staleness must be between 60 and 604800 seconds",
+  "热门域名预取命中阈值必须在 2–10000 之间": "The prefetch hit threshold must be between 2 and 10000",
+  "自恢复检查间隔必须在 10–3600 秒之间": "The recovery check interval must be between 10 and 3600 seconds",
+  "拦截响应 TTL 必须在 0–604800 秒之间": "Blocked-response TTL must be between 0 and 604800 seconds",
   "启动": "Start",
   "停止": "Stop",
   "自定义": "Custom",
@@ -127,8 +176,11 @@ export const enUS: Record<string, string> = {
   "IPv4 监听地址": "IPv4 listen address",
   "端口": "Port",
   "监听 IPv6": "Listen on IPv6",
-  "开启后额外绑定 [::]:同一端口，同时接受 IPv4 与 IPv6 DNS 请求。":
-    "Also binds [::] on the same port so both IPv4 and IPv6 queries are accepted.",
+  "开启后在下方地址绑定同一端口，同时接受 IPv4 与 IPv6 DNS 请求。":
+    "Binds the address below on the same port so both IPv4 and IPv6 queries are accepted.",
+  "IPv6 监听地址": "IPv6 listen address",
+  "使用 :: 监听所有本机 IPv6 地址，或填写 ::1、指定的本机 IPv6 地址。":
+    "Use :: for all local IPv6 addresses, or enter ::1 or a specific local IPv6 address.",
   "Fallback DNS 服务器": "Fallback DNS servers",
   "所有上游服务器都失败时重试的后备 DNS，语法与上游相同。留空则禁用。":
     "Retried when every upstream fails. Same syntax as upstreams. Leave empty to disable.",
@@ -244,11 +296,57 @@ export const enUS: Record<string, string> = {
     "One \"IP name\" pair per line, e.g. 192.168.1.23 Living room TV. The query log shows the name instead of the address.",
   "192.168.1.23 客厅电视": "192.168.1.23 Living room TV",
   "客户端过滤策略": "Client filtering rules",
-  "每行一条“IP/CIDR =&gt; 策略组 [@ 周期 时间]”，最长 CIDR 优先。周期使用 mon-sun 或 daily，支持跨午夜时段。":
-    "One \"IP/CIDR =&gt; policy [@ days time]\" per line; the longest CIDR wins. Use mon-sun or daily for the schedule; ranges may cross midnight.",
   "自定义策略组": "Policy groups",
-  "格式：名称 =&gt; filter|bypass, safe_search, block:服务|服务。可用服务见右侧说明。":
-    "Format: name =&gt; filter|bypass, safe_search, block:service|service. Available services are listed on the right.",
+  "当前策略": "Current policy",
+  "标准过滤": "Standard filtering",
+  "不过滤": "Bypass filtering",
+  "家庭保护": "Family protection",
+  "添加或编辑客户端策略": "Add or edit client policy",
+  "同一客户端或网段再次应用会更新原规则；更具体的网段优先匹配。":
+    "Applying the same client or network again updates its rule. More specific networks take priority.",
+  "客户端或网段": "Client or network",
+  "策略组": "Policy profile",
+  "新建或编辑自定义组…": "Create or edit a custom profile…",
+  "仅在指定时段使用此策略": "Use this policy only on a schedule",
+  "时段外继续按其它匹配规则处理；没有其它规则时使用标准过滤。结束时间早于开始时间表示跨午夜。":
+    "Outside this schedule, other matching rules apply; otherwise standard filtering is used. An end time before the start means overnight.",
+  "生效日期": "Active days",
+  "一": "Mon",
+  "二": "Tue",
+  "三": "Wed",
+  "四": "Thu",
+  "五": "Fri",
+  "六": "Sat",
+  "日": "Sun",
+  "开始时间": "Start time",
+  "结束时间": "End time",
+  "自定义组名称": "Custom profile name",
+  "过滤模式": "Filtering mode",
+  "启用安全搜索": "Enable Safe Search",
+  "搜索常用服务": "Search common services",
+  "需要拦截的服务": "Services to block",
+  "清空表单": "Clear form",
+  "应用到草稿": "Apply to draft",
+  "高级文本编辑": "Advanced text editor",
+  "表单会生成现有配置语法；高级规则可继续在此直接编辑。":
+    "The form generates the existing configuration syntax. Advanced rules can still be edited here.",
+  "格式：IP/CIDR =&gt; 策略组 [@ 周期 时间]。周期使用 mon-sun 或 daily，支持跨午夜时段。":
+    "Format: IP/CIDR =&gt; profile [@ days time]. Use mon-sun or daily; overnight ranges are supported.",
+  "格式：名称 =&gt; filter|bypass, safe_search, block:服务|服务。":
+    "Format: name =&gt; filter|bypass, safe_search, block:service|service.",
+  "请输入有效的 IPv4、IPv6 或 CIDR 网段": "Enter a valid IPv4, IPv6, or CIDR network",
+  "名称需为 1–32 位字母、数字、短横线或下划线，且不能使用内置名称":
+    "Use 1–32 letters, numbers, hyphens, or underscores, and do not use a built-in name",
+  "已应用到配置草稿，点击“保存全部更改”后生效":
+    "Applied to the configuration draft. Select Save all changes to activate it.",
+  "当前设备命中网段规则 {p0}；修改后会影响该网段内的所有设备。":
+    "This device matches network rule {p0}. Changes will affect every device in that network.",
+  "编辑 {p0} 的客户端策略": "Edit the client policy for {p0}",
+  "清除排行筛选": "Clear ranking filter",
+  "来自“被拦截域名排行”：精确域名文本 + 已过滤状态":
+    "From Top blocked domains: exact domain text + filtered status",
+  "来自“请求域名排行”：精确域名文本": "From Top queried domains: exact domain text",
+  "精确域名：{p0}": "Exact domain: {p0}",
   "家庭组启用安全搜索": "Enable safe search for the family group",
   "为 Google、Bing、DuckDuckGo 和 YouTube 返回强制安全模式重定向。":
     "Redirects Google, Bing, DuckDuckGo and YouTube to their enforced safe-mode hosts.",
@@ -600,7 +698,6 @@ export const enUS: Record<string, string> = {
   // ---------- 查询日志操作 ----------
   "已保存查询视图“{p0}”": "Saved view \"{p0}\"",
   "查询视图已保存": "View saved",
-  "删除查询视图“{p0}”？": "Delete the view \"{p0}\"?",
   "已删除查询视图“{p0}”": "Deleted view \"{p0}\"",
   "视图名称需要 1-40 个字符": "View names must be 1-40 characters",
   "最多保存 {p0} 个查询视图": "You can save at most {p0} views",
@@ -886,7 +983,6 @@ export const enUS: Record<string, string> = {
     "<div class=\"security-event-empty\" role=\"row\"><span role=\"cell\">No security events yet</span></div>",
   "触发限速": "Rate limited",
   "{p0}；首次：{p1} {p2}": "{p0}; first seen: {p1} {p2}",
-  "暂无请求数据": "No query data yet",
   "暂无客户端数据": "No client data yet",
   "暂无上游请求数据": "No upstream request data yet",
   "暂无上游响应时间数据": "No upstream latency data yet",
@@ -992,4 +1088,14 @@ export const enUS: Record<string, string> = {
   "正在检查规则…": "Checking rules…",
   "规则检查失败：{p0}": "Rule check failed: {p0}",
   "没有找到匹配规则": "No matching rule found",
+
+  // ---------- 仪表盘状态 ----------
+  "正在加载统计数据…": "Loading statistics…",
+  "所选统计范围内暂无 DNS 请求；发起查询或调整统计范围后再查看。":
+    "No DNS requests in the selected range. Make a query or adjust the statistics range.",
+  "无法加载最新统计，当前保留上次成功的数据：{p0}":
+    "Could not load the latest statistics. Showing the last successful data: {p0}",
+  "统计数据加载失败：{p0}": "Statistics failed to load: {p0}",
+  "所选统计范围内暂无请求": "No requests in the selected range",
+  "暂无可排行的数据": "No rankable data yet",
 };

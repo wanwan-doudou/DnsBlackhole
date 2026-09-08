@@ -3,6 +3,7 @@ import type { QueryLogQuery } from "./types";
 export const DEFAULT_QUERY_LOG_QUERY: QueryLogQuery = {
   filter: "all",
   search: "",
+  domain: null,
   hours: null,
   source: "all",
   queryType: "all",
@@ -24,4 +25,12 @@ export function activeAdvancedQueryFilterCount(query: QueryLogQuery): number {
     query.queryType !== "all",
     query.sort !== "newest",
   ].filter(Boolean).length;
+}
+
+export function domainRankingQuery(domain: string, blocked: boolean): QueryLogQuery {
+  return {
+    ...DEFAULT_QUERY_LOG_QUERY,
+    domain: domain.trim(),
+    filter: blocked ? "blocked" : "all",
+  };
 }

@@ -6,6 +6,7 @@
   "permissions": [
     "core:app:allow-version",
     "core:event:allow-listen",
+    "core:window:allow-set-theme",
     "updater:allow-check",
     "updater:allow-download-and-install",
     "process:allow-restart",

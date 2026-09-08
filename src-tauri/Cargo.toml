@@ -1,6 +1,6 @@
 [package]
 name = "dnsblackhole"
-version = "0.2.3"
+version = "0.2.4"
 description = "本地 DNS 黑名单工具"
 authors = ["doudou"]
 edition = "2024"
@@ -67,6 +67,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",

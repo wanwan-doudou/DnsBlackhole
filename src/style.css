@@ -479,6 +479,10 @@
   --green: var(--brand-23);
   --green-hover: var(--brand-27);
   --green-active: var(--brand-33);
+  /* 危险操作的实心按钮。和 --green 一样依赖 --on-accent 翻转文字：
+     浅色下是深红压白字，深色下是浅红压深字，两个方向都够对比度。 */
+  --danger-accent: var(--danger-19);
+  --danger-accent-hover: var(--danger-27);
   --control-green: var(--brand-10);
   --control-green-hover: var(--control-green-hover-token);
   --control-green-bg: var(--brand-0);
@@ -932,6 +936,53 @@ button.refreshing:disabled {
   padding: 24px var(--layout-gutter) 36px;
 }
 
+.config-change-bar {
+  position: sticky;
+  top: 0;
+  z-index: 12;
+  display: flex;
+  width: 100%;
+  max-width: var(--layout-max-width);
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: -10px auto 14px;
+  border: 1px solid var(--warn-3);
+  border-radius: 8px;
+  padding: 8px 12px 8px 16px;
+  background: var(--warn-0);
+  box-shadow: 0 5px 16px rgb(var(--neutral-rgb-2) / 0.12);
+}
+
+.config-change-bar > div:first-child {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 10px;
+}
+
+.config-change-bar strong {
+  color: var(--warn-15);
+  font-size: 13px;
+}
+
+#config_change_modules {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+#config_change_modules button {
+  min-height: 27px;
+  border-color: var(--warn-3);
+  padding: 3px 8px;
+  color: var(--warn-15);
+  background: transparent;
+  font-size: 11.5px;
+}
+
 .view {
   display: none;
   width: 100%;
@@ -959,6 +1010,26 @@ button.refreshing:disabled {
 
 .dashboard-summary {
   margin-bottom: 18px;
+}
+
+.dashboard-state {
+  margin-bottom: 12px;
+  border: 1px solid var(--info-2);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: var(--neutral-22);
+  background: var(--info-0);
+  font-size: 12.5px;
+}
+
+.dashboard-state.empty {
+  border-color: var(--neutral-5);
+}
+
+.dashboard-state.error {
+  border-color: var(--danger-4);
+  color: var(--danger-20);
+  background: var(--danger-0);
 }
 
 .dashboard-controls {
@@ -1359,6 +1430,10 @@ button.refreshing:disabled {
   background: var(--neutral-0);
 }
 
+.rank-body.is-empty {
+  min-height: 64px;
+}
+
 .rank-row {
   min-height: 52px;
   border-top: 1px solid var(--neutral-1);
@@ -1392,6 +1467,23 @@ button.refreshing:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.rank-domain-button {
+  width: 100%;
+  height: auto;
+  justify-content: flex-start;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.rank-domain-button:hover,
+.rank-domain-button:focus-visible {
+  color: var(--brand-23);
+  background: transparent;
+  outline-offset: -3px;
 }
 
 .rank-value {
@@ -1445,7 +1537,7 @@ button.refreshing:disabled {
 }
 
 .empty-rank {
-  padding: 34px 24px;
+  padding: 22px 24px;
   color: var(--neutral-15);
   font-size: 13px;
 }
@@ -1746,9 +1838,10 @@ button.refreshing:disabled {
 
 .data-storage-error {
   margin-top: 10px;
-  border-left: 3px solid var(--danger-12);
+  border: 1px solid var(--danger-4);
+  border-radius: 5px;
   padding: 8px 10px;
-  background: var(--warn-0);
+  background: var(--danger-0);
   color: var(--danger-23);
   font-size: 12.5px;
   line-height: 1.5;
@@ -2378,6 +2471,64 @@ button.refreshing:disabled {
   padding: 14px 20px;
 }
 
+.confirm-dialog {
+  width: min(440px, calc(100vw - 32px));
+}
+
+.confirm-dialog .update-dialog-header {
+  padding-bottom: 14px;
+}
+
+.confirm-dialog .update-dialog-body {
+  max-height: min(46vh, 420px);
+  color: var(--neutral-23);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+/* 迁移目录一类的提示自带换行和长路径，要原样保留并允许折行。
+   pre-wrap 只能加在段落上：加在容器上会把模板缩进也渲染成空行。 */
+.confirm-dialog .update-dialog-body p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.confirm-dialog .update-dialog-footer button {
+  min-width: 82px;
+}
+
+.confirm-dialog.danger .update-dialog-kicker {
+  color: var(--danger-26);
+}
+
+.confirm-dialog.danger .confirm-dialog-accept {
+  border-color: var(--danger-accent);
+  color: var(--on-accent);
+  background: var(--danger-accent);
+}
+
+.confirm-dialog.danger .confirm-dialog-accept:hover:not(:disabled) {
+  border-color: var(--danger-accent-hover);
+  color: var(--on-accent);
+  background: var(--danger-accent-hover);
+}
+
+.confirm-dialog.danger .confirm-dialog-accept:focus-visible {
+  box-shadow: 0 0 0 3px rgb(var(--danger-rgb) / 0.42);
+}
+
+/* 窄窗口（840×540）下横排两个按钮会挤压文字，改成竖排并保持主操作在上。 */
+@media (max-width: 520px) {
+  .confirm-dialog .update-dialog-footer {
+    flex-direction: column-reverse;
+  }
+
+  .confirm-dialog .update-dialog-footer button {
+    width: 100%;
+  }
+}
+
 .dns-settings {
   display: grid;
   grid-template-columns: minmax(420px, 1fr) 260px;
@@ -2438,21 +2589,20 @@ button.refreshing:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 24px;
-  border: 1px solid var(--info-1);
-  border-left: 4px solid var(--brand-9);
+  border: 1px solid var(--brand-5);
   border-radius: 7px;
   padding: 16px 18px;
   background: var(--brand-0);
 }
 
 .diagnostic-local.blocked {
-  border-left-color: var(--danger-14);
+  border-color: var(--danger-5);
   background: var(--danger-0);
 }
 
 .client-rank-table .rank-head,
 .client-rank-table .rank-row {
-  grid-template-columns: minmax(0, 1fr) 108px 108px;
+  grid-template-columns: minmax(0, 1fr) 120px 88px 88px;
 }
 
 .rank-client-button {
@@ -2483,6 +2633,26 @@ button.refreshing:disabled {
 
 .client-rank-metric.blocked {
   color: var(--danger-17);
+}
+
+.client-policy-button {
+  min-width: 0;
+  height: auto;
+  overflow: hidden;
+  border: 0;
+  border-left: 1px solid var(--neutral-1);
+  border-radius: 0;
+  padding: 0 10px;
+  color: var(--brand-23);
+  background: transparent;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.client-policy-button:hover,
+.client-policy-button:focus-visible {
+  background: var(--brand-0);
+  outline-offset: -3px;
 }
 
 .config-transfer-actions {
@@ -2646,6 +2816,15 @@ button.refreshing:disabled {
 
 .listen-settings .ipv6-listen-row {
   margin-bottom: 0;
+}
+
+.listen-settings .ipv6-listen-address-field {
+  padding-inline-start: 32px;
+}
+
+.listen-settings .ipv6-listen-address-field input:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .upstream-field textarea {
@@ -2968,6 +3147,183 @@ select:focus {
   gap: 16px;
 }
 
+.client-policy-builder {
+  margin-top: 18px;
+  border: 1px solid var(--info-1);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--info-0);
+}
+
+.compact-heading {
+  margin-bottom: 14px;
+}
+
+.compact-heading h4 {
+  margin: 0 0 4px;
+  color: var(--neutral-25);
+  font-size: 15px;
+}
+
+.client-policy-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.client-policy-form-grid select {
+  width: 100%;
+  height: 42px;
+}
+
+.client-policy-schedule-toggle,
+.client-policy-custom {
+  margin-top: 14px;
+}
+
+.client-policy-schedule {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px 150px;
+  gap: 14px;
+  align-items: end;
+  margin-top: 14px;
+}
+
+.client-policy-schedule fieldset,
+.client-service-picker {
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+.client-policy-schedule legend,
+.client-service-picker legend {
+  margin-bottom: 7px;
+  color: var(--neutral-22);
+  font-size: 12px;
+}
+
+.weekday-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.weekday-options label,
+#client_policy_services label {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--neutral-4);
+  border-radius: 6px;
+  padding: 4px 9px;
+  color: var(--neutral-23);
+  background: var(--neutral-0);
+  font-size: 12px;
+}
+
+.client-service-search {
+  max-width: 360px;
+  margin-top: 14px;
+}
+
+#client_policy_services {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.client-policy-actions {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+#client_policy_form_status {
+  color: var(--brand-24);
+  font-size: 12px;
+}
+
+.field-error {
+  color: var(--danger-20) !important;
+}
+
+[aria-invalid="true"] {
+  border-color: var(--danger-12) !important;
+}
+
+.client-policy-advanced {
+  margin-top: 14px;
+  border: 1px solid var(--neutral-4);
+  border-radius: 7px;
+  padding: 11px 14px;
+}
+
+.client-policy-advanced summary {
+  color: var(--neutral-24);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.client-policy-advanced > p {
+  margin: 8px 0 12px;
+  color: var(--neutral-18);
+  font-size: 12px;
+}
+
+.family-policy-fields {
+  margin-top: 16px;
+}
+
+.query-log-drilldown {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  border: 1px solid var(--brand-4);
+  border-radius: 7px;
+  padding: 8px 10px 8px 13px;
+  color: var(--brand-24);
+  background: var(--brand-0);
+  font-size: 12px;
+}
+
+.query-log-drilldown button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 4px 9px;
+}
+
+@media (max-width: 900px) {
+  .config-change-bar,
+  .client-policy-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .config-change-bar .button-group,
+  .client-policy-actions .button-group {
+    justify-content: flex-end;
+  }
+
+  .client-policy-form-grid,
+  .client-policy-schedule {
+    grid-template-columns: 1fr;
+  }
+
+  .client-rank-table .rank-head,
+  .client-rank-table .rank-row {
+    grid-template-columns: minmax(0, 1fr) 100px 70px 70px;
+  }
+}
+
 .access-list-field textarea {
   min-height: 132px;
 }
@@ -3171,12 +3527,20 @@ select:focus {
     justify-content: stretch;
   }
 
-  .query-log-advanced-panel {
+  .query-log-filter-fields {
     grid-template-columns: repeat(2, minmax(180px, 1fr));
   }
 
-  .query-log-reset-button {
+  .query-log-saved-views {
+    grid-template-columns: repeat(2, minmax(180px, 1fr));
+  }
+
+  .query-log-view-actions {
     justify-self: start;
+  }
+
+  .query-log-reset-button {
+    justify-self: end;
   }
 
   .dashboard-controls {

@@ -1,5 +1,5 @@
 import { exportQueryLogFile, getQueryLogs } from "./api";
-import type { QueryLogQuery, QueryLogRecord } from "./types";
+import type { QueryLogPage, QueryLogQuery, QueryLogRecord } from "./types";
 import { t } from "./i18n";
 
 const EXPORT_PAGE_SIZE = 200;
@@ -9,6 +9,18 @@ export type QueryLogExportResult = {
   exported: number;
   total: number;
   truncated: boolean;
+};
+
+type QueryLogExportPageRequest = QueryLogQuery & {
+  page: number;
+  pageSize: number;
+  cursor: string | null;
+};
+
+type QueryLogExportPageLoader = (request: QueryLogExportPageRequest) => Promise<QueryLogPage>;
+
+export type CollectedQueryLogExport = QueryLogExportResult & {
+  records: QueryLogRecord[];
 };
 
 export async function exportFilteredQueryLogs(
@@ -25,11 +37,26 @@ export async function exportFilteredQueryLogs(
     return null;
   }
 
+  const collected = await collectQueryLogExportRecords(query, getQueryLogs, onProgress);
+  const content = serializeQueryLogsCsv(collected.records);
+  await exportQueryLogFile(path, content);
+  return {
+    exported: collected.exported,
+    total: collected.total,
+    truncated: collected.truncated,
+  };
+}
+
+export async function collectQueryLogExportRecords(
+  query: QueryLogQuery,
+  loadPage: QueryLogExportPageLoader,
+  onProgress?: (exported: number, total: number) => void,
+): Promise<CollectedQueryLogExport> {
   const records: QueryLogRecord[] = [];
   let total = 0;
   let cursor: string | null = query.sort === "slowest" ? null : "";
   for (let page = 1; records.length < EXPORT_RECORD_LIMIT; page += 1) {
-    const result = await getQueryLogs({ ...query, page, pageSize: EXPORT_PAGE_SIZE, cursor });
+    const result = await loadPage({ ...query, page, pageSize: EXPORT_PAGE_SIZE, cursor });
     total = result.total;
     records.push(...result.records.slice(0, EXPORT_RECORD_LIMIT - records.length));
     onProgress?.(records.length, Math.min(total, EXPORT_RECORD_LIMIT));
@@ -43,9 +70,8 @@ export async function exportFilteredQueryLogs(
     cursor = cursor === null ? null : result.next_cursor;
   }
 
-  const content = serializeQueryLogsCsv(records);
-  await exportQueryLogFile(path, content);
   return {
+    records,
     exported: records.length,
     total,
     truncated: records.length < total,

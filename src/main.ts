@@ -43,6 +43,12 @@ import {
 } from "./api";
 import appIconUrl from "./app-icon.png";
 import { buildTrafficSeries, renderSparkline } from "./charts";
+import {
+  configSaveCompletion,
+  mergeQueryLogRuleIntoDraft,
+  rebaseConfigFingerprint,
+  shouldPreserveConfigDraft,
+} from "./config-draft-state";
 import { query } from "./dom";
 import {
   createSearchCompositionState,
@@ -71,6 +77,7 @@ import {
 import {
   DEFAULT_QUERY_LOG_QUERY,
   activeAdvancedQueryFilterCount,
+  domainRankingQuery,
   parseQueryLogHours,
 } from "./query-log-query";
 import { renderAppTemplate } from "./template";
@@ -96,6 +103,26 @@ import {
 } from "./config-transfer";
 import { exportFilteredQueryLogs } from "./query-log-export";
 import { dnsQueryTypeLabel, renderQueryLogRow } from "./query-log-render";
+import {
+  CLIENT_POLICY_SERVICE_KEYS,
+  expandPolicyWeekdays,
+  findClientPolicyGroup,
+  findEffectiveClientPolicyRule,
+  parseClientPolicyGroups,
+  resolveEffectiveClientPolicy,
+  selectedWeekdaysValue,
+  upsertClientPolicyGroup,
+  upsertClientPolicyRule,
+  validateIpOrCidr,
+  validatePolicyName,
+  type ClientPolicyService,
+  type ClientPolicyWeekday,
+} from "./client-policy-form";
+import {
+  mapBackendConfigError,
+  validateConfigDraft,
+  type ConfigValidationCode,
+} from "./config-validation";
 import {
   loadSavedQueryLogViews,
   persistSavedQueryLogViews,
@@ -139,7 +166,7 @@ import "./style.css";
 import "./styles/ui-extras.css";
 
 const frontendStartedAt = performance.now();
-const CURRENT_CONFIG_SCHEMA_VERSION = 17;
+const CURRENT_CONFIG_SCHEMA_VERSION = 18;
 
 function logLoadTime(
   module: string,
@@ -191,6 +218,7 @@ let queryLogRefreshQueued = false;
 let queryLogSearchTimer: number | undefined;
 const queryLogSearchComposition = createSearchCompositionState();
 let queryLogLivePaused = false;
+let queryLogExactDomain: string | null = null;
 let lastDashboardRefreshAt: number | null = null;
 let currentConfigSchemaVersion = CURRENT_CONFIG_SCHEMA_VERSION;
 let currentStatisticsRetentionHours = 30 * 24;
@@ -222,6 +250,7 @@ let filterUpdateProgressTimer: number | undefined;
 let filterUpdateProgressInFlight = false;
 let savedConfigFingerprint = "";
 let configDirty = false;
+let appBusy = false;
 let latestRuntimeStatus: RuntimeStatus | null = null;
 let pauseExpiryTimer: number | undefined;
 let lastTrayRuntimeSignature = "";
@@ -403,6 +432,8 @@ const dashboardView = query<HTMLElement>('[data-view-panel="dashboard"]');
 const dashboardRangeField = query<HTMLElement>(".dashboard-range-field");
 const dashboardStatisticsRange = query<HTMLSelectElement>("#dashboard_statistics_range");
 const clientRankBody = query<HTMLDivElement>("#client_rank");
+const queryRankBody = query<HTMLDivElement>("#query_rank");
+const blockedRankBody = query<HTMLDivElement>("#blocked_rank");
 const contextNav = query<HTMLElement>("#context_nav");
 const headerRuntime = query<HTMLElement>("#header_runtime");
 const runtimeStatusButton = query<HTMLButtonElement>("#runtime_status_btn");
@@ -421,10 +452,28 @@ const dnssecEnabledInput = query<HTMLInputElement>("#dnssec_enabled");
 const listenHostInput = query<HTMLInputElement>("#listen_host");
 const listenPortInput = query<HTMLInputElement>("#listen_port");
 const listenIpv6Input = query<HTMLInputElement>("#listen_ipv6");
+const listenIpv6HostInput = query<HTMLInputElement>("#listen_ipv6_host");
 const allowedClientsInput = query<HTMLTextAreaElement>("#allowed_clients");
 const blockedClientsInput = query<HTMLTextAreaElement>("#blocked_clients");
 const clientFilteringRulesInput = query<HTMLTextAreaElement>("#client_filtering_rules");
 const clientPolicyGroupsInput = query<HTMLTextAreaElement>("#client_policy_groups");
+const clientPolicyTargetInput = query<HTMLInputElement>("#client_policy_target");
+const clientPolicyProfileInput = query<HTMLSelectElement>("#client_policy_profile");
+const clientPolicyScheduleEnabledInput = query<HTMLInputElement>("#client_policy_schedule_enabled");
+const clientPolicySchedule = query<HTMLDivElement>("#client_policy_schedule");
+const clientPolicyStartInput = query<HTMLInputElement>("#client_policy_start");
+const clientPolicyEndInput = query<HTMLInputElement>("#client_policy_end");
+const clientPolicyCustom = query<HTMLDivElement>("#client_policy_custom");
+const clientPolicyGroupNameInput = query<HTMLInputElement>("#client_policy_group_name");
+const clientPolicyGroupModeInput = query<HTMLSelectElement>("#client_policy_group_mode");
+const clientPolicySafeSearchInput = query<HTMLInputElement>("#client_policy_safe_search");
+const clientPolicyServiceSearchInput = query<HTMLInputElement>("#client_policy_service_search");
+const clientPolicyServices = query<HTMLDivElement>("#client_policy_services");
+const clientPolicyTargetError = query<HTMLElement>("#client_policy_target_error");
+const clientPolicyGroupNameError = query<HTMLElement>("#client_policy_group_name_error");
+const clientPolicyFormStatus = query<HTMLElement>("#client_policy_form_status");
+const clientPolicyApplyButton = query<HTMLButtonElement>("#client_policy_apply_btn");
+const clientPolicyClearButton = query<HTMLButtonElement>("#client_policy_clear_btn");
 const familySafeSearchInput = query<HTMLInputElement>("#family_safe_search");
 const familyBlockedServicesInput = query<HTMLTextAreaElement>("#family_blocked_services");
 const rateLimitPerSecondInput = query<HTMLInputElement>("#rate_limit_per_second");
@@ -503,6 +552,10 @@ const saveSettingsButton = query<HTMLButtonElement>("#save_settings_btn");
 const saveSecurityButton = query<HTMLButtonElement>("#save_security_btn");
 const saveFiltersButton = query<HTMLButtonElement>("#save_filters_btn");
 const saveCustomButton = query<HTMLButtonElement>("#save_custom_btn");
+const configChangeBar = query<HTMLElement>("#config_change_bar");
+const configChangeModules = query<HTMLElement>("#config_change_modules");
+const saveAllConfigButton = query<HTMLButtonElement>("#save_all_config_btn");
+const discardConfigButton = query<HTMLButtonElement>("#discard_config_btn");
 const saveStateLabels = Array.from(document.querySelectorAll<HTMLElement>(".save-state-label"));
 const configSaveButtons = [
   saveButton,
@@ -510,6 +563,7 @@ const configSaveButtons = [
   saveSecurityButton,
   saveFiltersButton,
   saveCustomButton,
+  saveAllConfigButton,
 ];
 configSaveButtons.forEach((button) => {
   button.disabled = true;
@@ -588,6 +642,12 @@ const updateDialogLaterButton = query<HTMLButtonElement>("#update_dialog_later_b
 const updateCurrentVersionElement = query<HTMLElement>("#update_current_version");
 const updateReleaseVersionElement = query<HTMLElement>("#update_release_version");
 const updateReleaseNotesBodyElement = query<HTMLElement>("#update_release_notes_body");
+const confirmDialog = query<HTMLDialogElement>("#confirm_dialog");
+const confirmDialogKicker = query<HTMLElement>("#confirm_dialog_kicker");
+const confirmDialogTitle = query<HTMLElement>("#confirm_dialog_title");
+const confirmDialogMessage = query<HTMLElement>("#confirm_dialog_message");
+const confirmDialogCancelButton = query<HTMLButtonElement>("#confirm_dialog_cancel_btn");
+const confirmDialogAcceptButton = query<HTMLButtonElement>("#confirm_dialog_accept_btn");
 const queryLogRefreshButton = query<HTMLButtonElement>("#query_log_refresh_btn");
 const queryLogPauseButton = query<HTMLButtonElement>("#query_log_pause_btn");
 const queryLogExportButton = query<HTMLButtonElement>("#query_log_export_btn");
@@ -608,10 +668,14 @@ const queryLogViewNameInput = query<HTMLInputElement>("#query_log_view_name");
 const queryLogSaveViewButton = query<HTMLButtonElement>("#query_log_save_view_btn");
 const queryLogDeleteViewButton = query<HTMLButtonElement>("#query_log_delete_view_btn");
 const queryLogResetButton = query<HTMLButtonElement>("#query_log_reset_btn");
+const queryLogDrilldown = query<HTMLElement>("#query_log_drilldown");
+const queryLogDrilldownText = query<HTMLElement>("#query_log_drilldown_text");
+const queryLogDrilldownClearButton = query<HTMLButtonElement>("#query_log_drilldown_clear_btn");
 const queryLogBody = query<HTMLDivElement>("#query_log_body");
 const queryLogPageInfo = query<HTMLElement>("#query_log_page_info");
 const queryLogPrevButton = query<HTMLButtonElement>("#query_log_prev_btn");
 const queryLogNextButton = query<HTMLButtonElement>("#query_log_next_btn");
+const dashboardState = query<HTMLElement>("#dashboard_state");
 let savedQueryLogViews: SavedQueryLogView[] = loadSavedQueryLogViews();
 const queryRuleDialog = query<HTMLDialogElement>("#query_rule_dialog");
 const queryRuleForm = query<HTMLFormElement>("#query_rule_form");
@@ -701,7 +765,45 @@ function initializeCustomSelect(select: HTMLSelectElement): void {
   menu.id = menuId;
   menu.setAttribute("role", "listbox");
 
-  const optionButtons = Array.from(select.options).map((option) => {
+  select.classList.add("custom-select-native");
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
+  select.insertAdjacentElement("afterend", root);
+  root.append(trigger, menu);
+  const elements: CustomSelectElements = { root, trigger, valueLabel, menu, options: [] };
+  customSelects.set(select, elements);
+  rebuildCustomSelectOptions(select, elements);
+
+  trigger.addEventListener("click", () => {
+    if (!select.disabled) {
+      setCustomSelectOpen(select, !root.classList.contains("open"));
+    }
+  });
+  trigger.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      setCustomSelectOpen(select, true);
+      const selectedIndex = Math.max(0, select.selectedIndex);
+      focusCustomSelectOption(
+        elements.options,
+        event.key === "ArrowDown" ? selectedIndex : selectedIndex - 1,
+      );
+    } else if (event.key === "Escape") {
+      setCustomSelectOpen(select, false);
+    }
+  });
+  select.addEventListener("change", () => syncCustomSelect(select));
+  syncCustomSelect(select);
+}
+
+function rebuildCustomSelectOptions(
+  select: HTMLSelectElement,
+  elements: CustomSelectElements,
+): void {
+  elements.menu.replaceChildren();
+  elements.options.length = 0;
+
+  Array.from(select.options).forEach((option) => {
     const button = document.createElement("button");
     button.className = "custom-select-option";
     button.type = "button";
@@ -717,56 +819,34 @@ function initializeCustomSelect(select: HTMLSelectElement): void {
       select.value = option.value;
       syncCustomSelect(select);
       setCustomSelectOpen(select, false);
-      trigger.focus();
+      elements.trigger.focus();
       if (changed) {
         select.dispatchEvent(new Event("change", { bubbles: true }));
       }
     });
     button.addEventListener("keydown", (event) => {
-      const currentIndex = optionButtons.indexOf(button);
+      const currentIndex = elements.options.indexOf(button);
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const direction = event.key === "ArrowDown" ? 1 : -1;
-        focusCustomSelectOption(optionButtons, currentIndex + direction);
+        focusCustomSelectOption(elements.options, currentIndex + direction);
       } else if (event.key === "Home" || event.key === "End") {
         event.preventDefault();
-        focusCustomSelectOption(optionButtons, event.key === "Home" ? 0 : optionButtons.length - 1);
+        focusCustomSelectOption(
+          elements.options,
+          event.key === "Home" ? 0 : elements.options.length - 1,
+        );
       } else if (event.key === "Escape") {
         event.preventDefault();
         setCustomSelectOpen(select, false);
-        trigger.focus();
+        elements.trigger.focus();
       } else if (event.key === "Tab") {
         setCustomSelectOpen(select, false);
       }
     });
-    menu.append(button);
-    return button;
+    elements.menu.append(button);
+    elements.options.push(button);
   });
-
-  select.classList.add("custom-select-native");
-  select.tabIndex = -1;
-  select.setAttribute("aria-hidden", "true");
-  select.insertAdjacentElement("afterend", root);
-  root.append(trigger, menu);
-  customSelects.set(select, { root, trigger, valueLabel, menu, options: optionButtons });
-
-  trigger.addEventListener("click", () => {
-    if (!select.disabled) {
-      setCustomSelectOpen(select, !root.classList.contains("open"));
-    }
-  });
-  trigger.addEventListener("keydown", (event) => {
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      setCustomSelectOpen(select, true);
-      const selectedIndex = Math.max(0, select.selectedIndex);
-      focusCustomSelectOption(optionButtons, event.key === "ArrowDown" ? selectedIndex : selectedIndex - 1);
-    } else if (event.key === "Escape") {
-      setCustomSelectOpen(select, false);
-    }
-  });
-  select.addEventListener("change", () => syncCustomSelect(select));
-  syncCustomSelect(select);
 }
 
 function focusCustomSelectOption(options: HTMLButtonElement[], requestedIndex: number): void {
@@ -816,6 +896,16 @@ function syncCustomSelect(select: HTMLSelectElement): void {
   if (!elements) {
     return;
   }
+  const nativeOptions = Array.from(select.options);
+  const optionsChanged = nativeOptions.length !== elements.options.length || nativeOptions.some(
+    (option, index) => {
+      const button = elements.options[index];
+      return button?.dataset.value !== option.value || button.textContent !== option.textContent;
+    },
+  );
+  if (optionsChanged) {
+    rebuildCustomSelectOptions(select, elements);
+  }
   const selectedOption = select.selectedOptions[0] || select.options[0];
   elements.valueLabel.textContent = selectedOption?.textContent || t("请选择");
   elements.trigger.disabled = select.disabled;
@@ -828,8 +918,7 @@ function syncCustomSelect(select: HTMLSelectElement): void {
   });
 }
 
-// 选项固定的下拉框统一换成自绘控件，原生 select 在 WebView2 里样式不可控。
-// 已保存视图的选项会动态重建，不能走这里（initializeCustomSelect 只快照一次）。
+// WebView2 的原生下拉菜单样式不可控，统一换成支持动态选项的自绘控件。
 [
   filterProxyModeInput,
   filterUpdateIntervalInput,
@@ -838,6 +927,11 @@ function syncCustomSelect(select: HTMLSelectElement): void {
   themePreferenceInput,
   languagePreferenceInput,
   securityEventRetentionInput,
+  queryLogTimeRange,
+  queryLogSource,
+  queryLogQueryType,
+  queryLogSort,
+  queryLogSavedViewSelect,
 ].forEach(initializeCustomSelect);
 
 document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
@@ -988,6 +1082,7 @@ function applySearchScheduleDecision(decision: SearchScheduleDecision): void {
 }
 
 queryLogSearchInput.addEventListener("input", (event) => {
+  clearQueryLogDrilldown();
   const isComposing = event instanceof InputEvent && event.isComposing;
   applySearchScheduleDecision(onSearchInput(queryLogSearchComposition, isComposing));
 });
@@ -1036,6 +1131,7 @@ queryLogAdvancedButton.addEventListener("click", () => {
 });
 
 queryLogResetButton.addEventListener("click", () => {
+  clearQueryLogDrilldown();
   queryLogSearchInput.value = DEFAULT_QUERY_LOG_QUERY.search;
   setQueryLogFilterValue(DEFAULT_QUERY_LOG_QUERY.filter);
   queryLogTimeRange.value = "configured";
@@ -1084,9 +1180,17 @@ queryLogViewNameInput.addEventListener("keydown", (event) => {
   }
 });
 
-queryLogDeleteViewButton.addEventListener("click", () => {
+queryLogDeleteViewButton.addEventListener("click", async () => {
   const saved = savedQueryLogViews.find((view) => view.id === queryLogSavedViewSelect.value);
-  if (!saved || !window.confirm(t("删除查询视图“{p0}”？", { p0: saved.name }))) {
+  if (
+    !saved ||
+    !(await confirmAction({
+      title: t("删除查询视图"),
+      message: t("删除查询视图“{p0}”？该视图只保存在本机，删除后无法恢复。", { p0: saved.name }),
+      confirmLabel: t("删除"),
+      danger: true,
+    }))
+  ) {
     return;
   }
   savedQueryLogViews = removeSavedQueryLogView(savedQueryLogViews, saved.id);
@@ -1222,6 +1326,7 @@ dnsCachePrefetchEnabledInput.addEventListener("change", updateDnsCacheControls);
 rebindingProtectionEnabledInput.addEventListener("change", updateResponseProtectionControls);
 runtimeWatchdogEnabledInput.addEventListener("change", updateRuntimeWatchdogControls);
 monitoringApiEnabledInput.addEventListener("change", updateMonitoringApiControls);
+listenIpv6Input.addEventListener("change", updateIpv6ListenControls);
 blockingModeInputs.forEach((input) => {
   input.addEventListener("change", updateBlockingModeControls);
 });
@@ -1274,6 +1379,70 @@ queryLogBody.addEventListener("click", (event) => {
   void runQueryLogRuleAction(domain, action);
 });
 
+type ConfirmActionOptions = {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  danger?: boolean;
+};
+
+let settleConfirmDialog: ((confirmed: boolean) => void) | null = null;
+
+// 统一的项目风格确认框，替代 WebView 原生 confirm：原生框无法套用主题、
+// 文案不可控，而且在深色主题和窄窗口下和应用其余部分完全不一致。
+function confirmAction(options: ConfirmActionOptions): Promise<boolean> {
+  // 同一时刻只允许一个确认框；后来的请求先让前一个按"取消"收尾。
+  settleConfirmDialog?.(false);
+  confirmDialogTitle.textContent = options.title;
+  confirmDialogMessage.textContent = options.message;
+  confirmDialogAcceptButton.textContent = options.confirmLabel;
+  confirmDialogKicker.textContent = options.danger ? t("危险操作") : t("确认操作");
+  confirmDialog.classList.toggle("danger", options.danger === true);
+  confirmDialog.showModal();
+  // 取消默认获得焦点，避免误按回车直接执行破坏性操作。
+  confirmDialogCancelButton.focus();
+  return new Promise<boolean>((resolve) => {
+    settleConfirmDialog = (confirmed) => {
+      settleConfirmDialog = null;
+      if (confirmDialog.open) {
+        confirmDialog.close();
+      }
+      resolve(confirmed);
+    };
+  });
+}
+
+confirmDialogAcceptButton.addEventListener("click", () => settleConfirmDialog?.(true));
+confirmDialogCancelButton.addEventListener("click", () => settleConfirmDialog?.(false));
+confirmDialog.addEventListener("keydown", (event) => {
+  if (event.key !== "Tab") {
+    return;
+  }
+  const first = confirmDialogCancelButton;
+  const last = confirmDialogAcceptButton;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
+confirmDialog.addEventListener("click", (event) => {
+  if (event.target === confirmDialog) {
+    settleConfirmDialog?.(false);
+  }
+});
+// Esc 由 <dialog> 原生处理，这里只负责把等待中的 Promise 收成"取消"。
+confirmDialog.addEventListener("cancel", () => settleConfirmDialog?.(false));
+// close 是异步派发的：连续弹两次时，前一个的 close 会在新对话框打开之后才到达，
+// 此时 open 仍为 true，必须跳过，否则会把刚打开的确认框直接关掉。
+confirmDialog.addEventListener("close", () => {
+  if (!confirmDialog.open) {
+    settleConfirmDialog?.(false);
+  }
+});
+
 queryRuleDialogCloseButton.addEventListener("click", closeQueryRuleDialog);
 queryRuleDialogCancelButton.addEventListener("click", closeQueryRuleDialog);
 queryRuleDialog.addEventListener("cancel", () => {
@@ -1301,6 +1470,15 @@ const CONFIG_VIEW_SELECTOR = [
   '[data-view-panel="filters"]',
   '[data-view-panel="custom"]',
 ].join(",");
+const CONFIG_VIEWS = ["settings", "dns", "security", "filters", "custom"] as const;
+type ConfigView = (typeof CONFIG_VIEWS)[number];
+const CONFIG_VIEW_LABELS: Record<ConfigView, string> = {
+  settings: t("常规与运行"),
+  dns: t("DNS 设置"),
+  security: t("安全防护"),
+  filters: t("DNS 黑名单"),
+  custom: t("自定义规则与重写"),
+};
 
 function handleConfigFieldChange(event: Event): void {
   const target = event.target;
@@ -1316,7 +1494,12 @@ function handleConfigFieldChange(event: Event): void {
   const readOnly =
     (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) && target.readOnly;
   // 界面偏好（主题、语言）存在本机且立即生效，不该让"保存更改"变成待保存状态
-  if (readOnly || target.closest("[data-ui-preference]") || !target.closest(CONFIG_VIEW_SELECTOR)) {
+  if (
+    readOnly ||
+    target.closest("[data-ui-preference]") ||
+    target.closest(".client-policy-builder") ||
+    !target.closest(CONFIG_VIEW_SELECTOR)
+  ) {
     return;
   }
   window.queueMicrotask(updateConfigDirtyState);
@@ -1324,6 +1507,14 @@ function handleConfigFieldChange(event: Event): void {
 
 app.addEventListener("input", handleConfigFieldChange);
 app.addEventListener("change", handleConfigFieldChange);
+
+configChangeModules.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-dirty-view]");
+  const view = button?.dataset.dirtyView as ConfigView | undefined;
+  if (view) {
+    setActiveView(view);
+  }
+});
 
 window.addEventListener("keydown", (event) => {
   if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s") {
@@ -1336,13 +1527,9 @@ window.addEventListener("keydown", (event) => {
   void saveConfig();
 });
 
-window.addEventListener("beforeunload", (event) => {
-  if (!configDirty) {
-    return;
-  }
-  event.preventDefault();
-  event.returnValue = "";
-});
+// 这里刻意不注册 beforeunload：WebView 的原生"重新加载站点"提示无法套用项目样式，
+// 开发环境热更新也会误触发。应用内可控的重载（语言切换）改用自定义确认框，
+// 生产窗口关闭由 Tauri 隐藏窗口处理，不依赖该提示。
 
 saveButton.addEventListener("click", async () => {
   await saveConfig();
@@ -1364,6 +1551,41 @@ saveCustomButton.addEventListener("click", async () => {
   await saveConfig();
 });
 
+saveAllConfigButton.addEventListener("click", async () => {
+  await saveConfig();
+});
+
+discardConfigButton.addEventListener("click", async () => {
+  if (!configDirty) {
+    return;
+  }
+  const modules = dirtyConfigViews(configFingerprint(collectConfig()))
+    .map((view) => CONFIG_VIEW_LABELS[view])
+    .join("、");
+  const confirmed = await confirmAction({
+    title: t("放弃未保存的更改"),
+    message: modules
+      ? t("将丢弃以下模块的未保存更改并重新载入已保存配置：{p0}。此操作无法撤销。", { p0: modules })
+      : t("将丢弃全部未保存更改并重新载入已保存配置。此操作无法撤销。"),
+    confirmLabel: t("放弃更改"),
+    danger: true,
+  });
+  if (!confirmed) {
+    return;
+  }
+  discardConfigButton.disabled = true;
+  try {
+    if (await loadConfig(true)) {
+      clearConfigFieldErrors();
+      updateConfigDirtyState();
+      if (!configDirty) showMessage(t("已放弃未保存的更改"), false);
+    }
+  } finally {
+    // 交回统一状态管理，避免在没有可放弃更改时把按钮留成可点。
+    updateConfigSaveState();
+  }
+});
+
 queryLogPauseButton.addEventListener("click", () => {
   queryLogLivePaused = !queryLogLivePaused;
   queryLogPauseButton.classList.toggle("active", queryLogLivePaused);
@@ -1373,8 +1595,13 @@ queryLogPauseButton.addEventListener("click", () => {
   }
 });
 
-queryLogExportButton.addEventListener("click", () => {
-  if (!window.confirm(t("导出的 CSV 会包含当前筛选中的域名和客户端地址，请妥善保管。是否继续？"))) {
+queryLogExportButton.addEventListener("click", async () => {
+  const confirmed = await confirmAction({
+    title: t("导出查询日志"),
+    message: t("导出的 CSV 会包含当前筛选中的域名和客户端地址，请妥善保管。是否继续？"),
+    confirmLabel: t("继续导出"),
+  });
+  if (!confirmed) {
     return;
   }
   void runFileAction(queryLogExportButton, t("准备导出…"), async () => {
@@ -1407,6 +1634,12 @@ dashboardStatisticsRange.addEventListener("change", () => {
 });
 
 clientRankBody.addEventListener("click", (event) => {
+  const policyButton = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-client-policy]");
+  const policyClient = policyButton?.dataset.clientPolicy;
+  if (policyClient) {
+    openClientPolicyEditor(policyClient);
+    return;
+  }
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-client-log]");
   const client = button?.dataset.clientLog;
   if (!client) {
@@ -1417,6 +1650,32 @@ clientRankBody.addEventListener("click", (event) => {
   setActiveView("logs");
   queryLogSearchInput.focus();
 });
+
+[queryRankBody, blockedRankBody].forEach((body) => {
+  body.addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-domain-log]");
+    const domain = button?.dataset.domainLog;
+    if (domain) {
+      openDomainQueryLogs(domain, button.dataset.domainBlocked === "true");
+    }
+  });
+});
+
+queryLogDrilldownClearButton.addEventListener("click", () => {
+  clearQueryLogDrilldown();
+  queryLogResetButton.click();
+  queryLogSearchInput.focus();
+});
+
+clientPolicyScheduleEnabledInput.addEventListener("change", updateClientPolicyFormVisibility);
+clientPolicyProfileInput.addEventListener("change", () => {
+  loadSelectedClientPolicyGroup();
+  updateClientPolicyFormVisibility();
+});
+clientPolicyServiceSearchInput.addEventListener("input", renderClientPolicyServices);
+clientPolicyGroupsInput.addEventListener("input", () => refreshClientPolicyProfiles());
+clientPolicyClearButton.addEventListener("click", clearClientPolicyForm);
+clientPolicyApplyButton.addEventListener("click", applyClientPolicyDraft);
 
 exportConfigButton.addEventListener("click", () => {
   void runFileAction(exportConfigButton, t("导出中…"), async () => {
@@ -1431,7 +1690,15 @@ exportConfigButton.addEventListener("click", () => {
 
 importConfigButton.addEventListener("click", () => {
   void runFileAction(importConfigButton, t("恢复中…"), async () => {
-    if (configDirty && !window.confirm(t("恢复配置会覆盖当前未保存的更改，是否继续？"))) {
+    if (
+      configDirty &&
+      !(await confirmAction({
+        title: t("从备份恢复配置"),
+        message: t("恢复配置会覆盖当前未保存的更改，是否继续？"),
+        confirmLabel: t("继续恢复"),
+        danger: true,
+      }))
+    ) {
       return;
     }
     const imported = await chooseConfigBackup();
@@ -1441,7 +1708,7 @@ importConfigButton.addEventListener("click", () => {
     currentStatisticsRetentionHours = imported.statistics_retention_hours;
     currentQueryLogRetentionHours = imported.query_log_retention_hours;
     const status = await saveConfigCommand(imported);
-    await loadConfig();
+    await loadConfig(true);
     renderStatus(status);
     showMessage(t("配置已校验、迁移并恢复"), false);
   });
@@ -1480,7 +1747,9 @@ startButton.addEventListener("click", async () => {
   setBusy(true);
   try {
     await saveConfigOnly();
+    const enabledAtStart = enabledInput.checked;
     const status = await startDns();
+    reconcileEnabledConfig(true, enabledAtStart);
     renderStatus(status);
     showMessage(t("DNS 服务已启动"), false);
     await loadConfig();
@@ -1493,7 +1762,12 @@ startButton.addEventListener("click", async () => {
 });
 
 stopButton.addEventListener("click", async () => {
-  await runStatusAction(() => stopDns(), t("DNS 服务已停止"));
+  const enabledAtStart = enabledInput.checked;
+  await runStatusAction(
+    () => stopDns(),
+    t("DNS 服务已停止"),
+    () => reconcileEnabledConfig(false, enabledAtStart),
+  );
 });
 
 addFilterButton.addEventListener("click", () => {
@@ -1527,7 +1801,13 @@ updateFiltersButton.addEventListener("click", async () => {
   startFilterUpdateProgressPolling();
   try {
     await waitForPaint();
-    const result = await updateFiltersCommand(collectConfig());
+    const submitted = collectConfig();
+    const savedBeforeUpdate = savedConfigFingerprint;
+    const result = await updateFiltersCommand(submitted);
+    if (savedConfigFingerprint === savedBeforeUpdate) {
+      savedConfigFingerprint = configFingerprint(submitted);
+    }
+    updateConfigDirtyState();
     renderStatus(result.status);
     showMessage(result.message, result.failed > 0 && result.cancelled === 0);
     await loadConfig();
@@ -1568,9 +1848,11 @@ clearDnsCacheButton.addEventListener("click", async () => {
 });
 
 clearFilterCacheButton.addEventListener("click", async () => {
-  const confirmed = window.confirm(
-    t("这会删除可重新生成的规则编译缓存。已下载的远程黑名单和当前生效规则不会删除；下次启动或规则变更时会自动重新生成缓存。是否继续？"),
-  );
+  const confirmed = await confirmAction({
+    title: t("清理规则编译缓存"),
+    message: t("这会删除可重新生成的规则编译缓存。已下载的远程黑名单和当前生效规则不会删除；下次启动或规则变更时会自动重新生成缓存。是否继续？"),
+    confirmLabel: t("清理缓存"),
+  });
   if (!confirmed) {
     return;
   }
@@ -1629,11 +1911,13 @@ migrateDataStorageButton.addEventListener("click", async () => {
   }
   const targetPath = selectedDataStoragePath;
   const useExisting = selectedStorageTarget.action === "use_existing";
-  const confirmed = window.confirm(
-    useExisting
+  const confirmed = await confirmAction({
+    title: useExisting ? t("接管现有数据目录") : t("迁移数据目录"),
+    message: useExisting
       ? t("检测到现有 DnsBlackhole 数据：\n{p0}\n\n应用将验证并备份该数据库，然后切换使用此目录。现有目录和当前目录都不会被删除。是否继续？", { p0: targetPath })
       : t("应用将重启并把数据库与过滤器缓存迁移到：\n{p0}\n\n目标数据验证成功后才会清理原目录。是否继续？", { p0: targetPath }),
-  );
+    confirmLabel: useExisting ? t("接管并重启") : t("迁移并重启"),
+  });
   if (!confirmed) {
     return;
   }
@@ -1781,9 +2065,12 @@ installMacosServiceButton.addEventListener("click", async () => {
 });
 
 uninstallMacosServiceButton.addEventListener("click", async () => {
-  const confirmed = window.confirm(
-    t("卸载后台服务后，DNS 将无法监听 53 端口，局域网设备的 DNS 查询会立即失败。是否继续卸载？"),
-  );
+  const confirmed = await confirmAction({
+    title: t("卸载 macOS 后台服务"),
+    message: t("卸载后台服务后，DNS 将无法监听 53 端口，局域网设备的 DNS 查询会立即失败。是否继续卸载？"),
+    confirmLabel: t("卸载服务"),
+    danger: true,
+  });
   if (!confirmed) {
     return;
   }
@@ -1810,9 +2097,12 @@ openMacosServiceSettingsButton.addEventListener("click", async () => {
 });
 
 clearQueryLogsButton.addEventListener("click", async () => {
-  const confirmed = window.confirm(
-    t("这会永久删除全部查询日志，但不会删除统计数据和配置。清除后，新查询仍会继续记录。是否继续？"),
-  );
+  const confirmed = await confirmAction({
+    title: t("清除查询日志"),
+    message: t("这会永久删除全部查询日志，但不会删除统计数据和配置。清除后，新查询仍会继续记录。是否继续？"),
+    confirmLabel: t("清除日志"),
+    danger: true,
+  });
   if (!confirmed) {
     return;
   }
@@ -1835,9 +2125,12 @@ clearQueryLogsButton.addEventListener("click", async () => {
 });
 
 clearStatisticsButton.addEventListener("click", async () => {
-  const confirmed = window.confirm(
-    t("这会永久删除全部累计统计、趋势和排行，但不会删除查询日志和配置。清除后将从新的 DNS 查询重新统计。是否继续？"),
-  );
+  const confirmed = await confirmAction({
+    title: t("清除统计数据"),
+    message: t("这会永久删除全部累计统计、趋势和排行，但不会删除查询日志和配置。清除后将从新的 DNS 查询重新统计。是否继续？"),
+    confirmLabel: t("清除统计"),
+    danger: true,
+  });
   if (!confirmed) {
     return;
   }
@@ -1873,16 +2166,36 @@ syncCustomSelect(languagePreferenceInput);
 void setTrayLocale(getLocale()).catch((error: unknown) => {
   console.warn("同步托盘语言失败", error);
 });
-languagePreferenceInput.addEventListener("change", () => {
-  setLocalePreference(languagePreferenceInput.value as LocalePreference, () => {
+let appliedLocalePreference: LocalePreference = getLocalePreference();
+languagePreferenceInput.addEventListener("change", async () => {
+  const next = languagePreferenceInput.value as LocalePreference;
+  // 切换语言需要重载界面，未保存的配置草稿会一起丢失，先让用户确认。
+  if (
+    configDirty &&
+    !(await confirmAction({
+      title: t("切换界面语言"),
+      message: t("切换语言需要重新载入界面，当前未保存的配置更改会丢失。建议先保存再切换。"),
+      confirmLabel: t("放弃更改并切换"),
+      danger: true,
+    }))
+  ) {
+    languagePreferenceInput.value = appliedLocalePreference;
+    syncCustomSelect(languagePreferenceInput);
+    return;
+  }
+  appliedLocalePreference = next;
+  setLocalePreference(next, () => {
     rememberViewAcrossReload(activeView);
   });
 });
 
 clearSecurityEventsButton.addEventListener("click", async () => {
-  const confirmed = window.confirm(
-    t("这会永久删除已落盘的全部安全事件历史，但不会影响统计数据和查询日志。是否继续？"),
-  );
+  const confirmed = await confirmAction({
+    title: t("清除安全事件"),
+    message: t("这会永久删除已落盘的全部安全事件历史，但不会影响统计数据和查询日志。是否继续？"),
+    confirmLabel: t("清除事件"),
+    danger: true,
+  });
   if (!confirmed) {
     return;
   }
@@ -1925,9 +2238,12 @@ installWindowsServiceButton.addEventListener("click", async () => {
 });
 
 uninstallWindowsServiceButton.addEventListener("click", async () => {
-  const confirmed = window.confirm(
-    t("卸载 Windows DNS 系统服务后，127.0.0.1/::1 将不再提供 DNS；若系统 DNS 已接管，会先自动恢复原 DNS。是否继续？"),
-  );
+  const confirmed = await confirmAction({
+    title: t("卸载 Windows DNS 系统服务"),
+    message: t("卸载 Windows DNS 系统服务后，127.0.0.1/::1 将不再提供 DNS；若系统 DNS 已接管，会先自动恢复原 DNS。是否继续？"),
+    confirmLabel: t("卸载服务"),
+    danger: true,
+  });
   if (!confirmed) {
     return;
   }
@@ -1948,11 +2264,13 @@ uninstallWindowsServiceButton.addEventListener("click", async () => {
 
 takeOverWindowsSystemDnsButton.addEventListener("click", async () => {
   const synchronizing = currentWindowsSystemDnsStatus?.managed === true;
-  const confirmed = window.confirm(
-    synchronizing
+  const confirmed = await confirmAction({
+    title: synchronizing ? t("同步接管系统 DNS") : t("接管系统 DNS"),
+    message: synchronizing
       ? t("同步后，当前活动的有线或无线网卡会使用 127.0.0.1 和 ::1。每张网卡现有的自动获取或手动 DNS 都会分别保存；已在 Windows 中改过的配置会作为新的恢复配置。是否继续？")
       : t("接管后，当前已连接的物理网卡将只使用 127.0.0.1 和 ::1 作为 DNS，不设置公共备用 DNS。每张网卡的原 DNS（包括自动获取）会先分别保存，可随时恢复。是否继续？"),
-  );
+    confirmLabel: synchronizing ? t("同步接管") : t("接管系统 DNS"),
+  });
   if (!confirmed) {
     return;
   }
@@ -2226,6 +2544,7 @@ function shouldAutoRefreshQueryLogs(): boolean {
     queryLogPage === 1 &&
     query.filter === DEFAULT_QUERY_LOG_QUERY.filter &&
     query.search === DEFAULT_QUERY_LOG_QUERY.search &&
+    query.domain === DEFAULT_QUERY_LOG_QUERY.domain &&
     activeAdvancedQueryFilterCount(query) === 0 &&
     !queryLogSearchComposition.composing
   );
@@ -2238,13 +2557,28 @@ function shouldAutoRefreshDashboard(): boolean {
   );
 }
 
-async function loadConfig(): Promise<boolean> {
+async function loadConfig(force = false): Promise<boolean> {
   const started = performance.now();
+  const draftAtStart = configLoaded ? configFingerprint(collectConfig()) : null;
+  const savedAtStart = savedConfigFingerprint;
   let succeeded = false;
   try {
     const config = await getConfig();
     if (!config || typeof config.schema_version !== "number") {
       throw new Error(t("DNS 服务返回了空配置或配置格式无效"));
+    }
+    // 请求期间的新输入和跨页面未保存的草稿都不能被服务端回填覆盖。
+    if (shouldPreserveConfigDraft({
+      loaded: configLoaded,
+      force,
+      dirty: configDirty,
+      savedAtStart,
+      savedNow: savedConfigFingerprint,
+      draftAtStart,
+      draftNow: configLoaded ? configFingerprint(collectConfig()) : null,
+    })) {
+      succeeded = true;
+      return true;
     }
     currentConfigSchemaVersion = Math.max(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
     currentStatisticsRetentionHours = config.statistics_retention_hours;
@@ -2262,10 +2596,12 @@ async function loadConfig(): Promise<boolean> {
     listenHostInput.value = config.listen_host;
     listenPortInput.value = String(config.listen_port);
     listenIpv6Input.checked = config.listen_ipv6;
+    listenIpv6HostInput.value = config.listen_ipv6_host;
     allowedClientsInput.value = config.allowed_clients;
     blockedClientsInput.value = config.blocked_clients;
     clientFilteringRulesInput.value = config.client_filtering_rules;
     clientPolicyGroupsInput.value = config.client_policy_groups;
+    refreshClientPolicyProfiles();
     familySafeSearchInput.checked = config.family_safe_search;
     familyBlockedServicesInput.value = config.family_blocked_services;
     rateLimitPerSecondInput.value = String(config.rate_limit_per_second);
@@ -2324,6 +2660,7 @@ async function loadConfig(): Promise<boolean> {
     updateResponseProtectionControls();
     updateRuntimeWatchdogControls();
     updateMonitoringApiControls();
+    updateIpv6ListenControls();
     updateBlockingModeControls();
     blacklistInput.value = config.blacklist;
     ruleEditor.refresh();
@@ -2336,9 +2673,6 @@ async function loadConfig(): Promise<boolean> {
     succeeded = true;
     return true;
   } catch (error) {
-    configLoaded = false;
-    savedConfigFingerprint = "";
-    configDirty = false;
     updateConfigSaveState();
     showMessage(String(error), true);
     return false;
@@ -2926,19 +3260,30 @@ async function saveConfig(): Promise<void> {
 
 async function saveConfigOnly(): Promise<RuntimeStatus> {
   const config = collectConfig();
+  const validationIssues = validateConfigDraft(config);
+  if (validationIssues.length > 0) {
+    showConfigValidationIssues(validationIssues);
+    throw new Error(t("请先修正标出的配置字段"));
+  }
+  clearConfigFieldErrors();
   const previousStatisticsRetentionHours = currentStatisticsRetentionHours;
   const previousQueryLogRetentionHours = currentQueryLogRetentionHours;
   currentStatisticsRetentionHours = config.statistics_retention_hours;
   currentQueryLogRetentionHours = config.query_log_retention_hours;
   try {
     const status = await saveConfigCommand(config);
-    savedConfigFingerprint = configFingerprint(config);
-    configDirty = false;
+    const completion = configSaveCompletion(
+      configFingerprint(config),
+      configFingerprint(collectConfig()),
+    );
+    savedConfigFingerprint = completion.savedFingerprint;
+    configDirty = completion.dirty;
     updateConfigSaveState();
     return status;
   } catch (error) {
     currentStatisticsRetentionHours = previousStatisticsRetentionHours;
     currentQueryLogRetentionHours = previousQueryLogRetentionHours;
+    focusBackendConfigError(String(error));
     throw error;
   }
 }
@@ -3008,6 +3353,7 @@ function collectConfig(): AppConfig {
     listen_host: listenHostInput.value.trim(),
     listen_port: Number(listenPortInput.value),
     listen_ipv6: listenIpv6Input.checked,
+    listen_ipv6_host: listenIpv6HostInput.value.trim(),
     filters: filtersState.map((filter) => ({
       ...filter,
       name: filter.name.trim(),
@@ -3031,11 +3377,135 @@ function updateConfigDirtyState(): void {
   if (!configLoaded) {
     return;
   }
-  configDirty = configFingerprint(collectConfig()) !== savedConfigFingerprint;
-  updateConfigSaveState();
+  // 大黑名单下指纹要序列化整份配置，按键路径上只算一次并透传给变更条。
+  const fingerprint = configFingerprint(collectConfig());
+  configDirty = fingerprint !== savedConfigFingerprint;
+  updateConfigSaveState(fingerprint);
 }
 
-function updateConfigSaveState(): void {
+function configValidationMessage(code: ConfigValidationCode): string {
+  const messages: Record<ConfigValidationCode, string> = {
+    ip_address: t("请输入有效的 IPv4 或 IPv6 地址"),
+    ipv4_address: t("请输入有效的 IP 地址；DNS 的 IPv4 监听地址必须为 IPv4"),
+    ipv6_address: t("请输入有效的 IPv6 地址，例如 ::、::1 或 fd00::1"),
+    port: t("端口必须是 1–65535 之间的整数"),
+    monitoring_port_conflict: t("监控接口端口不能与 DNS 监听端口相同"),
+    rate_limit: t("每客户端限速必须是 0–100000 之间的整数"),
+    cache_size: t("启用缓存时，缓存大小必须是 1 字节到 512 MB"),
+    cache_ttl: t("缓存 TTL 必须在 0–604800 秒内，且最小值不能大于最大值"),
+    cache_stale: t("乐观缓存最大陈旧时间必须在 60–604800 秒之间"),
+    cache_prefetch: t("热门域名预取命中阈值必须在 2–10000 之间"),
+    watchdog_interval: t("自恢复检查间隔必须在 10–3600 秒之间"),
+    blocking_ttl: t("拦截响应 TTL 必须在 0–604800 秒之间"),
+  };
+  return messages[code];
+}
+
+function clearConfigFieldErrors(): void {
+  document.querySelectorAll<HTMLElement>(".config-field-error").forEach((element) => element.remove());
+  document.querySelectorAll<HTMLElement>('[aria-invalid="true"]').forEach((element) => {
+    if (element.closest(".client-policy-builder")) {
+      return;
+    }
+    element.removeAttribute("aria-invalid");
+    // 说明元素已经删除，同时摘掉指向它的 aria-describedby，避免留下悬空引用。
+    const describedBy = (element.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/)
+      .filter((id) => id.length > 0 && !id.endsWith("_config_error"));
+    if (describedBy.length > 0) {
+      element.setAttribute("aria-describedby", describedBy.join(" "));
+    } else {
+      element.removeAttribute("aria-describedby");
+    }
+  });
+}
+
+function markConfigFieldError(fieldId: string, message: string): HTMLElement | null {
+  const field = document.getElementById(fieldId);
+  if (!field) {
+    return null;
+  }
+  field.setAttribute("aria-invalid", "true");
+  const error = document.createElement("small");
+  const errorId = `${fieldId}_config_error`;
+  error.id = errorId;
+  error.className = "field-error config-field-error";
+  error.textContent = message;
+  const describedBy = new Set((field.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean));
+  describedBy.add(errorId);
+  field.setAttribute("aria-describedby", [...describedBy].join(" "));
+  field.insertAdjacentElement("afterend", error);
+  return field;
+}
+
+function focusConfigField(view: ViewName, field: HTMLElement): void {
+  setActiveView(view);
+  const details = field.closest("details");
+  if (details instanceof HTMLDetailsElement) {
+    details.open = true;
+  }
+  window.setTimeout(() => {
+    field.scrollIntoView({ block: "center", behavior: "smooth" });
+    field.focus();
+  }, 0);
+}
+
+function showConfigValidationIssues(issues: ReturnType<typeof validateConfigDraft>): void {
+  clearConfigFieldErrors();
+  const marked = issues.map((issue) => ({
+    issue,
+    field: markConfigFieldError(issue.fieldId, configValidationMessage(issue.code)),
+  }));
+  const first = marked.find((entry) => entry.field);
+  if (first?.field) {
+    focusConfigField(first.issue.view, first.field);
+  }
+}
+
+function focusBackendConfigError(message: string): void {
+  const mapped = mapBackendConfigError(message);
+  if (!mapped) {
+    return;
+  }
+  clearConfigFieldErrors();
+  const field = markConfigFieldError(mapped.fieldId, message);
+  if (field) {
+    focusConfigField(mapped.view, field);
+  }
+}
+
+const configKeyViewCache = new Map<string, ConfigView>();
+
+// 配置键归属的页面在模板渲染后就固定了，查一次缓存起来，避免每次按键都查 DOM。
+function configKeyView(key: string): ConfigView {
+  const cached = configKeyViewCache.get(key);
+  if (cached) {
+    return cached;
+  }
+  const field = document.getElementById(key) ?? document.querySelector(`[name="${key}"]`);
+  const panel = field?.closest<HTMLElement>("[data-view-panel]")?.dataset.viewPanel;
+  const view = CONFIG_VIEWS.find((candidate) => candidate === panel) ?? "settings";
+  configKeyViewCache.set(key, view);
+  return view;
+}
+
+function dirtyConfigViews(currentFingerprint: string): ConfigView[] {
+  if (!configLoaded || !configDirty) {
+    return [];
+  }
+  const saved = JSON.parse(savedConfigFingerprint) as Record<string, unknown>;
+  const current = JSON.parse(currentFingerprint) as Record<string, unknown>;
+  const dirty = new Set<ConfigView>();
+  for (const [key, value] of Object.entries(current)) {
+    if (JSON.stringify(value) === JSON.stringify(saved[key])) {
+      continue;
+    }
+    dirty.add(key === "filters" ? "filters" : configKeyView(key));
+  }
+  return CONFIG_VIEWS.filter((view) => dirty.has(view));
+}
+
+function updateConfigSaveState(currentFingerprint?: string): void {
   const label = !configLoaded
     ? t("配置不可用")
     : configDirty
@@ -3046,8 +3516,20 @@ function updateConfigSaveState(): void {
     element.classList.toggle("dirty", configLoaded && configDirty);
   });
   configSaveButtons.forEach((button) => {
-    button.disabled = !configLoaded || !configDirty;
+    button.disabled = appBusy || !configLoaded || !configDirty;
   });
+  const dirtyViews =
+    configLoaded && configDirty
+      ? dirtyConfigViews(currentFingerprint ?? configFingerprint(collectConfig()))
+      : [];
+  configChangeBar.classList.toggle("hidden", dirtyViews.length === 0);
+  setHtmlIfChanged(
+    configChangeModules,
+    dirtyViews
+      .map((view) => `<button type="button" data-dirty-view="${view}">${escapeHtml(CONFIG_VIEW_LABELS[view])}</button>`)
+      .join(""),
+  );
+  discardConfigButton.disabled = appBusy || dirtyViews.length === 0;
 }
 
 async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
@@ -3091,6 +3573,9 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
     }
     succeeded = true;
   } catch (error) {
+    if (renderDashboard && (!options.auto || !latestRuntimeStatus)) {
+      renderDashboardFailure(String(error));
+    }
     // 自动轮询会撞上后台服务重启或等待批准的窗口，瞬态错误只记录不打扰用户
     if (options.auto) {
       console.error("自动刷新状态失败", error);
@@ -3119,7 +3604,8 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
 function collectQueryLogQuery(): QueryLogQuery {
   return {
     filter: queryLogFilterInput.value as QueryLogFilter,
-    search: queryLogSearchInput.value.trim(),
+    search: queryLogExactDomain ? "" : queryLogSearchInput.value.trim(),
+    domain: queryLogExactDomain,
     hours: parseQueryLogHours(queryLogTimeRange.value),
     source: queryLogSource.value as QueryLogSourceFilter,
     queryType: queryLogQueryType.value as QueryLogTypeFilter,
@@ -3138,13 +3624,20 @@ function resetQueryLogPagination(): void {
 }
 
 function applyQueryLogQuery(queryValue: QueryLogQuery): void {
-  queryLogSearchInput.value = queryValue.search;
+  queryLogExactDomain = queryValue.domain?.trim() || null;
+  queryLogSearchInput.value = queryLogExactDomain ?? queryValue.search;
   setQueryLogFilterValue(queryValue.filter);
   queryLogTimeRange.value = queryValue.hours === null ? "configured" : String(queryValue.hours);
   queryLogSource.value = queryValue.source;
   queryLogQueryType.value = queryValue.queryType;
   queryLogSort.value = queryValue.sort;
   [queryLogTimeRange, queryLogSource, queryLogQueryType, queryLogSort].forEach(syncCustomSelect);
+  if (queryLogExactDomain) {
+    queryLogDrilldownText.textContent = t("精确域名：{p0}", { p0: queryLogExactDomain });
+    queryLogDrilldown.classList.remove("hidden");
+  } else {
+    clearQueryLogDrilldown();
+  }
 }
 
 function renderSavedQueryLogViews(selectedId = queryLogSavedViewSelect.value): void {
@@ -3256,10 +3749,12 @@ async function refreshQueryLogs(options: RefreshOptions = {}): Promise<void> {
 async function runStatusAction(
   action: () => Promise<RuntimeStatus>,
   successMessage: string,
+  reconcileConfig?: () => void,
 ): Promise<void> {
   setBusy(true);
   try {
     const status = await action();
+    reconcileConfig?.();
     renderStatus(status);
     showMessage(successMessage, false);
     await loadConfig();
@@ -3269,6 +3764,14 @@ async function runStatusAction(
   } finally {
     setBusy(false);
   }
+}
+
+function reconcileEnabledConfig(enabled: boolean, draftAtActionStart: boolean): void {
+  savedConfigFingerprint = rebaseConfigFingerprint(savedConfigFingerprint, { enabled });
+  if (enabledInput.checked === draftAtActionStart) {
+    enabledInput.checked = enabled;
+  }
+  updateConfigDirtyState();
 }
 
 function rememberViewAcrossReload(view: ViewName): void {
@@ -3660,8 +4163,8 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
     "#blocked_sparkline",
     buildTrafficSeries(traffic, "blocked", effectiveStatisticsHours),
   );
-  renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries);
-  renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked);
+  renderRankTable("#query_rank", status.stats.query_domains ?? {}, status.stats.queries, undefined, "queries");
+  renderRankTable("#blocked_rank", status.stats.blocked_domains ?? {}, status.stats.blocked, undefined, "blocked");
   renderClientOverview(status.stats.client_requests ?? {}, status.stats.client_blocked ?? {});
   renderRankTable("#blocklist_rank", status.stats.blocklist_hits ?? {}, status.stats.blocked);
   renderUpstreamRequestRank(
@@ -3670,6 +4173,30 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
     status.stats.forwarded,
   );
   renderUpstreamLatencyRank("#upstream_latency_rank", status.stats.upstream_avg_latency ?? []);
+  renderDashboardSummary(status);
+}
+
+function renderDashboardSummary(status: RuntimeStatus): void {
+  if (status.stats.queries === 0) {
+    renderDashboardState(
+      "empty",
+      t("所选统计范围内暂无 DNS 请求；发起查询或调整统计范围后再查看。"),
+    );
+  } else {
+    renderDashboardState("ready", "");
+  }
+}
+
+function renderDashboardFailure(message: string): void {
+  const detail = latestRuntimeStatus
+    ? t("无法加载最新统计，当前保留上次成功的数据：{p0}", { p0: message })
+    : t("统计数据加载失败：{p0}", { p0: message });
+  renderDashboardState("error", detail);
+}
+
+function renderDashboardState(state: "loading" | "empty" | "error" | "ready", message: string): void {
+  dashboardState.className = `dashboard-state ${state}${state === "ready" ? " hidden" : ""}`;
+  dashboardState.textContent = message;
 }
 
 function renderSecurityEvents(status: RuntimeStatus): void {
@@ -4021,11 +4548,229 @@ function updateMonitoringApiControls(): void {
   monitoringApiTokenInput.disabled = !enabled;
 }
 
+function updateIpv6ListenControls(): void {
+  listenIpv6HostInput.disabled = !listenIpv6Input.checked;
+}
+
 function updateBlockingModeControls(): void {
   const isCustom = selectedRadioValue(blockingModeInputs, "null_ip") === "custom_ip";
   blockingCustomFields.classList.toggle("visible", isCustom);
   blockingCustomIpv4Input.disabled = !isCustom;
   blockingCustomIpv6Input.disabled = !isCustom;
+}
+
+const CLIENT_POLICY_SERVICE_LABELS: Record<ClientPolicyService, string> = {
+  youtube: "YouTube",
+  tiktok: "TikTok",
+  instagram: "Instagram",
+  facebook: "Facebook",
+  x: "X",
+  reddit: "Reddit",
+  twitch: "Twitch",
+  discord: "Discord",
+  steam: "Steam",
+  epic: "Epic Games",
+  roblox: "Roblox",
+};
+
+renderClientPolicyServices();
+updateClientPolicyFormVisibility();
+
+function renderClientPolicyServices(): void {
+  if (clientPolicyServices.childElementCount === 0) {
+    clientPolicyServices.innerHTML = CLIENT_POLICY_SERVICE_KEYS.map(
+      (service) => `<label data-service="${service}"><input type="checkbox" value="${service}" /><span>${CLIENT_POLICY_SERVICE_LABELS[service]}</span></label>`,
+    ).join("");
+  }
+  const search = clientPolicyServiceSearchInput.value.trim().toLocaleLowerCase();
+  clientPolicyServices.querySelectorAll<HTMLElement>("[data-service]").forEach((label) => {
+    const service = label.dataset.service as ClientPolicyService;
+    label.classList.toggle(
+      "hidden",
+      search.length > 0 && !CLIENT_POLICY_SERVICE_LABELS[service].toLocaleLowerCase().includes(search),
+    );
+  });
+}
+
+function refreshClientPolicyProfiles(selected = clientPolicyProfileInput.value): void {
+  const groups = parseClientPolicyGroups(clientPolicyGroupsInput.value);
+  const options = [
+    ["filter", t("标准过滤")],
+    ["bypass", t("不过滤")],
+    ["family", t("家庭保护")],
+    ...groups.map((group) => [group.name, group.name]),
+    ["__custom__", t("新建或编辑自定义组…")],
+  ];
+  clientPolicyProfileInput.innerHTML = options
+    .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`)
+    .join("");
+  clientPolicyProfileInput.value = options.some(([value]) => value === selected) ? selected : "filter";
+  updateClientPolicyFormVisibility();
+}
+
+function updateClientPolicyFormVisibility(): void {
+  clientPolicySchedule.classList.toggle("hidden", !clientPolicyScheduleEnabledInput.checked);
+  const profile = clientPolicyProfileInput.value;
+  const custom = profile === "__custom__" || !["filter", "bypass", "family"].includes(profile);
+  clientPolicyCustom.classList.toggle("hidden", !custom);
+}
+
+function loadSelectedClientPolicyGroup(): void {
+  const profile = clientPolicyProfileInput.value;
+  if (profile === "__custom__") {
+    clientPolicyGroupNameInput.value = "";
+    clientPolicyGroupModeInput.value = "filter";
+    clientPolicySafeSearchInput.checked = false;
+    setClientPolicyServices([]);
+    return;
+  }
+  const group = findClientPolicyGroup(clientPolicyGroupsInput.value, profile);
+  if (!group) {
+    return;
+  }
+  clientPolicyGroupNameInput.value = group.name;
+  clientPolicyGroupModeInput.value = group.mode;
+  clientPolicySafeSearchInput.checked = group.safeSearch;
+  setClientPolicyServices(group.services);
+}
+
+function setClientPolicyServices(services: readonly ClientPolicyService[]): void {
+  clientPolicyServices.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach((input) => {
+    input.checked = services.includes(input.value as ClientPolicyService);
+  });
+}
+
+function setClientPolicyFieldError(input: HTMLInputElement, element: HTMLElement, message = ""): void {
+  input.setAttribute("aria-invalid", String(Boolean(message)));
+  element.textContent = message;
+  element.classList.toggle("hidden", !message);
+}
+
+function clearClientPolicyForm(): void {
+  clientPolicyTargetInput.value = "";
+  refreshClientPolicyProfiles("filter");
+  clientPolicyScheduleEnabledInput.checked = false;
+  clientPolicyStartInput.value = "20:00";
+  clientPolicyEndInput.value = "07:00";
+  clientPolicyGroupNameInput.value = "";
+  clientPolicyGroupModeInput.value = "filter";
+  clientPolicySafeSearchInput.checked = false;
+  clientPolicyServiceSearchInput.value = "";
+  document.querySelectorAll<HTMLInputElement>('#client_policy_schedule input[type="checkbox"]').forEach((input) => {
+    input.checked = true;
+  });
+  setClientPolicyServices([]);
+  renderClientPolicyServices();
+  setClientPolicyFieldError(clientPolicyTargetInput, clientPolicyTargetError);
+  setClientPolicyFieldError(clientPolicyGroupNameInput, clientPolicyGroupNameError);
+  clientPolicyFormStatus.textContent = "";
+  updateClientPolicyFormVisibility();
+}
+
+function openClientPolicyEditor(client: string): void {
+  clearClientPolicyForm();
+  const rule = findEffectiveClientPolicyRule(clientFilteringRulesInput.value, client);
+  clientPolicyTargetInput.value = rule?.network ?? client;
+  if (rule) {
+    refreshClientPolicyProfiles(rule.profile);
+    clientPolicyScheduleEnabledInput.checked = rule.schedule !== null;
+    if (rule.schedule) {
+      const activeDays: readonly string[] = expandPolicyWeekdays(rule.schedule.days);
+      document.querySelectorAll<HTMLInputElement>('#client_policy_schedule input[type="checkbox"]').forEach((input) => {
+        input.checked = activeDays.includes(input.value);
+      });
+      clientPolicyStartInput.value = rule.schedule.start;
+      clientPolicyEndInput.value = rule.schedule.end;
+    }
+    loadSelectedClientPolicyGroup();
+    if (rule.network.toLocaleLowerCase() !== client.toLocaleLowerCase()) {
+      clientPolicyFormStatus.textContent = t(
+        "当前设备命中网段规则 {p0}；修改后会影响该网段内的所有设备。",
+        { p0: rule.network },
+      );
+    }
+  }
+  updateClientPolicyFormVisibility();
+  setActiveView("security");
+  window.setTimeout(() => {
+    clientPolicyTargetInput.scrollIntoView({ block: "center", behavior: "smooth" });
+    clientPolicyTargetInput.focus();
+  }, 0);
+}
+
+function applyClientPolicyDraft(): void {
+  setClientPolicyFieldError(clientPolicyTargetInput, clientPolicyTargetError);
+  setClientPolicyFieldError(clientPolicyGroupNameInput, clientPolicyGroupNameError);
+  const network = clientPolicyTargetInput.value.trim();
+  if (!validateIpOrCidr(network)) {
+    setClientPolicyFieldError(clientPolicyTargetInput, clientPolicyTargetError, t("请输入有效的 IPv4、IPv6 或 CIDR 网段"));
+    clientPolicyTargetInput.focus();
+    return;
+  }
+  try {
+    let profile = clientPolicyProfileInput.value;
+    let groupsDraft = clientPolicyGroupsInput.value;
+    const custom = profile === "__custom__" || !["filter", "bypass", "family"].includes(profile);
+    if (custom) {
+      profile = clientPolicyGroupNameInput.value.trim().toLowerCase();
+      if (!validatePolicyName(profile) || ["filter", "bypass", "family"].includes(profile)) {
+        setClientPolicyFieldError(clientPolicyGroupNameInput, clientPolicyGroupNameError, t("名称需为 1–32 位字母、数字、短横线或下划线，且不能使用内置名称"));
+        clientPolicyGroupNameInput.focus();
+        return;
+      }
+      const services = Array.from(
+        clientPolicyServices.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:checked'),
+        (input) => input.value as ClientPolicyService,
+      );
+      groupsDraft = upsertClientPolicyGroup(groupsDraft, {
+        name: profile,
+        mode: clientPolicyGroupModeInput.value === "bypass" ? "bypass" : "filter",
+        safeSearch: clientPolicySafeSearchInput.checked,
+        services,
+      });
+    }
+    const schedule = clientPolicyScheduleEnabledInput.checked
+      ? {
+          days: selectedWeekdaysValue(Array.from(
+            document.querySelectorAll<HTMLInputElement>('#client_policy_schedule input[type="checkbox"]:checked'),
+            (input) => input.value as ClientPolicyWeekday,
+          )),
+          start: clientPolicyStartInput.value,
+          end: clientPolicyEndInput.value,
+        }
+      : null;
+    const rulesDraft = upsertClientPolicyRule(clientFilteringRulesInput.value, {
+      network,
+      profile,
+      schedule,
+    });
+    clientPolicyGroupsInput.value = groupsDraft;
+    clientFilteringRulesInput.value = rulesDraft;
+    refreshClientPolicyProfiles(profile);
+    updateConfigDirtyState();
+    clientPolicyFormStatus.textContent = t("已应用到配置草稿，点击“保存全部更改”后生效");
+  } catch (error) {
+    clientPolicyFormStatus.textContent = String(error);
+    showMessage(String(error), true);
+  }
+}
+
+function openDomainQueryLogs(domain: string, blocked: boolean): void {
+  applyQueryLogQuery(domainRankingQuery(domain, blocked));
+  resetQueryLogPagination();
+  queryLogDrilldownText.textContent = blocked
+    ? t("来自“被拦截域名排行”：精确域名文本 + 已过滤状态")
+    : t("来自“请求域名排行”：精确域名文本");
+  queryLogDrilldown.classList.remove("hidden");
+  refreshQueryLogAdvancedState();
+  setActiveView("logs");
+  queryLogSearchInput.focus();
+}
+
+function clearQueryLogDrilldown(): void {
+  queryLogExactDomain = null;
+  queryLogDrilldown.classList.add("hidden");
+  queryLogDrilldownText.textContent = "";
 }
 
 function parseClientNames(value: string): Map<string, string> {
@@ -4465,6 +5210,25 @@ async function runQueryLogRuleAction(
   setBusy(true);
   try {
     const result = await applyQueryLogRule(domain, action, target);
+    const merged = mergeQueryLogRuleIntoDraft(
+      {
+        blacklist: blacklistInput.value,
+        dnsRewrites: dnsRewritesInput.value,
+      },
+      {
+        blacklist: result.config.blacklist,
+        dnsRewrites: result.config.dns_rewrites,
+      },
+      action,
+    );
+    blacklistInput.value = merged.blacklist;
+    dnsRewritesInput.value = merged.dnsRewrites;
+    savedConfigFingerprint = rebaseConfigFingerprint(savedConfigFingerprint, {
+      blacklist: result.config.blacklist,
+      dns_rewrites: result.config.dns_rewrites,
+    });
+    ruleEditor.refresh();
+    updateConfigDirtyState();
     renderStatus(result.status, { renderDashboard: false });
     await loadConfig();
     showMessage(result.message, false);
@@ -4578,15 +5342,18 @@ function renderRankTable(
   counts: Record<string, number>,
   total: number,
   formatLabel?: (key: string) => string,
+  drilldown?: "queries" | "blocked",
 ): void {
   const container = query<HTMLDivElement>(selector);
   const rows = Object.entries(counts)
     .filter(([domain, count]) => domain.length > 0 && count > 0)
     .sort((a, b) => b[1] - a[1] || compareRankLabel(a[0], b[0]))
     .slice(0, RANK_ROW_LIMIT);
+  container.classList.toggle("is-empty", rows.length === 0);
 
   if (rows.length === 0) {
-    setHtmlIfChanged(container, `<div class="empty-rank">${t("暂无请求数据")}</div>`);
+    const message = total === 0 ? t("所选统计范围内暂无请求") : t("暂无可排行的数据");
+    setHtmlIfChanged(container, `<div class="empty-rank">${message}</div>`);
     return;
   }
 
@@ -4597,11 +5364,12 @@ function renderRankTable(
       const percent = total > 0 ? count / total : 0;
       const label = formatLabel ? formatLabel(key) : key;
 
+      const domainCell = drilldown
+        ? `<button class="rank-domain rank-domain-button" type="button" data-domain-log="${escapeHtml(key)}" data-domain-blocked="${drilldown === "blocked"}" title="${t("查看 {p0} 的查询日志", { p0: escapeHtml(label) })}"><span>${escapeHtml(label)}</span></button>`
+        : `<div class="rank-domain" title="${escapeHtml(label)}"><span>${escapeHtml(label)}</span></div>`;
       return `
         <div class="rank-row">
-          <div class="rank-domain" title="${escapeHtml(label)}">
-            <span>${escapeHtml(label)}</span>
-          </div>
+          ${domainCell}
           <div class="rank-value">
             <span class="rank-count">${formatCount(count)}</span>
             <span class="rank-percent">${formatPercent(percent)}</span>
@@ -4622,18 +5390,32 @@ function renderClientOverview(
     .filter(([client, count]) => client.length > 0 && count > 0)
     .sort((a, b) => b[1] - a[1] || compareRankLabel(a[0], b[0]))
     .slice(0, RANK_ROW_LIMIT);
+  clientRankBody.classList.toggle("is-empty", rows.length === 0);
   if (rows.length === 0) {
     setHtmlIfChanged(clientRankBody, `<div class="empty-rank">${t("暂无客户端数据")}</div>`);
     return;
   }
+  // 生效策略取已保存配置，整份指纹只解析一次，不要放进逐行渲染里。
+  const savedRules = configLoaded
+    ? (JSON.parse(savedConfigFingerprint) as AppConfig).client_filtering_rules
+    : "";
   const html = rows.map(([client, count]) => {
     const blockedCount = blocked[client] ?? 0;
     const label = formatClientRankLabel(client);
+    const policy = resolveEffectiveClientPolicy(client, savedRules);
+    const policyLabel = policy.profile === "filter"
+      ? t("标准过滤")
+      : policy.profile === "bypass"
+        ? t("不过滤")
+        : policy.profile === "family"
+          ? t("家庭保护")
+          : policy.profile;
     return `
       <div class="rank-row client-rank-row">
         <button class="rank-domain rank-client-button" data-client-log="${escapeHtml(client)}" type="button" title="${t("查看 {p0} 的查询日志", { p0: escapeHtml(label) })}">
           <span>${escapeHtml(label)}</span>
         </button>
+        <button class="client-policy-button" data-client-policy="${escapeHtml(client)}" type="button" title="${t("编辑 {p0} 的客户端策略", { p0: escapeHtml(label) })}">${escapeHtml(policyLabel)}</button>
         <span class="client-rank-metric">${formatCount(count)}</span>
         <span class="client-rank-metric blocked">${formatRate(blockedCount, count)}</span>
       </div>
@@ -4654,6 +5436,7 @@ function renderUpstreamRequestRank(
       (a, b) => b.requests - a.requests || compareRankLabel(a.upstream, b.upstream),
     )
     .slice(0, RANK_ROW_LIMIT);
+  container.classList.toggle("is-empty", visibleRows.length === 0);
 
   if (visibleRows.length === 0) {
     setHtmlIfChanged(container, `<div class="empty-rank">${t("暂无上游请求数据")}</div>`);
@@ -4689,6 +5472,7 @@ function renderUpstreamLatencyRank(selector: string, rows: UpstreamLatencyStat[]
     .filter((row) => row.upstream.length > 0)
     .sort((a, b) => a.avg_ms - b.avg_ms || compareRankLabel(a.upstream, b.upstream))
     .slice(0, RANK_ROW_LIMIT);
+  container.classList.toggle("is-empty", visibleRows.length === 0);
 
   if (visibleRows.length === 0) {
     setHtmlIfChanged(container, `<div class="empty-rank">${t("暂无上游响应时间数据")}</div>`);
@@ -4738,7 +5522,12 @@ function toggleEditing(current: Set<string>, id: string): Set<string> {
 }
 
 function setBusy(busy: boolean): void {
+  appBusy = busy;
   for (const button of document.querySelectorAll<HTMLButtonElement>("button")) {
+    // 确认框是模态的，禁用它自己的按钮会让打开中的对话框只剩 Esc 可用。
+    if (button.closest("#confirm_dialog")) {
+      continue;
+    }
     button.disabled = busy;
   }
   if (!busy && currentStorageInfo) {
@@ -4787,6 +5576,9 @@ function setDashboardLoading(loading: boolean): void {
   customSelects
     .get(dashboardStatisticsRange)
     ?.trigger.setAttribute("aria-busy", String(loading));
+  if (loading && !latestRuntimeStatus) {
+    renderDashboardState("loading", t("正在加载统计数据…"));
+  }
 }
 
 function setFilterUpdating(updating: boolean): void {

@@ -23,6 +23,7 @@ export type QueryLogSort = "newest" | "oldest" | "slowest";
 export type QueryLogQuery = {
   filter: QueryLogFilter;
   search: string;
+  domain: string | null;
   hours: number | null;
   source: QueryLogSourceFilter;
   queryType: QueryLogTypeFilter;
@@ -129,6 +130,7 @@ export type AppConfig = {
   listen_host: string;
   listen_port: number;
   listen_ipv6: boolean;
+  listen_ipv6_host: string;
   upstream_dns: string;
   fallback_dns: string;
   bootstrap_dns: string;

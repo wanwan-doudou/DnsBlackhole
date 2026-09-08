@@ -275,6 +275,7 @@ pub struct QueryLogQuery<'a> {
     pub hours: Option<u32>,
     pub filter: &'a str,
     pub search: &'a str,
+    pub domain: Option<&'a str>,
     pub source: &'a str,
     pub query_type: &'a str,
     pub sort: &'a str,
@@ -763,6 +764,7 @@ impl Database {
             hours: None,
             filter,
             search,
+            domain: None,
             source: "all",
             query_type: "all",
             sort: "newest",
@@ -778,6 +780,7 @@ impl Database {
             hours,
             filter,
             search,
+            domain,
             source,
             query_type,
             sort,
@@ -836,6 +839,7 @@ impl Database {
             ),
         });
         let search = search.trim();
+        let domain = domain.map(str::trim).filter(|value| !value.is_empty());
         let query_logs_source = if search.is_empty()
             && source_sql.is_empty()
             && query_type_sql.is_empty()
@@ -875,7 +879,7 @@ impl Database {
              )"
         };
         let base_where_sql = format!(
-            "timestamp >= :since{search_index_sql}{search_sql}{filter_sql}{source_sql}{query_type_sql}"
+            "timestamp >= :since{search_index_sql}{search_sql} AND (:domain IS NULL OR domain = :domain COLLATE NOCASE){filter_sql}{source_sql}{query_type_sql}"
         );
         let page_where_sql = format!("{base_where_sql}{cursor_sql}");
         // 模糊搜索的候选集构建成本远高于普通时间索引分页。把总数作为窗口列
@@ -937,6 +941,7 @@ impl Database {
                         &total_sql,
                         named_params! {
                             ":since": since_param,
+                            ":domain": domain,
                         },
                         |row| read_u64(row, 0),
                     )
@@ -946,6 +951,7 @@ impl Database {
                         named_params! {
                             ":since": since_param,
                             ":search": search_pattern,
+                            ":domain": domain,
                         },
                         |row| read_u64(row, 0),
                     )
@@ -959,6 +965,7 @@ impl Database {
         let mut rows = if search.is_empty() {
             stmt.query(named_params! {
                 ":since": since_param,
+                ":domain": domain,
                 ":limit": limit,
                 ":offset": offset,
             })
@@ -966,6 +973,7 @@ impl Database {
             stmt.query(named_params! {
                 ":since": since_param,
                 ":search": search_pattern,
+                ":domain": domain,
                 ":limit": limit,
                 ":offset": offset,
             })
@@ -997,6 +1005,7 @@ impl Database {
                     named_params! {
                         ":since": since_param,
                         ":search": search_pattern,
+                        ":domain": domain,
                     },
                     |row| read_u64(row, 0),
                 )
@@ -2617,6 +2626,7 @@ mod tests {
                 hours: Some(1),
                 filter: "all",
                 search: "",
+                domain: None,
                 source: "cache",
                 query_type: "aaaa",
                 sort: "newest",
@@ -2634,6 +2644,7 @@ mod tests {
                 hours: None,
                 filter: "all",
                 search: "",
+                domain: None,
                 source: "all",
                 query_type: "all",
                 sort: "slowest",
@@ -2643,6 +2654,36 @@ mod tests {
             })
             .expect("slow query sort should load");
         assert_eq!(slowest.records[0].domain, "cache.example");
+    }
+
+    #[test]
+    fn query_logs_support_exact_domain_filtering() {
+        let db = Database::open_in_memory().expect("database should open");
+        db.insert_query_logs(&[
+            (sample_query_log("example.com"), false),
+            (sample_query_log("sub.example.com"), false),
+            (sample_query_log("another.example"), false),
+        ])
+        .expect("query logs should save");
+
+        let page = db
+            .query_logs_advanced(QueryLogQuery {
+                retention_hours: 24,
+                hours: None,
+                filter: "all",
+                search: "",
+                domain: Some("EXAMPLE.COM"),
+                source: "all",
+                query_type: "all",
+                sort: "newest",
+                cursor: None,
+                page: 1,
+                page_size: 20,
+            })
+            .expect("exact domain query should load");
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.records[0].domain, "example.com");
     }
 
     #[test]
@@ -2659,6 +2700,7 @@ mod tests {
                 hours: None,
                 filter: "all",
                 search: "",
+                domain: None,
                 source: "all",
                 query_type: "all",
                 sort: "newest",
@@ -2677,6 +2719,7 @@ mod tests {
                 hours: None,
                 filter: "all",
                 search: "",
+                domain: None,
                 source: "all",
                 query_type: "all",
                 sort: "newest",
@@ -2702,7 +2745,7 @@ mod tests {
 
     #[test]
     #[ignore = "性能测试：按需生成 30000 条查询日志"]
-    fn measures_advanced_query_log_filters() {
+    fn measures_large_query_log_workflows() {
         let db = Database::open_in_memory().expect("db should open");
         let entries = (0..30_000)
             .map(|index| {
@@ -2727,6 +2770,7 @@ mod tests {
                 hours: Some(1),
                 filter: "all",
                 search: "",
+                domain: None,
                 source: "cache",
                 query_type: "aaaa",
                 sort: "slowest",
@@ -2742,6 +2786,67 @@ mod tests {
         );
         assert_eq!(page.total, 2_500);
         assert!(elapsed < Duration::from_secs(2));
+
+        let pagination_started = Instant::now();
+        let first = db
+            .query_logs_advanced(QueryLogQuery {
+                retention_hours: 24,
+                hours: Some(1),
+                filter: "all",
+                search: "",
+                domain: None,
+                source: "all",
+                query_type: "all",
+                sort: "newest",
+                cursor: Some(""),
+                page: 1,
+                page_size: 200,
+            })
+            .expect("first cursor page should load");
+        let cursor = first
+            .next_cursor
+            .as_deref()
+            .expect("first page should continue");
+        let second = db
+            .query_logs_advanced(QueryLogQuery {
+                retention_hours: 24,
+                hours: Some(1),
+                filter: "all",
+                search: "",
+                domain: None,
+                source: "all",
+                query_type: "all",
+                sort: "newest",
+                cursor: Some(cursor),
+                page: 2,
+                page_size: 200,
+            })
+            .expect("second cursor page should load");
+        let pagination_elapsed = pagination_started.elapsed();
+        let first_ids = first
+            .records
+            .iter()
+            .map(|record| record.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(first.total, 30_000);
+        assert_eq!(first.records.len(), 200);
+        assert_eq!(second.records.len(), 200);
+        assert!(
+            second
+                .records
+                .iter()
+                .all(|record| !first_ids.contains(&record.id))
+        );
+        assert!(pagination_elapsed < Duration::from_secs(2));
+        eprintln!("two cursor pages: {pagination_elapsed:.2?}");
+
+        let stats_started = Instant::now();
+        let stats = db.log_stats(24).expect("dashboard statistics should load");
+        let stats_elapsed = stats_started.elapsed();
+        assert_eq!(stats.queries, 30_000);
+        assert_eq!(stats.forwarded, 30_000);
+        assert!(stats_elapsed < Duration::from_secs(2));
+        eprintln!("dashboard statistics: {stats_elapsed:.2?}");
     }
 
     #[test]
@@ -4111,6 +4216,76 @@ mod tests {
             .expect("parallel log stats should load");
         assert_eq!(stats.queries, 0);
         assert_eq!(stats.blocked, 0);
+
+        drop(database);
+        fs::remove_dir_all(storage_dir).expect("test storage directory should remove");
+    }
+
+    #[test]
+    #[ignore = "性能测试：创建文件数据库并重复打开只读连接"]
+    fn measures_short_lived_dashboard_read_connections() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let storage_dir = std::env::temp_dir().join(format!(
+            "dnsblackhole-dashboard-read-bench-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&storage_dir).expect("test storage directory should create");
+        let database = Database::open(&storage_dir).expect("file database should open");
+        let entries = (0..30_000)
+            .map(|index| {
+                let mut entry = sample_query_log(&format!("dashboard-{index}.example"));
+                entry.blocked = index % 4 == 0;
+                entry.forwarded = !entry.blocked;
+                (entry, false)
+            })
+            .collect::<Vec<_>>();
+        database
+            .insert_query_logs(&entries)
+            .expect("dashboard fixture should save");
+        let path = database
+            .read_path
+            .as_deref()
+            .expect("file database should expose read path");
+
+        const OPEN_RUNS: usize = 30;
+        let mut open_ms = Vec::with_capacity(OPEN_RUNS);
+        for _ in 0..OPEN_RUNS {
+            let started = Instant::now();
+            let connections = (0..READ_CONNECTION_POOL_SIZE)
+                .map(|_| open_read_connection(path))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read connections should open");
+            open_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            drop(connections);
+        }
+
+        const STATS_RUNS: usize = 20;
+        let mut stats_ms = Vec::with_capacity(STATS_RUNS);
+        for _ in 0..STATS_RUNS {
+            let started = Instant::now();
+            let stats = database
+                .log_stats(24)
+                .expect("dashboard statistics should load");
+            assert_eq!(stats.queries, 30_000);
+            stats_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let percentile = |values: &mut Vec<f64>, numerator: usize| {
+            values.sort_by(f64::total_cmp);
+            let index = (values.len() * numerator).div_ceil(100).saturating_sub(1);
+            values[index]
+        };
+        let open_p50 = percentile(&mut open_ms.clone(), 50);
+        let open_p95 = percentile(&mut open_ms, 95);
+        let stats_p50 = percentile(&mut stats_ms.clone(), 50);
+        let stats_p95 = percentile(&mut stats_ms, 95);
+        assert!(open_p95 < 500.0);
+        assert!(stats_p95 < 2_000.0);
+
+        eprintln!("four short-lived read connections: P50 {open_p50:.2} ms, P95 {open_p95:.2} ms");
+        eprintln!("dashboard statistics: P50 {stats_p50:.2} ms, P95 {stats_p95:.2} ms");
 
         drop(database);
         fs::remove_dir_all(storage_dir).expect("test storage directory should remove");

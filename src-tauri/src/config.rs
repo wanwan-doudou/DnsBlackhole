@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "macos", windows)))]
 use tauri::{AppHandle, Manager};
 
-pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 17;
+pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 18;
 pub(crate) const MAX_STATISTICS_RETENTION_HOURS: u32 = 24 * 365;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESOLVED_UPSTREAM_ADDRESSES: usize = 16;
@@ -60,6 +60,8 @@ pub struct AppConfig {
     pub listen_port: u16,
     #[serde(default = "default_listen_ipv6")]
     pub listen_ipv6: bool,
+    #[serde(default = "default_listen_ipv6_host")]
+    pub listen_ipv6_host: String,
     pub upstream_dns: String,
     #[serde(default)]
     pub fallback_dns: String,
@@ -307,6 +309,7 @@ impl Default for AppConfig {
             listen_host: default_listen_host(),
             listen_port: default_listen_port(),
             listen_ipv6: default_listen_ipv6(),
+            listen_ipv6_host: default_listen_ipv6_host(),
             upstream_dns: default_upstream_dns(),
             fallback_dns: default_fallback_dns(),
             bootstrap_dns: default_bootstrap_dns(),
@@ -394,9 +397,17 @@ impl AppConfig {
             return Err("启用 IPv6 双监听时，监听地址必须填写 IPv4 地址".into());
         }
 
+        let ipv6_host = self.listen_ipv6_host.trim();
+        if ipv6_host.is_empty() {
+            return Err("启用 IPv6 监听时，IPv6 监听地址不能为空".into());
+        }
+        let ipv6_addr = ipv6_host
+            .parse::<Ipv6Addr>()
+            .map_err(|_| "IPv6 监听地址必须是 IPv6 地址，例如 ::、::1 或 fd00::1".to_string())?;
+
         Ok(vec![
             ipv4_addr,
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), self.listen_port),
+            SocketAddr::new(IpAddr::V6(ipv6_addr), self.listen_port),
         ])
     }
 
@@ -679,6 +690,10 @@ fn default_listen_port() -> u16 {
 
 fn default_listen_ipv6() -> bool {
     true
+}
+
+fn default_listen_ipv6_host() -> String {
+    Ipv6Addr::UNSPECIFIED.to_string()
 }
 
 fn default_filter_update_interval_hours() -> u32 {
@@ -1740,6 +1755,9 @@ fn read_config_file(path: &Path) -> Result<AppConfig, String> {
 }
 
 pub fn migrate_legacy_defaults(config: &mut AppConfig) {
+    if config.schema_version < 18 {
+        config.listen_ipv6_host = default_listen_ipv6_host();
+    }
     if config.schema_version < 17 {
         config.dns_cache_optimistic_max_stale_seconds =
             default_dns_cache_optimistic_max_stale_seconds();
@@ -1867,6 +1885,15 @@ pub fn write_filter_cache(data_dir: &Path, id: &str, content: &str) -> Result<()
     let path = filter_cache_path(data_dir, id);
     write_file_atomically(&dir, &path, content.as_bytes())
         .map_err(|e| format!("写入清单缓存失败：{}：{e}", path.display()))
+}
+
+pub fn remove_filter_cache(data_dir: &Path, id: &str) -> Result<(), String> {
+    let path = filter_cache_path(data_dir, id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除清单缓存失败：{}：{error}", path.display())),
+    }
 }
 
 fn write_file_atomically(dir: &Path, path: &Path, content: &[u8]) -> Result<(), String> {
@@ -2151,6 +2178,7 @@ mod tests {
         assert_eq!(config.listen_host, "0.0.0.0");
         assert_eq!(config.listen_port, 53);
         assert!(config.listen_ipv6);
+        assert_eq!(config.listen_ipv6_host, "::");
         assert_eq!(config.rate_limit_per_second, 2_000);
         assert_eq!(config.filter_max_size_mb, 200);
         assert!(!config.allow_insecure_http);
@@ -2453,6 +2481,53 @@ mod tests {
                 .expect("listen addresses should validate"),
             ["0.0.0.0:53".parse().unwrap(), "[::]:53".parse().unwrap()]
         );
+    }
+
+    #[test]
+    fn uses_configured_ipv6_listen_address() {
+        let config = AppConfig {
+            listen_ipv6_host: "::1".into(),
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .listen_socket_addrs()
+                .expect("listen addresses should validate"),
+            ["0.0.0.0:53".parse().unwrap(), "[::1]:53".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn validates_ipv6_listen_address_only_when_enabled() {
+        let mut config = AppConfig {
+            listen_ipv6_host: "127.0.0.1".into(),
+            ..AppConfig::default()
+        };
+        assert!(config.validate().unwrap_err().contains("IPv6 监听地址"));
+
+        config.listen_ipv6 = false;
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config
+                .listen_socket_addrs()
+                .expect("disabled IPv6 should only bind IPv4"),
+            ["0.0.0.0:53".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn migrates_existing_dual_listener_to_all_ipv6_addresses() {
+        let mut config = AppConfig {
+            schema_version: 17,
+            listen_ipv6_host: "::1".into(),
+            ..AppConfig::default()
+        };
+
+        migrate_legacy_defaults(&mut config);
+
+        assert_eq!(config.listen_ipv6_host, "::");
+        assert_eq!(config.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
     }
 
     #[test]

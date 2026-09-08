@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { serializeQueryLogsCsv } from "./query-log-export";
-import type { QueryLogRecord } from "./types";
+import { collectQueryLogExportRecords, serializeQueryLogsCsv } from "./query-log-export";
+import type { QueryLogPage, QueryLogQuery, QueryLogRecord } from "./types";
 
 function record(domain: string): QueryLogRecord {
   return {
@@ -39,5 +39,53 @@ describe("serializeQueryLogsCsv", () => {
   it("neutralizes spreadsheet formulas", () => {
     const csv = serializeQueryLogsCsv([record("=HYPERLINK.example")]);
     expect(csv).toContain('"\'=HYPERLINK.example"');
+  });
+
+  it("collects and serializes a 30000-record export through cursor pages", async () => {
+    const records = Array.from({ length: 30_000 }, (_, index) => ({
+      ...record(`host-${index}.example`),
+      id: index + 1,
+    }));
+    const query: QueryLogQuery = {
+      filter: "all",
+      search: "",
+      domain: null,
+      hours: 24,
+      source: "all",
+      queryType: "all",
+      sort: "newest",
+    };
+    let calls = 0;
+    const progress: Array<[number, number]> = [];
+    const loadPage = async ({ page, pageSize, cursor }: QueryLogQuery & {
+      page: number;
+      pageSize: number;
+      cursor: string | null;
+    }): Promise<QueryLogPage> => {
+      calls += 1;
+      const offset = cursor ? Number(cursor) : 0;
+      const nextOffset = Math.min(offset + pageSize, records.length);
+      return {
+        records: records.slice(offset, nextOffset),
+        total: records.length,
+        page,
+        page_size: pageSize,
+        next_cursor: nextOffset < records.length ? String(nextOffset) : null,
+      };
+    };
+
+    const collected = await collectQueryLogExportRecords(query, loadPage, (exported, total) => {
+      progress.push([exported, total]);
+    });
+    const csv = serializeQueryLogsCsv(collected.records);
+
+    expect(calls).toBe(150);
+    expect(collected.exported).toBe(30_000);
+    expect(collected.total).toBe(30_000);
+    expect(collected.truncated).toBe(false);
+    expect(progress[progress.length - 1]).toEqual([30_000, 30_000]);
+    expect(csv).toContain('"host-0.example"');
+    expect(csv).toContain('"host-29999.example"');
+    expect(csv.split("\r\n")).toHaveLength(30_002);
   });
 });

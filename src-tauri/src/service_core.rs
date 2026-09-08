@@ -315,6 +315,50 @@ impl AppState {
         self.start_current().map(|_| ())
     }
 
+    fn restore_config_after_failure(
+        &self,
+        previous: &AppConfig,
+        was_running: bool,
+        error: String,
+    ) -> String {
+        self.restore_config_after_failure_with(previous, was_running, error, Vec::new())
+    }
+
+    fn restore_config_after_failure_with(
+        &self,
+        previous: &AppConfig,
+        was_running: bool,
+        error: String,
+        mut failures: Vec<String>,
+    ) -> String {
+        if let Err(error) = self.database.save_config(previous) {
+            failures.push(error);
+        }
+        if let Err(error) = self.replace_config(previous.clone()) {
+            failures.push(error);
+        } else {
+            let recovery = if was_running {
+                self.start_current().map(|_| ())
+            } else {
+                self.stop_current()
+                    .and_then(|()| self.set_effective_summary(configured_rule_summary(previous)))
+            };
+            if let Err(error) = recovery {
+                failures.push(error);
+            }
+        }
+        let message = if failures.is_empty() {
+            format!("新配置应用失败：{error}；已恢复原配置及服务状态")
+        } else {
+            format!(
+                "新配置应用失败：{error}；恢复也失败：{}",
+                failures.join("；")
+            )
+        };
+        self.set_error(Some(message.clone()));
+        message
+    }
+
     pub(crate) fn set_error(&self, error: Option<String>) {
         if let Ok(mut current) = self.last_error.lock() {
             *current = error;
@@ -600,6 +644,7 @@ pub(crate) fn needs_dns_restart(previous: &AppConfig, next: &AppConfig) -> bool 
     previous.listen_host != next.listen_host
         || previous.listen_port != next.listen_port
         || previous.listen_ipv6 != next.listen_ipv6
+        || previous.listen_ipv6_host != next.listen_ipv6_host
         || previous.upstream_dns != next.upstream_dns
         || previous.fallback_dns != next.fallback_dns
         || previous.bootstrap_dns != next.bootstrap_dns
@@ -641,8 +686,7 @@ pub(crate) fn save_config_blocking(
         .lock()
         .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
     let previous = state.current_config()?;
-    let submitted_without_statistics_config =
-        config.schema_version < config::CURRENT_CONFIG_SCHEMA_VERSION;
+    let submitted_without_statistics_config = config.schema_version < 11;
     let submitted_schema_version = config.schema_version;
     config::migrate_legacy_defaults(&mut config);
     if submitted_without_statistics_config {
@@ -661,27 +705,45 @@ pub(crate) fn save_config_blocking(
         config.monitoring_api_port = previous.monitoring_api_port;
         config.monitoring_api_token = previous.monitoring_api_token.clone();
     }
+    if submitted_schema_version < 18 {
+        config.listen_ipv6_host = previous.listen_ipv6_host.clone();
+    }
     config.validate()?;
     let filter_changed = filter_runtime_changed(&previous, &config);
     let restart_required = needs_dns_restart(&previous, &config);
     let start_required =
         config.enabled && (!previous.enabled || restart_required || state.server_needs_start()?);
+    let was_running = !state.server_needs_start()?;
+    let old_monitor_occupies_new_dns_port =
+        previous.monitoring_api_enabled && previous.monitoring_api_port == config.listen_port;
+    let can_preflight_dns_listeners = start_required
+        && (!was_running
+            || (previous.listen_port != config.listen_port && !old_monitor_occupies_new_dns_port));
+    if can_preflight_dns_listeners {
+        DnsServer::preflight_listeners(&config)
+            .map_err(|error| format!("新配置监听条件预检失败：{error}；原配置及服务未更改"))?;
+    }
     state.database.save_config(&config)?;
-    state.replace_config(config.clone())?;
+    if let Err(error) = state.replace_config(config.clone()) {
+        return Err(state.restore_config_after_failure(&previous, was_running, error));
+    }
 
-    if !config.enabled {
-        state.stop_current()?;
-        if filter_changed {
-            state.set_effective_summary(configured_rule_summary(&config))?;
+    let applied = (|| {
+        if !config.enabled {
+            state.stop_current()?;
+            if filter_changed {
+                state.set_effective_summary(configured_rule_summary(&config))?;
+            }
+            state.set_error(None);
+        } else if filter_changed || start_required {
+            state.apply_config_change(&previous, &config)?;
+        } else {
+            state.set_error(None);
         }
-        state.set_error(None);
-    } else if filter_changed || start_required {
-        if let Err(error) = state.apply_config_change(&previous, &config) {
-            state.set_error(Some(error.clone()));
-            return Err(error);
-        }
-    } else {
-        state.set_error(None);
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = applied {
+        return Err(state.restore_config_after_failure(&previous, was_running, error));
     }
 
     // 新窗口会立即用于所有查询；物理删除和 VACUUM 放到后台，避免保存配置卡住数秒。
@@ -708,6 +770,7 @@ pub(crate) fn query_logs_blocking(
     state: Arc<AppState>,
     filter: Option<String>,
     search: Option<String>,
+    domain: Option<String>,
     hours: Option<u32>,
     source: Option<String>,
     query_type: Option<String>,
@@ -732,6 +795,7 @@ pub(crate) fn query_logs_blocking(
         hours,
         filter: filter.as_deref().unwrap_or("all"),
         search: search.as_deref().unwrap_or(""),
+        domain: domain.as_deref(),
         source: source.as_deref().unwrap_or("all"),
         query_type: query_type.as_deref().unwrap_or("all"),
         sort: sort.as_deref().unwrap_or("newest"),
@@ -894,17 +958,24 @@ fn update_filters_blocking_with_scope(
         .map_err(|_| "清单更新任务状态异常".to_string())?;
     config::migrate_legacy_defaults(&mut config);
     config.validate()?;
+    // 手动更新沿用“提交当前编辑后更新”的语义，但提交必须发生在下载前。
+    // 自动更新只从服务端取快照，绝不提交调用方的旧配置。
+    if matches!(scope, FilterUpdateScope::ManualAll) {
+        save_config_blocking(Arc::clone(&state), config)?;
+    }
+    config = state.current_config()?;
     state.begin_filter_update();
     let _progress_guard = FilterUpdateProgressGuard(&state);
+    let staging = FilterUpdateStaging::new(&state.data_dir)?;
     let report = match scope {
         FilterUpdateScope::ManualAll => filters::update_enabled_filters(
-            &state.data_dir,
+            &staging.0,
             &mut config,
             &state.filter_update_cancel,
             |progress| state.record_filter_update_progress(progress),
         )?,
         FilterUpdateScope::AutomaticDueAt(now) => filters::update_due_filters(
-            &state.data_dir,
+            &staging.0,
             &mut config,
             now,
             &state.filter_update_cancel,
@@ -916,18 +987,67 @@ fn update_filters_blocking_with_scope(
         .lock()
         .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
     let previous = state.current_config()?;
+    let merged = merge_filter_update(&state.data_dir, &staging.0, &previous, &config)?;
+    config = merged.config;
+    let was_running = !state.server_needs_start()?;
     state.database.save_config(&config)?;
-    state.replace_config(config.clone())?;
+    if let Err(error) = publish_filter_cache_updates(&state.data_dir, &merged.cache_updates) {
+        let mut failures = error.rollback_failures;
+        if let Err(error) = state.database.save_config(&previous) {
+            failures.push(error);
+        }
+        let message = if failures.is_empty() {
+            format!("清单更新应用失败：{}；已恢复原配置和清单缓存", error.cause)
+        } else {
+            format!(
+                "清单更新应用失败：{}；恢复也失败：{}",
+                error.cause,
+                failures.join("；")
+            )
+        };
+        state.set_error(Some(message.clone()));
+        return Err(message);
+    }
+    if let Err(error) = state.replace_config(config.clone()) {
+        let failures = restore_filter_cache_updates(&state.data_dir, &merged.cache_updates)
+            .err()
+            .into_iter()
+            .collect();
+        return Err(state.restore_config_after_failure_with(
+            &previous,
+            was_running,
+            error,
+            failures,
+        ));
+    }
 
     let rules_may_have_changed = report.updated > 0 || filter_runtime_changed(&previous, &config);
     if config.enabled && rules_may_have_changed {
-        state
-            .apply_config_change(&previous, &config)
-            .inspect_err(|error| {
-                state.set_error(Some(error.clone()));
-            })?;
-    } else if !config.enabled {
-        state.set_effective_summary(configured_rule_summary(&config))?;
+        if let Err(error) = state.apply_config_change(&previous, &config) {
+            let failures = restore_filter_cache_updates(&state.data_dir, &merged.cache_updates)
+                .err()
+                .into_iter()
+                .collect();
+            return Err(state.restore_config_after_failure_with(
+                &previous,
+                was_running,
+                error,
+                failures,
+            ));
+        }
+    } else if !config.enabled
+        && let Err(error) = state.set_effective_summary(configured_rule_summary(&config))
+    {
+        let failures = restore_filter_cache_updates(&state.data_dir, &merged.cache_updates)
+            .err()
+            .into_iter()
+            .collect();
+        return Err(state.restore_config_after_failure_with(
+            &previous,
+            was_running,
+            error,
+            failures,
+        ));
     }
 
     let status = match scope {
@@ -943,20 +1063,135 @@ fn update_filters_blocking_with_scope(
     })
 }
 
+struct FilterUpdateStaging(PathBuf);
+
+impl FilterUpdateStaging {
+    fn new(data_dir: &std::path::Path) -> Result<Self, String> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = data_dir.join(format!("filter-update-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&path)
+            .map_err(|error| format!("创建清单更新临时目录失败：{error}"))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for FilterUpdateStaging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct FilterCacheUpdate {
+    id: String,
+    previous_content: Option<String>,
+    next_content: String,
+}
+
+struct MergedFilterUpdate {
+    config: AppConfig,
+    cache_updates: Vec<FilterCacheUpdate>,
+}
+
+#[derive(Debug)]
+struct FilterCachePublishError {
+    cause: String,
+    rollback_failures: Vec<String>,
+}
+
+// 在运行状态锁内校验订阅身份并准备缓存变更，下载阶段不会改动正在使用的缓存。
+fn merge_filter_update(
+    data_dir: &std::path::Path,
+    staging: &std::path::Path,
+    latest: &AppConfig,
+    downloaded: &AppConfig,
+) -> Result<MergedFilterUpdate, String> {
+    let mut merged = latest.clone();
+    let mut cache_updates = Vec::new();
+    for filter in &mut merged.filters {
+        let Some(result) = downloaded.filters.iter().find(|result| {
+            result.id == filter.id && result.url == filter.url && result.enabled && filter.enabled
+        }) else {
+            continue;
+        };
+        if let Some(content) = config::read_filter_cache(staging, &filter.id)? {
+            cache_updates.push(FilterCacheUpdate {
+                id: filter.id.clone(),
+                previous_content: config::read_filter_cache(data_dir, &filter.id)?,
+                next_content: content,
+            });
+            let name = filter.name.clone();
+            *filter = result.clone();
+            filter.name = name;
+        } else if result.last_error.is_some() {
+            filter.last_error = result.last_error.clone();
+        }
+    }
+    Ok(MergedFilterUpdate {
+        config: merged,
+        cache_updates,
+    })
+}
+
+fn publish_filter_cache_updates(
+    data_dir: &std::path::Path,
+    updates: &[FilterCacheUpdate],
+) -> Result<(), FilterCachePublishError> {
+    for (index, update) in updates.iter().enumerate() {
+        if let Err(error) = config::write_filter_cache(data_dir, &update.id, &update.next_content) {
+            return Err(FilterCachePublishError {
+                cause: error,
+                rollback_failures: restore_filter_cache_updates(data_dir, &updates[..index])
+                    .err()
+                    .into_iter()
+                    .collect(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn restore_filter_cache_updates(
+    data_dir: &std::path::Path,
+    updates: &[FilterCacheUpdate],
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for update in updates.iter().rev() {
+        let result = match &update.previous_content {
+            Some(content) => config::write_filter_cache(data_dir, &update.id, content),
+            None => config::remove_filter_cache(data_dir, &update.id),
+        };
+        if let Err(error) = result {
+            failures.push(error);
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("；"))
+    }
+}
+
 pub(crate) fn start_dns_blocking(state: Arc<AppState>) -> Result<RuntimeStatus, String> {
     let _runtime_guard = state
         .runtime_update_lock
         .lock()
         .map_err(|_| "DNS 运行状态更新任务异常".to_string())?;
-    let mut config = state.current_config()?;
+    let previous = state.current_config()?;
+    let was_running = !state.server_needs_start()?;
+    let mut config = previous.clone();
     config::migrate_legacy_defaults(&mut config);
     config.enabled = true;
     config.validate()?;
     state.database.save_config(&config)?;
-    state.replace_config(config.clone())?;
-    state.start_current().inspect_err(|error| {
-        state.set_error(Some(error.clone()));
-    })?;
+    if let Err(error) = state.replace_config(config.clone()) {
+        return Err(state.restore_config_after_failure(&previous, was_running, error));
+    }
+    if let Err(error) = state.start_current() {
+        return Err(state.restore_config_after_failure(&previous, was_running, error));
+    }
     state.invalidate_log_stats_cache();
     Ok(state.status(true))
 }
@@ -1247,6 +1482,339 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn filter_update_preserves_latest_settings_and_rejects_stale_subscriptions() {
+        let root = FilterUpdateStaging::new(&std::env::temp_dir()).unwrap();
+        let staging = FilterUpdateStaging::new(&root.0).unwrap();
+        let mut downloaded = AppConfig::default();
+        downloaded.filters.truncate(4);
+        for filter in &mut downloaded.filters {
+            filter.enabled = true;
+            filter.rule_count = 123;
+            filter.last_updated = Some(42);
+            config::write_filter_cache(&staging.0, &filter.id, "||downloaded.example^").unwrap();
+        }
+        let mut latest = downloaded.clone();
+        latest.enabled = false;
+        latest.upstream_dns = "9.9.9.9".into();
+        latest.blacklist = "||local.example^".into();
+        latest.filters[0].name = "用户重命名".into();
+        latest.filters[0].rule_count = 1;
+        latest.filters[1].url = "https://example.com/new.txt".into();
+        latest.filters[1].rule_count = 2;
+        latest.filters[2].enabled = false;
+        latest.filters[2].rule_count = 3;
+        latest.filters.pop();
+        let merged = merge_filter_update(&root.0, &staging.0, &latest, &downloaded).unwrap();
+        assert!(!merged.config.enabled);
+        assert_eq!(merged.config.upstream_dns, "9.9.9.9");
+        assert_eq!(merged.config.blacklist, latest.blacklist);
+        assert_eq!(merged.config.filters.len(), 3);
+        assert_eq!(merged.config.filters[0].name, "用户重命名");
+        assert_eq!(merged.config.filters[0].rule_count, 123);
+        assert_eq!(merged.config.filters[1], latest.filters[1]);
+        assert_eq!(merged.config.filters[2], latest.filters[2]);
+        assert_eq!(merged.cache_updates.len(), 1);
+        assert!(
+            config::read_filter_cache(&root.0, &downloaded.filters[0].id)
+                .unwrap()
+                .is_none()
+        );
+        publish_filter_cache_updates(&root.0, &merged.cache_updates).unwrap();
+        assert!(
+            config::read_filter_cache(&root.0, &downloaded.filters[0].id)
+                .unwrap()
+                .is_some()
+        );
+        for filter in &downloaded.filters[1..] {
+            assert!(
+                config::read_filter_cache(&root.0, &filter.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        restore_filter_cache_updates(&root.0, &merged.cache_updates).unwrap();
+        assert!(
+            config::read_filter_cache(&root.0, &downloaded.filters[0].id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancelled_filter_without_download_keeps_existing_cache_and_metadata() {
+        let root = FilterUpdateStaging::new(&std::env::temp_dir()).unwrap();
+        let staging = FilterUpdateStaging::new(&root.0).unwrap();
+        let latest = AppConfig::default();
+        let filter = &latest.filters[0];
+        config::write_filter_cache(&root.0, &filter.id, "||old.example^").unwrap();
+        let merged = merge_filter_update(&root.0, &staging.0, &latest, &latest).unwrap();
+        assert_eq!(merged.config.filters, latest.filters);
+        assert!(merged.cache_updates.is_empty());
+        assert_eq!(
+            config::read_filter_cache(&root.0, &filter.id)
+                .unwrap()
+                .unwrap(),
+            "||old.example^"
+        );
+    }
+
+    #[test]
+    fn published_filter_cache_can_restore_previous_content() {
+        let root = FilterUpdateStaging::new(&std::env::temp_dir()).unwrap();
+        let staging = FilterUpdateStaging::new(&root.0).unwrap();
+        let latest = AppConfig::default();
+        let mut downloaded = latest.clone();
+        let filter = &latest.filters[0];
+        downloaded.filters[0].last_updated = Some(42);
+        downloaded.filters[0].rule_count = 1;
+        config::write_filter_cache(&root.0, &filter.id, "||old.example^").unwrap();
+        config::write_filter_cache(&staging.0, &filter.id, "||new.example^").unwrap();
+
+        let merged = merge_filter_update(&root.0, &staging.0, &latest, &downloaded).unwrap();
+        publish_filter_cache_updates(&root.0, &merged.cache_updates).unwrap();
+        assert_eq!(
+            config::read_filter_cache(&root.0, &filter.id)
+                .unwrap()
+                .unwrap(),
+            "||new.example^"
+        );
+
+        restore_filter_cache_updates(&root.0, &merged.cache_updates).unwrap();
+        assert_eq!(
+            config::read_filter_cache(&root.0, &filter.id)
+                .unwrap()
+                .unwrap(),
+            "||old.example^"
+        );
+    }
+
+    #[test]
+    fn automatic_download_does_not_overwrite_concurrent_save_or_stop() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::mpsc,
+        };
+        let root = FilterUpdateStaging::new(&std::env::temp_dir()).unwrap();
+        let http = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let initial = AppConfig {
+            enabled: true,
+            listen_host: "127.0.0.1".into(),
+            listen_port: port,
+            listen_ipv6: false,
+            allow_insecure_http: true,
+            filter_proxy_mode: config::FilterProxyMode::Direct,
+            filters: vec![config::FilterSubscription {
+                id: "slow-download".into(),
+                name: "slow".into(),
+                url: format!("http://{}/filter.txt", http.local_addr().unwrap()),
+                ..Default::default()
+            }],
+            ..AppConfig::default()
+        };
+        let state = Arc::new(AppState::new(
+            initial.clone(),
+            Arc::new(Database::open_in_memory().unwrap()),
+            root.0.clone(),
+            root.0.clone(),
+        ));
+        save_config_blocking(Arc::clone(&state), initial.clone()).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let http_thread = thread::spawn(move || {
+            let (mut stream, _) = http.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let body = "||downloaded.example^";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let updating = Arc::clone(&state);
+        let update_thread =
+            thread::spawn(move || update_due_filters_blocking(updating, initial, unix_now()));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut edited = state.current_config().unwrap();
+        edited.upstream_dns = "9.9.9.9".into();
+        edited.blacklist = "||user.example^".into();
+        save_config_blocking(Arc::clone(&state), edited).unwrap();
+        stop_dns_blocking(Arc::clone(&state)).unwrap();
+        release_tx.send(()).unwrap();
+        http_thread.join().unwrap();
+        let result = update_thread.join().unwrap().unwrap();
+        assert_eq!(result.updated, 1);
+        assert!(!result.status.running);
+        let latest = state.database.load_config().unwrap().unwrap();
+        assert!(!latest.enabled);
+        assert_eq!(latest.upstream_dns, "9.9.9.9");
+        assert_eq!(latest.blacklist, "||user.example^");
+        assert!(latest.filters[0].last_updated.is_some());
+    }
+
+    #[test]
+    fn unavailable_port_restores_config_and_running_dns() {
+        use std::net::{TcpListener, TcpStream};
+        let state = test_state();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let previous = AppConfig {
+            enabled: true,
+            listen_host: "127.0.0.1".into(),
+            listen_port: port,
+            listen_ipv6: false,
+            use_filters: false,
+            filters: Vec::new(),
+            blacklist: "||example.com^".into(),
+            ..AppConfig::default()
+        };
+        save_config_blocking(Arc::clone(&state), previous.clone()).unwrap();
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let next = AppConfig {
+            listen_port: occupied.local_addr().unwrap().port(),
+            ..previous.clone()
+        };
+        let error = save_config_blocking(Arc::clone(&state), next).unwrap_err();
+        assert!(error.contains("监听条件预检失败"), "{error}");
+        assert!(error.contains("原配置及服务未更改"), "{error}");
+        assert_eq!(state.current_config().unwrap().listen_port, port);
+        assert_eq!(
+            state.database.load_config().unwrap().unwrap().listen_port,
+            port
+        );
+        assert!(!state.server_needs_start().unwrap());
+        let response = TcpStream::connect(("127.0.0.1", port));
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.send_to(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01", ("127.0.0.1", port)).unwrap();
+        let mut packet = [0; 512];
+        let answer = client.recv(&mut packet);
+        state.stop_current().unwrap();
+        assert!(response.is_ok());
+        assert!(answer.unwrap() >= 12);
+        assert_eq!(&packet[..2], &[0x12, 0x34]);
+        assert_ne!(packet[2] & 0x80, 0);
+        assert_eq!(packet[3] & 0x0f, 0);
+    }
+
+    #[test]
+    fn unavailable_listen_address_is_rejected_before_stopping_running_dns() {
+        let state = test_state();
+        let previous_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let next_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let previous = AppConfig {
+            enabled: true,
+            listen_host: "127.0.0.1".into(),
+            listen_port: previous_port,
+            listen_ipv6: false,
+            use_filters: false,
+            filters: Vec::new(),
+            ..AppConfig::default()
+        };
+        save_config_blocking(Arc::clone(&state), previous.clone()).unwrap();
+
+        let next = AppConfig {
+            listen_host: "192.0.2.1".into(),
+            listen_port: next_port,
+            ..previous.clone()
+        };
+        let error = save_config_blocking(Arc::clone(&state), next).unwrap_err();
+
+        assert!(error.contains("监听条件预检失败"), "{error}");
+        assert_eq!(state.current_config().unwrap().listen_host, "127.0.0.1");
+        assert!(!state.server_needs_start().unwrap());
+        state.stop_current().unwrap();
+    }
+
+    #[test]
+    fn recovery_failure_is_reported_and_retains_previous_config() {
+        let state = test_state();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let previous = AppConfig {
+            listen_host: "127.0.0.1".into(),
+            listen_port: occupied.local_addr().unwrap().port(),
+            listen_ipv6: false,
+            use_filters: false,
+            filters: Vec::new(),
+            ..AppConfig::default()
+        };
+        let error = state.restore_config_after_failure(&previous, true, "模拟新配置失败".into());
+        assert!(error.contains("恢复也失败"), "{error}");
+        assert!(!error.contains("已恢复原配置"));
+        assert!(state.server_needs_start().unwrap());
+        assert_eq!(
+            state.database.load_config().unwrap().unwrap().listen_port,
+            previous.listen_port
+        );
+    }
+
+    #[test]
+    fn legacy_save_preserves_configured_ipv6_listen_address() {
+        let state = test_state();
+        let current = AppConfig {
+            enabled: false,
+            listen_ipv6_host: "::1".into(),
+            ..AppConfig::default()
+        };
+        save_config_blocking(Arc::clone(&state), current.clone()).unwrap();
+        let legacy_submission = AppConfig {
+            schema_version: 17,
+            listen_ipv6_host: "::".into(),
+            upstream_dns: "9.9.9.9".into(),
+            ..current
+        };
+
+        save_config_blocking(Arc::clone(&state), legacy_submission).unwrap();
+
+        let saved = state.current_config().unwrap();
+        assert_eq!(saved.listen_ipv6_host, "::1");
+        assert_eq!(saved.upstream_dns, "9.9.9.9");
+    }
+
+    #[test]
+    fn failed_start_restores_disabled_config() {
+        let state = test_state();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let previous = AppConfig {
+            enabled: false,
+            listen_host: "127.0.0.1".into(),
+            listen_port: occupied.local_addr().unwrap().port(),
+            listen_ipv6: false,
+            use_filters: false,
+            filters: Vec::new(),
+            ..AppConfig::default()
+        };
+        save_config_blocking(Arc::clone(&state), previous.clone()).unwrap();
+
+        let error = start_dns_blocking(Arc::clone(&state)).unwrap_err();
+
+        assert!(error.contains("已恢复原配置及服务状态"), "{error}");
+        assert!(!state.current_config().unwrap().enabled);
+        assert!(!state.database.load_config().unwrap().unwrap().enabled);
+        assert!(state.server_needs_start().unwrap());
+    }
+
     fn test_state() -> Arc<AppState> {
         let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
         let data_dir = std::env::temp_dir().join("dnsblackhole-service-core-test");
@@ -1347,6 +1915,7 @@ mod tests {
         let _ = state.status_with_log_stats(false, true);
         query_logs_blocking(
             Arc::clone(&state),
+            None,
             None,
             None,
             None,

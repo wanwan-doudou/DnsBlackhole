@@ -1,9 +1,15 @@
 .query-log-toolbar {
   display: grid;
-  grid-template-columns: auto minmax(420px, 1fr);
+  grid-template-columns: auto minmax(460px, 1fr);
   align-items: center;
-  gap: 18px;
-  margin: 0 0 18px;
+  column-gap: 18px;
+  row-gap: 14px;
+  margin: 0;
+  border: 1px solid var(--neutral-4);
+  border-bottom: 0;
+  border-radius: 9px 9px 0 0;
+  padding: 16px;
+  background: var(--neutral-0);
 }
 
 .query-log-title {
@@ -103,11 +109,11 @@
 .query-log-advanced-trigger,
 .query-log-advanced-panel select,
 .query-log-advanced-panel input {
-  height: 36px;
+  height: 38px;
   border: 1px solid var(--field-border);
-  border-radius: 3px;
-  color: var(--neutral-27);
-  background: var(--neutral-0);
+  border-radius: 7px;
+  color: var(--info-5);
+  background: var(--control-bg);
   outline: none;
   font-size: 13px;
 }
@@ -193,11 +199,9 @@
 .query-log-advanced-panel {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: repeat(4, minmax(150px, 1fr));
-  align-items: end;
-  gap: 12px;
+  gap: 16px;
   border-top: 1px solid var(--neutral-4);
-  padding-top: 14px;
+  padding-top: 16px;
 }
 
 .query-log-advanced-panel[hidden] {
@@ -207,6 +211,21 @@
 .query-log-advanced-panel label {
   display: grid;
   gap: 6px;
+}
+
+.query-log-filter-fields {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 14px;
+}
+
+.query-log-saved-views {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.85fr) minmax(240px, 1.15fr) auto auto;
+  align-items: end;
+  gap: 14px;
+  border-top: 1px solid var(--neutral-1);
+  padding-top: 16px;
 }
 
 .query-log-advanced-panel label > span {
@@ -233,11 +252,11 @@
 
 .query-log-view-actions button,
 .query-log-reset-button {
-  height: 36px;
+  height: 38px;
 }
 
 .query-log-reset-button {
-  justify-self: start;
+  justify-self: end;
   white-space: nowrap;
 }
 
@@ -257,12 +276,13 @@
 }
 
 .query-log-filter-trigger i {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   flex: 0 0 auto;
-  border-right: 2px solid var(--neutral-12);
-  border-bottom: 2px solid var(--neutral-12);
-  transform: rotate(45deg) translateY(-2px);
+  border-right: 1.5px solid var(--neutral-21);
+  border-bottom: 1.5px solid var(--neutral-21);
+  transform: rotate(45deg) translate(-1px, -1px);
+  transition: transform 0.16s ease;
 }
 
 .query-log-filter.open .query-log-filter-trigger {
@@ -270,37 +290,43 @@
   box-shadow: 0 0 0 3px rgb(var(--brand-rgb) / 0.16);
 }
 
+.query-log-filter.open .query-log-filter-trigger i {
+  transform: rotate(225deg) translate(-1px, -1px);
+}
+
 .query-log-filter-options {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
   left: 0;
-  z-index: 40;
+  z-index: 80;
   display: none;
-  overflow: visible;
+  max-height: 240px;
+  overflow-y: auto;
   border: 1px solid var(--neutral-7);
-  border-radius: 5px;
-  padding: 6px;
+  border-radius: 8px;
+  padding: 5px;
   background: var(--neutral-0);
   box-shadow:
-    0 10px 24px rgb(var(--neutral-rgb-2) / 0.13),
-    0 2px 6px rgb(var(--neutral-rgb-2) / 0.08);
+    0 14px 30px rgb(var(--neutral-rgb-2) / 0.14),
+    0 3px 8px rgb(var(--neutral-rgb-2) / 0.08);
 }
 
 .query-log-filter.open .query-log-filter-options {
-  display: block;
+  display: grid;
+  gap: 2px;
 }
 
 .query-log-filter-options button {
   position: relative;
   display: flex;
   width: 100%;
-  height: 34px;
+  height: 36px;
   align-items: center;
   justify-content: flex-start;
   border: 0;
-  border-radius: 4px;
-  padding: 0 32px 0 12px;
+  border-radius: 5px;
+  padding: 0 36px 0 11px;
   color: var(--neutral-25);
   background: var(--neutral-0);
   text-align: left;
@@ -310,7 +336,7 @@
 
 .query-log-filter-options button:hover:not(:disabled) {
   color: var(--info-6);
-  background: var(--info-0);
+  background: var(--brand-0);
 }
 
 .query-log-filter-options button.active,
@@ -335,9 +361,8 @@
 .query-log-panel {
   overflow: visible;
   border: 1px solid var(--neutral-4);
-  border-radius: 9px;
+  border-radius: 0 0 9px 9px;
   background: var(--neutral-0);
-  box-shadow: 0 1px 2px rgb(var(--info-rgb-2) / 0.04);
 }
 
 .query-log-head,

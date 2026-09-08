@@ -65,6 +65,19 @@ pub struct DnsServer {
 }
 
 impl DnsServer {
+    /// 在不启动工作线程的情况下验证 DNS 监听套接字能否同时绑定。
+    /// 套接字会在返回前释放，因此只能降低常见配置错误的概率，最终启动仍需处理竞态失败。
+    pub(crate) fn preflight_listeners(config: &AppConfig) -> Result<(), String> {
+        let listen_addrs = config.listen_socket_addrs()?;
+        let listeners = listen_addrs
+            .iter()
+            .copied()
+            .map(|addr| bind_listener_pair(addr, addr.is_ipv6() && config.listen_ipv6))
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(listeners);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn start(
         config: AppConfig,
@@ -427,26 +440,40 @@ fn spawn_query_log_writer(
     database: Arc<Database>,
     receiver: mpsc::Receiver<QueryPersistenceEntry>,
 ) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut batch = Vec::with_capacity(QUERY_LOG_BATCH_SIZE);
+    thread::spawn(move || run_query_log_writer(database, receiver, |_, _| {}))
+}
 
-        while let Ok(message) = receiver.recv() {
-            batch.push(message);
+fn run_query_log_writer(
+    database: Arc<Database>,
+    receiver: mpsc::Receiver<QueryPersistenceEntry>,
+    mut observe_flush: impl FnMut(usize, Duration),
+) {
+    let mut batch = Vec::with_capacity(QUERY_LOG_BATCH_SIZE);
 
-            while batch.len() < QUERY_LOG_BATCH_SIZE {
-                match receiver.recv_timeout(QUERY_LOG_BATCH_WAIT_TIMEOUT) {
-                    Ok(message) => batch.push(message),
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
+    while let Ok(message) = receiver.recv() {
+        let batch_started = Instant::now();
+        let deadline = batch_started + QUERY_LOG_BATCH_WAIT_TIMEOUT;
+        batch.push(message);
+
+        while batch.len() < QUERY_LOG_BATCH_SIZE {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-
-            if let Err(error) = database.insert_query_events(&batch) {
-                eprintln!("{error}");
+            match receiver.recv_timeout(remaining) {
+                Ok(message) => batch.push(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            batch.clear();
         }
-    })
+
+        let batch_size = batch.len();
+        if let Err(error) = database.insert_query_events(&batch) {
+            eprintln!("{error}");
+        }
+        observe_flush(batch_size, batch_started.elapsed());
+        batch.clear();
+    }
 }
 
 fn serve_udp(
@@ -802,6 +829,577 @@ mod tests {
     use super::super::protocol::{RCODE_NXDOMAIN, parse_question, read_u16};
     use super::super::stats::{DnsStats, DnsTransport, SecurityEventType};
     use super::*;
+
+    fn persistence_entry() -> QueryPersistenceEntry {
+        QueryPersistenceEntry {
+            entry: crate::database::QueryLogEntry {
+                domain: "batch.example".into(),
+                query_type: 1,
+                query_class: 1,
+                transport: "udp".into(),
+                response_source: "upstream".into(),
+                response: None,
+                client_ip: None,
+                blocked: false,
+                forwarded: true,
+                failed: false,
+                upstream_server: None,
+                upstream_duration_ms: None,
+                processing_duration_ms: 0.0,
+                error: None,
+                matched_rule: None,
+                rule_source: None,
+                rule_type: None,
+                important_overrode: false,
+                allowlist_rule: None,
+            },
+            anonymize_client_ip: false,
+            persist_log: true,
+            persist_statistics: false,
+        }
+    }
+
+    #[test]
+    fn query_log_writer_flushes_during_continuous_traffic_and_on_close() {
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        let writer = spawn_query_log_writer(Arc::clone(&database), receiver);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            let mut sent = 0;
+            loop {
+                sender.send(persistence_entry()).unwrap();
+                sent += 1;
+                if sent == 1 {
+                    ready_tx.send(()).unwrap();
+                }
+                if stop_rx.recv_timeout(Duration::from_millis(20)).is_ok() {
+                    break;
+                }
+            }
+            sent
+        });
+        ready_rx.recv().unwrap();
+        let started = Instant::now();
+        let mut visible = false;
+        while started.elapsed() < Duration::from_secs(2) {
+            if !database
+                .query_logs(24, "all", "", 1, 1000)
+                .unwrap()
+                .records
+                .is_empty()
+            {
+                visible = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop_tx.send(()).unwrap();
+        let sent = producer.join().unwrap();
+        writer.join().unwrap();
+        assert!(visible, "持续流量应在凑满批次前写入数据库");
+        assert_eq!(
+            database.query_logs(24, "all", "", 1, 1000).unwrap().total as usize,
+            sent
+        );
+    }
+
+    #[test]
+    fn query_log_writer_flushes_a_burst_and_final_partial_batch() {
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        let writer = spawn_query_log_writer(Arc::clone(&database), receiver);
+        for _ in 0..QUERY_LOG_BATCH_SIZE + 3 {
+            sender.send(persistence_entry()).unwrap();
+        }
+        drop(sender);
+        writer.join().unwrap();
+        assert_eq!(
+            database.query_logs(24, "all", "", 1, 1000).unwrap().total as usize,
+            QUERY_LOG_BATCH_SIZE + 3
+        );
+    }
+
+    #[test]
+    fn query_log_writer_flushes_low_frequency_batch_at_deadline() {
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        let writer = spawn_query_log_writer(Arc::clone(&database), receiver);
+        sender.send(persistence_entry()).unwrap();
+
+        let started = Instant::now();
+        while database
+            .query_logs(24, "all", "", 1, 1000)
+            .unwrap()
+            .records
+            .is_empty()
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "低频日志应在固定截止时间后写入数据库"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(sender);
+        writer.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    fn process_cpu_time() -> Duration {
+        use windows_sys::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentProcess, GetProcessTimes},
+        };
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let success = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        assert_ne!(success, 0, "process CPU time should load");
+        let ticks = |value: FILETIME| {
+            (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
+        };
+        Duration::from_nanos((ticks(kernel) + ticks(user)).saturating_mul(100))
+    }
+
+    #[cfg(windows)]
+    fn process_working_set_bytes() -> usize {
+        use windows_sys::Win32::System::{
+            ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+            Threading::GetCurrentProcess,
+        };
+
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..PROCESS_MEMORY_COUNTERS::default()
+        };
+        let success = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+        };
+        assert_ne!(success, 0, "process memory should load");
+        counters.WorkingSetSize
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "性能测试：隔离 DNS 实例处理 50000 次请求"]
+    fn measures_dns_runtime_latency_cpu_memory_and_queue_drops() {
+        const BATCHES: usize = 5;
+        const QUERIES_PER_BATCH: usize = 10_000;
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            rate_limit_per_second: 0,
+            dns_cache_enabled: false,
+            statistics_enabled: false,
+            query_log_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let server = DnsServer::start(
+            config,
+            "||example.com^$dnsrewrite=1.2.3.4",
+            Arc::clone(&stats),
+            database,
+        )
+        .expect("isolated DNS server should start");
+        let thread_count = thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(4)
+            .clamp(2, 16);
+        let queries_per_thread = QUERIES_PER_BATCH.div_ceil(thread_count);
+        let actual_per_batch = queries_per_thread * thread_count;
+        let memory_before = process_working_set_bytes();
+        let cpu_before = process_cpu_time();
+        let wall_started = Instant::now();
+        let mut latencies = Vec::with_capacity(actual_per_batch * BATCHES);
+        let mut working_sets = Vec::with_capacity(BATCHES);
+
+        for batch in 0..BATCHES {
+            let barrier = Arc::new(std::sync::Barrier::new(thread_count + 1));
+            let handles = (0..thread_count)
+                .map(|thread_index| {
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                            .expect("load client should bind");
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .expect("load client timeout should set");
+                        let mut query = example_a_query();
+                        let mut response = [0_u8; 512];
+                        let mut thread_latencies = Vec::with_capacity(queries_per_thread);
+                        barrier.wait();
+                        for index in 0..queries_per_thread {
+                            let id = ((batch * actual_per_batch
+                                + thread_index * queries_per_thread
+                                + index)
+                                % usize::from(u16::MAX))
+                                as u16;
+                            query[0..2].copy_from_slice(&id.to_be_bytes());
+                            let started = Instant::now();
+                            socket
+                                .send_to(&query, (Ipv4Addr::LOCALHOST, port))
+                                .expect("load query should send");
+                            let (length, _) = socket
+                                .recv_from(&mut response)
+                                .expect("load response should arrive");
+                            assert_eq!(&response[..2], &id.to_be_bytes());
+                            assert_eq!(response[3] & 0x0f, 0);
+                            assert!(length >= query.len());
+                            thread_latencies.push(started.elapsed());
+                        }
+                        thread_latencies
+                    })
+                })
+                .collect::<Vec<_>>();
+            barrier.wait();
+            for handle in handles {
+                latencies.extend(handle.join().expect("load client should finish"));
+            }
+            working_sets.push(process_working_set_bytes());
+        }
+
+        let wall_elapsed = wall_started.elapsed();
+        let cpu_elapsed = process_cpu_time().saturating_sub(cpu_before);
+        let total_queries = actual_per_batch * BATCHES;
+        latencies.sort();
+        let percentile = |numerator: usize| {
+            let index = (latencies.len() * numerator)
+                .div_ceil(100)
+                .saturating_sub(1);
+            latencies[index]
+        };
+        let p50 = percentile(50);
+        let p95 = percentile(95);
+        let p99 = percentile(99);
+        let throughput = total_queries as f64 / wall_elapsed.as_secs_f64();
+        let cpu_cores = cpu_elapsed.as_secs_f64() / wall_elapsed.as_secs_f64();
+        let snapshot = stats.lock().unwrap().clone();
+        assert_eq!(snapshot.queries as usize, total_queries);
+        assert_eq!(snapshot.worker_queue_dropped_total, 0);
+        assert_eq!(snapshot.persistence_queue_dropped_total, 0);
+        assert_eq!(snapshot.upstream_task_queue_rejected_total, 0);
+        assert_eq!(snapshot.tcp_connection_rejected_total, 0);
+        assert_eq!(snapshot.failed, 0);
+        assert!(throughput > 25_000.0, "隔离本地吞吐不应低于 25000 QPS");
+        assert!(p95 < Duration::from_millis(5), "P95 不应超过 5 ms");
+        assert!(p99 < Duration::from_millis(10), "P99 不应超过 10 ms");
+
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        let memory_after_warmup = working_sets[0];
+        let memory_after = *working_sets.last().unwrap();
+        eprintln!(
+            "DNS runtime: {total_queries} queries in {wall_elapsed:.2?}, {throughput:.0} qps, P50 {p50:.2?}, P95 {p95:.2?}, P99 {p99:.2?}"
+        );
+        eprintln!(
+            "CPU: {:.2?} ({cpu_cores:.2} logical-core equivalents); working set before {:.2} MiB, after warm-up {:.2} MiB, final {:.2} MiB, samples {:?} MiB",
+            cpu_elapsed,
+            mib(memory_before),
+            mib(memory_after_warmup),
+            mib(memory_after),
+            working_sets
+                .iter()
+                .map(|bytes| format!("{:.2}", mib(*bytes)))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "queue drops: worker {}, persistence {}, upstream {}, TCP {}",
+            snapshot.worker_queue_dropped_total,
+            snapshot.persistence_queue_dropped_total,
+            snapshot.upstream_task_queue_rejected_total,
+            snapshot.tcp_connection_rejected_total
+        );
+
+        server.stop();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "性能测试：隔离 DNS 实例持续运行 60 秒并采样内存"]
+    fn measures_dns_runtime_soak_memory() {
+        const CLIENT_THREADS: usize = 4;
+        const SAMPLE_COUNT: usize = 6;
+        const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            rate_limit_per_second: 0,
+            dns_cache_enabled: false,
+            statistics_enabled: false,
+            query_log_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let server = DnsServer::start(
+            config,
+            "||example.com^$dnsrewrite=1.2.3.4",
+            Arc::clone(&stats),
+            database,
+        )
+        .expect("isolated DNS server should start");
+        let barrier = Arc::new(std::sync::Barrier::new(CLIENT_THREADS + 1));
+        let stop_clients = Arc::new(AtomicBool::new(false));
+        let clients = (0..CLIENT_THREADS)
+            .map(|thread_index| {
+                let barrier = Arc::clone(&barrier);
+                let stop_clients = Arc::clone(&stop_clients);
+                thread::spawn(move || {
+                    let socket =
+                        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("soak client should bind");
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .expect("soak client timeout should set");
+                    let mut query = example_a_query();
+                    let mut response = [0_u8; 512];
+                    let mut completed = 0_usize;
+                    barrier.wait();
+                    while !stop_clients.load(Ordering::Relaxed) {
+                        let id = ((thread_index + completed * CLIENT_THREADS)
+                            % usize::from(u16::MAX)) as u16;
+                        query[0..2].copy_from_slice(&id.to_be_bytes());
+                        socket
+                            .send_to(&query, (Ipv4Addr::LOCALHOST, port))
+                            .expect("soak query should send");
+                        let (length, _) = socket
+                            .recv_from(&mut response)
+                            .expect("soak response should arrive");
+                        assert_eq!(&response[..2], &id.to_be_bytes());
+                        assert!(length >= query.len());
+                        completed += 1;
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    completed
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let memory_before = process_working_set_bytes();
+        let cpu_before = process_cpu_time();
+        let started = Instant::now();
+        barrier.wait();
+        let mut working_sets = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            thread::sleep(SAMPLE_INTERVAL);
+            working_sets.push(process_working_set_bytes());
+        }
+        stop_clients.store(true, Ordering::Relaxed);
+        let completed = clients
+            .into_iter()
+            .map(|client| client.join().expect("soak client should finish"))
+            .sum::<usize>();
+        let elapsed = started.elapsed();
+        let cpu_elapsed = process_cpu_time().saturating_sub(cpu_before);
+        let snapshot = stats.lock().unwrap().clone();
+        assert_eq!(snapshot.queries as usize, completed);
+        assert_eq!(snapshot.worker_queue_dropped_total, 0);
+        assert_eq!(snapshot.persistence_queue_dropped_total, 0);
+        assert_eq!(snapshot.upstream_task_queue_rejected_total, 0);
+        assert_eq!(snapshot.failed, 0);
+
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        let memory_after_warmup = working_sets[0];
+        let memory_after = *working_sets.last().unwrap();
+        let growth_after_warmup = memory_after.saturating_sub(memory_after_warmup);
+        assert!(
+            growth_after_warmup < 16 * 1024 * 1024,
+            "working set grew too much after warm-up: {:.2} MiB",
+            mib(growth_after_warmup)
+        );
+        eprintln!(
+            "60-second soak: {completed} queries in {elapsed:.2?}, {:.0} qps, CPU {:.2?}; working set before {:.2} MiB, samples {:?} MiB, post-warm-up growth {:.2} MiB",
+            completed as f64 / elapsed.as_secs_f64(),
+            cpu_elapsed,
+            mib(memory_before),
+            working_sets
+                .iter()
+                .map(|bytes| format!("{:.2}", mib(*bytes)))
+                .collect::<Vec<_>>(),
+            mib(growth_after_warmup)
+        );
+
+        server.stop();
+    }
+
+    #[test]
+    #[ignore = "性能测试：约 2 秒持续流量并写入 20000 条突发日志"]
+    fn measures_query_log_writer_frequency_throughput_and_visibility() {
+        let steady_database = Arc::new(Database::open_in_memory().unwrap());
+        let (steady_sender, steady_receiver) = mpsc::channel();
+        let (steady_observer, observations) = mpsc::channel();
+        let steady_started = Instant::now();
+        let steady_writer = {
+            let database = Arc::clone(&steady_database);
+            thread::spawn(move || {
+                run_query_log_writer(database, steady_receiver, move |batch_size, elapsed| {
+                    steady_observer
+                        .send((batch_size, elapsed, steady_started.elapsed()))
+                        .unwrap();
+                });
+            })
+        };
+
+        const STEADY_EVENTS: usize = 100;
+        for _ in 0..STEADY_EVENTS {
+            steady_sender.send(persistence_entry()).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(steady_sender);
+        steady_writer.join().unwrap();
+        let steady_elapsed = steady_started.elapsed();
+        let observations = observations.try_iter().collect::<Vec<_>>();
+        let transaction_count = observations.len();
+        let persisted = observations
+            .iter()
+            .map(|(batch_size, _, _)| batch_size)
+            .sum::<usize>();
+        let first_visible = observations
+            .first()
+            .map(|(_, _, since_start)| *since_start)
+            .expect("steady traffic should flush");
+        let max_flush = observations
+            .iter()
+            .map(|(_, elapsed, _)| *elapsed)
+            .max()
+            .unwrap();
+        assert_eq!(persisted, STEADY_EVENTS);
+        assert_eq!(
+            steady_database
+                .query_logs(24, "all", "", 1, STEADY_EVENTS as u32)
+                .unwrap()
+                .total as usize,
+            STEADY_EVENTS
+        );
+        assert!(first_visible < Duration::from_millis(500));
+        assert!(max_flush < Duration::from_secs(1));
+
+        let legacy_database = Arc::new(Database::open_in_memory().unwrap());
+        let (legacy_sender, legacy_receiver) = mpsc::channel();
+        let (legacy_observer, legacy_observations) = mpsc::channel();
+        let legacy_started = Instant::now();
+        let legacy_writer = {
+            let database = Arc::clone(&legacy_database);
+            thread::spawn(move || {
+                let mut batch = Vec::with_capacity(QUERY_LOG_BATCH_SIZE);
+                while let Ok(message) = legacy_receiver.recv() {
+                    let batch_started = Instant::now();
+                    batch.push(message);
+                    while batch.len() < QUERY_LOG_BATCH_SIZE {
+                        match legacy_receiver.recv_timeout(QUERY_LOG_BATCH_WAIT_TIMEOUT) {
+                            Ok(message) => batch.push(message),
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    let batch_size = batch.len();
+                    database.insert_query_events(&batch).unwrap();
+                    legacy_observer
+                        .send((
+                            batch_size,
+                            batch_started.elapsed(),
+                            legacy_started.elapsed(),
+                        ))
+                        .unwrap();
+                    batch.clear();
+                }
+            })
+        };
+        for _ in 0..STEADY_EVENTS {
+            legacy_sender.send(persistence_entry()).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(legacy_sender);
+        legacy_writer.join().unwrap();
+        let legacy_observations = legacy_observations.try_iter().collect::<Vec<_>>();
+        let legacy_transaction_count = legacy_observations.len();
+        let legacy_first_visible = legacy_observations
+            .first()
+            .map(|(_, _, since_start)| *since_start)
+            .expect("legacy writer should eventually flush");
+        assert_eq!(
+            legacy_database
+                .query_logs(24, "all", "", 1, STEADY_EVENTS as u32)
+                .unwrap()
+                .total as usize,
+            STEADY_EVENTS
+        );
+        assert!(
+            first_visible < legacy_first_visible / 2,
+            "固定截止时间应让持续流量至少提前一半可见"
+        );
+        assert!(transaction_count > legacy_transaction_count);
+
+        let burst_database = Arc::new(Database::open_in_memory().unwrap());
+        let (burst_sender, burst_receiver) = mpsc::channel();
+        let (burst_observer, burst_observations) = mpsc::channel();
+        let burst_writer = {
+            let database = Arc::clone(&burst_database);
+            thread::spawn(move || {
+                run_query_log_writer(database, burst_receiver, move |batch_size, elapsed| {
+                    burst_observer.send((batch_size, elapsed)).unwrap();
+                });
+            })
+        };
+        const BURST_EVENTS: usize = 20_000;
+        let burst_started = Instant::now();
+        for _ in 0..BURST_EVENTS {
+            burst_sender.send(persistence_entry()).unwrap();
+        }
+        drop(burst_sender);
+        burst_writer.join().unwrap();
+        let burst_elapsed = burst_started.elapsed();
+        let burst_observations = burst_observations.try_iter().collect::<Vec<_>>();
+        let burst_transactions = burst_observations.len();
+        let burst_persisted = burst_observations
+            .iter()
+            .map(|(batch_size, _)| batch_size)
+            .sum::<usize>();
+        let throughput = BURST_EVENTS as f64 / burst_elapsed.as_secs_f64();
+        assert_eq!(burst_persisted, BURST_EVENTS);
+        assert_eq!(
+            burst_database
+                .query_logs(24, "all", "", 1, 1)
+                .unwrap()
+                .total as usize,
+            BURST_EVENTS
+        );
+        assert!(throughput > 1_000.0);
+
+        eprintln!(
+            "steady writer: {STEADY_EVENTS} events in {steady_elapsed:.2?}, {transaction_count} transactions, first visible {first_visible:.2?}, max flush {max_flush:.2?}"
+        );
+        eprintln!(
+            "legacy sliding deadline: {legacy_transaction_count} transactions, first visible {legacy_first_visible:.2?}"
+        );
+        eprintln!(
+            "burst writer: {BURST_EVENTS} events in {burst_elapsed:.2?}, {burst_transactions} transactions, {throughput:.0} events/s"
+        );
+    }
 
     fn example_a_query() -> Vec<u8> {
         vec![

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_QUERY_LOG_QUERY,
   activeAdvancedQueryFilterCount,
+  domainRankingQuery,
   parseQueryLogHours,
 } from "./query-log-query";
 
@@ -23,5 +24,17 @@ describe("query log query", () => {
         sort: "slowest",
       }),
     ).toBe(3);
+  });
+
+  it("clears unrelated filters when drilling down from domain rankings", () => {
+    expect(domainRankingQuery(" example.com ", false)).toEqual({
+      ...DEFAULT_QUERY_LOG_QUERY,
+      domain: "example.com",
+    });
+    expect(domainRankingQuery("blocked.example", true)).toEqual({
+      ...DEFAULT_QUERY_LOG_QUERY,
+      domain: "blocked.example",
+      filter: "blocked",
+    });
   });
 });

@@ -496,17 +496,33 @@ async fn save_config(
     tauri::async_runtime::spawn_blocking(move || {
         config::migrate_legacy_defaults(&mut config);
         config.validate()?;
+        let previous_autostart = read_autostart_config(&app)?;
         apply_autostart_config(&app, config.launch_at_startup)?;
-        #[cfg(any(target_os = "macos", windows))]
-        {
-            privileged_bridge::ServiceClient::call(
-                "save_config",
-                &serde_json::json!({ "config": config }),
-            )
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            save_config_blocking(state.local()?, config)
+        let result: Result<RuntimeStatus, String> = {
+            #[cfg(any(target_os = "macos", windows))]
+            {
+                privileged_bridge::ServiceClient::call(
+                    "save_config",
+                    &serde_json::json!({ "config": config }),
+                )
+            }
+            #[cfg(not(any(target_os = "macos", windows)))]
+            {
+                save_config_blocking(state.local()?, config)
+            }
+        };
+        match result {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                if let Some(previous) = previous_autostart
+                    && let Err(rollback_error) = apply_autostart_config(&app, previous)
+                {
+                    return Err(format!(
+                        "{error}；恢复保存前的开机自启状态失败：{rollback_error}"
+                    ));
+                }
+                Err(error)
+            }
         }
     })
     .await
@@ -558,6 +574,7 @@ async fn get_query_logs(
     state: tauri::State<'_, Arc<GuiState>>,
     filter: Option<String>,
     search: Option<String>,
+    domain: Option<String>,
     hours: Option<u32>,
     source: Option<String>,
     query_type: Option<String>,
@@ -578,6 +595,7 @@ async fn get_query_logs(
                 &serde_json::json!({
                     "filter": filter,
                     "search": search,
+                    "domain": domain,
                     "hours": hours,
                     "source": source,
                     "query_type": query_type,
@@ -594,6 +612,7 @@ async fn get_query_logs(
                 state.local()?,
                 filter,
                 search,
+                domain,
                 hours,
                 source,
                 query_type,
@@ -963,6 +982,30 @@ async fn clear_filter_cache(
     })
     .await
     .map_err(|error| format!("清理缓存任务异常：{error}"))?
+}
+
+#[cfg(all(
+    any(target_os = "macos", windows, target_os = "linux"),
+    not(debug_assertions)
+))]
+fn read_autostart_config(app: &tauri::AppHandle) -> Result<Option<bool>, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map(Some)
+        .map_err(|error| format!("读取开机自启状态失败：{error}"))
+}
+
+#[cfg(all(
+    any(target_os = "macos", windows, target_os = "linux"),
+    debug_assertions
+))]
+fn read_autostart_config(_app: &tauri::AppHandle) -> Result<Option<bool>, String> {
+    Ok(None)
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn read_autostart_config(_app: &tauri::AppHandle) -> Result<Option<bool>, String> {
+    Ok(None)
 }
 
 #[cfg(all(

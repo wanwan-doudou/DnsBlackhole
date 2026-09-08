@@ -545,7 +545,12 @@ pub(crate) fn current_second() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv6Addr;
+    use std::{
+        net::Ipv6Addr,
+        sync::Barrier,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
@@ -617,5 +622,53 @@ mod tests {
         assert_eq!(current.failed, 0);
         assert_eq!(current.upstream_task_queue_rejected_total, 1);
         assert!(current.last_error.is_none());
+    }
+
+    #[test]
+    #[ignore = "性能测试：比较统计共享锁的单线程与并发吞吐"]
+    fn measures_stats_mutex_contention() {
+        const TOTAL_OPERATIONS: usize = 640_000;
+        let run = |thread_count: usize| {
+            let stats = Arc::new(Mutex::new(DnsStats::default()));
+            let barrier = Arc::new(Barrier::new(thread_count + 1));
+            let operations_per_thread = TOTAL_OPERATIONS.div_ceil(thread_count);
+            let actual_operations = operations_per_thread * thread_count;
+            let handles = (0..thread_count)
+                .map(|index| {
+                    let stats = Arc::clone(&stats);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        let client = IpAddr::V6(Ipv6Addr::from(index as u128 + 1));
+                        barrier.wait();
+                        for _ in 0..operations_per_thread {
+                            record_query(&stats, "contention.example", client, false);
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let started = Instant::now();
+            barrier.wait();
+            for handle in handles {
+                handle.join().expect("stats worker should finish");
+            }
+            let elapsed = started.elapsed();
+            assert_eq!(stats.lock().unwrap().queries as usize, actual_operations);
+            (actual_operations, elapsed)
+        };
+
+        let (single_operations, single_elapsed) = run(1);
+        let parallelism = thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(4)
+            .clamp(2, 32);
+        let (parallel_operations, parallel_elapsed) = run(parallelism);
+        let throughput =
+            |operations: usize, elapsed: Duration| operations as f64 / elapsed.as_secs_f64();
+        let single_throughput = throughput(single_operations, single_elapsed);
+        let parallel_throughput = throughput(parallel_operations, parallel_elapsed);
+        eprintln!(
+            "stats mutex: single {single_throughput:.0} ops/s, {parallelism} threads {parallel_throughput:.0} ops/s, ratio {:.2}",
+            parallel_throughput / single_throughput
+        );
     }
 }
