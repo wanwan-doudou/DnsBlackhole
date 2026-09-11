@@ -1319,6 +1319,7 @@ mod desktop {
             #[cfg(target_os = "macos")]
             {
                 app.manage(Arc::new(GuiState {}));
+                privileged_bridge::cleanup_legacy_launch_agent();
                 if let Err(error) = privileged_bridge::ensure_macos_service_current() {
                     eprintln!("自动修复 macOS DNS 后台服务失败：{error}");
                 }

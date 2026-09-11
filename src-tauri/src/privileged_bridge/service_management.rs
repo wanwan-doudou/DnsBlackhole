@@ -1,4 +1,4 @@
-use std::{thread, time::Duration};
+use std::{fs, path::PathBuf, process::Command, thread, time::Duration};
 
 use objc2_foundation::{NSError, NSString};
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
@@ -44,6 +44,7 @@ fn ensure_macos_service_with(probe_attempts: usize) -> Result<MacosServiceStatus
 }
 
 pub fn macos_service_install(force: bool) -> Result<MacosServiceStatus, String> {
+    cleanup_legacy_launch_agent();
     register_service(force)?;
     // 刚注册的服务由 launchd 首次拉起：AMFI 校验双架构二进制、初始化数据目录与
     // 数据库都需要时间，用重启级探测窗口等待就绪，避免把启动中的服务误判为异常、
@@ -52,6 +53,7 @@ pub fn macos_service_install(force: bool) -> Result<MacosServiceStatus, String> 
 }
 
 pub fn macos_service_uninstall() -> Result<MacosServiceStatus, String> {
+    cleanup_legacy_launch_agent();
     let service = daemon_service();
     let current = unsafe { service.status() };
     if current != SMAppServiceStatus::NotRegistered && current != SMAppServiceStatus::NotFound {
@@ -67,6 +69,36 @@ pub fn macos_service_uninstall() -> Result<MacosServiceStatus, String> {
 
 pub fn macos_service_open_settings() {
     unsafe { SMAppService::openSystemSettingsLoginItems() };
+}
+
+/// 早期开发版本曾用用户级 LaunchAgent 注册后台任务：
+/// ~/Library/LaunchAgents/DnsBlackhole.plist 的 ProgramArguments 指向 GUI 主程序。
+/// 残留任务会在每次登录时被 launchd 拉起主程序，且应用更新后 ad-hoc 签名的
+/// cdhash 变化会触发 Launch Constraint Violation（SIGKILL）崩溃。
+/// 仅在确认 plist 由本项目写入时清理（bootout 后删除文件），失败不阻断主流程。
+pub(crate) fn cleanup_legacy_launch_agent() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let plist_path = PathBuf::from(home).join("Library/LaunchAgents/DnsBlackhole.plist");
+    let Ok(content) = fs::read_to_string(&plist_path) else {
+        return;
+    };
+    if !is_legacy_agent_plist(&content) {
+        return;
+    }
+    let uid = unsafe { libc::getuid() };
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/DnsBlackhole")])
+        .status();
+    if let Err(error) = fs::remove_file(&plist_path) {
+        eprintln!("清理旧版 DnsBlackhole LaunchAgent 失败：{error}");
+    }
+}
+
+fn is_legacy_agent_plist(content: &str) -> bool {
+    content.contains("<string>DnsBlackhole</string>")
+        && content.contains("DnsBlackhole.app/Contents/MacOS/dnsblackhole")
 }
 
 fn register_service(force: bool) -> Result<(), String> {
@@ -233,5 +265,32 @@ mod tests {
             service_version: "0.0.0-old".to_string(),
         };
         assert!(!service_is_current(&hello));
+    }
+
+    #[test]
+    fn recognizes_legacy_launch_agent_plist() {
+        let content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+  <dict>
+  <key>Label</key>
+  <string>DnsBlackhole</string>
+  <key>ProgramArguments</key>
+  <array><string>/Applications/DnsBlackhole.app/Contents/MacOS/dnsblackhole</string></array>
+  <key>RunAtLoad</key>
+  <true/>
+  </dict>
+</plist>
+"#;
+        assert!(is_legacy_agent_plist(content));
+    }
+
+    #[test]
+    fn ignores_unrelated_launch_agent_plist() {
+        let content = r#"<plist version="1.0"><dict><key>Label</key>
+<string>com.example.other</string>
+<key>ProgramArguments</key>
+<array><string>/usr/bin/other</string></array>
+</dict></plist>"#;
+        assert!(!is_legacy_agent_plist(content));
     }
 }
