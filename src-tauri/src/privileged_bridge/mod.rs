@@ -35,8 +35,8 @@ pub use daemon::run_daemon;
 pub use linux_daemon::run_daemon as run_linux_daemon;
 #[cfg(target_os = "macos")]
 pub(crate) use service_management::{
-    ensure_macos_service_current, macos_service_install, macos_service_open_settings,
-    macos_service_uninstall,
+    cleanup_legacy_launch_agent, ensure_macos_service_current, macos_service_install,
+    macos_service_open_settings, macos_service_uninstall,
 };
 #[cfg(windows)]
 pub use windows_service::run_service_dispatcher as run_windows_service;
@@ -103,6 +103,12 @@ pub fn handle_windows_service_command() -> Option<Result<(), String>> {
 // 协议 6：系统 DNS 状态包含活动/备份网卡详情，并支持自定义恢复地址。
 // GUI 只通过本协议做配置、状态查询和日志读取，不再转发 DNS 查询。
 pub const BRIDGE_PROTOCOL_VERSION: u16 = 6;
+// macOS 的根目录位于密封只读系统卷（SSV）上，daemon 无法在 /run 下创建目录，
+// 会以 “Read-only file system (os error 30)” 退出并被 launchd KeepAlive 无限重启；
+// launchd daemon 的可写 tmpfs 是 /var/run。Linux 上 /run 为 root 可写 tmpfs，保持不变。
+#[cfg(target_os = "macos")]
+pub const BRIDGE_SOCKET_PATH: &str = "/var/run/dnsblackhole/service.sock";
+#[cfg(not(target_os = "macos"))]
 pub const BRIDGE_SOCKET_PATH: &str = "/run/dnsblackhole/service.sock";
 // 单帧上限：查询日志分页（最多 200 条记录）与统计快照都远小于该值
 const MAX_FRAME_SIZE: usize = 512 * 1024;
@@ -217,5 +223,13 @@ mod tests {
         assert_eq!(decoded.id, 7);
         assert!(decoded.error.is_none());
         assert_eq!(decoded.result.expect("应有结果")["running"], true);
+    }
+
+    // macOS 根目录在密封只读系统卷上，daemon 必须把 IPC socket 放在可写的 /var/run；
+    // 该测试防止路径被改回 Linux 的 /run，导致 daemon 无限崩溃循环。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_socket_path_lives_under_writable_var_run() {
+        assert!(BRIDGE_SOCKET_PATH.starts_with("/var/run/"));
     }
 }
