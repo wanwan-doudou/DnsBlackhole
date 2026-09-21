@@ -823,7 +823,7 @@ mod tests {
     use crate::{config::AppConfig, database::Database};
 
     use super::super::protocol::{RCODE_NXDOMAIN, parse_question, read_u16};
-    use super::super::stats::{DnsStats, DnsTransport, SecurityEventType};
+    use super::super::stats::{DnsStats, DnsTransport, SecurityEventType, TrafficTotals};
     use super::*;
 
     fn persistence_entry() -> QueryPersistenceEntry {
@@ -848,10 +848,12 @@ mod tests {
                 rule_type: None,
                 important_overrode: false,
                 allowlist_rule: None,
+            traffic: TrafficTotals::default(),
             },
             anonymize_client_ip: false,
             persist_log: true,
             persist_statistics: false,
+        traffic_only: false,
         }
     }
 
@@ -1641,6 +1643,111 @@ mod tests {
             event.event_type == SecurityEventType::AccessDenied
                 && event.protocol == DnsTransport::Tcp
                 && event.client_ip == Ipv4Addr::LOCALHOST.to_string()
+        }));
+
+        server.stop();
+    }
+
+    #[test]
+    fn blocked_query_records_real_client_packet_bytes() {
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            // 拦截路径不出网，上游字节必然为 0，断言才能精确到字节。
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            dns_cache_enabled: false,
+            statistics_enabled: true,
+            query_log_enabled: true,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().unwrap());
+        let query = example_a_query();
+        let domain = super::super::protocol::parse_question(&query)
+            .unwrap()
+            .domain;
+        let server = DnsServer::start(
+            config,
+            &format!("||{domain}^"),
+            Arc::clone(&stats),
+            Arc::clone(&database),
+        )
+        .unwrap();
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        udp.send_to(&query, (Ipv4Addr::LOCALHOST, port)).unwrap();
+        let mut response = [0_u8; 512];
+        let (response_len, _) = udp.recv_from(&mut response).unwrap();
+        server.stop();
+
+        let traffic = database.log_stats(24).unwrap().traffic_totals;
+        assert_eq!(
+            traffic.client_bytes_in,
+            query.len() as u64,
+            "上行应等于客户端实际发出的报文长度"
+        );
+        assert_eq!(
+            traffic.client_bytes_out,
+            response_len as u64,
+            "下行应等于客户端实际收到的报文长度"
+        );
+        assert_eq!(traffic.upstream_bytes_out, 0, "拦截不应产生上游流量");
+        assert_eq!(traffic.upstream_bytes_in, 0, "拦截不应产生上游流量");
+        assert_eq!(traffic.cache_saved_bytes, 0, "拦截不是缓存命中");
+    }
+
+    #[test]
+    fn invalid_client_query_is_audited_instead_of_reported_as_runtime_error() {
+        let port = available_local_port();
+        let config = AppConfig {
+            listen_host: Ipv4Addr::LOCALHOST.to_string(),
+            listen_port: port,
+            listen_ipv6: false,
+            upstream_dns: "127.0.0.1:9".into(),
+            fallback_dns: String::new(),
+            query_log_enabled: false,
+            ..AppConfig::default()
+        };
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let database = Arc::new(Database::open_in_memory().expect("内存数据库应可打开"));
+        let server = DnsServer::start(config, "", Arc::clone(&stats), database)
+            .expect("测试 DNS 服务应可启动");
+
+        // 复现线上症状：ARCOUNT 声明 1 条附加记录，实际 rdata 被截断。
+        let mut query = example_a_query();
+        query[11] = 1;
+        query.extend_from_slice(&[0x00, 0x00, 0x29]);
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP 客户端应可绑定");
+        udp.set_read_timeout(Some(Duration::from_millis(700)))
+            .expect("应可设置 UDP 读取超时");
+        udp.send_to(&query, (Ipv4Addr::LOCALHOST, port))
+            .expect("应可发送 UDP 查询");
+        let mut response = [0_u8; 512];
+        let error = udp
+            .recv_from(&mut response)
+            .expect_err("无效查询不应收到响应");
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+
+        let snapshot = stats.lock().expect("统计锁不应中毒").clone();
+        assert_eq!(snapshot.invalid_query_total, 1);
+        assert_eq!(snapshot.dropped_udp_total, 1);
+        // 界面的错误 toast 读的是 last_error，这两条断言就是"不再误报故障"的回归护栏。
+        assert!(snapshot.last_error.is_none(), "客户端不合规不应记为本机故障");
+        assert_eq!(snapshot.failed, 0);
+        assert_eq!(snapshot.access_denied_total, 0);
+        assert!(snapshot.security_events.iter().any(|event| {
+            event.event_type == SecurityEventType::InvalidQuery
+                && event.protocol == DnsTransport::Udp
+                && event.client_ip == Ipv4Addr::LOCALHOST.to_string()
+                && event.reason == "DNS 请求附加记录格式无效"
         }));
 
         server.stop();

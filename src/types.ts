@@ -6,6 +6,7 @@ export type ViewName =
   | "filters"
   | "custom"
   | "logs"
+  | "traffic"
   | "about"
   | "settings";
 export type QueryLogFilter = "all" | "processed" | "blocked" | "failed";
@@ -219,6 +220,16 @@ export type TrafficBucket = {
   minute: number;
   queries: number;
   blocked: number;
+  bytes?: number;
+};
+
+/// DNS 报文字节量。统计报文本身的长度，不含 TLS 与 HTTP 封装开销。
+export type TrafficTotals = {
+  client_bytes_in: number;
+  client_bytes_out: number;
+  upstream_bytes_out: number;
+  upstream_bytes_in: number;
+  cache_saved_bytes: number;
 };
 
 export type UpstreamRequestStat = {
@@ -245,6 +256,7 @@ export type DnsStats = {
   rebinding_blocked_total?: number;
   cname_cloaking_blocked_total?: number;
   dropped_udp_total: number;
+  invalid_query_total?: number;
   worker_queue_dropped_total?: number;
   persistence_queue_dropped_total?: number;
   upstream_task_queue_rejected_total?: number;
@@ -272,6 +284,9 @@ export type DnsStats = {
   client_blocked?: Record<string, number>;
   blocklist_hits?: Record<string, number>;
   traffic?: TrafficBucket[];
+  traffic_totals?: TrafficTotals;
+  domain_traffic?: Record<string, number>;
+  client_traffic?: Record<string, number>;
   upstream_requests?: UpstreamRequestStat[];
   upstream_avg_latency?: UpstreamLatencyStat[];
 };
@@ -280,6 +295,7 @@ export type SecurityEvent = {
   event_type:
     | "access_denied"
     | "rate_limited"
+    | "invalid_query"
     | "web_auth_login"
     | "web_auth_failed"
     | "web_auth_locked"
@@ -455,6 +471,7 @@ export type RefreshOptions = {
 
 export type RenderStatusOptions = {
   renderDashboard?: boolean;
+  renderTraffic?: boolean;
 };
 
 export type HistoryPoint = {

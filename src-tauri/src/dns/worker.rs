@@ -32,12 +32,13 @@ use super::{
     },
     rules::DnsRewriteAction,
     stats::{
-        DnsStats, DnsTransport, ResponseProtectionKind, current_second, record_access_denied,
-        record_blocked_query, record_error, record_forwarded, record_persistence_queue_drop,
-        record_query, record_rate_limited, record_refused_any, record_response_blocked,
+        DnsStats, DnsTransport, ResponseProtectionKind, TrafficTotals, current_second,
+        record_access_denied, record_blocked_query, record_error, record_forwarded,
+        record_invalid_query, record_persistence_queue_drop, record_query, record_rate_limited,
+        record_refused_any, record_response_blocked,
     },
     task_pool,
-    upstream::{RuntimeUpstream, UpstreamForwardResponse, forward_query},
+    upstream::{RuntimeUpstream, UpstreamForwardResponse, UpstreamTraffic, forward_query},
     upstream_routes::{RouteUpstreamPool, UpstreamRoutes},
 };
 
@@ -134,6 +135,11 @@ struct QueryLogMetadata<'a> {
     query_class: u16,
     transport: &'static str,
     processing_started: Instant,
+    /// 客户端发来的查询报文长度。转发链路会改写 EDNS，所以要在进入处理前取。
+    query_bytes: u64,
+    /// 这次查询打上游消耗的字节。转发按引用累加，落日志时一次性取走，
+    /// 失败重试和 fallback 都算在同一条查询头上。
+    upstream_traffic: Arc<UpstreamTraffic>,
 }
 
 struct ResponseProtectionBlock {
@@ -146,6 +152,7 @@ impl<'a> QueryLogMetadata<'a> {
         question: &'a Question,
         response_target: &DnsResponseTarget,
         processing_started: Instant,
+        query_bytes: u64,
     ) -> Self {
         let transport = match response_target {
             DnsResponseTarget::Udp { .. } => "udp",
@@ -157,6 +164,8 @@ impl<'a> QueryLogMetadata<'a> {
             query_class: question.qclass,
             transport,
             processing_started,
+            query_bytes,
+            upstream_traffic: Arc::new(UpstreamTraffic::default()),
         }
     }
 }
@@ -300,14 +309,21 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
 
     let parsed_query = match parse_query(query) {
         Ok(query) => query,
-        Err(error) => {
-            record_error(&context.stats, error);
+        // 解析失败的是客户端报文，属于远端请求不合规，只记安全事件不记运行故障。
+        Err(reason) => {
+            record_invalid_query(
+                &context.stats,
+                client_addr.ip(),
+                response_transport(response_target),
+                reason,
+            );
             send_no_response(response_target);
             return;
         }
     };
     let question = &parsed_query.question;
-    let log_metadata = QueryLogMetadata::new(question, response_target, processing_started);
+    let log_metadata =
+        QueryLogMetadata::new(question, response_target, processing_started, query.len() as u64);
 
     // 整包读取当前过滤状态，一次查询内保持一致；规则热替换只影响后续查询
     let filter = current_filter_runtime(&context.filter_runtime);
@@ -737,6 +753,10 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
                     context.dns_cache_config.clone(),
                     Arc::clone(&context.filter_runtime),
                     filtering_active,
+                    context
+                        .statistics_enabled
+                        .then(|| context.persistence_sender.clone())
+                        .flatten(),
                 );
             }
         }
@@ -779,6 +799,7 @@ fn handle_dns_query(context: &DnsWorkerContext, work_item: DnsWorkItem) {
         &context.next_upstream,
         &context.fallback_next_upstream,
         &context.stats,
+        &log_metadata.upstream_traffic,
     );
     if filtering_active
         && let Ok(forwarded) = &forward_result
@@ -1164,6 +1185,9 @@ fn deliver_pending_follower(
         query_class: follower.query_class,
         transport: follower.transport,
         processing_started: follower.processing_started,
+        query_bytes: follower.query.len() as u64,
+        // 上游那一程由 leader 发起，已经记在 leader 的查询上，这里留空避免重复计。
+        upstream_traffic: Arc::new(UpstreamTraffic::default()),
     };
     let query = follower.query.as_slice();
     let response_target = &follower.response_target;
@@ -1225,6 +1249,7 @@ fn deliver_pending_follower(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn forward_query_with_fallback(
     query: &[u8],
     upstream_servers: &[RuntimeUpstream],
@@ -1233,6 +1258,7 @@ fn forward_query_with_fallback(
     next_upstream: &AtomicUsize,
     fallback_next_upstream: &AtomicUsize,
     stats: &Arc<Mutex<DnsStats>>,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> Result<UpstreamForwardResponse, String> {
     let deadline = Instant::now() + FORWARD_QUERY_TOTAL_TIMEOUT;
     let mut result = forward_query_once_with_fallback(
@@ -1244,6 +1270,7 @@ fn forward_query_with_fallback(
         fallback_next_upstream,
         deadline,
         stats,
+        traffic,
     );
     for delay in NETWORK_UNAVAILABLE_RETRY_DELAYS {
         if !result
@@ -1268,6 +1295,7 @@ fn forward_query_with_fallback(
             fallback_next_upstream,
             deadline,
             stats,
+            traffic,
         );
     }
     result
@@ -1283,6 +1311,7 @@ fn forward_query_with_route(
     next_upstream: &AtomicUsize,
     fallback_next_upstream: &AtomicUsize,
     stats: &Arc<Mutex<DnsStats>>,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> Result<UpstreamForwardResponse, String> {
     if let Some(route) = route {
         return forward_query_with_fallback(
@@ -1293,6 +1322,7 @@ fn forward_query_with_route(
             &route.next_upstream,
             fallback_next_upstream,
             stats,
+            traffic,
         );
     }
     forward_query_with_fallback(
@@ -1303,6 +1333,7 @@ fn forward_query_with_route(
         next_upstream,
         fallback_next_upstream,
         stats,
+        traffic,
     )
 }
 
@@ -1316,6 +1347,7 @@ fn forward_query_once_with_fallback(
     fallback_next_upstream: &AtomicUsize,
     deadline: Instant,
     stats: &Arc<Mutex<DnsStats>>,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> Result<UpstreamForwardResponse, String> {
     match forward_query(
         query,
@@ -1324,6 +1356,7 @@ fn forward_query_once_with_fallback(
         next_upstream,
         deadline,
         stats,
+        traffic,
     ) {
         Ok(response) => Ok(response),
         Err(primary_error) => {
@@ -1338,6 +1371,7 @@ fn forward_query_once_with_fallback(
                 fallback_next_upstream,
                 deadline,
                 stats,
+                traffic,
             )
             .map_err(|fallback_error| {
                 format!("主上游失败：{primary_error}；fallback 上游也失败：{fallback_error}")
@@ -1363,6 +1397,32 @@ pub(crate) fn prepare_forwarded_response(response: &[u8], query: &[u8]) -> Vec<u
     })
 }
 
+/// 把后台缓存刷新打出去的上游字节送进统计。队列满时直接丢弃：
+/// 流量是可累加的近似量，为它挤占客户端查询的持久化名额并不划算。
+fn report_background_traffic(
+    sender: Option<&mpsc::SyncSender<QueryPersistenceEntry>>,
+    traffic: &UpstreamTraffic,
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    let (upstream_bytes_out, upstream_bytes_in) = traffic.snapshot();
+    if upstream_bytes_out == 0 && upstream_bytes_in == 0 {
+        return;
+    }
+    let _ = sender.try_send(QueryPersistenceEntry {
+        entry: QueryLogEntry::background_traffic(TrafficTotals {
+            upstream_bytes_out,
+            upstream_bytes_in,
+            ..TrafficTotals::default()
+        }),
+        anonymize_client_ip: false,
+        persist_log: false,
+        persist_statistics: true,
+        traffic_only: true,
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn refresh_cache_async(
     query: Vec<u8>,
@@ -1377,6 +1437,7 @@ fn refresh_cache_async(
     dns_cache_config: Option<DnsCacheConfig>,
     filter_runtime: SharedFilterRuntime,
     filtering_active: bool,
+    traffic_sender: Option<mpsc::SyncSender<QueryPersistenceEntry>>,
 ) {
     let Some(cache) = dns_cache else {
         return;
@@ -1398,7 +1459,10 @@ fn refresh_cache_async(
         }
         let next_upstream = AtomicUsize::new(0);
         let fallback_next_upstream = AtomicUsize::new(0);
-        match forward_query_with_route(
+        // 后台刷新没有客户端查询可挂靠，字节单独累计后作为 traffic_only 条目上报，
+        // 否则乐观刷新和预取打出去的上游流量会整段漏掉。
+        let refresh_traffic = Arc::new(UpstreamTraffic::default());
+        let forwarded = forward_query_with_route(
             &query,
             routed_upstream.as_deref(),
             upstream_servers.as_ref(),
@@ -1407,7 +1471,10 @@ fn refresh_cache_async(
             &next_upstream,
             &fallback_next_upstream,
             &stats,
-        ) {
+            &refresh_traffic,
+        );
+        report_background_traffic(traffic_sender.as_ref(), &refresh_traffic);
+        match forwarded {
             Ok(forwarded) => {
                 let blocked = filtering_active
                     && parse_query(&query).ok().is_some_and(|parsed| {
@@ -1478,6 +1545,8 @@ fn finish_pending_protection_block(
             query_class: follower.query_class,
             transport: follower.transport,
             processing_started: follower.processing_started,
+            query_bytes: follower.query.len() as u64,
+            upstream_traffic: Arc::new(UpstreamTraffic::default()),
         };
         deliver_response_protection_block(
             context,
@@ -1631,6 +1700,17 @@ fn queue_query_log_with_match(
         return;
     }
 
+    // 只有真的发回了客户端才算下行：发送失败的调用点传 None，那些字节没上过网。
+    let client_bytes_out = response.map_or(0, |bytes| bytes.len() as u64);
+    let (upstream_bytes_out, upstream_bytes_in) = metadata.upstream_traffic.snapshot();
+    // 命中缓存时上游那一程没有发生，省下的就是本该走的那一趟：上行是这条查询本身，
+    // 下行是缓存里那份响应——它当初正是从上游取回来的，所以不是按系数估算。
+    let cache_saved_bytes = if matches!(response_source, QueryResponseSource::Cache) {
+        metadata.query_bytes.saturating_add(client_bytes_out)
+    } else {
+        0
+    };
+
     let entry = QueryLogEntry {
         domain: metadata.domain.to_string(),
         query_type: metadata.query_type,
@@ -1651,6 +1731,13 @@ fn queue_query_log_with_match(
         rule_type: rule_match.map(|matched| matched.rule_type.clone()),
         important_overrode: rule_match.is_some_and(|matched| matched.important_overrode),
         allowlist_rule: rule_match.and_then(|matched| matched.allowlist_rule.clone()),
+        traffic: TrafficTotals {
+            client_bytes_in: metadata.query_bytes,
+            client_bytes_out,
+            upstream_bytes_out,
+            upstream_bytes_in,
+            cache_saved_bytes,
+        },
     };
 
     let message = QueryPersistenceEntry {
@@ -1658,6 +1745,7 @@ fn queue_query_log_with_match(
         anonymize_client_ip: context.anonymize_client_ip,
         persist_log,
         persist_statistics,
+        traffic_only: false,
     };
     match sender.try_send(message) {
         Ok(()) => {}

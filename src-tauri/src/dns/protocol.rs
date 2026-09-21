@@ -68,6 +68,10 @@ pub(crate) struct ParsedQuery {
     pub(crate) cache_safe: bool,
 }
 
+/// 解析客户端请求报文。
+///
+/// 返回的 `Err` 一律是"客户端请求不合规"的拒绝理由（含委托给 `parse_question` 的部分），
+/// 不代表本机出故障，调用方应按安全事件记录，不要写进 `DnsStats::last_error`。
 pub(crate) fn parse_query(packet: &[u8]) -> Result<ParsedQuery, String> {
     if packet.len() < DNS_HEADER_LEN {
         return Err("DNS 请求长度不足".into());
@@ -78,7 +82,11 @@ pub(crate) fn parse_query(packet: &[u8]) -> Result<ParsedQuery, String> {
         return Err("DNS 请求的 QR 标志无效".into());
     }
     if flags & 0x7800 != 0 {
-        return Err("暂不支持非标准 DNS opcode".into());
+        // 带上 opcode 编号才看得出是谁：5=UPDATE（Windows 动态 DNS 注册常发）、4=NOTIFY。
+        return Err(format!(
+            "暂不支持非标准 DNS opcode {}",
+            (flags >> 11) & 0x0f
+        ));
     }
     if flags & 0x0040 != 0 {
         return Err("DNS 请求设置了保留标志位".into());
@@ -157,12 +165,14 @@ pub(crate) fn parse_question(packet: &[u8]) -> Result<Question, String> {
             break;
         }
 
-        if label_len > 63 {
-            return Err("DNS label 长度超过 63 字节".into());
+        // RFC 1035：长度字节高两位为 11 表示压缩指针，01/10 是保留值。
+        // 压缩判定必须排在长度判定前面，否则指针会先被当成超长 label，报错文案会指错方向。
+        if label_len & 0b1100_0000 == 0b1100_0000 {
+            return Err("暂不支持压缩格式的 DNS question".into());
         }
 
-        if label_len & 0b1100_0000 != 0 {
-            return Err("暂不支持压缩格式的 DNS question".into());
+        if label_len > 63 {
+            return Err("DNS label 长度超过 63 字节".into());
         }
 
         if offset + label_len > packet.len() {

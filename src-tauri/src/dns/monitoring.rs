@@ -208,10 +208,22 @@ fn prometheus_metrics(stats: &DnsStats) -> String {
             "dnsblackhole_access_denied_total {}\n",
             "# TYPE dnsblackhole_rate_limited_total counter\n",
             "dnsblackhole_rate_limited_total {}\n",
+            "# HELP dnsblackhole_invalid_query_total Total client queries rejected as invalid.\n",
+            "# TYPE dnsblackhole_invalid_query_total counter\n",
+            "dnsblackhole_invalid_query_total {}\n",
             "# TYPE dnsblackhole_cache_entries gauge\n",
             "dnsblackhole_cache_entries {}\n",
             "# TYPE dnsblackhole_cache_bytes gauge\n",
-            "dnsblackhole_cache_bytes {}\n"
+            "dnsblackhole_cache_bytes {}\n",
+            "# HELP dnsblackhole_dns_bytes_total DNS message bytes moved, excluding TLS and HTTP framing.\n",
+            "# TYPE dnsblackhole_dns_bytes_total counter\n",
+            "dnsblackhole_dns_bytes_total{{direction=\"client_in\"}} {}\n",
+            "dnsblackhole_dns_bytes_total{{direction=\"client_out\"}} {}\n",
+            "dnsblackhole_dns_bytes_total{{direction=\"upstream_out\"}} {}\n",
+            "dnsblackhole_dns_bytes_total{{direction=\"upstream_in\"}} {}\n",
+            "# HELP dnsblackhole_cache_saved_bytes_total Upstream bytes avoided by cache hits.\n",
+            "# TYPE dnsblackhole_cache_saved_bytes_total counter\n",
+            "dnsblackhole_cache_saved_bytes_total {}\n"
         ),
         stats.queries,
         stats.blocked,
@@ -221,8 +233,14 @@ fn prometheus_metrics(stats: &DnsStats) -> String {
         stats.cache_misses,
         stats.access_denied_total,
         stats.rate_limited_total,
+        stats.invalid_query_total,
         stats.cache_entries,
         stats.cache_bytes,
+        stats.traffic_totals.client_bytes_in,
+        stats.traffic_totals.client_bytes_out,
+        stats.traffic_totals.upstream_bytes_out,
+        stats.traffic_totals.upstream_bytes_in,
+        stats.traffic_totals.cache_saved_bytes,
     )
 }
 

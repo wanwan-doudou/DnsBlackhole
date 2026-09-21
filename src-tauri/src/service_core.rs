@@ -471,6 +471,9 @@ impl AppState {
                     stats.client_blocked = log_stats.client_blocked;
                     stats.blocklist_hits = log_stats.blocklist_hits;
                     stats.traffic = log_stats.traffic;
+                    stats.traffic_totals = log_stats.traffic_totals;
+                    stats.domain_traffic = log_stats.domain_traffic;
+                    stats.client_traffic = log_stats.client_traffic;
                     stats.upstream_requests = log_stats.upstream_requests;
                     stats.upstream_avg_latency = log_stats.upstream_avg_latency;
                     stats.dashboard_started_at = log_stats.dashboard_started_at;

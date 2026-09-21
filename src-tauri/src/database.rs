@@ -19,15 +19,15 @@ use crate::{
     config::{self, AppConfig, MAX_STATISTICS_RETENTION_HOURS},
     dns::{
         DnsResponseAnswer, DnsResponseSummary, DnsTransport, SecurityEvent, SecurityEventType,
-        TrafficBucket, UpstreamLatencyStat, UpstreamRequestStat,
+        TrafficBucket, TrafficTotals, UpstreamLatencyStat, UpstreamRequestStat,
     },
 };
 
 mod rankings;
 
 use rankings::{
-    blocklist_hit_counts, client_counts, grouped_domain_counts, traffic_buckets,
-    upstream_avg_latency, upstream_request_counts,
+    blocklist_hit_counts, client_counts, client_traffic_counts, domain_traffic_counts,
+    grouped_domain_counts, traffic_buckets, upstream_avg_latency, upstream_request_counts,
 };
 
 const UPSERT_SECURITY_EVENT_SQL: &str = "
@@ -84,9 +84,14 @@ const UPSERT_HOURLY_STAT_SQL: &str = "
             failed,
             requests,
             latency_total_ms,
-            latency_samples
+            latency_samples,
+            client_bytes_in,
+            client_bytes_out,
+            upstream_bytes_out,
+            upstream_bytes_in,
+            cache_saved_bytes
         )
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
     ON CONFLICT(hour, dimension, value) DO UPDATE SET
         queries = queries + excluded.queries,
         blocked = blocked + excluded.blocked,
@@ -94,7 +99,12 @@ const UPSERT_HOURLY_STAT_SQL: &str = "
         failed = failed + excluded.failed,
         requests = requests + excluded.requests,
         latency_total_ms = latency_total_ms + excluded.latency_total_ms,
-        latency_samples = latency_samples + excluded.latency_samples";
+        latency_samples = latency_samples + excluded.latency_samples,
+        client_bytes_in = client_bytes_in + excluded.client_bytes_in,
+        client_bytes_out = client_bytes_out + excluded.client_bytes_out,
+        upstream_bytes_out = upstream_bytes_out + excluded.upstream_bytes_out,
+        upstream_bytes_in = upstream_bytes_in + excluded.upstream_bytes_in,
+        cache_saved_bytes = cache_saved_bytes + excluded.cache_saved_bytes";
 const UPSERT_LIFETIME_STAT_SQL: &str = "
     INSERT INTO dashboard_summary_stats
         (
@@ -108,10 +118,15 @@ const UPSERT_LIFETIME_STAT_SQL: &str = "
             requests,
             latency_total_ms,
             latency_samples,
+            client_bytes_in,
+            client_bytes_out,
+            upstream_bytes_out,
+            upstream_bytes_in,
+            cache_saved_bytes,
             first_seen_at,
             last_seen_at
         )
-    VALUES ('all', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+    VALUES ('all', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
     ON CONFLICT(scope, dimension, value) DO UPDATE SET
         queries = queries + excluded.queries,
         blocked = blocked + excluded.blocked,
@@ -120,6 +135,11 @@ const UPSERT_LIFETIME_STAT_SQL: &str = "
         requests = requests + excluded.requests,
         latency_total_ms = latency_total_ms + excluded.latency_total_ms,
         latency_samples = latency_samples + excluded.latency_samples,
+        client_bytes_in = client_bytes_in + excluded.client_bytes_in,
+        client_bytes_out = client_bytes_out + excluded.client_bytes_out,
+        upstream_bytes_out = upstream_bytes_out + excluded.upstream_bytes_out,
+        upstream_bytes_in = upstream_bytes_in + excluded.upstream_bytes_in,
+        cache_saved_bytes = cache_saved_bytes + excluded.cache_saved_bytes,
         first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
         last_seen_at = MAX(last_seen_at, excluded.last_seen_at)";
 const READ_CONNECTION_POOL_SIZE: usize = 4;
@@ -142,7 +162,16 @@ const TRAFFIC_RETENTION_HOURS: u64 = 30 * 24;
 const VACUUM_FREELIST_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const VACUUM_FREELIST_MIN_RATIO: f64 = 0.25;
 type DomainRankings = (HashMap<String, u64>, HashMap<String, u64>);
-type DashboardTotals = (u64, u64, u64, u64, Option<u64>, Option<u64>);
+#[derive(Debug, Clone, Copy, Default)]
+struct DashboardTotals {
+    queries: u64,
+    blocked: u64,
+    forwarded: u64,
+    failed: u64,
+    traffic: TrafficTotals,
+    started_at: Option<u64>,
+    ended_at: Option<u64>,
+}
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct HourlyStatKey {
@@ -160,6 +189,7 @@ struct StatDelta {
     requests: u64,
     latency_total_ms: u64,
     latency_samples: u64,
+    traffic: TrafficTotals,
 }
 
 /// Web 管理密码凭据。密码只以 Argon2id 的 PHC 字符串形式存在，不保留明文。
@@ -234,6 +264,37 @@ pub struct QueryLogEntry {
     pub rule_type: Option<String>,
     pub important_overrode: bool,
     pub allowlist_rule: Option<String>,
+    /// 这条查询搬运的 DNS 报文字节。只累计到统计表，不逐条写进查询日志。
+    pub traffic: TrafficTotals,
+}
+
+impl QueryLogEntry {
+    /// 后台缓存刷新的流量载体。这类请求由本机发起、没有客户端，除字节外一律留空，
+    /// 配合 `QueryPersistenceEntry::traffic_only` 只累加流量、不计查询数。
+    pub fn background_traffic(traffic: TrafficTotals) -> Self {
+        Self {
+            domain: String::new(),
+            query_type: 0,
+            query_class: 0,
+            transport: String::new(),
+            response_source: "cache_refresh".to_string(),
+            response: None,
+            client_ip: None,
+            blocked: false,
+            forwarded: false,
+            failed: false,
+            upstream_server: None,
+            upstream_duration_ms: None,
+            processing_duration_ms: 0.0,
+            error: None,
+            matched_rule: None,
+            rule_source: None,
+            rule_type: None,
+            important_overrode: false,
+            allowlist_rule: None,
+            traffic,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +303,9 @@ pub struct QueryPersistenceEntry {
     pub anonymize_client_ip: bool,
     pub persist_log: bool,
     pub persist_statistics: bool,
+    /// 后台缓存刷新产生的上游流量没有对应的客户端查询。它只累加字节，
+    /// 不计入查询数、拦截数和各维度排行，否则用户没发起的请求会虚增统计。
+    pub traffic_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +369,9 @@ pub struct LogStats {
     pub client_blocked: HashMap<String, u64>,
     pub blocklist_hits: HashMap<String, u64>,
     pub traffic: Vec<TrafficBucket>,
+    pub traffic_totals: TrafficTotals,
+    pub domain_traffic: HashMap<String, u64>,
+    pub client_traffic: HashMap<String, u64>,
     pub upstream_requests: Vec<UpstreamRequestStat>,
     pub upstream_avg_latency: Vec<UpstreamLatencyStat>,
     pub dashboard_started_at: Option<u64>,
@@ -665,6 +732,7 @@ impl Database {
                 anonymize_client_ip: *anonymize_client_ip,
                 persist_log: true,
                 persist_statistics: true,
+            traffic_only: false,
             })
             .collect::<Vec<_>>();
         self.insert_query_events(&events)
@@ -1286,25 +1354,27 @@ fn freelist_is_bloated(freelist_pages: i64, page_count: i64, page_size: i64) -> 
 }
 
 fn log_stats_with_connection(conn: &Connection, since_hour: u64) -> Result<LogStats, String> {
-    let (queries, blocked, forwarded, failed, dashboard_started_at, dashboard_ended_at) =
-        total_log_counts(conn, since_hour)?;
+    let totals = total_log_counts(conn, since_hour)?;
     let (query_domains, blocked_domains) = grouped_domain_counts(conn, since_hour)?;
     let (client_requests, client_blocked) = client_counts(conn, since_hour)?;
     Ok(LogStats {
-        queries,
-        blocked,
-        forwarded,
-        failed,
+        queries: totals.queries,
+        blocked: totals.blocked,
+        forwarded: totals.forwarded,
+        failed: totals.failed,
         query_domains,
         blocked_domains,
         client_requests,
         client_blocked,
         blocklist_hits: blocklist_hit_counts(conn, since_hour)?,
         traffic: traffic_buckets(conn)?,
+        traffic_totals: totals.traffic,
+        domain_traffic: domain_traffic_counts(conn, since_hour)?,
+        client_traffic: client_traffic_counts(conn, since_hour)?,
         upstream_requests: upstream_request_counts(conn, since_hour)?,
         upstream_avg_latency: upstream_avg_latency(conn, since_hour)?,
-        dashboard_started_at,
-        dashboard_ended_at,
+        dashboard_started_at: totals.started_at,
+        dashboard_ended_at: totals.ended_at,
     })
 }
 
@@ -1331,7 +1401,12 @@ fn parallel_log_stats(
             let conn = domains_conn
                 .lock()
                 .map_err(|_| "数据库域名排行连接已损坏".to_string())?;
-            grouped_domain_counts(&conn, since_hour)
+            let (query_domains, blocked_domains) = grouped_domain_counts(&conn, since_hour)?;
+            Ok::<_, String>((
+                query_domains,
+                blocked_domains,
+                domain_traffic_counts(&conn, since_hour)?,
+            ))
         });
         let clients = scope.spawn(move || {
             let conn = clients_conn
@@ -1342,6 +1417,7 @@ fn parallel_log_stats(
                 client_requests,
                 client_blocked,
                 blocklist_hit_counts(&conn, since_hour)?,
+                client_traffic_counts(&conn, since_hour)?,
             ))
         });
         let upstreams = scope.spawn(move || {
@@ -1354,16 +1430,13 @@ fn parallel_log_stats(
             ))
         });
 
-        let (
-            (queries, blocked, forwarded, failed, dashboard_started_at, dashboard_ended_at),
-            traffic,
-        ) = totals
+        let (totals, traffic) = totals
             .join()
             .map_err(|_| "数据库统计线程异常".to_string())??;
-        let (query_domains, blocked_domains) = domains
+        let (query_domains, blocked_domains, domain_traffic) = domains
             .join()
             .map_err(|_| "数据库域名排行线程异常".to_string())??;
-        let (client_requests, client_blocked, blocklist_hits) = clients
+        let (client_requests, client_blocked, blocklist_hits, client_traffic) = clients
             .join()
             .map_err(|_| "数据库客户端排行线程异常".to_string())??;
         let (upstream_requests, upstream_avg_latency) = upstreams
@@ -1371,21 +1444,42 @@ fn parallel_log_stats(
             .map_err(|_| "数据库上游排行线程异常".to_string())??;
 
         Ok(LogStats {
-            queries,
-            blocked,
-            forwarded,
-            failed,
+            queries: totals.queries,
+            blocked: totals.blocked,
+            forwarded: totals.forwarded,
+            failed: totals.failed,
             query_domains,
             blocked_domains,
             client_requests,
             client_blocked,
             blocklist_hits,
             traffic,
+            traffic_totals: totals.traffic,
+            domain_traffic,
+            client_traffic,
             upstream_requests,
             upstream_avg_latency,
-            dashboard_started_at,
-            dashboard_ended_at,
+            dashboard_started_at: totals.started_at,
+            dashboard_ended_at: totals.ended_at,
         })
+    })
+}
+
+fn read_dashboard_totals(row: &Row<'_>) -> rusqlite::Result<DashboardTotals> {
+    Ok(DashboardTotals {
+        queries: read_u64(row, 0)?,
+        blocked: read_u64(row, 1)?,
+        forwarded: read_u64(row, 2)?,
+        failed: read_u64(row, 3)?,
+        traffic: TrafficTotals {
+            client_bytes_in: read_u64(row, 4)?,
+            client_bytes_out: read_u64(row, 5)?,
+            upstream_bytes_out: read_u64(row, 6)?,
+            upstream_bytes_in: read_u64(row, 7)?,
+            cache_saved_bytes: read_u64(row, 8)?,
+        },
+        started_at: read_optional_u64(row, 9)?,
+        ended_at: read_optional_u64(row, 10)?,
     })
 }
 
@@ -1393,20 +1487,14 @@ fn total_log_counts(conn: &Connection, since_hour: u64) -> Result<DashboardTotal
     if since_hour == 0 {
         return conn
             .query_row(
-                "SELECT queries, blocked, forwarded, failed, first_seen_at, last_seen_at
+                "SELECT queries, blocked, forwarded, failed,
+                        client_bytes_in, client_bytes_out,
+                        upstream_bytes_out, upstream_bytes_in, cache_saved_bytes,
+                        first_seen_at, last_seen_at
                  FROM dashboard_summary_stats
                  WHERE scope = 'all' AND dimension = 'total' AND value = ''",
                 [],
-                |row| {
-                    Ok((
-                        read_u64(row, 0)?,
-                        read_u64(row, 1)?,
-                        read_u64(row, 2)?,
-                        read_u64(row, 3)?,
-                        read_optional_u64(row, 4)?,
-                        read_optional_u64(row, 5)?,
-                    ))
-                },
+                read_dashboard_totals,
             )
             .optional()
             .map(|counts| counts.unwrap_or_default())
@@ -1419,21 +1507,17 @@ fn total_log_counts(conn: &Connection, since_hour: u64) -> Result<DashboardTotal
             COALESCE(SUM(blocked), 0),
             COALESCE(SUM(forwarded), 0),
             COALESCE(SUM(failed), 0),
+            COALESCE(SUM(client_bytes_in), 0),
+            COALESCE(SUM(client_bytes_out), 0),
+            COALESCE(SUM(upstream_bytes_out), 0),
+            COALESCE(SUM(upstream_bytes_in), 0),
+            COALESCE(SUM(cache_saved_bytes), 0),
             MIN(hour) * 3600,
             MAX(hour) * 3600
          FROM statistics_hourly
          WHERE dimension = 'total' AND value = '' AND hour >= ?1",
         params![since],
-        |row| {
-            Ok((
-                read_u64(row, 0)?,
-                read_u64(row, 1)?,
-                read_u64(row, 2)?,
-                read_u64(row, 3)?,
-                read_optional_u64(row, 4)?,
-                read_optional_u64(row, 5)?,
-            ))
-        },
+        read_dashboard_totals,
     )
     .map_err(|e| format!("读取仪表盘累计统计失败：{e}"))
 }
@@ -1524,6 +1608,7 @@ fn aggregate_hourly_stats(
     let mut stats = HashMap::new();
     for persisted in entries.iter().filter(|entry| entry.persist_statistics) {
         let entry = &persisted.entry;
+        let traffic = entry.traffic;
         add_stat_delta(
             &mut stats,
             HourlyStatKey {
@@ -1532,13 +1617,18 @@ fn aggregate_hourly_stats(
                 value: String::new(),
             },
             StatDelta {
-                queries: 1,
-                blocked: u64::from(entry.blocked),
-                forwarded: u64::from(entry.forwarded),
-                failed: u64::from(entry.failed),
+                queries: u64::from(!persisted.traffic_only),
+                blocked: u64::from(entry.blocked && !persisted.traffic_only),
+                forwarded: u64::from(entry.forwarded && !persisted.traffic_only),
+                failed: u64::from(entry.failed && !persisted.traffic_only),
+                traffic,
                 ..StatDelta::default()
             },
         );
+        // 后台缓存刷新没有真实客户端，除流量外不参与任何排行。
+        if persisted.traffic_only {
+            continue;
+        }
         add_stat_delta(
             &mut stats,
             HourlyStatKey {
@@ -1549,6 +1639,7 @@ fn aggregate_hourly_stats(
             StatDelta {
                 queries: 1,
                 blocked: u64::from(entry.blocked),
+                traffic,
                 ..StatDelta::default()
             },
         );
@@ -1566,6 +1657,7 @@ fn aggregate_hourly_stats(
                 StatDelta {
                     queries: 1,
                     blocked: u64::from(entry.blocked),
+                    traffic,
                     ..StatDelta::default()
                 },
             );
@@ -1630,6 +1722,22 @@ fn add_stat_delta(
     current.latency_samples = current
         .latency_samples
         .saturating_add(delta.latency_samples);
+    let traffic = &mut current.traffic;
+    traffic.client_bytes_in = traffic
+        .client_bytes_in
+        .saturating_add(delta.traffic.client_bytes_in);
+    traffic.client_bytes_out = traffic
+        .client_bytes_out
+        .saturating_add(delta.traffic.client_bytes_out);
+    traffic.upstream_bytes_out = traffic
+        .upstream_bytes_out
+        .saturating_add(delta.traffic.upstream_bytes_out);
+    traffic.upstream_bytes_in = traffic
+        .upstream_bytes_in
+        .saturating_add(delta.traffic.upstream_bytes_in);
+    traffic.cache_saved_bytes = traffic
+        .cache_saved_bytes
+        .saturating_add(delta.traffic.cache_saved_bytes);
 }
 
 fn execute_hourly_stat_upsert(
@@ -1649,6 +1757,11 @@ fn execute_hourly_stat_upsert(
             u64_to_db_i64(delta.requests, "统计上游请求数")?,
             u64_to_db_i64(delta.latency_total_ms, "统计上游总耗时")?,
             u64_to_db_i64(delta.latency_samples, "统计上游耗时样本数")?,
+            u64_to_db_i64(delta.traffic.client_bytes_in, "统计客户端上行字节")?,
+            u64_to_db_i64(delta.traffic.client_bytes_out, "统计客户端下行字节")?,
+            u64_to_db_i64(delta.traffic.upstream_bytes_out, "统计上游发送字节")?,
+            u64_to_db_i64(delta.traffic.upstream_bytes_in, "统计上游接收字节")?,
+            u64_to_db_i64(delta.traffic.cache_saved_bytes, "统计缓存节省字节")?,
         ])
         .map_err(|e| format!("写入小时统计失败：{e}"))?;
     Ok(())
@@ -1671,6 +1784,11 @@ fn execute_lifetime_stat_upsert(
             u64_to_db_i64(delta.requests, "永久统计上游请求数")?,
             u64_to_db_i64(delta.latency_total_ms, "永久统计上游总耗时")?,
             u64_to_db_i64(delta.latency_samples, "永久统计上游耗时样本数")?,
+            u64_to_db_i64(delta.traffic.client_bytes_in, "永久统计客户端上行字节")?,
+            u64_to_db_i64(delta.traffic.client_bytes_out, "永久统计客户端下行字节")?,
+            u64_to_db_i64(delta.traffic.upstream_bytes_out, "永久统计上游发送字节")?,
+            u64_to_db_i64(delta.traffic.upstream_bytes_in, "永久统计上游接收字节")?,
+            u64_to_db_i64(delta.traffic.cache_saved_bytes, "永久统计缓存节省字节")?,
             u64_to_db_i64(observed_at, "永久统计观测时间")?,
         ])
         .map_err(|e| format!("写入永久统计失败：{e}"))?;
@@ -1899,6 +2017,11 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             requests INTEGER NOT NULL DEFAULT 0,
             latency_total_ms INTEGER NOT NULL DEFAULT 0,
             latency_samples INTEGER NOT NULL DEFAULT 0,
+            client_bytes_in INTEGER NOT NULL DEFAULT 0,
+            client_bytes_out INTEGER NOT NULL DEFAULT 0,
+            upstream_bytes_out INTEGER NOT NULL DEFAULT 0,
+            upstream_bytes_in INTEGER NOT NULL DEFAULT 0,
+            cache_saved_bytes INTEGER NOT NULL DEFAULT 0,
             first_seen_at INTEGER NOT NULL,
             last_seen_at INTEGER NOT NULL,
             PRIMARY KEY (scope, dimension, value)
@@ -1915,6 +2038,11 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             requests INTEGER NOT NULL DEFAULT 0,
             latency_total_ms INTEGER NOT NULL DEFAULT 0,
             latency_samples INTEGER NOT NULL DEFAULT 0,
+            client_bytes_in INTEGER NOT NULL DEFAULT 0,
+            client_bytes_out INTEGER NOT NULL DEFAULT 0,
+            upstream_bytes_out INTEGER NOT NULL DEFAULT 0,
+            upstream_bytes_in INTEGER NOT NULL DEFAULT 0,
+            cache_saved_bytes INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (hour, dimension, value)
         ) WITHOUT ROWID;
         ",
@@ -1941,6 +2069,18 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     add_column_if_missing(conn, "query_logs", "response_answer_count", "INTEGER")?;
     add_column_if_missing(conn, "query_logs", "response_answers", "TEXT")?;
     add_column_if_missing(conn, "query_logs", "response_truncated", "INTEGER")?;
+    // 流量统计是后加的，老库按 0 起算：既往查询没有留下报文长度，无法回填。
+    for table in ["statistics_hourly", "dashboard_summary_stats"] {
+        for column in [
+            "client_bytes_in",
+            "client_bytes_out",
+            "upstream_bytes_out",
+            "upstream_bytes_in",
+            "cache_saved_bytes",
+        ] {
+            add_column_if_missing(conn, table, column, "INTEGER NOT NULL DEFAULT 0")?;
+        }
+    }
     conn.execute_batch(
         "
         -- columnsize = 0 省掉逐行的列长度记录：detail = none 下本就无法用 bm25 排序，
@@ -2691,6 +2831,7 @@ fn security_event_type_to_db(value: SecurityEventType) -> &'static str {
     match value {
         SecurityEventType::AccessDenied => "access_denied",
         SecurityEventType::RateLimited => "rate_limited",
+        SecurityEventType::InvalidQuery => "invalid_query",
         SecurityEventType::WebAuthLogin => "web_auth_login",
         SecurityEventType::WebAuthFailed => "web_auth_failed",
         SecurityEventType::WebAuthLocked => "web_auth_locked",
@@ -2701,6 +2842,7 @@ fn security_event_type_to_db(value: SecurityEventType) -> &'static str {
 fn security_event_type_from_db(value: &str) -> SecurityEventType {
     match value {
         "rate_limited" => SecurityEventType::RateLimited,
+        "invalid_query" => SecurityEventType::InvalidQuery,
         "web_auth_login" => SecurityEventType::WebAuthLogin,
         "web_auth_failed" => SecurityEventType::WebAuthFailed,
         "web_auth_locked" => SecurityEventType::WebAuthLocked,
@@ -2913,6 +3055,7 @@ mod tests {
             rule_type: None,
             important_overrode: false,
             allowlist_rule: None,
+            traffic: TrafficTotals::default(),
         }
     }
 
@@ -3162,6 +3305,78 @@ mod tests {
     }
 
     #[test]
+    fn traffic_bytes_accumulate_into_dashboard_totals() {
+        let db = Database::open_in_memory().expect("db should open");
+        let mut forwarded = sample_query_log("forward.example");
+        forwarded.traffic = TrafficTotals {
+            client_bytes_in: 40,
+            client_bytes_out: 120,
+            upstream_bytes_out: 40,
+            upstream_bytes_in: 120,
+            cache_saved_bytes: 0,
+        };
+        let mut cached = sample_query_log("cache.example");
+        cached.response_source = "cache".into();
+        cached.forwarded = false;
+        cached.traffic = TrafficTotals {
+            client_bytes_in: 30,
+            client_bytes_out: 90,
+            upstream_bytes_out: 0,
+            upstream_bytes_in: 0,
+            cache_saved_bytes: 120,
+        };
+        db.insert_query_logs(&[(forwarded, false), (cached, false)])
+            .expect("logs should insert");
+
+        for hours in [24, 0] {
+            let stats = db.log_stats(hours).expect("stats should load");
+            let traffic = stats.traffic_totals;
+            assert_eq!(stats.queries, 2, "保留 {hours} 小时时查询数应完整");
+            assert_eq!(traffic.client_bytes_in, 70);
+            assert_eq!(traffic.client_bytes_out, 210);
+            assert_eq!(traffic.upstream_bytes_out, 40);
+            assert_eq!(traffic.upstream_bytes_in, 120);
+            // 命中缓存省下的是本该走的那一趟上游往返，不参与实际流量。
+            assert_eq!(traffic.cache_saved_bytes, 120);
+        }
+    }
+
+    #[test]
+    fn background_refresh_traffic_does_not_inflate_query_counts() {
+        let db = Database::open_in_memory().expect("db should open");
+        let client_query = QueryPersistenceEntry {
+            entry: sample_query_log("client.example"),
+            anonymize_client_ip: false,
+            persist_log: true,
+            persist_statistics: true,
+            traffic_only: false,
+        };
+        let refresh = QueryPersistenceEntry {
+            entry: QueryLogEntry::background_traffic(TrafficTotals {
+                upstream_bytes_out: 44,
+                upstream_bytes_in: 160,
+                ..TrafficTotals::default()
+            }),
+            anonymize_client_ip: false,
+            persist_log: false,
+            persist_statistics: true,
+            traffic_only: true,
+        };
+        db.insert_query_events(&[client_query, refresh])
+            .expect("events should insert");
+
+        let stats = db.log_stats(24).expect("stats should load");
+        // 后台刷新是本机发起的，用户没查过，不能进查询数和域名排行。
+        assert_eq!(stats.queries, 1);
+        assert_eq!(stats.forwarded, 1);
+        assert!(!stats.query_domains.contains_key(""));
+        assert_eq!(stats.query_domains.len(), 1);
+        // 但它打出去的上游字节是真实网络开销，必须计入流量。
+        assert_eq!(stats.traffic_totals.upstream_bytes_out, 44);
+        assert_eq!(stats.traffic_totals.upstream_bytes_in, 160);
+    }
+
+    #[test]
     fn migrates_blocklist_source_from_name_to_filter_id() {
         let db = Database::open_in_memory().expect("db should open");
         let config = AppConfig {
@@ -3308,6 +3523,7 @@ mod tests {
                     rule_type: Some("suffix block".into()),
                     important_overrode: false,
                     allowlist_rule: None,
+                traffic: TrafficTotals::default(),
                 },
                 true,
             ),
@@ -3341,6 +3557,7 @@ mod tests {
                     rule_type: None,
                     important_overrode: false,
                     allowlist_rule: None,
+                traffic: TrafficTotals::default(),
                 },
                 true,
             ),
@@ -3918,6 +4135,7 @@ mod tests {
             rule_type: None,
             important_overrode: false,
             allowlist_rule: None,
+        traffic: TrafficTotals::default(),
         };
 
         db.insert_query_events(&[QueryPersistenceEntry {
@@ -3925,6 +4143,7 @@ mod tests {
             anonymize_client_ip: false,
             persist_log: true,
             persist_statistics: false,
+        traffic_only: false,
         }])
         .expect("log-only event should persist");
         assert_eq!(
@@ -3940,6 +4159,7 @@ mod tests {
             anonymize_client_ip: false,
             persist_log: false,
             persist_statistics: true,
+        traffic_only: false,
         }])
         .expect("statistics-only event should persist");
         assert_eq!(
@@ -3977,6 +4197,7 @@ mod tests {
             anonymize_client_ip: false,
             persist_log: true,
             persist_statistics: true,
+        traffic_only: false,
         }])
         .expect("combined event should persist");
         db.clear_statistics().expect("statistics should clear");
@@ -4006,6 +4227,7 @@ mod tests {
             anonymize_client_ip: false,
             persist_log: false,
             persist_statistics: true,
+        traffic_only: false,
         }])
         .expect("statistics should resume after clearing");
         db.clear_query_logs().expect("query logs should clear");
@@ -4834,10 +5056,12 @@ mod tests {
                     rule_type: None,
                     important_overrode: false,
                     allowlist_rule: None,
+                traffic: TrafficTotals::default(),
                 },
                 anonymize_client_ip: false,
                 persist_log: true,
                 persist_statistics: true,
+            traffic_only: false,
             }])
             .expect("normal write should run WAL maintenance");
         reader.join().expect("concurrent reader should finish");
@@ -4881,6 +5105,7 @@ mod tests {
             rule_type: None,
             important_overrode: false,
             allowlist_rule: None,
+        traffic: TrafficTotals::default(),
         };
 
         db.insert_query_logs(&[(sample("a.example.com"), true)])

@@ -15,9 +15,12 @@ export function trendDayCountForHours(hours: number): number {
   return Math.min(DAILY_TREND_DAYS, Math.max(2, Math.ceil(hours / 24) + 1));
 }
 
+/// 趋势曲线可取的字段。bytes 是该时段实际搬运的报文量。
+export type TrafficField = "queries" | "blocked" | "bytes";
+
 export function buildDailyTrafficSeries(
   buckets: TrafficBucket[] | undefined,
-  field: "queries" | "blocked",
+  field: TrafficField,
   dayCount = DAILY_TREND_DAYS,
   now = Date.now(),
 ): HistoryPoint[] {
@@ -44,7 +47,7 @@ export function buildDailyTrafficSeries(
     date.setHours(0, 0, 0, 0);
     const index = dayIndex.get(date.getTime());
     if (index !== undefined) {
-      values[index].value += bucket[field];
+      values[index].value += bucket[field] ?? 0;
     }
   }
 
@@ -54,7 +57,7 @@ export function buildDailyTrafficSeries(
 /// 按统计窗口自动选择趋势粒度：短窗口用小时，长窗口用自然日。
 export function buildTrafficSeries(
   buckets: TrafficBucket[] | undefined,
-  field: "queries" | "blocked",
+  field: TrafficField,
   hours: number,
   now = Date.now(),
 ): HistoryPoint[] {
@@ -67,7 +70,7 @@ export function buildTrafficSeries(
 
 export function buildHourlyTrafficSeries(
   buckets: TrafficBucket[] | undefined,
-  field: "queries" | "blocked",
+  field: TrafficField,
   hourCount: number,
   now = Date.now(),
 ): HistoryPoint[] {
@@ -90,14 +93,18 @@ export function buildHourlyTrafficSeries(
     const timestamp = bucket.minute * 60_000;
     const index = Math.floor((timestamp - firstHourStart) / 3_600_000);
     if (index >= 0 && index < values.length) {
-      values[index].value += bucket[field];
+      values[index].value += bucket[field] ?? 0;
     }
   }
 
   return values;
 }
 
-export function renderSparkline(selector: string, series: HistoryPoint[]): void {
+export function renderSparkline(
+  selector: string,
+  series: HistoryPoint[],
+  formatValue: (value: number) => string = formatCount,
+): void {
   const line = query<SVGPathElement>(selector);
   const svg = line.ownerSVGElement;
   if (!svg) {
@@ -128,7 +135,7 @@ export function renderSparkline(selector: string, series: HistoryPoint[]): void 
     area.setAttribute("d", areaPath);
   }
 
-  bindSparklineHover(svg, coords, width);
+  bindSparklineHover(svg, coords, width, formatValue);
 }
 
 function buildAreaPath(points: ChartPoint[], baseline: number): string {
@@ -183,7 +190,12 @@ function buildMonotonePath(points: ChartPoint[]): string {
   return path;
 }
 
-function bindSparklineHover(svg: SVGSVGElement, coords: ChartPoint[], width: number): void {
+function bindSparklineHover(
+  svg: SVGSVGElement,
+  coords: ChartPoint[],
+  width: number,
+  formatValue: (value: number) => string,
+): void {
   const guide = svg.querySelector<SVGLineElement>(".spark-guide");
   const point = svg.querySelector<SVGCircleElement>(".spark-point");
   const tooltipId = svg.dataset.tooltip;
@@ -215,7 +227,7 @@ function bindSparklineHover(svg: SVGSVGElement, coords: ChartPoint[], width: num
     guide.setAttribute("x2", nearest.x.toFixed(1));
     point.setAttribute("cx", nearest.x.toFixed(1));
     point.setAttribute("cy", nearest.y.toFixed(1));
-    tooltip.innerHTML = `<strong>${formatCount(nearest.value)}</strong><span>${escapeHtml(nearest.label)}</span>`;
+    tooltip.innerHTML = `<strong>${escapeHtml(formatValue(nearest.value))}</strong><span>${escapeHtml(nearest.label)}</span>`;
 
     // 先显示再测量：.hidden 为 display:none 时取不到 tooltip 的真实尺寸
     guide.classList.remove("hidden");

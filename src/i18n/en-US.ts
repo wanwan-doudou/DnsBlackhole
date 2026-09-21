@@ -39,6 +39,21 @@ export const enUS: Record<string, string> = {
   "统计趋势": "Trend",
   "DNS 查询": "DNS queries",
   "已拦截查询": "Blocked queries",
+  "DNS 流量": "DNS traffic",
+  "流量": "Traffic",
+  "统计 DNS 报文本身的字节，不含 TLS 握手与 HTTP 头等封装开销。":
+    "Counts the DNS messages themselves, excluding TLS handshakes and HTTP headers.",
+  "客户端方向": "Client side",
+  "上游方向": "Upstream side",
+  "缓存省下的上游流量": "Upstream traffic saved by cache",
+  "命中缓存、未发往上游。": "Served from cache, never sent upstream.",
+  "流量构成": "Traffic breakdown",
+  "平均每次查询": "Per query average",
+  "按 {p0} 次查询平均": "Averaged over {p0} queries",
+  "客户端流量排行": "Top clients by traffic",
+  "域名流量排行": "Top domains by traffic",
+  "收 {p0} · 发 {p1}": "In {p0} · Out {p1}",
+  "发 {p0} · 收 {p1}": "Out {p0} · In {p1}",
   "请求域名排行": "Top queried domains",
   "暂无汇总数据": "No aggregated data yet",
   "域名": "Domain",
@@ -377,11 +392,12 @@ export const enUS: Record<string, string> = {
 
   // ---------- 安全事件 ----------
   "安全事件": "Security events",
-  "UDP 拒绝仍保持静默丢弃；这里展示拒绝、限速与 Web 管理认证事件，最多保留最近 200 条聚合事件。事件会落盘保存，DNS 未启动时也能查看。":
-    "Denied UDP queries are still dropped silently. This lists denials, rate limiting and web admin sign-in events, keeping the 200 most recent aggregated events. Events are stored on disk and stay visible even while DNS is not running.",
+  "UDP 拒绝仍保持静默丢弃；这里展示拒绝、限速、无效请求与 Web 管理认证事件。它们是值得留痕的非常规请求与管理操作，不一定代表遭到攻击。最多保留最近 200 条聚合事件，落盘保存，DNS 未启动时也能查看。":
+    "Denied UDP queries are still dropped silently. This lists denials, rate limiting, invalid requests and web admin sign-in events. They are unusual requests and admin actions worth recording, not necessarily signs of an attack. It keeps the 200 most recent aggregated events, stored on disk and visible even while DNS is not running.",
   "访问拒绝": "Access denied",
   "限速触发": "Rate limited",
   "UDP 静默丢弃": "UDP dropped silently",
+  "无效请求": "Invalid request",
   "ANY 拒绝": "ANY refused",
   "Rebinding 拦截": "Rebinding blocked",
   "CNAME cloaking 拦截": "CNAME cloaking blocked",

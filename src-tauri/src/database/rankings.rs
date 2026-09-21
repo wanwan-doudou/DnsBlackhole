@@ -257,7 +257,8 @@ pub(super) fn traffic_buckets(conn: &Connection) -> Result<Vec<TrafficBucket>, S
                 'utc'
             ) AS INTEGER) / 60 AS bucket_minute,
             SUM(queries),
-            SUM(blocked)
+            SUM(blocked),
+            SUM(client_bytes_in + client_bytes_out + upstream_bytes_out + upstream_bytes_in)
          FROM statistics_hourly
          WHERE dimension = 'total' AND value = '' AND hour >= ?1
          GROUP BY date(hour * 3600, 'unixepoch', 'localtime')
@@ -270,6 +271,7 @@ pub(super) fn traffic_buckets(conn: &Connection) -> Result<Vec<TrafficBucket>, S
                 minute: read_u64(row, 0)?,
                 queries: read_u64(row, 1)?,
                 blocked: read_u64(row, 2)?,
+                bytes: read_u64(row, 3)?,
             })
         })
         .map_err(|e| format!("读取趋势数据失败：{e}"))?;
@@ -397,4 +399,80 @@ pub(super) fn upstream_avg_latency(
         stats.push(row.map_err(|e| format!("解析上游响应时间排行失败：{e}"))?);
     }
     Ok(stats)
+}
+
+/// 按维度取流量排行。排的是实际搬运的报文字节，
+/// 不含 `cache_saved_bytes`——那是没有发生的流量，混进来会让排名失真。
+fn traffic_rank(
+    conn: &Connection,
+    dimension: &'static str,
+    since_hour: u64,
+    label: &str,
+) -> Result<HashMap<String, u64>, String> {
+    let bytes = "client_bytes_in + client_bytes_out + upstream_bytes_out + upstream_bytes_in";
+    let (sql, since) = if since_hour == 0 {
+        (
+            format!(
+                "SELECT value, ({bytes}) AS bytes
+                 FROM dashboard_summary_stats
+                 WHERE scope = 'all' AND dimension = ?1 AND ({bytes}) > 0
+                 ORDER BY bytes DESC, value ASC
+                 LIMIT 200"
+            ),
+            None,
+        )
+    } else {
+        (
+            format!(
+                "SELECT value, SUM({bytes}) AS bytes
+                 FROM statistics_hourly
+                 WHERE dimension = ?1 AND hour >= ?2
+                 GROUP BY value
+                 HAVING SUM({bytes}) > 0
+                 ORDER BY bytes DESC, value ASC
+                 LIMIT 200"
+            ),
+            Some(u64_to_db_i64(since_hour, label)?),
+        )
+    };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备{label}查询失败：{e}"))?;
+    let mut ranking = HashMap::new();
+    let mut rows = match since {
+        Some(since) => stmt
+            .query(params![dimension, since])
+            .map_err(|e| format!("读取{label}失败：{e}"))?,
+        None => stmt
+            .query(params![dimension])
+            .map_err(|e| format!("读取{label}失败：{e}"))?,
+    };
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("读取{label}失败：{e}"))?
+    {
+        let value: String = row
+            .get(0)
+            .map_err(|e| format!("解析{label}失败：{e}"))?;
+        if value.is_empty() {
+            continue;
+        }
+        ranking.insert(value, read_u64(row, 1).map_err(|e| format!("解析{label}失败：{e}"))?);
+    }
+    Ok(ranking)
+}
+
+pub(super) fn domain_traffic_counts(
+    conn: &Connection,
+    since_hour: u64,
+) -> Result<HashMap<String, u64>, String> {
+    traffic_rank(conn, "domain", since_hour, "域名流量排行")
+}
+
+pub(super) fn client_traffic_counts(
+    conn: &Connection,
+    since_hour: u64,
+) -> Result<HashMap<String, u64>, String> {
+    traffic_rank(conn, "client", since_hour, "客户端流量排行")
 }

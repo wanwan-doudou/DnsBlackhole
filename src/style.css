@@ -1034,12 +1034,16 @@ button.refreshing:disabled {
 }
 
 [data-view-panel="dashboard"].is-loading .dashboard-summary,
-[data-view-panel="dashboard"].is-loading .dashboard-rank-grid {
+[data-view-panel="dashboard"].is-loading .dashboard-rank-grid,
+[data-view-panel="traffic"].is-loading .dashboard-summary,
+[data-view-panel="traffic"].is-loading .traffic-breakdown-panel,
+[data-view-panel="traffic"].is-loading .dashboard-rank-grid {
   opacity: 0.68;
 }
 
 .dashboard-summary,
-.dashboard-rank-grid {
+.dashboard-rank-grid,
+.traffic-breakdown-panel {
   transition: opacity 0.16s ease;
 }
 
@@ -1156,6 +1160,78 @@ button.refreshing:disabled {
 
 .spark-card {
   min-width: 0;
+}
+
+/* 流量页：节省卡没有曲线，用说明文字占住 .spark-box 的固定高度 */
+.traffic-saved-card .spark-box>strong {
+  color: var(--brand-22);
+}
+
+.traffic-saved-note {
+  position: absolute;
+  top: 78px;
+  right: 17px;
+  left: 17px;
+  margin: 0;
+  color: var(--neutral-22);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.traffic-breakdown-panel {
+  margin-bottom: 18px;
+}
+
+.traffic-split {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  /* 左右与标题同为 24px，三格的左边缘才和「流量构成」对齐 */
+  padding: 0 24px 18px;
+}
+
+.traffic-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  border-left: 1px solid var(--info-1);
+  padding-left: 14px;
+}
+
+.traffic-item:first-child {
+  border-left: 0;
+  padding-left: 0;
+}
+
+.traffic-item>span {
+  color: var(--neutral-22);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.traffic-item>strong {
+  color: var(--neutral-27);
+  font-size: 19px;
+  line-height: 1.2;
+  font-weight: 600;
+}
+
+.traffic-item>small {
+  color: var(--neutral-22);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+@media (max-width: 900px) {
+  .traffic-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .traffic-item {
+    border-left: 0;
+    padding-left: 0;
+  }
 }
 
 .spark-box {
@@ -1362,6 +1438,12 @@ button.refreshing:disabled {
 .rank-head {
   min-height: 30px;
   padding-right: 0;
+  /* 表头在滚动容器外面，.rank-body 用 scrollbar-gutter 预留了滚动条宽度而它没有，
+     同一套 grid 列宽就会差出一条滚动条的距离，表头分隔线对不上数据列。
+     这里同样声明成 scroll container 并预留 gutter：表头内容只有一行，
+     不会真的出现滚动条，但两边的列边界会落在同一条线上。 */
+  overflow-y: auto;
+  scrollbar-gutter: stable;
   color: var(--neutral-24);
   background: var(--info-0);
   box-shadow: 0 3px 10px rgb(var(--info-rgb-2) / 0.12);
@@ -1380,15 +1462,15 @@ button.refreshing:disabled {
 }
 
 .rank-body {
+  /* 高度取行高 52px 的整数倍（5 行 / 8 行），常规不换行的行就能整行显示，
+     不必再靠 scroll-snap 对齐——那个会在同一次滚轮手势里把后续事件吃掉，
+     表现为"滚到一半卡住、挪一下鼠标才能接着滚"。 */
   min-height: 260px;
-  /* 约八行，再多就在卡片内部滚动，免得排行一长把整页撑得很高。 */
-  max-height: 420px;
+  max-height: 416px;
   overflow-x: hidden;
   overflow-y: auto;
   /* 预留滚动条宽度，有无滚动条的两张卡片列宽才一致。 */
   scrollbar-gutter: stable;
-  /* 滚动停下来时对齐到整行，否则首尾会各露半行，看起来像文字被裁掉一截。 */
-  scroll-snap-type: y proximity;
   background: var(--neutral-0);
 }
 
@@ -1399,7 +1481,6 @@ button.refreshing:disabled {
 .rank-row {
   min-height: 52px;
   border-top: 1px solid var(--neutral-1);
-  scroll-snap-align: start;
   transition: background-color 0.12s ease;
 }
 
@@ -1512,7 +1593,11 @@ button.refreshing:disabled {
   padding: 16px;
 }
 
-.rank-panel {
+.rank-panel,
+/* 跟排行卡同样把 padding 交给内部元素：.rank-title 自带 24px 左内边距，
+   面板再叠一层 16px，标题就会比下面的数据更靠右。这条必须排在
+   上面的 .panel { padding: 16px } 之后才生效。 */
+.traffic-breakdown-panel {
   padding: 0;
 }
 
@@ -4149,8 +4234,8 @@ select:focus {
   }
 
   .rank-body {
-    min-height: 200px;
-    max-height: 280px;
+    min-height: 208px;
+    max-height: 260px;
   }
 
   .diagnostic-results {

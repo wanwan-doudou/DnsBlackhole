@@ -100,6 +100,37 @@ pub(crate) struct UpstreamForwardResponse {
     pub(crate) duration_ms: u64,
 }
 
+/// 一次转发内的上游字节累计。同一个查询可能打多台上游（失败重试、fallback、并行模式），
+/// 这些都是真实发生的网络开销，统一累加后再归因到该查询。
+///
+/// 并行模式下晚于结果返回的分支不一定来得及计入，那部分会被低估；
+/// 默认的负载均衡模式串行发起，计数是完整的。
+///
+/// 统计口径是 DNS 报文本身的长度，不含 TCP 长度前缀、TLS 握手与 HTTP 头等封装开销：
+/// 那些字节在 reqwest / hickory 内部，拿不到也不稳定。
+#[derive(Debug, Default)]
+pub(crate) struct UpstreamTraffic {
+    sent: AtomicU64,
+    received: AtomicU64,
+}
+
+impl UpstreamTraffic {
+    pub(crate) fn record_sent(&self, bytes: usize) {
+        self.sent.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_received(&self, bytes: usize) {
+        self.received.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        (
+            self.sent.load(Ordering::Relaxed),
+            self.received.load(Ordering::Relaxed),
+        )
+    }
+}
+
 struct IpLatencyProbe {
     response_index: usize,
     duration: Duration,
@@ -733,10 +764,11 @@ pub(crate) fn forward_query(
     next_upstream: &AtomicUsize,
     deadline: Instant,
     stats: &Arc<Mutex<DnsStats>>,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> Result<UpstreamForwardResponse, String> {
     match mode {
         UpstreamMode::LoadBalance => {
-            forward_load_balanced(query, upstream_servers, next_upstream, deadline)
+            forward_load_balanced(query, upstream_servers, next_upstream, deadline, traffic)
         }
         UpstreamMode::ParallelRequests => forward_parallel(
             query,
@@ -744,9 +776,10 @@ pub(crate) fn forward_query(
             next_upstream,
             deadline,
             Some(stats),
+            traffic,
         ),
         UpstreamMode::FastestAddr => {
-            forward_fastest_addr(query, upstream_servers, deadline, Some(stats))
+            forward_fastest_addr(query, upstream_servers, deadline, Some(stats), traffic)
         }
     }
 }
@@ -756,6 +789,7 @@ fn forward_load_balanced(
     upstream_servers: &[RuntimeUpstream],
     next_upstream: &AtomicUsize,
     deadline: Instant,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> Result<UpstreamForwardResponse, String> {
     let mut last_error = None;
     let server_count = upstream_servers.len();
@@ -769,7 +803,7 @@ fn forward_load_balanced(
         if Instant::now() >= deadline {
             break;
         }
-        match forward_to_upstream(query, &upstream, deadline) {
+        match forward_to_upstream(query, &upstream, deadline, traffic) {
             Ok(response) => return Ok(response),
             Err(error) => last_error = Some(error),
         }
@@ -784,6 +818,7 @@ fn forward_parallel(
     next_upstream: &AtomicUsize,
     query_deadline: Instant,
     stats: Option<&Arc<Mutex<DnsStats>>>,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> Result<UpstreamForwardResponse, String> {
     if upstream_servers.is_empty() {
         return Err("没有可用的上游 DNS".into());
@@ -795,13 +830,13 @@ fn forward_parallel(
     }
 
     let deadline = (Instant::now() + PARALLEL_RESULT_WAIT).min(query_deadline);
-    let batch = spawn_parallel_forwards(query, selected_upstreams, deadline, true, stats);
+    let batch = spawn_parallel_forwards(query, selected_upstreams, deadline, true, stats, traffic);
     let mut last_error = None;
 
     // 队列满时立即在当前线程执行一个兜底；其他已提交任务仍在并行运行。
     // 不能等到批次 deadline 后再执行，否则会在最拥塞时额外增加一个网络超时。
     if let Some(upstream) = batch.synchronous_fallback.as_ref() {
-        match forward_to_upstream(query, upstream, deadline) {
+        match forward_to_upstream(query, upstream, deadline, traffic) {
             Ok(response) => {
                 batch.control.cancel();
                 return Ok(response);
@@ -836,6 +871,7 @@ fn forward_fastest_addr(
     upstream_servers: &[RuntimeUpstream],
     query_deadline: Instant,
     stats: Option<&Arc<Mutex<DnsStats>>>,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> Result<UpstreamForwardResponse, String> {
     let selected_upstreams = select_parallel_upstreams(upstream_servers, 0);
     if selected_upstreams.is_empty() {
@@ -847,11 +883,11 @@ fn forward_fastest_addr(
     }
 
     let deadline = (Instant::now() + PARALLEL_RESULT_WAIT).min(query_deadline);
-    let batch = spawn_parallel_forwards(query, selected_upstreams, deadline, false, stats);
+    let batch = spawn_parallel_forwards(query, selected_upstreams, deadline, false, stats, traffic);
     let mut responses = Vec::new();
     let mut last_error = None;
     if let Some(upstream) = batch.synchronous_fallback.as_ref() {
-        match forward_to_upstream(query, upstream, deadline) {
+        match forward_to_upstream(query, upstream, deadline, traffic) {
             Ok(response) => responses.push(response),
             Err(error) => last_error = Some(error),
         }
@@ -888,6 +924,7 @@ fn spawn_parallel_forwards(
     deadline: Instant,
     cancel_on_success: bool,
     stats: Option<&Arc<Mutex<DnsStats>>>,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> ParallelForwardBatch {
     let (sender, receiver) = mpsc::channel();
     let query = Arc::new(query.to_vec());
@@ -902,6 +939,7 @@ fn spawn_parallel_forwards(
             &control,
             cancel_on_success,
             stats,
+            traffic,
         ) {
             Ok(()) => scheduled += 1,
             Err(upstream) => {
@@ -925,17 +963,23 @@ fn spawn_parallel_forward_task(
     control: &Arc<ParallelRequestControl>,
     cancel_on_success: bool,
     stats: Option<&Arc<Mutex<DnsStats>>>,
+    traffic: &Arc<UpstreamTraffic>,
 ) -> Result<(), Box<RuntimeUpstream>> {
     let fallback = upstream.clone();
     let sender = sender.clone();
     let query = Arc::clone(query);
     let task_control = Arc::clone(control);
+    let task_traffic = Arc::clone(traffic);
     if task_pool::spawn_task(move || {
         if !task_control.can_start() {
             return;
         }
-        let result =
-            forward_to_upstream(query.as_ref().as_slice(), &upstream, task_control.deadline);
+        let result = forward_to_upstream(
+            query.as_ref().as_slice(),
+            &upstream,
+            task_control.deadline,
+            &task_traffic,
+        );
         if cancel_on_success && result.is_ok() {
             task_control.cancel();
         }
@@ -1202,9 +1246,12 @@ fn forward_to_upstream(
     query: &[u8],
     upstream: &RuntimeUpstream,
     deadline: Instant,
+    traffic: &UpstreamTraffic,
 ) -> Result<UpstreamForwardResponse, String> {
     remaining_upstream_timeout(deadline)?;
     let started = Instant::now();
+    // 超时检查通过就意味着这次查询会真的发出去，失败分支的上行字节同样要计入。
+    traffic.record_sent(query.len());
     let response = if upstream.dnssec_enabled
         || matches!(
             upstream.server,
@@ -1231,6 +1278,8 @@ fn forward_to_upstream(
     };
     let response = match response {
         Ok(response) => {
+            // 响应无效或 DNSSEC 失败时这些字节同样已经过网，先计入再判断。
+            traffic.record_received(response.len());
             if let Err(error) = validate_response_for_query(query, &response) {
                 mark_upstream_unhealthy(upstream);
                 return Err(format!("上游 {} 响应无效：{error}", upstream.label));
@@ -1846,6 +1895,7 @@ mod tests {
             &example_a_query(),
             &upstream,
             Instant::now() + Duration::from_secs(8),
+            &Arc::new(UpstreamTraffic::default()),
         )
         .expect("公共 DoT 查询应成功");
         assert_eq!(&response.response[..2], &[0x12, 0x34]);
@@ -1866,6 +1916,7 @@ mod tests {
             &example_a_query(),
             &upstream,
             Instant::now() + Duration::from_secs(8),
+            &Arc::new(UpstreamTraffic::default()),
         )
         .expect("公共 DoQ 查询应成功");
         assert_eq!(&response.response[..2], &[0x12, 0x34]);
@@ -1895,6 +1946,7 @@ mod tests {
             &example_a_query(),
             &upstream,
             Instant::now() + Duration::from_secs(2),
+            &Arc::new(UpstreamTraffic::default()),
         ) {
             Ok(_) => panic!("DNSSEC 模式必须拒绝 SERVFAIL"),
             Err(error) => error,
@@ -1966,6 +2018,7 @@ mod tests {
             &upstreams,
             &AtomicUsize::new(0),
             Instant::now() + Duration::from_secs(1),
+            &Arc::new(UpstreamTraffic::default()),
         ) {
             Ok(_) => panic!("全体退避时应快速失败"),
             Err(error) => error,
@@ -1988,6 +2041,7 @@ mod tests {
             &upstreams,
             &AtomicUsize::new(0),
             Instant::now() + Duration::from_secs(5),
+            &Arc::new(UpstreamTraffic::default()),
         )
         .unwrap();
         assert_eq!(response.upstream, third_label);
@@ -2077,6 +2131,7 @@ mod tests {
                     &next,
                     Instant::now() + Duration::from_secs(2),
                     None,
+                    &Arc::new(UpstreamTraffic::default()),
                 );
                 waits.push(started.elapsed().as_millis());
                 std::thread::sleep(GAP);
@@ -2184,6 +2239,7 @@ mod tests {
                 &upstreams,
                 &AtomicUsize::new(0),
                 started + Duration::from_millis(200),
+                &Arc::new(UpstreamTraffic::default()),
             )
             .is_err()
         );
@@ -2206,6 +2262,7 @@ mod tests {
             &AtomicUsize::new(0),
             Instant::now() + Duration::from_secs(3),
             None,
+            &Arc::new(UpstreamTraffic::default()),
         );
         let primary_received_at = slow_received.recv_timeout(Duration::from_secs(1));
         let parallel_received_at = fast_received.recv_timeout(Duration::from_secs(1));

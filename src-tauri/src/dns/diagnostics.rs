@@ -15,7 +15,9 @@ use super::{
     filter_runtime::FilterRuntime,
     protocol::{DnsResponseAnswer, summarize_response},
     stats::DnsStats,
-    upstream::{RuntimeUpstream, build_runtime_upstreams_with_dnssec, forward_query},
+    upstream::{
+        RuntimeUpstream, UpstreamTraffic, build_runtime_upstreams_with_dnssec, forward_query,
+    },
 };
 
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -255,6 +257,8 @@ fn test_upstreams(query: &[u8], upstreams: Vec<RuntimeUpstream>) -> Vec<Upstream
     let query = Arc::new(query.to_vec());
     thread_results(upstreams, |upstream| {
         let stats = Arc::new(Mutex::new(DnsStats::default()));
+        // 诊断是用户手动发起的连通性测试，不服务任何客户端查询，
+        // 字节丢弃在这里，避免把它算进 DNS 流量统计。
         match forward_query(
             query.as_slice(),
             std::slice::from_ref(&upstream),
@@ -262,6 +266,7 @@ fn test_upstreams(query: &[u8], upstreams: Vec<RuntimeUpstream>) -> Vec<Upstream
             &AtomicUsize::new(0),
             Instant::now() + DIAGNOSTIC_TIMEOUT,
             &stats,
+            &Arc::new(UpstreamTraffic::default()),
         ) {
             Ok(result) => {
                 let summary = summarize_response(&result.response);

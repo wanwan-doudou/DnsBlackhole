@@ -157,6 +157,7 @@ import type {
   SecurityEvent,
   StorageInfo,
   StorageTargetInfo,
+  TrafficBucket,
   UpstreamLatencyStat,
   UpstreamMode,
   UpstreamRequestStat,
@@ -497,7 +498,12 @@ async function checkApplicationUpdate(): Promise<Update | null> {
 
 const contentElement = query<HTMLDivElement>(".content");
 const dashboardView = query<HTMLElement>('[data-view-panel="dashboard"]');
-const dashboardRangeField = query<HTMLElement>(".dashboard-range-field");
+// 两个面板各有一个统计范围选择器，选择器必须按面板限定，不能靠 DOM 顺序。
+const dashboardRangeField = query<HTMLElement>(
+  '[data-view-panel="dashboard"] .dashboard-range-field',
+);
+const trafficView = query<HTMLElement>('[data-view-panel="traffic"]');
+const trafficRangeField = query<HTMLElement>('[data-view-panel="traffic"] .dashboard-range-field');
 const dashboardStatisticsRange = query<HTMLSelectElement>("#dashboard_statistics_range");
 const clientRankBody = query<HTMLDivElement>("#client_rank");
 const queryRankBody = query<HTMLDivElement>("#query_rank");
@@ -759,6 +765,7 @@ let pendingQueryRuleDomain = "";
 const securityAccessDenied = query<HTMLElement>("#security_access_denied");
 const securityRateLimited = query<HTMLElement>("#security_rate_limited");
 const securityDroppedUdp = query<HTMLElement>("#security_dropped_udp");
+const securityInvalidQuery = query<HTMLElement>("#security_invalid_query");
 const securityRefusedAny = query<HTMLElement>("#security_refused_any");
 const securityRebindingBlocked = query<HTMLElement>("#security_rebinding_blocked");
 const securityCnameBlocked = query<HTMLElement>("#security_cname_blocked");
@@ -782,6 +789,15 @@ const cachePrefetches = query<HTMLElement>("#cache_prefetches");
 const cacheEvictions = query<HTMLElement>("#cache_evictions");
 const cacheEntries = query<HTMLElement>("#cache_entries");
 const cacheBytes = query<HTMLElement>("#cache_bytes");
+const trafficTotal = query<HTMLElement>("#traffic_total");
+const trafficClient = query<HTMLElement>("#traffic_client");
+const trafficClientDetail = query<HTMLElement>("#traffic_client_detail");
+const trafficUpstream = query<HTMLElement>("#traffic_upstream");
+const trafficUpstreamDetail = query<HTMLElement>("#traffic_upstream_detail");
+const trafficPerQuery = query<HTMLElement>("#traffic_per_query");
+const trafficPerQueryDetail = query<HTMLElement>("#traffic_per_query_detail");
+const trafficSaved = query<HTMLElement>("#traffic_saved");
+const trafficStatisticsRange = query<HTMLSelectElement>("#traffic_statistics_range");
 const diagnosticDomainInput = query<HTMLInputElement>("#diagnostic_domain");
 const diagnosticQueryTypeInput = query<HTMLSelectElement>("#diagnostic_query_type");
 const diagnosticClientIpInput = query<HTMLInputElement>("#diagnostic_client_ip");
@@ -998,6 +1014,7 @@ function syncCustomSelect(select: HTMLSelectElement): void {
   filterUpdateIntervalInput,
   diagnosticQueryTypeInput,
   dashboardStatisticsRange,
+  trafficStatisticsRange,
   themePreferenceInput,
   languagePreferenceInput,
   securityEventRetentionInput,
@@ -1393,6 +1410,11 @@ queryLogBody.addEventListener("focusin", (event) => {
 });
 
 contentElement.addEventListener("scroll", markContentScrolling, { passive: true });
+// scroll 事件不冒泡，卡片内部的排行表得自己挂一个，否则在表里滚动时
+// 自动刷新照常重建 DOM，正看着的那几行会被抽走。
+document.querySelectorAll<HTMLElement>(".rank-body").forEach((body) => {
+  body.addEventListener("scroll", markContentScrolling, { passive: true });
+});
 
 queryLogEnabledInput.addEventListener("change", updateLogControls);
 statisticsEnabledInput.addEventListener("change", updateStatisticsControls);
@@ -1697,14 +1719,30 @@ queryLogExportButton.addEventListener("click", async () => {
   });
 });
 
-dashboardStatisticsRange.addEventListener("change", () => {
-  dashboardStatisticsHours = dashboardStatisticsRange.value === "configured"
-    ? undefined
-    : Number(dashboardStatisticsRange.value);
-  dashboardStatisticsRevision += 1;
-  syncCustomSelect(dashboardStatisticsRange);
-  setDashboardLoading(true);
-  void refreshStatus({ button: document.querySelector<HTMLButtonElement>("[data-refresh-dashboard]") ?? undefined });
+[dashboardStatisticsRange, trafficStatisticsRange].forEach((select) => {
+  select.addEventListener("change", () => {
+    dashboardStatisticsHours = select.value === "configured"
+      ? undefined
+      : Number(select.value);
+    dashboardStatisticsRevision += 1;
+    // 仪表盘和流量页看的是同一份统计，范围必须一致，否则两页数字对不上。
+    const peer = select === dashboardStatisticsRange
+      ? trafficStatisticsRange
+      : dashboardStatisticsRange;
+    if (peer.value !== select.value) {
+      peer.value = select.value;
+      syncCustomSelect(peer);
+    }
+    syncCustomSelect(select);
+    setDashboardLoading(true);
+    void refreshStatus({ button: document.querySelector<HTMLButtonElement>("[data-refresh-dashboard]") ?? undefined });
+  });
+});
+
+document.querySelectorAll<HTMLButtonElement>("[data-refresh-traffic]").forEach((button) => {
+  button.addEventListener("click", () => {
+    void refreshStatus({ button });
+  });
 });
 
 clientRankBody.addEventListener("click", (event) => {
@@ -4007,29 +4045,35 @@ async function refreshStatus(options: RefreshOptions = {}): Promise<void> {
 
   const started = performance.now();
   const renderDashboard = activeView === "dashboard";
+  const renderTraffic = activeView === "traffic";
+  // 两页看的是同一份统计聚合，取数条件必须一起放开。
+  const needsLogStats = renderDashboard || renderTraffic;
   const requestedStatisticsHours = dashboardStatisticsHours;
   const requestedStatisticsRevision = dashboardStatisticsRevision;
   let succeeded = false;
   refreshInFlight = true;
   setRefreshButtonState(options.button, true);
-  if (renderDashboard && options.auto !== true) {
+  if (needsLogStats && options.auto !== true) {
     setDashboardLoading(true);
   }
   try {
     const status = await getStatus(
       options.auto !== true,
-      renderDashboard,
-      renderDashboard ? requestedStatisticsHours : undefined,
+      needsLogStats,
+      needsLogStats ? requestedStatisticsHours : undefined,
     );
     if (options.auto && isContentScrolling) {
       queuedAutoRefresh = true;
       return;
     }
     const dashboardRangeIsCurrent = requestedStatisticsRevision === dashboardStatisticsRevision;
-    renderStatus(status, { renderDashboard: renderDashboard && dashboardRangeIsCurrent });
-    if (renderDashboard && dashboardRangeIsCurrent) {
+    renderStatus(status, {
+      renderDashboard: renderDashboard && dashboardRangeIsCurrent,
+      renderTraffic: renderTraffic && dashboardRangeIsCurrent,
+    });
+    if (needsLogStats && dashboardRangeIsCurrent) {
       lastDashboardRefreshAt = performance.now();
-    } else if (renderDashboard) {
+    } else if (needsLogStats) {
       statusRefreshQueued = true;
     }
     succeeded = true;
@@ -4303,6 +4347,9 @@ function setActiveView(view: ViewName): void {
   }
   if (view === "logs") {
     void refreshQueryLogs();
+  }
+  if (view === "traffic" && viewChanged) {
+    void refreshStatus({ auto: true });
   }
   if (view === "filters" && viewChanged) {
     void refreshFilterUpdateMetadata();
@@ -4608,6 +4655,7 @@ function renderFilter(filter: FilterSubscription): string {
 
 function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}): void {
   const renderDashboard = options.renderDashboard ?? true;
+  const renderTraffic = options.renderTraffic ?? true;
 
   latestRuntimeStatus = status;
   renderRuntimeStatus(status);
@@ -4626,6 +4674,10 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   renderSecurityEvents(status);
   renderCacheStats(status);
 
+  if (renderTraffic) {
+    renderTrafficView(status);
+  }
+
   if (!renderDashboard) {
     return;
   }
@@ -4635,12 +4687,7 @@ function renderStatus(status: RuntimeStatus, options: RenderStatusOptions = {}):
   setTextIfChanged(query("#block_rate"), formatRate(status.stats.blocked, status.stats.queries));
   renderDashboardSummaryWindow(status.stats.dashboard_started_at, status.stats.dashboard_ended_at);
   const effectiveStatisticsHours = dashboardStatisticsHours ?? currentStatisticsRetentionHours;
-  const allTraffic = status.stats.traffic ?? [];
-  const traffic = effectiveStatisticsHours === 0
-    ? allTraffic
-    : allTraffic.filter(
-        (bucket) => bucket.minute >= Math.floor(Date.now() / 60_000) - effectiveStatisticsHours * 60,
-      );
+  const traffic = trafficBucketsInWindow(status.stats.traffic ?? [], effectiveStatisticsHours);
   renderSparkline(
     "#query_sparkline",
     buildTrafficSeries(traffic, "queries", effectiveStatisticsHours),
@@ -4693,6 +4740,7 @@ function renderSecurityEvents(status: RuntimeStatus): void {
   setTextIfChanged(securityAccessDenied, formatCount(status.stats.access_denied_total));
   setTextIfChanged(securityRateLimited, formatCount(status.stats.rate_limited_total));
   setTextIfChanged(securityDroppedUdp, formatCount(status.stats.dropped_udp_total));
+  setTextIfChanged(securityInvalidQuery, formatCount(status.stats.invalid_query_total ?? 0));
   setTextIfChanged(securityRefusedAny, formatCount(status.stats.refused_any_total));
   setTextIfChanged(
     securityRebindingBlocked,
@@ -4781,6 +4829,8 @@ function securityEventLabel(eventType: SecurityEvent["event_type"]): string {
   switch (eventType) {
     case "rate_limited":
       return t("触发限速");
+    case "invalid_query":
+      return t("无效请求");
     case "web_auth_login":
       return t("管理登录成功");
     case "web_auth_failed":
@@ -5639,6 +5689,96 @@ async function downloadAndInstallWithRetry(): Promise<void> {
   );
 }
 
+/// 按统计窗口截取趋势桶。0 表示全部历史，不截断。
+function trafficBucketsInWindow(buckets: TrafficBucket[], hours: number): TrafficBucket[] {
+  if (hours === 0) {
+    return buckets;
+  }
+  const since = Math.floor(Date.now() / 60_000) - hours * 60;
+  return buckets.filter((bucket) => bucket.minute >= since);
+}
+
+/// 流量页与仪表盘共用统计范围，数据同样来自统计库而非进程内计数。
+/// 统计关闭或老库尚未攒下字节时后端不返回这些字段，按 0 渲染即可。
+function renderTrafficView(status: RuntimeStatus): void {
+  const totals = status.stats.traffic_totals;
+  const clientIn = totals?.client_bytes_in ?? 0;
+  const clientOut = totals?.client_bytes_out ?? 0;
+  const upstreamOut = totals?.upstream_bytes_out ?? 0;
+  const upstreamIn = totals?.upstream_bytes_in ?? 0;
+  const total = clientIn + clientOut + upstreamOut + upstreamIn;
+
+  const clientTotal = clientIn + clientOut;
+  const upstreamTotal = upstreamOut + upstreamIn;
+
+  setTextIfChanged(trafficTotal, formatBytes(total));
+  setTextIfChanged(trafficClient, formatBytes(clientTotal));
+  setTextIfChanged(
+    trafficClientDetail,
+    t("收 {p0} · 发 {p1}", { p0: formatBytes(clientIn), p1: formatBytes(clientOut) }),
+  );
+  setTextIfChanged(trafficUpstream, formatBytes(upstreamTotal));
+  setTextIfChanged(
+    trafficUpstreamDetail,
+    t("发 {p0} · 收 {p1}", { p0: formatBytes(upstreamOut), p1: formatBytes(upstreamIn) }),
+  );
+  setTextIfChanged(trafficSaved, formatBytes(totals?.cache_saved_bytes ?? 0));
+
+  // 分子分母取同一个统计范围：这段时间搬了多少字节、处理了多少查询。
+  // 范围里若包含流量统计上线前的查询，平均值会偏低，那是数据的真实反映——
+  // 换个"只算有字节记录的查询"的分母能让数字好看，但分子含后台刷新、
+  // 分母不含，两边就不是同一批数据了。
+  const queries = status.stats.queries;
+  setTextIfChanged(trafficPerQuery, queries > 0 ? formatBytes(total / queries) : "0 B");
+  setTextIfChanged(
+    trafficPerQueryDetail,
+    queries > 0
+      ? t("按 {p0} 次查询平均", { p0: formatCount(queries) })
+      : t("所选统计范围内暂无请求"),
+  );
+
+  const effectiveHours = dashboardStatisticsHours ?? currentStatisticsRetentionHours;
+  const buckets = trafficBucketsInWindow(status.stats.traffic ?? [], effectiveHours);
+  renderSparkline(
+    "#traffic_sparkline",
+    buildTrafficSeries(buckets, "bytes", effectiveHours),
+    formatBytes,
+  );
+
+  const clientTraffic = status.stats.client_traffic ?? {};
+  const domainTraffic = status.stats.domain_traffic ?? {};
+  renderRankTable(
+    "#client_traffic_rank",
+    clientTraffic,
+    sumRankValues(clientTraffic),
+    formatClientLabel,
+    undefined,
+    formatBytes,
+  );
+  renderRankTable(
+    "#domain_traffic_rank",
+    domainTraffic,
+    sumRankValues(domainTraffic),
+    undefined,
+    undefined,
+    formatBytes,
+  );
+
+  const window = dashboardSummaryWindowText(
+    status.stats.dashboard_started_at,
+    status.stats.dashboard_ended_at,
+  );
+  for (const id of ["#traffic_window", "#client_traffic_window", "#domain_traffic_window"]) {
+    setTextIfChanged(query<HTMLElement>(id), window);
+  }
+}
+
+/// 排行的百分比要以榜单自身的总量为分母。查询数排行用的是全局 queries，
+/// 但流量排行没有对应的"全局字节"字段可借，直接按榜内求和。
+function sumRankValues(counts: Record<string, number>): number {
+  return Object.values(counts).reduce((sum, value) => sum + value, 0);
+}
+
 function renderDashboardSummaryWindow(
   startedAt?: number | null,
   endedAt?: number | null,
@@ -5649,6 +5789,20 @@ function renderDashboardSummaryWindow(
   if (endedAt !== undefined) {
     latestDashboardEndedAt = endedAt;
   }
+  const label = dashboardSummaryWindowText(startedAt, endedAt);
+  query("#query_rank_window").textContent = label;
+  query("#blocked_rank_window").textContent = label;
+  query("#client_rank_window").textContent = label;
+  query("#blocklist_rank_window").textContent = label;
+  query("#upstream_rank_window").textContent = label;
+  query("#upstream_latency_window").textContent = label;
+}
+
+/// 汇总窗口的人话描述。仪表盘各排行和流量页共用同一套口径。
+function dashboardSummaryWindowText(
+  startedAt?: number | null,
+  endedAt?: number | null,
+): string {
   const summaryStartedAt = startedAt ?? latestDashboardStartedAt;
   const summaryEndedAt = endedAt ?? latestDashboardEndedAt;
   let label: string;
@@ -5673,28 +5827,26 @@ function renderDashboardSummaryWindow(
   } else {
     label = t("暂无汇总数据");
   }
-  query("#query_rank_window").textContent = label;
-  query("#blocked_rank_window").textContent = label;
-  query("#client_rank_window").textContent = label;
-  query("#blocklist_rank_window").textContent = label;
-  query("#upstream_rank_window").textContent = label;
-  query("#upstream_latency_window").textContent = label;
+  return label;
 }
 
 function updateDashboardRangeOptions(): void {
-  Array.from(dashboardStatisticsRange.options).forEach((option) => {
-    if (option.value === "configured" || option.value === "0") {
-      option.disabled = false;
-      return;
+  [dashboardStatisticsRange, trafficStatisticsRange].forEach((select) => {
+    Array.from(select.options).forEach((option) => {
+      if (option.value === "configured" || option.value === "0") {
+        option.disabled = false;
+        return;
+      }
+      const hours = Number(option.value);
+      option.disabled =
+        currentStatisticsRetentionHours > 0 && hours > currentStatisticsRetentionHours;
+    });
+    if (select.selectedOptions[0]?.disabled) {
+      select.value = "configured";
+      dashboardStatisticsHours = undefined;
     }
-    const hours = Number(option.value);
-    option.disabled = currentStatisticsRetentionHours > 0 && hours > currentStatisticsRetentionHours;
+    syncCustomSelect(select);
   });
-  if (dashboardStatisticsRange.selectedOptions[0]?.disabled) {
-    dashboardStatisticsRange.value = "configured";
-    dashboardStatisticsHours = undefined;
-  }
-  syncCustomSelect(dashboardStatisticsRange);
 }
 
 function updateFilterField(id: string, target: HTMLInputElement): void {
@@ -5901,6 +6053,7 @@ function renderRankTable(
   total: number,
   formatLabel?: (key: string) => string,
   drilldown?: "queries" | "blocked",
+  formatValue: (value: number) => string = formatCount,
 ): void {
   const container = query<HTMLDivElement>(selector);
   const rows = Object.entries(counts)
@@ -5929,7 +6082,7 @@ function renderRankTable(
         <div class="rank-row">
           ${domainCell}
           <div class="rank-value">
-            <span class="rank-count">${formatCount(count)}</span>
+            <span class="rank-count">${formatValue(count)}</span>
             <span class="rank-percent">${formatPercent(percent)}</span>
             <span class="rank-bar"><span style="width: ${barWidth.toFixed(2)}%"></span></span>
           </div>
@@ -6128,12 +6281,16 @@ function setRefreshButtonState(button: HTMLButtonElement | undefined, refreshing
 }
 
 function setDashboardLoading(loading: boolean): void {
-  dashboardView.classList.toggle("is-loading", loading);
-  dashboardView.setAttribute("aria-busy", String(loading));
-  dashboardRangeField.classList.toggle("is-loading", loading);
-  customSelects
-    .get(dashboardStatisticsRange)
-    ?.trigger.setAttribute("aria-busy", String(loading));
+  [dashboardView, trafficView].forEach((view) => {
+    view.classList.toggle("is-loading", loading);
+    view.setAttribute("aria-busy", String(loading));
+  });
+  [dashboardRangeField, trafficRangeField].forEach((field) => {
+    field.classList.toggle("is-loading", loading);
+  });
+  [dashboardStatisticsRange, trafficStatisticsRange].forEach((select) => {
+    customSelects.get(select)?.trigger.setAttribute("aria-busy", String(loading));
+  });
   if (loading && !latestRuntimeStatus) {
     renderDashboardState("loading", t("正在加载统计数据…"));
   }

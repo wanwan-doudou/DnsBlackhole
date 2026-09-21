@@ -16,6 +16,12 @@ use super::security_events::SecurityEventMessage;
 const TRAFFIC_BUCKET_WINDOW_MINUTES: u64 = 90 * 24 * 60;
 pub(crate) const SECURITY_EVENT_CAPACITY: usize = 200;
 const SECURITY_EVENT_AGGREGATE_SECONDS: u64 = 10;
+/// 聚合时向前回看的最大条目数。
+///
+/// 只比对队尾时，多个客户端（或多种拒绝理由）交替触发就永远合并不上，
+/// 持续扫描会把 200 条最近视图整个冲掉，挤掉真正该看见的拒绝与限速记录。
+/// 回看窗口内的少量条目即可收敛这类交叉流量，代价是每条事件最多多比对 32 次。
+const SECURITY_EVENT_AGGREGATE_LOOKBACK: usize = 32;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DnsStats {
@@ -36,6 +42,8 @@ pub struct DnsStats {
     #[serde(default)]
     pub cname_cloaking_blocked_total: u64,
     pub dropped_udp_total: u64,
+    #[serde(default)]
+    pub invalid_query_total: u64,
     #[serde(default)]
     pub worker_queue_dropped_total: u64,
     #[serde(default)]
@@ -85,6 +93,13 @@ pub struct DnsStats {
     #[serde(default)]
     pub blocklist_hits: HashMap<String, u64>,
     pub traffic: Vec<TrafficBucket>,
+    /// DNS 报文字节量，随仪表盘统计范围一起从统计库汇总，不是进程内计数。
+    #[serde(default)]
+    pub traffic_totals: TrafficTotals,
+    #[serde(default)]
+    pub domain_traffic: HashMap<String, u64>,
+    #[serde(default)]
+    pub client_traffic: HashMap<String, u64>,
     pub upstream_requests: Vec<UpstreamRequestStat>,
     pub upstream_avg_latency: Vec<UpstreamLatencyStat>,
 }
@@ -94,6 +109,8 @@ pub struct DnsStats {
 pub enum SecurityEventType {
     AccessDenied,
     RateLimited,
+    /// 客户端请求在解析阶段被拒绝：报文畸形，或格式合法但本服务不支持（如非 QUERY opcode）
+    InvalidQuery,
     /// Web 管理后台登录成功
     WebAuthLogin,
     /// Web 管理后台登录失败
@@ -127,6 +144,33 @@ pub struct TrafficBucket {
     pub minute: u64,
     pub queries: u64,
     pub blocked: u64,
+    /// 该时段实际搬运的 DNS 报文字节，不含缓存省下的那部分。
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+/// DNS 报文字节量。统计的是 DNS 报文本身的长度，不含 TCP 长度前缀、
+/// TLS 握手与 DoH 的 HTTP 头：那些封装开销在 reqwest / hickory 内部，取不到。
+///
+/// 只有真正过网的报文才计入——响应发送失败时不计下行，命中缓存时不计上游。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TrafficTotals {
+    /// 客户端发来的查询报文
+    #[serde(default)]
+    pub client_bytes_in: u64,
+    /// 成功回给客户端的响应报文
+    #[serde(default)]
+    pub client_bytes_out: u64,
+    /// 发往上游的查询报文，含失败重试、fallback 与并行分支
+    #[serde(default)]
+    pub upstream_bytes_out: u64,
+    /// 从上游收到的响应报文
+    #[serde(default)]
+    pub upstream_bytes_in: u64,
+    /// 命中缓存因而没有发生的上游往返字节。用缓存里那份响应的真实大小计，
+    /// 它本来就是从上游取回来的，不是凭系数估算。
+    #[serde(default)]
+    pub cache_saved_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -341,6 +385,32 @@ pub(crate) fn record_access_denied(
     }
 }
 
+/// 客户端报文解析失败：这是远端请求不合规，不是本机故障。
+///
+/// 扫描器、老旧设备和异常实现在局域网里很常见，服务端拒绝它们本就是正确行为，
+/// 所以既不计入 `failed`，也不写 `last_error`（写了会被界面弹成红色错误 toast）。
+/// 诊断价值由安全事件承担：带客户端 IP、协议、拒绝原因与聚合计数，并落盘保存。
+pub(crate) fn record_invalid_query(
+    stats: &Arc<Mutex<DnsStats>>,
+    client_ip: IpAddr,
+    protocol: DnsTransport,
+    reason: String,
+) {
+    if let Ok(mut current) = stats.lock() {
+        current.invalid_query_total += 1;
+        if protocol == DnsTransport::Udp {
+            current.dropped_udp_total += 1;
+        }
+        record_security_event(
+            &mut current,
+            SecurityEventType::InvalidQuery,
+            protocol,
+            client_ip,
+            reason,
+        );
+    }
+}
+
 pub(crate) fn record_rate_limited(
     stats: &Arc<Mutex<DnsStats>>,
     client_ip: IpAddr,
@@ -386,16 +456,23 @@ pub(crate) fn append_security_event(
     reason: String,
 ) -> SecurityEvent {
     let now = current_second();
-    if let Some(last) = stats.security_events.back_mut()
-        && last.event_type == event_type
-        && last.protocol == protocol
-        && last.client_ip == client_ip
-        && last.reason == reason
-        && now.saturating_sub(last.last_seen_at) <= SECURITY_EVENT_AGGREGATE_SECONDS
+    if let Some(index) =
+        find_aggregatable_event(stats, now, event_type, protocol, &client_ip, &reason)
     {
-        last.last_seen_at = now;
-        last.count = last.count.saturating_add(1);
-        return last.clone();
+        // 队列按 last_seen_at 升序，命中后移到队尾才能保持「最近发生」的排序语义。
+        // first_seen_at 原样保留，落库时仍会累加到同一条聚合行上。
+        let mut event = stats
+            .security_events
+            .remove(index)
+            .expect("命中的聚合条目应仍在队列中");
+        event.last_seen_at = now;
+        event.count = event.count.saturating_add(1);
+        stats.security_events.push_back(event);
+        return stats
+            .security_events
+            .back()
+            .expect("合并后的事件应在队尾")
+            .clone();
     }
 
     if stats.security_events.len() >= SECURITY_EVENT_CAPACITY {
@@ -415,6 +492,34 @@ pub(crate) fn append_security_event(
         .back()
         .expect("新事件应已加入队列")
         .clone()
+}
+
+/// 在回看窗口内找可合并的同类事件，返回它在队列中的下标。
+fn find_aggregatable_event(
+    stats: &DnsStats,
+    now: u64,
+    event_type: SecurityEventType,
+    protocol: DnsTransport,
+    client_ip: &str,
+    reason: &str,
+) -> Option<usize> {
+    let events = &stats.security_events;
+    for offset in 1..=events.len().min(SECURITY_EVENT_AGGREGATE_LOOKBACK) {
+        let index = events.len() - offset;
+        let event = &events[index];
+        // 队列按 last_seen_at 升序，遇到窗口外的条目说明更早的也都已超时。
+        if now.saturating_sub(event.last_seen_at) > SECURITY_EVENT_AGGREGATE_SECONDS {
+            break;
+        }
+        if event.event_type == event_type
+            && event.protocol == protocol
+            && event.client_ip == client_ip
+            && event.reason == reason
+        {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn persist_security_event(stats: &mut DnsStats, mut event: SecurityEvent) {
@@ -586,6 +691,71 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_clients_still_aggregate_within_the_lookback_window() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let scanner = "192.168.1.40".parse().unwrap();
+        let denied = "192.168.1.41".parse().unwrap();
+
+        // 扫描器与被拒客户端交替触发：只比对队尾时每条都会新建，最近视图很快被冲掉。
+        for _ in 0..50 {
+            record_invalid_query(
+                &stats,
+                scanner,
+                DnsTransport::Udp,
+                "DNS 请求附加记录格式无效".into(),
+            );
+            record_access_denied(
+                &stats,
+                denied,
+                DnsTransport::Udp,
+                "客户端不在允许列表中".into(),
+            );
+        }
+
+        let current = stats.lock().unwrap();
+        assert_eq!(current.security_events.len(), 2);
+        assert!(
+            current
+                .security_events
+                .iter()
+                .all(|event| event.count == 50),
+            "同类事件应合并成一条并累加次数"
+        );
+        // 合并后仍按 last_seen_at 升序，界面倒序展示才不会把新事件排到旧事件下面。
+        assert_eq!(
+            current.security_events.back().unwrap().event_type,
+            SecurityEventType::AccessDenied
+        );
+    }
+
+    #[test]
+    fn aggregation_lookback_is_bounded_and_keeps_distinct_events() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        // 回看窗口之外的同类事件不再合并，保证热路径比对次数有上限。
+        for index in 0..=SECURITY_EVENT_AGGREGATE_LOOKBACK {
+            record_invalid_query(
+                &stats,
+                IpAddr::V6(Ipv6Addr::from(index as u128)),
+                DnsTransport::Udp,
+                "DNS 请求包含未解析的尾部数据".into(),
+            );
+        }
+        record_invalid_query(
+            &stats,
+            IpAddr::V6(Ipv6Addr::from(0_u128)),
+            DnsTransport::Udp,
+            "DNS 请求包含未解析的尾部数据".into(),
+        );
+
+        let current = stats.lock().unwrap();
+        assert_eq!(
+            current.security_events.len(),
+            SECURITY_EVENT_AGGREGATE_LOOKBACK + 2
+        );
+        assert_eq!(current.invalid_query_total as usize, SECURITY_EVENT_AGGREGATE_LOOKBACK + 2);
+    }
+
+    #[test]
     fn bounds_security_event_history() {
         let stats = Arc::new(Mutex::new(DnsStats::default()));
         for index in 0..=SECURITY_EVENT_CAPACITY {
@@ -626,6 +796,48 @@ mod tests {
         assert_eq!(current.failed, 0);
         assert_eq!(current.persistence_queue_dropped_total, 1);
         assert_eq!(current.last_error.as_deref(), Some("持久化队列已满"));
+    }
+
+    #[test]
+    fn invalid_client_query_is_audited_without_runtime_error() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        let ip = "192.168.1.30".parse().unwrap();
+        let reason = "DNS 请求附加记录格式无效".to_string();
+
+        record_error(&stats, "网络暂不可用".to_string());
+        record_forwarded(&stats, false);
+        record_invalid_query(&stats, ip, DnsTransport::Udp, reason.clone());
+        record_invalid_query(&stats, ip, DnsTransport::Udp, reason.clone());
+
+        let current = stats.lock().unwrap();
+        assert_eq!(current.invalid_query_total, 2);
+        assert_eq!(current.dropped_udp_total, 2);
+        // 客户端不合规不是本机故障：既不计入失败数，也不会被界面弹成错误提示。
+        assert_eq!(current.failed, 1);
+        assert!(current.last_error.is_none());
+        assert_eq!(current.access_denied_total, 0);
+        assert_eq!(current.security_events.len(), 1);
+        assert_eq!(
+            current.security_events[0].event_type,
+            SecurityEventType::InvalidQuery
+        );
+        assert_eq!(current.security_events[0].reason, reason);
+        assert_eq!(current.security_events[0].count, 2);
+    }
+
+    #[test]
+    fn invalid_tcp_query_is_not_counted_as_udp_drop() {
+        let stats = Arc::new(Mutex::new(DnsStats::default()));
+        record_invalid_query(
+            &stats,
+            "192.168.1.31".parse().unwrap(),
+            DnsTransport::Tcp,
+            "DNS 请求包含未解析的尾部数据".into(),
+        );
+
+        let current = stats.lock().unwrap();
+        assert_eq!(current.invalid_query_total, 1);
+        assert_eq!(current.dropped_udp_total, 0);
     }
 
     #[test]

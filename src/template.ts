@@ -32,6 +32,7 @@ export function renderAppTemplate(appIconUrl: string): string {
           <button class="nav-item" data-view="settings" data-nav-group="settings" type="button">${t("设置")}</button>
           <button class="nav-item" data-view="filters" data-nav-group="filters" type="button">${t("过滤器")}</button>
           <button class="nav-item" data-view="logs" type="button">${t("查询日志")}</button>
+          <button class="nav-item" data-view="traffic" type="button">${t("流量")}</button>
           <button class="nav-item" data-view="about" type="button">${t("关于")}</button>
         </nav>
 
@@ -232,6 +233,121 @@ export function renderAppTemplate(appIconUrl: string): string {
           </section>
         </div>
 
+      </section>
+
+      <section class="view" data-view-panel="traffic">
+        <div class="dashboard-controls">
+          <div>
+            <h2>${t("DNS 流量")}</h2>
+            <span>${t("统计 DNS 报文本身的字节，不含 TLS 握手与 HTTP 头等封装开销。")}</span>
+          </div>
+          <label class="dashboard-range-field">
+            <span>${t("统计范围")}</span>
+            <select id="traffic_statistics_range">
+              <option value="configured">${t("按保留设置")}</option>
+              <option value="24">${t("最近 24 小时")}</option>
+              <option value="168">${t("最近 7 天")}</option>
+              <option value="720">${t("最近 30 天")}</option>
+              <option value="0">${t("全部历史")}</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="dashboard-summary traffic-summary">
+          <article class="spark-card">
+            <div class="spark-box">
+              <span class="spark-caption">${t("DNS 流量")}</span>
+              <strong id="traffic_total">0 B</strong>
+              <svg class="sparkline" data-tooltip="traffic_spark_tooltip" viewBox="0 0 260 78" preserveAspectRatio="none" aria-hidden="true">
+                <defs>
+                  <linearGradient id="traffic_spark_gradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="var(--neutral-10)" stop-opacity="0.82"></stop>
+                    <stop offset="64%" stop-color="var(--neutral-10)" stop-opacity="0.6"></stop>
+                    <stop offset="92%" stop-color="var(--neutral-10)" stop-opacity="0.16"></stop>
+                    <stop offset="100%" stop-color="var(--neutral-10)" stop-opacity="0"></stop>
+                  </linearGradient>
+                </defs>
+                <line class="spark-baseline" x1="0" y1="72" x2="260" y2="72"></line>
+                <path class="spark-area" fill="url(#traffic_spark_gradient)" d=""></path>
+                <path class="spark-line" id="traffic_sparkline" d=""></path>
+                <line class="spark-guide hidden" x1="0" y1="8" x2="0" y2="72"></line>
+                <circle class="spark-point hidden" cx="0" cy="72" r="3"></circle>
+              </svg>
+              <div class="spark-tooltip hidden" id="traffic_spark_tooltip"></div>
+            </div>
+          </article>
+
+          <article class="spark-card traffic-saved-card">
+            <div class="spark-box">
+              <span class="spark-caption">${t("缓存省下的上游流量")}</span>
+              <strong id="traffic_saved">0 B</strong>
+              <p class="traffic-saved-note">${t("命中缓存、未发往上游。")}</p>
+            </div>
+          </article>
+        </div>
+
+        <section class="panel traffic-breakdown-panel">
+          <div class="rank-title">
+            <div>
+              <h2>${t("流量构成")}</h2>
+              <span id="traffic_window">${t("暂无汇总数据")}</span>
+            </div>
+            <button class="icon-button" data-refresh-traffic type="button" title="${t("刷新")}">↻</button>
+          </div>
+          <div class="traffic-split">
+            <div class="traffic-item">
+              <span>${t("客户端方向")}</span>
+              <strong id="traffic_client">0 B</strong>
+              <small id="traffic_client_detail">-</small>
+            </div>
+            <div class="traffic-item">
+              <span>${t("上游方向")}</span>
+              <strong id="traffic_upstream">0 B</strong>
+              <small id="traffic_upstream_detail">-</small>
+            </div>
+            <div class="traffic-item">
+              <span>${t("平均每次查询")}</span>
+              <strong id="traffic_per_query">0 B</strong>
+              <small id="traffic_per_query_detail">-</small>
+            </div>
+          </div>
+        </section>
+
+        <div class="dashboard-rank-grid">
+          <section class="panel rank-panel">
+            <div class="rank-title">
+              <div>
+                <h2>${t("客户端流量排行")}</h2>
+                <span id="client_traffic_window">${t("暂无汇总数据")}</span>
+              </div>
+              <button class="icon-button" data-refresh-traffic type="button" title="${t("刷新")}">↻</button>
+            </div>
+            <div class="rank-table">
+              <div class="rank-head">
+                <span>${t("客户端")}</span>
+                <span>${t("流量")}</span>
+              </div>
+              <div class="rank-body is-empty" id="client_traffic_rank"></div>
+            </div>
+          </section>
+
+          <section class="panel rank-panel">
+            <div class="rank-title">
+              <div>
+                <h2>${t("域名流量排行")}</h2>
+                <span id="domain_traffic_window">${t("暂无汇总数据")}</span>
+              </div>
+              <button class="icon-button" data-refresh-traffic type="button" title="${t("刷新")}">↻</button>
+            </div>
+            <div class="rank-table">
+              <div class="rank-head">
+                <span>${t("域名")}</span>
+                <span>${t("流量")}</span>
+              </div>
+              <div class="rank-body is-empty" id="domain_traffic_rank"></div>
+            </div>
+          </section>
+        </div>
       </section>
 
       <section class="view query-log-view" data-view-panel="logs">
@@ -902,7 +1018,7 @@ export function renderAppTemplate(appIconUrl: string): string {
             <section class="settings-section dns-security-section">
               <div class="section-heading">
                 <h3>${t("安全事件")}</h3>
-                <span>${t("UDP 拒绝仍保持静默丢弃；这里展示拒绝、限速与 Web 管理认证事件，最多保留最近 200 条聚合事件。事件会落盘保存，DNS 未启动时也能查看。")}</span>
+                <span>${t("UDP 拒绝仍保持静默丢弃；这里展示拒绝、限速、无效请求与 Web 管理认证事件。它们是值得留痕的非常规请求与管理操作，不一定代表遭到攻击。最多保留最近 200 条聚合事件，落盘保存，DNS 未启动时也能查看。")}</span>
               </div>
               <div class="security-stat-grid">
                 <div class="security-stat-card">
@@ -916,6 +1032,10 @@ export function renderAppTemplate(appIconUrl: string): string {
                 <div class="security-stat-card">
                   <span>${t("UDP 静默丢弃")}</span>
                   <strong id="security_dropped_udp">0</strong>
+                </div>
+                <div class="security-stat-card">
+                  <span>${t("无效请求")}</span>
+                  <strong id="security_invalid_query">0</strong>
                 </div>
                 <div class="security-stat-card">
                   <span>${t("ANY 拒绝")}</span>

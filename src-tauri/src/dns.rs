@@ -37,7 +37,7 @@ pub use server::DnsServer;
 pub(crate) use stats::apply_cache_stats;
 pub use stats::{
     DnsStats, DnsTransport, RuntimeStatus, SecurityEvent, SecurityEventType, TrafficBucket,
-    UpstreamLatencyStat, UpstreamRequestStat, empty_status,
+    TrafficTotals, UpstreamLatencyStat, UpstreamRequestStat, empty_status,
 };
 pub(crate) use stats::SECURITY_EVENT_CAPACITY;
 // Web 管理认证自己落盘安全事件，只借用内存队列的聚合逻辑。
@@ -62,7 +62,8 @@ mod tests {
         analyze_rules,
         cache::{DnsCache, DnsCacheConfig, QueryCacheKey, cache_ttl_seconds},
         protocol::{
-            BlockingPolicy, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY, TYPE_CNAME, TYPE_SOA,
+            BlockingPolicy, DNS_HEADER_LEN, RCODE_NXDOMAIN, RCODE_REFUSED, TYPE_A, TYPE_ANY,
+            TYPE_CNAME, TYPE_SOA,
             build_block_response, build_dnsrewrite_response, build_error_response,
             build_rewrite_response, extract_response_ips, normalize_cached_response, parse_query,
             parse_question, prepare_cached_response, read_u16, response_is_truncated,
@@ -1224,6 +1225,89 @@ mod tests {
 
     fn a_query(domain: &str) -> Vec<u8> {
         typed_query(domain, TYPE_A)
+    }
+
+    /// `parse_query` 的每一条 Err 都是"客户端请求不合规"，调用方按安全事件记录，
+    /// 不能写进 last_error（会被界面弹成红色故障提示）。这里锁定完整的拒绝理由集合。
+    #[test]
+    fn every_parse_query_rejection_is_a_client_side_reason() {
+        let valid = a_query("example.com");
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("DNS 请求长度不足", valid[..8].to_vec()),
+            ("DNS 请求的 QR 标志无效", {
+                let mut packet = valid.clone();
+                packet[2] |= 0x80;
+                packet
+            }),
+            // opcode 5 = UPDATE，Windows 客户端做动态 DNS 注册时就会发这种包。
+            ("暂不支持非标准 DNS opcode 5", {
+                let mut packet = valid.clone();
+                packet[2] |= 0x28;
+                packet
+            }),
+            ("DNS 请求设置了保留标志位", {
+                let mut packet = valid.clone();
+                packet[3] |= 0x40;
+                packet
+            }),
+            ("DNS 请求必须且只能包含 1 个 question", {
+                let mut packet = valid.clone();
+                packet[5] = 2;
+                packet
+            }),
+            ("DNS 域名解析越界", valid[..DNS_HEADER_LEN].to_vec()),
+            ("DNS label 长度超过 63 字节", {
+                let mut packet = valid.clone();
+                packet[DNS_HEADER_LEN] = 0b0100_0000;
+                packet
+            }),
+            ("暂不支持压缩格式的 DNS question", {
+                let mut packet = valid.clone();
+                packet[DNS_HEADER_LEN] = 0b1100_0000;
+                packet
+            }),
+            ("DNS label 长度越界", {
+                let mut packet = valid[..DNS_HEADER_LEN].to_vec();
+                packet.push(9);
+                packet.extend_from_slice(b"example");
+                packet
+            }),
+            ("DNS label 必须使用 ASCII/Punycode 编码", {
+                let mut packet = valid.clone();
+                packet[DNS_HEADER_LEN + 1] = 0xff;
+                packet
+            }),
+            ("DNS question 缺少类型或类别", {
+                let mut packet = valid.clone();
+                packet.truncate(packet.len() - 2);
+                packet
+            }),
+            ("DNS 请求资源记录格式无效", {
+                let mut packet = valid.clone();
+                packet[7] = 1;
+                packet
+            }),
+            ("DNS 请求附加记录格式无效", {
+                let mut packet = valid.clone();
+                packet[11] = 1;
+                packet.extend_from_slice(&[0x00, 0x00, 0x29]);
+                packet
+            }),
+            ("DNS 请求包含未解析的尾部数据", {
+                let mut packet = valid.clone();
+                packet.push(0x00);
+                packet
+            }),
+        ];
+
+        for (reason, packet) in cases {
+            assert_eq!(
+                parse_query(&packet).err().as_deref(),
+                Some(reason),
+                "报文应被拒绝并给出「{reason}」"
+            );
+        }
+        assert!(parse_query(&valid).is_ok(), "正常查询仍应解析成功");
     }
 
     fn typed_query(domain: &str, qtype: u16) -> Vec<u8> {
